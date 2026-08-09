@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0 — 2026-08-10
+
+### Android build rooms (provider v1)
+- Create a room from any Gradle/Android project: containerized JDK 17 + Android SDK (digest-pinned image, licenses pre-accepted), per-room Gradle caches and a persistent SDK volume — nothing installed on the host.
+- One-click **Build APK** as a verified change; in-room terminal; adapted health checks. Emulator + preview is the designed v2.
+
+### Per-room services with real backups
+- Add PostgreSQL 17 / Redis 8 into a room's private network (`localhost:5432/6379` in-room, no host clashes).
+- Backup / restart / remove from Overview; destructive operations capture an **automatic safety backup**, and undoing a removal restores the service *and its data*. `db-restore` guards itself with a pre-restore backup too.
+
+### Full-page room view
+- The site and the room pages (Overview · Stack · System · Activity · Health · Console) each cover the whole window, browser-style; sleeping rooms home on Overview and navigate to the site on wake; browser-style ⋯ menu.
+
+### Room System page
+- Per-room control panel: environment variables, CPU/memory limits (docker-enforced), timezone — one undoable change.
+
+### Browser-grade preview tools
+- Docked Chrome DevTools (F12 or the `</>` button) beside the site; viewport presets (desktop/laptop/tablet/phone) via device emulation.
+
+### Host cleanliness
+- Settings → Host footprint: exactly what's on the host, open-folder buttons, autostart toggle, and **Uninstall & remove everything** (deletes all rooms/volumes, CA trust, autostart, app data, then launches the uninstaller).
+
 ## 0.1.0 — 2026-08-10
 
 First working release of DevHotel — every project gets its own room.
