@@ -31,5 +31,12 @@ First working release of DevHotel — every project gets its own room.
 ### MCP
 - `devhotel-mcp` stdio server (bundled in the app, also in `packages/mcp`): list_rooms, create_room, start_room, sleep_room, inspect_room, run_in_room, check_room, apply_quick_change, undo_change, copy_diagnostic — all over a token-authed loopback control API, attributed as agent changes.
 
+### UI & languages
+- Detail panel redesign: status hero with URL pill and big actions, brass undo card, five icon tabs (Overview / Stack / Activity / Health / Console), room rename.
+- 9 languages: English, 한국어, 日本語, 简体中文, Español, Français, Deutsch, Português (Brasil), Русский — auto-detected, switchable in Settings.
+
+### Providers
+- Room provider abstraction (goal.md §18.1) with the Web provider implemented and an honest Android stub — Android Rooms are designed (see docs) and arrive after Web Rooms are rock-solid.
+
 ### Project
-- pnpm monorepo (desktop / core / mcp / shared), 117+ unit tests + live Docker smoke, GitHub Actions CI + tag-triggered GitHub Releases, MIT.
+- pnpm monorepo (desktop / core / mcp / shared), 125 unit tests + live Docker smoke, GitHub Actions CI + tag-triggered GitHub Releases, MIT.
