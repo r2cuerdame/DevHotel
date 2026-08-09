@@ -33,6 +33,7 @@ export const IPC = {
   appVersion: 'app:version',
   openExternal: 'app:openExternal',
   openPath: 'app:openPath',
+  pickFolder: 'app:pickFolder',
   previewSetBounds: 'preview:setBounds',
   previewDetach: 'preview:detach',
   previewNav: 'preview:nav',
@@ -120,6 +121,7 @@ export interface IpcApi {
     version(): Promise<string>
     openExternal(url: string): Promise<void>
     openPath(path: string): Promise<void>
+    pickFolder(): Promise<string | null>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

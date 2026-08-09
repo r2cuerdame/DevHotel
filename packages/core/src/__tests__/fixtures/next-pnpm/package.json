@@ -1,0 +1,14 @@
+{
+  "name": "loop-office",
+  "private": true,
+  "packageManager": "pnpm@10.4.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build"
+  },
+  "dependencies": {
+    "next": "15.1.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  }
+}

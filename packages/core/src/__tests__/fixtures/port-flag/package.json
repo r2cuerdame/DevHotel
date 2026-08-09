@@ -1,0 +1,9 @@
+{
+  "name": "port-flag",
+  "scripts": {
+    "dev": "next dev -p 4100"
+  },
+  "dependencies": {
+    "next": "15.1.0"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "engines-only",
+  "engines": {
+    "node": ">=20"
+  }
+}
