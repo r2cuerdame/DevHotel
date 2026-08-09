@@ -27,6 +27,18 @@ const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
 
+const OPENBOX_FRAMELESS_RC = `<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="*">
+      <decor>no</decor>
+      <maximized>yes</maximized>
+      <position force="yes"><x>0</x><y>0</y></position>
+    </application>
+  </applications>
+</openbox_config>
+`
+
 function must(result: ExecResult, what: string): ExecResult {
   if (result.code !== 0) {
     const detail = result.stderr.trim() || result.stdout.trim()
@@ -266,6 +278,19 @@ export class OciCliBackend implements IsolationBackend {
   async createEmulator(roomId: string, opts?: { device: string; version: string }): Promise<void> {
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
     must(await runDocker(buildEmulatorArgs(roomId, opts)), 'run emulator container')
+    // frameless fullscreen phone: openbox applies these rules when the
+    // emulator window maps, stripping decorations and margins
+    await runDocker(
+      [
+        'exec',
+        '-i',
+        emulatorName(roomId),
+        'sh',
+        '-c',
+        'mkdir -p ~/.config/openbox && cat > ~/.config/openbox/rc.xml && DISPLAY=:0 openbox --reconfigure || true'
+      ],
+      { input: OPENBOX_FRAMELESS_RC }
+    )
   }
 
   async removeEmulator(roomId: string): Promise<void> {

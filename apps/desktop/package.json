@@ -1,7 +1,7 @@
 {
   "name": "@devhotel/desktop",
   "productName": "DevHotel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Every project gets its own room — a browser for isolated local development servers.",
   "author": "DevHotel contributors",
   "private": true,

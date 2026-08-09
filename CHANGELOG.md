@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 — 2026-08-10
+
+### Android rooms run your app on screen
+- KVM-backed emulator joins the room's network; the **Site page shows the phone screen** (frameless, phone-sized, auto-connected) — a browser for your Android app.
+- **Build & run**: one click builds the APK, waits for boot, installs over in-room adb, and launches the app.
+- Device (Galaxy/Nexus) and Android version (11–14) selectable per room, undoable; latest-build card with an open-APK-folder jump.
+
+### Services
+- Backups are listed in Overview with time/size and a one-click **Restore** (safety-backed-up and undoable).
+
+### Stack & Health
+- Package manager (npm ↔ pnpm) is now a quick change with Undo; Health shows the live in-room npm/pnpm version.
+
 ## 0.2.0 — 2026-08-10
 
 ### Android build rooms (provider v1)
