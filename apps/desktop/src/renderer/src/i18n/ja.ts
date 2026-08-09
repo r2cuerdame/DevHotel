@@ -232,5 +232,7 @@ export const ja: Translation = {
   'footprint.openApp': 'インストールフォルダを開く',
   'footprint.cleanUninstall': 'すべて削除してアンインストール…',
   'footprint.cleanUninstallConfirm': 'すべてのルーム(コンテナ・ボリューム・データベース)を削除し、CA 信頼と自動起動を解除し、アプリデータを消去してからアンインストーラーを起動します。元に戻せません。続行しますか?',
-  'footprint.cleaning': 'クリーンアップ中…'
+  'footprint.cleaning': 'クリーンアップ中…',
+  'android.lastBuild': '最新ビルド',
+  'android.openApkFolder': 'APK フォルダを開く'
 }

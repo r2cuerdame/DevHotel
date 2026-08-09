@@ -250,5 +250,7 @@ export const en = {
   'footprint.openApp': 'Open install folder',
   'footprint.cleanUninstall': 'Uninstall & remove everything…',
   'footprint.cleanUninstallConfirm': 'This deletes ALL rooms (containers, volumes, databases), removes CA trust and autostart, erases app data, and launches the uninstaller. This cannot be undone. Continue?',
-  'footprint.cleaning': 'Cleaning up…'
+  'footprint.cleaning': 'Cleaning up…',
+  'android.lastBuild': 'Latest build',
+  'android.openApkFolder': 'Open APK folder'
 } as const

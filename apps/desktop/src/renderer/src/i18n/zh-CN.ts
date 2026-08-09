@@ -228,5 +228,7 @@ export const zhCN: Translation = {
   'footprint.openApp': '打开安装文件夹',
   'footprint.cleanUninstall': '全部清除并卸载…',
   'footprint.cleanUninstallConfirm': '这将删除所有房间(容器、卷、数据库),移除 CA 信任和自启动,清除应用数据,然后启动卸载程序。此操作无法撤销。继续吗?',
-  'footprint.cleaning': '清理中…'
+  'footprint.cleaning': '清理中…',
+  'android.lastBuild': '最近构建',
+  'android.openApkFolder': '打开 APK 文件夹'
 }

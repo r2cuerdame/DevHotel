@@ -9,6 +9,34 @@ const SERVICES: { id: ServiceKind; label: string; addVersion: string; addKey: ke
   { id: 'redis', label: 'Redis', addVersion: '8', addKey: 'services.addRedis' }
 ]
 
+/** Persistent card for the newest successful APK build, with a jump to the file on disk. */
+function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
+  const inspection = useStore((s) => s.inspections[room.id])
+  const t = useT()
+  const build = inspection?.recentChanges.find((c) => c.kind === 'android-build' && c.verify?.ok)
+  if (!build?.verify) return null
+  const containerPath = build.verify.detail.replace(/^APK ready: /, '')
+  const rel = containerPath.replace(/^\/workspace\//, '').replaceAll('/', '\\')
+  const hostFile = room.sourceType === 'linked-folder' ? `${room.sourceRef}\\${rel}` : null
+  const hostDir = hostFile ? hostFile.slice(0, hostFile.lastIndexOf('\\')) : null
+  return (
+    <div className="change-item" style={{ marginTop: 8 }}>
+      <span className="status-dot" data-status="ready" />
+      <span className="title">
+        <span className="eyebrow" style={{ display: 'block', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'var(--brass)' }}>
+          {t('android.lastBuild')}
+        </span>
+        <span className="mono small">{hostFile ?? containerPath}</span>
+      </span>
+      {hostDir && (
+        <button className="btn" onClick={() => void api.app.openPath(hostDir)}>
+          {t('android.openApkFolder')}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHealth: () => void }): React.JSX.Element {
   const inspection = useStore((s) => s.inspections[room.id])
   const undoChange = useStore((s) => s.undoChange)
@@ -123,6 +151,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
               <div className="small muted">{t('android.apkHint')}</div>
             </span>
           </div>
+          <LatestBuild room={room} />
         </div>
       ) : (
         <div className="panel-section">

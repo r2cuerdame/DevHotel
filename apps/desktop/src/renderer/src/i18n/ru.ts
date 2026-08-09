@@ -233,5 +233,7 @@ export const ru: Translation = {
   'footprint.openApp': 'Открыть папку установки',
   'footprint.cleanUninstall': 'Удалить всё и деинсталлировать…',
   'footprint.cleanUninstallConfirm': 'Будут удалены ВСЕ номера (контейнеры, тома, базы данных), убраны доверие CA и автозапуск, стёрты данные приложения, затем запустится деинсталлятор. Это необратимо. Продолжить?',
-  'footprint.cleaning': 'Очистка…'
+  'footprint.cleaning': 'Очистка…',
+  'android.lastBuild': 'Последняя сборка',
+  'android.openApkFolder': 'Открыть папку APK'
 }

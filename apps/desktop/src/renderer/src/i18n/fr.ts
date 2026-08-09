@@ -234,5 +234,7 @@ export const fr: Translation = {
   'footprint.openApp': 'Ouvrir le dossier d\'installation',
   'footprint.cleanUninstall': 'Tout supprimer et désinstaller…',
   'footprint.cleanUninstallConfirm': 'Cela supprime TOUTES les chambres (conteneurs, volumes, bases de données), retire la confiance CA et le démarrage auto, efface les données puis lance le désinstalleur. Irréversible. Continuer ?',
-  'footprint.cleaning': 'Nettoyage…'
+  'footprint.cleaning': 'Nettoyage…',
+  'android.lastBuild': 'Dernier build',
+  'android.openApkFolder': 'Ouvrir le dossier APK'
 }

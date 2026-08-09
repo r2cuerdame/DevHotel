@@ -233,5 +233,7 @@ export const de: Translation = {
   'footprint.openApp': 'Installationsordner öffnen',
   'footprint.cleanUninstall': 'Alles entfernen & deinstallieren…',
   'footprint.cleanUninstallConfirm': 'Löscht ALLE Zimmer (Container, Volumes, Datenbanken), entfernt CA-Vertrauen und Autostart, löscht App-Daten und startet den Deinstaller. Nicht rückgängig machbar. Fortfahren?',
-  'footprint.cleaning': 'Aufräumen…'
+  'footprint.cleaning': 'Aufräumen…',
+  'android.lastBuild': 'Letzter Build',
+  'android.openApkFolder': 'APK-Ordner öffnen'
 }

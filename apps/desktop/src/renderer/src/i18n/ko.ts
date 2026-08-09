@@ -232,5 +232,7 @@ export const ko: Translation = {
   'footprint.openApp': '설치 폴더 열기',
   'footprint.cleanUninstall': '모두 지우고 제거…',
   'footprint.cleanUninstallConfirm': '모든 객실(컨테이너·볼륨·데이터베이스)을 삭제하고, CA 신뢰와 자동 시작을 해제하고, 앱 데이터를 지운 뒤 제거 프로그램을 실행합니다. 되돌릴 수 없습니다. 계속할까요?',
-  'footprint.cleaning': '정리 중…'
+  'footprint.cleaning': '정리 중…',
+  'android.lastBuild': '최근 빌드',
+  'android.openApkFolder': 'APK 폴더 열기'
 }

@@ -233,5 +233,7 @@ export const ptBR: Translation = {
   'footprint.openApp': 'Abrir pasta de instalação',
   'footprint.cleanUninstall': 'Desinstalar e remover tudo…',
   'footprint.cleanUninstallConfirm': 'Isso exclui TODOS os quartos (contêineres, volumes, bancos de dados), remove a confiança da CA e o início automático, apaga os dados do app e abre o desinstalador. Não pode ser desfeito. Continuar?',
-  'footprint.cleaning': 'Limpando…'
+  'footprint.cleaning': 'Limpando…',
+  'android.lastBuild': 'Última build',
+  'android.openApkFolder': 'Abrir pasta do APK'
 }
