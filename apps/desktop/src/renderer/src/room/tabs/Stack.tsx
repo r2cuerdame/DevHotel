@@ -81,6 +81,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   return (
     <>
       <InstalledPrograms room={room} pending={pending} run={run} />
+      <DatabasesSection room={room} pending={pending} run={run} />
 
       <div className="panel-section">
         <h3>{t('label.startCommand')}</h3>
@@ -159,6 +160,125 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
         </div>
       </div>
     </>
+  )
+}
+
+const DB_SERVICES: { id: 'postgres' | 'redis'; label: string; addVersion: string; options: string[] }[] = [
+  { id: 'postgres', label: 'PostgreSQL', addVersion: '17', options: ['15', '16', '17'] },
+  { id: 'redis', label: 'Redis', addVersion: '8', options: ['7', '8'] }
+]
+
+/** Full database lifecycle: add, version switch (backup→recreate→restore), backup, restart, remove, restore. */
+function DatabasesSection({
+  room,
+  pending,
+  run
+}: {
+  room: RoomRecord
+  pending: string | null
+  run: (kind: string, fn: () => Promise<unknown>) => Promise<void>
+}): React.JSX.Element {
+  const applyChange = useStore((s) => s.applyChange)
+  const inspection = useStore((s) => s.inspections[room.id])
+  const t = useT()
+  const [versions, setVersions] = useState<Record<string, string>>({})
+  const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+
+  return (
+    <div className="panel-section">
+      <h3>{t('services.databases')}</h3>
+      {DB_SERVICES.map(({ id, label, options }) => {
+        const svc = room.services[id]
+        if (!svc) return null
+        const sel = versions[id] ?? svc.version
+        return (
+          <div key={id} className="change-item">
+            <span className="status-dot" data-status={running ? 'ready' : 'sleeping'} />
+            <span className="title">
+              {label} <span className="muted">{svc.version}</span>
+            </span>
+            <select value={sel} onChange={(e) => setVersions({ ...versions, [id]: e.target.value })} style={{ width: 76 }}>
+              {options.map((o) => (
+                <option key={o} value={o}>
+                  {o}
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn"
+              disabled={sel === svc.version || pending !== null || !running}
+              onClick={() => void run(`${id}-ver`, () => applyChange(room.id, { kind: 'service-version', service: id, version: sel }))}
+            >
+              {pending === `${id}-ver` ? t('common.applying') : t('common.apply')}
+            </button>
+            <button
+              className="btn"
+              disabled={pending !== null}
+              onClick={() => void run(`${id}-backup`, () => applyChange(room.id, { kind: 'db-backup', service: id }))}
+            >
+              {pending === `${id}-backup` ? t('common.applying') : t('services.backup')}
+            </button>
+            <button
+              className="btn"
+              disabled={pending !== null}
+              onClick={() => void run(`${id}-restart`, () => applyChange(room.id, { kind: 'service-restart', service: id }))}
+            >
+              {pending === `${id}-restart` ? t('common.applying') : t('common.restart')}
+            </button>
+            <button
+              className="btn danger"
+              disabled={pending !== null}
+              onClick={() => {
+                if (window.confirm(t('services.removeConfirm', { service: label }))) {
+                  void run(`${id}-remove`, () => applyChange(room.id, { kind: 'service-remove', service: id }))
+                }
+              }}
+            >
+              {pending === `${id}-remove` ? t('common.applying') : t('services.remove')}
+            </button>
+          </div>
+        )
+      })}
+      {DB_SERVICES.some(({ id }) => !room.services[id]) && (
+        <div className="row wrap" style={{ marginBottom: 8 }}>
+          {DB_SERVICES.filter(({ id }) => !room.services[id]).map(({ id, label, addVersion }) => (
+            <button
+              key={id}
+              className="btn"
+              disabled={pending !== null}
+              onClick={() => void run(`${id}-add`, () => applyChange(room.id, { kind: 'service-add', service: id, version: addVersion }))}
+            >
+              {pending === `${id}-add` ? t('common.applying') : `+ ${label} ${addVersion}`}
+            </button>
+          ))}
+        </div>
+      )}
+      <p className="small muted">{t('services.servicesHint')}</p>
+      {inspection && inspection.backups.length > 0 && (
+        <>
+          <h3 style={{ marginTop: 14 }}>{t('services.backupsTitle')}</h3>
+          {inspection.backups.map((b) => (
+            <div key={b.file} className="change-item">
+              <span className="title">
+                <span className="mono small">{b.file.split('\\').pop()}</span>
+                <div className="small muted">{new Date(b.createdAt).toLocaleString()}</div>
+              </span>
+              <button
+                className="btn"
+                disabled={pending !== null || !running || !room.services[b.service]}
+                onClick={() => {
+                  if (window.confirm(t('services.restoreConfirm'))) {
+                    void run(`restore-${b.file}`, () => applyChange(room.id, { kind: 'db-restore', service: b.service, file: b.file }))
+                  }
+                }}
+              >
+                {pending === `restore-${b.file}` ? t('common.applying') : t('services.restore')}
+              </button>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
   )
 }
 

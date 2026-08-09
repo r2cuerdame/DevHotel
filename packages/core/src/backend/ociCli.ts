@@ -30,7 +30,7 @@ const LONG_TIMEOUT_MS = 600_000
 const OPENBOX_FRAMELESS_RC = `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <applications>
-    <application class="*">
+    <application title="Android Emulator*">
       <decor>no</decor>
       <maximized>yes</maximized>
       <position force="yes"><x>0</x><y>0</y></position>

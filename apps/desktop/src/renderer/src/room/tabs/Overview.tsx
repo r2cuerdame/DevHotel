@@ -1,13 +1,7 @@
 import { useState } from 'react'
-import type { RoomRecord, ServiceKind } from '@devhotel/shared'
-import { formatBytes, statusLabel, useStore, useT } from '../../state/store'
+import type { RoomRecord } from '@devhotel/shared'
+import { statusLabel, useStore, useT } from '../../state/store'
 import { api } from '../../api'
-import type { Translation } from '../../i18n'
-
-const SERVICES: { id: ServiceKind; label: string; addVersion: string; addKey: keyof Translation }[] = [
-  { id: 'postgres', label: 'PostgreSQL', addVersion: '17', addKey: 'services.addPostgres' },
-  { id: 'redis', label: 'Redis', addVersion: '8', addKey: 'services.addRedis' }
-]
 
 /** Persistent card for the newest successful APK build, with a jump to the file on disk. */
 function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
@@ -187,91 +181,6 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
         )}
       </dl>
 
-      {!android && (
-        <div className="panel-section">
-          <h3>{t('services.databases')}</h3>
-          {SERVICES.map(({ id, label }) => {
-            const svc = room.services[id]
-            if (!svc) return null
-            return (
-              <div key={id} className="change-item">
-                <span className="status-dot" data-status={running ? 'ready' : 'sleeping'} />
-                <span className="title">
-                  {label} <span className="muted">{svc.version}</span>
-                </span>
-                <button
-                  className="btn"
-                  disabled={pending !== null}
-                  onClick={() => void run(`${id}-backup`, () => applyChange(room.id, { kind: 'db-backup', service: id }))}
-                >
-                  {pending === `${id}-backup` ? t('common.applying') : t('services.backup')}
-                </button>
-                <button
-                  className="btn"
-                  disabled={pending !== null}
-                  onClick={() => void run(`${id}-restart`, () => applyChange(room.id, { kind: 'service-restart', service: id }))}
-                >
-                  {pending === `${id}-restart` ? t('common.applying') : t('common.restart')}
-                </button>
-                <button
-                  className="btn danger"
-                  disabled={pending !== null}
-                  onClick={() => {
-                    if (window.confirm(t('services.removeConfirm', { service: label }))) {
-                      void run(`${id}-remove`, () => applyChange(room.id, { kind: 'service-remove', service: id }))
-                    }
-                  }}
-                >
-                  {pending === `${id}-remove` ? t('common.applying') : t('services.remove')}
-                </button>
-              </div>
-            )
-          })}
-          {SERVICES.some(({ id }) => !room.services[id]) && (
-            <div className="row wrap" style={{ marginBottom: 8 }}>
-              {SERVICES.filter(({ id }) => !room.services[id]).map(({ id, addVersion, addKey }) => (
-                <button
-                  key={id}
-                  className="btn"
-                  disabled={pending !== null}
-                  onClick={() => void run(`${id}-add`, () => applyChange(room.id, { kind: 'service-add', service: id, version: addVersion }))}
-                >
-                  {pending === `${id}-add` ? t('common.applying') : t(addKey)}
-                </button>
-              ))}
-            </div>
-          )}
-          <p className="small muted">{t('services.servicesHint')}</p>
-          {inspection && inspection.backups.length > 0 && (
-            <>
-              <h3 style={{ marginTop: 14 }}>{t('services.backupsTitle')}</h3>
-              {inspection.backups.map((b) => (
-                <div key={b.file} className="change-item">
-                  <span className="title">
-                    <span className="mono small">{b.file.split('\\').pop()}</span>
-                    <div className="small muted">
-                      {new Date(b.createdAt).toLocaleString()} · {formatBytes(b.size)}
-                    </div>
-                  </span>
-                  <button
-                    className="btn"
-                    disabled={pending !== null || !running || !room.services[b.service]}
-                    onClick={() => {
-                      if (window.confirm(t('services.restoreConfirm'))) {
-                        void run(`restore-${b.file}`, () =>
-                          applyChange(room.id, { kind: 'db-restore', service: b.service, file: b.file })
-                        )
-                      }
-                    }}
-                  >
-                    {pending === `restore-${b.file}` ? t('common.applying') : t('services.restore')}
-                  </button>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-      )}
     </>
   )
 }
