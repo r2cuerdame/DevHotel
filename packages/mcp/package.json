@@ -1,0 +1,27 @@
+{
+  "name": "devhotel-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for DevHotel — let agents use isolated Rooms instead of dirtying the host.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "devhotel-mcp": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js --banner:js=\"#!/usr/bin/env node\" --external:node:*",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@devhotel/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,22 @@
+appId: io.devhotel.app
+productName: DevHotel
+directories:
+  output: release
+files:
+  - out/**
+  - package.json
+asarUnpack:
+  - out/main/chunks/**
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: true
+  perMachine: false
+  deleteAppDataOnUninstall: false
+publish:
+  provider: github
+  owner: r2cuerdame
+  repo: DevHotel

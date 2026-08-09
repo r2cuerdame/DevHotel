@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  --bg: #111418;
+  --bg-raised: #1a1f26;
+  --border: #2a313b;
+  --text: #e6e9ee;
+  --text-dim: #8b949e;
+  --accent: #d4a24e;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.lobby-empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.lobby-empty h1 {
+  font-size: 28px;
+  margin: 0;
+  letter-spacing: 0.04em;
+}
+
+.lobby-empty p {
+  color: var(--text-dim);
+  margin: 0;
+}
