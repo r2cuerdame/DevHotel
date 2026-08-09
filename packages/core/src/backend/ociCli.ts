@@ -1,13 +1,16 @@
 import { runDocker } from './cli'
 import {
   ANCHOR_IMAGE,
+  EMULATOR_IMAGE,
   RELAY_PORT,
   anchorName,
   buildAnchorArgs,
+  buildEmulatorArgs,
   buildOneShotArgs,
   buildServiceArgs,
   buildWebCreateArgs,
   cacheVolume,
+  emulatorName,
   effectiveDepsVolume,
   imageFor,
   parsePortOutput,
@@ -257,6 +260,21 @@ export class OciCliBackend implements IsolationBackend {
 
   async copyToService(roomId: string, svc: 'postgres' | 'redis', hostPath: string, containerPath: string): Promise<void> {
     must(await runDocker(['cp', hostPath, `${svcName(roomId, svc)}:${containerPath}`]), `copy into ${svc}`)
+  }
+
+  async createEmulator(roomId: string): Promise<void> {
+    await this.ensureImage(EMULATOR_IMAGE)
+    must(await runDocker(buildEmulatorArgs(roomId)), 'run emulator container')
+  }
+
+  async removeEmulator(roomId: string): Promise<void> {
+    await runDocker(['rm', '-f', emulatorName(roomId)])
+  }
+
+  async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
+    const result = await runDocker(['inspect', '--format', '{{.State.Status}}', emulatorName(roomId)])
+    if (result.code !== 0) return 'missing'
+    return result.stdout.trim() === 'running' ? 'running' : 'exited'
   }
 
   async imageExists(image: string): Promise<boolean> {

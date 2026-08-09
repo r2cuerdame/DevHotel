@@ -234,5 +234,11 @@ export const ja: Translation = {
   'footprint.cleanUninstallConfirm': 'すべてのルーム(コンテナ・ボリューム・データベース)を削除し、CA 信頼と自動起動を解除し、アプリデータを消去してからアンインストーラーを起動します。元に戻せません。続行しますか?',
   'footprint.cleaning': 'クリーンアップ中…',
   'android.lastBuild': '最新ビルド',
-  'android.openApkFolder': 'APK フォルダを開く'
+  'android.openApkFolder': 'APK フォルダを開く',
+  'android.run': 'ビルドして実行',
+  'android.launching': '起動中…',
+  'android.emulatorHint': 'サイトページがエミュレータ画面です。ビルドして実行するとアプリが表示されます。',
+  'services.backupsTitle': 'バックアップ',
+  'services.restore': '復元',
+  'services.restoreConfirm': 'このバックアップから復元しますか？現在のデータは先に自動バックアップされ、復元も元に戻せます。'
 }

@@ -83,11 +83,19 @@ export interface CreateRoomInput {
   }
 }
 
+export interface BackupInfo {
+  file: string
+  service: ServiceKind
+  size: number
+  createdAt: string
+}
+
 export interface RoomInspection {
   room: RoomRecord
   urls: { app: string }
   /** host folder holding this room's manifest.yaml, logs/, thumbnail */
   dataDir: string
+  backups: BackupInfo[]
   stackLine: string
   latestCheck: import('./checks').CheckReport | null
   recentChanges: import('./changes').ChangeEntry[]

@@ -75,7 +75,7 @@ describe('AndroidRoomProvider (build rooms v1)', () => {
     expect(plan.runtime.kind).toBe('jdk')
     expect(plan.packageManager.value).toBe('gradle')
     expect(plan.startCommand.value).toMatch(/gradle assembleDebug/)
-    expect(plan.internalPort.value).toBe(0)
+    expect(plan.internalPort.value).toBe(6080)
     expect(plan.warnings.some((w) => /No Gradle project/.test(w))).toBe(true)
   })
 
@@ -85,10 +85,11 @@ describe('AndroidRoomProvider (build rooms v1)', () => {
     expect(plan.framework).toBe('android')
   })
 
-  it('buildSpec is a standalone sdk container with gradle cache and keepalive command', () => {
-    const room = makeRoom({ provider: 'android', runtime: { kind: 'jdk', version: '17' } })
+  it('buildSpec is a pod-mode sdk container relaying the emulator screen', () => {
+    const room = makeRoom({ provider: 'android', runtime: { kind: 'jdk', version: '17' }, internalPort: 6080 })
     const spec = getProvider('android').buildSpec(room)
-    expect(spec.standalone).toBe(true)
+    expect(spec.standalone).toBeUndefined()
+    expect(spec.internalPort).toBe(6080)
     expect(spec.noDepsVolume).toBe(true)
     expect(spec.imageOverride).toMatch(/android/)
     expect(spec.startCommand).toMatch(/sleep/)

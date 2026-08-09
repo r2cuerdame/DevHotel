@@ -8,12 +8,14 @@ export type QuickChange =
   | { kind: 'internal-port'; port: number }
   | { kind: 'deps-install'; clean: boolean }
   | { kind: 'android-build' }
+  | { kind: 'android-run' }
   | { kind: 'service-add'; service: 'postgres' | 'redis'; version?: string }
   | { kind: 'service-remove'; service: 'postgres' | 'redis' }
   | { kind: 'service-restart'; service: 'postgres' | 'redis' }
   | { kind: 'db-backup'; service: 'postgres' | 'redis' }
   | { kind: 'db-restore'; service: 'postgres' | 'redis'; file: string }
   | { kind: 'os-settings'; os: import('./rooms').RoomOsSettings }
+  | { kind: 'package-manager'; pm: 'npm' | 'pnpm'; version?: string }
 
 export type ChangeStatus = 'pending' | 'applied' | 'verified' | 'rolled-back' | 'undone' | 'failed'
 

@@ -95,12 +95,26 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
     )
   }
 
-  // 5 package manager
-  push({
-    step: 'package-manager',
-    status: 'healthy',
-    summary: `${room.packageManager.kind}${room.packageManager.version ? ` ${room.packageManager.version}` : ''}`
-  })
+  // 5 package manager — report the live in-room version when possible
+  if (backendOk && awake && (await backend.webState(room.id)) === 'running') {
+    const res = await backend.execInRoom(
+      room.id,
+      ['sh', '-lc', `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; ${room.packageManager.kind} --version 2>/dev/null | head -1`],
+      { timeoutMs: 30_000 }
+    )
+    const version = res.stdout.trim()
+    push(
+      res.code === 0 && version
+        ? { step: 'package-manager', status: 'healthy', summary: `${room.packageManager.kind} ${version}` }
+        : { step: 'package-manager', status: 'warning', summary: `${room.packageManager.kind} not answering in the room` }
+    )
+  } else {
+    push({
+      step: 'package-manager',
+      status: 'healthy',
+      summary: `${room.packageManager.kind}${room.packageManager.version ? ` ${room.packageManager.version}` : ''}`
+    })
+  }
 
   // 6 dependencies
   if (room.sourceType === 'empty') {

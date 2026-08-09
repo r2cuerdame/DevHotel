@@ -45,7 +45,7 @@ export class AndroidRoomProvider implements RoomProvider {
       runtime: { kind: 'jdk', value: '17', source: 'sdk image' },
       packageManager: { value: 'gradle', source: 'gradle project' },
       startCommand: { value: opts.overrides?.startCommand ?? ANDROID_DEFAULT_BUILD_COMMAND, source: opts.overrides?.startCommand ? 'user override' : 'default' },
-      internalPort: { value: 0, source: 'not used by build rooms' },
+      internalPort: { value: 6080, source: 'emulator screen' },
       domain: slugifyDomain(opts.project, opts.nickname),
       https: false,
       warnings
@@ -55,14 +55,14 @@ export class AndroidRoomProvider implements RoomProvider {
   buildSpec(room: RoomRecord, overrides?: Partial<WebSpec>): WebSpec {
     return {
       roomId: room.id,
-      internalPort: room.internalPort || 0,
+      // the room's "site" is the emulator screen (noVNC) relayed by the anchor
+      internalPort: room.internalPort || 6080,
       nodeMajor: room.runtime.version,
       sourceType: room.sourceType,
       sourceRef: room.sourceRef,
       startCommand: ANDROID_KEEPALIVE_COMMAND,
       env: { GRADLE_USER_HOME: '/cache/gradle' },
       imageOverride: ANDROID_IMAGE,
-      standalone: true,
       noDepsVolume: true,
       // persists AGP's auto-installed platforms/build-tools across container recreates;
       // docker seeds the volume from the image (cmdline-tools + pre-accepted licenses)

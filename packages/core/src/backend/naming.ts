@@ -33,6 +33,39 @@ export function imageFor(spec: WebSpec): string {
 
 export type ServiceKind = 'postgres' | 'redis'
 
+/** Android emulator sidecar (KVM) — its noVNC screen is the room's "site". */
+export const EMULATOR_IMAGE = 'budtmo/docker-android:emulator_14.0'
+export const EMULATOR_SCREEN_PORT = 6080
+export const EMULATOR_ADB_ADDR = 'localhost:5555'
+
+export function emulatorName(roomId: string): string {
+  return `dh-${roomId}-svc-emulator`
+}
+
+export function buildEmulatorArgs(roomId: string): string[] {
+  return [
+    'run',
+    '-d',
+    '--name',
+    emulatorName(roomId),
+    '--network',
+    `container:${anchorName(roomId)}`,
+    '-l',
+    `devhotel.room=${roomId}`,
+    '-l',
+    'devhotel.role=svc-emulator',
+    '-l',
+    'devhotel.managed=1',
+    '--device',
+    '/dev/kvm',
+    '-e',
+    'EMULATOR_DEVICE=Samsung Galaxy S10',
+    '-e',
+    'WEB_VNC=true',
+    EMULATOR_IMAGE
+  ]
+}
+
 export const SERVICE_DEFAULT_VERSIONS: Record<ServiceKind, string> = { postgres: '17', redis: '8' }
 /** In-room credentials for managed services — local-only, documented in the Services UI. */
 export const SERVICE_DB_USER = 'devhotel'

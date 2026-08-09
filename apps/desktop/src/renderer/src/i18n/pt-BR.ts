@@ -235,5 +235,11 @@ export const ptBR: Translation = {
   'footprint.cleanUninstallConfirm': 'Isso exclui TODOS os quartos (contêineres, volumes, bancos de dados), remove a confiança da CA e o início automático, apaga os dados do app e abre o desinstalador. Não pode ser desfeito. Continuar?',
   'footprint.cleaning': 'Limpando…',
   'android.lastBuild': 'Última build',
-  'android.openApkFolder': 'Abrir pasta do APK'
+  'android.openApkFolder': 'Abrir pasta do APK',
+  'android.run': 'Compilar e executar',
+  'android.launching': 'Iniciando…',
+  'android.emulatorHint': 'A página Site mostra a tela do emulador — o app aparece lá após compilar e executar.',
+  'services.backupsTitle': 'Backups',
+  'services.restore': 'Restaurar',
+  'services.restoreConfirm': 'Restaurar este backup? Os dados atuais são salvos antes, e a restauração pode ser desfeita.'
 }

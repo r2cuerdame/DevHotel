@@ -50,7 +50,6 @@ export function BrowserBar({
   }, [room.id])
 
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
-  const android = room.provider === 'android'
   const onSite = page === 'site'
   const httpsPort = gateway?.httpsPort
   const httpPort = gateway?.httpPort
@@ -67,8 +66,7 @@ export function BrowserBar({
       <button className="icon-btn" title={t('bar.backToLobby')} onClick={backToLobby}>
         ⌂
       </button>
-      {!android && (
-        <>
+      <>
           <button
             className="icon-btn"
             title={t('common.back')}
@@ -94,16 +92,11 @@ export function BrowserBar({
             ⟳
           </button>
         </>
-      )}
 
       <div className="domain-pill">
         {onSite && room.https && <span title="HTTPS">🔒</span>}
         <span className="url">
-          {android
-            ? t('android.pill', { project: room.project, nickname: room.nickname })
-            : onSite
-              ? url
-              : `devhotel · ${pageLabel ? t(pageLabel.key) : ''} — ${room.project} / ${room.nickname}`}
+          {onSite ? url : `devhotel · ${pageLabel ? t(pageLabel.key) : ''} — ${room.project} / ${room.nickname}`}
         </span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} style={{ display: 'inline-block', marginRight: 6 }} />
@@ -111,7 +104,7 @@ export function BrowserBar({
         </span>
       </div>
 
-      {!android && onSite && running && (
+      {room.provider === 'web' && onSite && running && (
         <>
           <button
             className="icon-btn"
@@ -161,8 +154,7 @@ export function BrowserBar({
         </button>
       )}
 
-      {!android && (
-        <button
+      <button
           className="icon-btn"
           title={t('bar.roomDetails')}
           onClick={() => onNavigate(onSite ? 'overview' : 'site')}
@@ -170,7 +162,6 @@ export function BrowserBar({
         >
           {onSite ? '☰' : '◉'}
         </button>
-      )}
 
       <div ref={menuRef} style={{ position: 'relative' }}>
         <button className="icon-btn" title={t('bar.more')} onClick={() => setMenuOpen((v) => !v)}>
@@ -178,15 +169,13 @@ export function BrowserBar({
         </button>
         {menuOpen && (
           <div className="bar-menu">
-            {!android && (
-              <MenuItem
+            <MenuItem
                 label={t('bar.openExternal')}
                 onClick={() => {
                   void api.app.openExternal(url)
                   setMenuOpen(false)
                 }}
               />
-            )}
             {room.sourceType === 'linked-folder' && (
               <MenuItem
                 label={t('bar.openSourceFolder')}

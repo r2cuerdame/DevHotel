@@ -16,6 +16,12 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('internal-port'), port: z.number().int().min(1).max(65535) }),
   z.object({ kind: z.literal('deps-install'), clean: z.boolean() }),
   z.object({ kind: z.literal('android-build') }),
+  z.object({ kind: z.literal('android-run') }),
+  z.object({
+    kind: z.literal('package-manager'),
+    pm: z.enum(['npm', 'pnpm']),
+    version: z.string().regex(/^\d+(\.\d+){0,2}$/).optional()
+  }),
   z.object({ kind: z.literal('service-add'), service: zServiceKind, version: z.string().regex(/^\d+$/).optional() }),
   z.object({ kind: z.literal('service-remove'), service: zServiceKind }),
   z.object({ kind: z.literal('service-restart'), service: zServiceKind }),

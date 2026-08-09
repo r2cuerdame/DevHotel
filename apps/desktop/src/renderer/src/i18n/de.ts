@@ -235,5 +235,11 @@ export const de: Translation = {
   'footprint.cleanUninstallConfirm': 'Löscht ALLE Zimmer (Container, Volumes, Datenbanken), entfernt CA-Vertrauen und Autostart, löscht App-Daten und startet den Deinstaller. Nicht rückgängig machbar. Fortfahren?',
   'footprint.cleaning': 'Aufräumen…',
   'android.lastBuild': 'Letzter Build',
-  'android.openApkFolder': 'APK-Ordner öffnen'
+  'android.openApkFolder': 'APK-Ordner öffnen',
+  'android.run': 'Bauen & starten',
+  'android.launching': 'Wird gestartet…',
+  'android.emulatorHint': 'Die Site-Seite zeigt den Emulator-Bildschirm — nach Bauen & starten erscheint die App dort.',
+  'services.backupsTitle': 'Backups',
+  'services.restore': 'Wiederherstellen',
+  'services.restoreConfirm': 'Dieses Backup wiederherstellen? Die aktuellen Daten werden zuerst gesichert, und die Wiederherstellung ist rückgängig machbar.'
 }

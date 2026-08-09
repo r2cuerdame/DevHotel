@@ -141,6 +141,18 @@ export class FakeBackend implements IsolationBackend {
   async copyToService(_roomId: string, svc: 'postgres' | 'redis', _hostPath: string, containerPath: string) {
     this.calls.push(`copyToService:${svc}:${containerPath}`)
   }
+  emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
+  async createEmulator(roomId: string) {
+    this.calls.push(`createEmulator:${roomId}`)
+    this.emulatorStateValue = 'running'
+  }
+  async removeEmulator(roomId: string) {
+    this.calls.push(`removeEmulator:${roomId}`)
+    this.emulatorStateValue = 'missing'
+  }
+  async emulatorState() {
+    return this.emulatorStateValue
+  }
 }
 
 export class FakeGateway {

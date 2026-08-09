@@ -230,5 +230,11 @@ export const zhCN: Translation = {
   'footprint.cleanUninstallConfirm': '这将删除所有房间(容器、卷、数据库),移除 CA 信任和自启动,清除应用数据,然后启动卸载程序。此操作无法撤销。继续吗?',
   'footprint.cleaning': '清理中…',
   'android.lastBuild': '最近构建',
-  'android.openApkFolder': '打开 APK 文件夹'
+  'android.openApkFolder': '打开 APK 文件夹',
+  'android.run': '构建并运行',
+  'android.launching': '启动中…',
+  'android.emulatorHint': '站点页面即模拟器屏幕 — 构建并运行后应用会显示在那里。',
+  'services.backupsTitle': '备份列表',
+  'services.restore': '恢复',
+  'services.restoreConfirm': '要从此备份恢复吗？当前数据会先自动备份，恢复操作也可以撤销。'
 }

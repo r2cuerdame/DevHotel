@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
@@ -38,7 +38,7 @@ import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
-const ANDROID_CHANGE_KINDS = new Set(['android-build', 'start-command', 'restart-web', 'os-settings'])
+const ANDROID_CHANGE_KINDS = new Set(['android-build', 'android-run', 'start-command', 'restart-web', 'os-settings'])
 
 export interface OrchestratorEvent {
   roomId: string
@@ -224,6 +224,10 @@ export class RoomOrchestrator {
         if (providerKind === 'web' && record.sourceType !== 'empty') {
           await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
         }
+        if (providerKind === 'android') {
+          this.olog(id, 'start emulator')
+          await this.backend.createEmulator(id)
+        }
         await this.syncRouteFor(id)
         const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
         this.rooms.update(id, { status: verify.ok ? 'ready' : 'attention', lastUsedAt: new Date().toISOString() })
@@ -254,11 +258,20 @@ export class RoomOrchestrator {
     try {
       // Recreate containers from the current record so changes made while
       // asleep (node version, command, port) are materialized on wake.
+      if (room.provider === 'android' && room.internalPort === 0) {
+        // rooms created before the emulator screen existed relayed nothing
+        this.rooms.update(roomId, { internalPort: 6080 })
+      }
+      const { hostPort } = await this.backend.recreateAnchor({
+        roomId,
+        internalPort: this.mustGet(roomId).internalPort
+      })
+      this.rooms.update(roomId, { hostPort, status: 'running' })
       if (room.provider === 'android') {
-        this.rooms.update(roomId, { status: 'running' })
+        this.olog(roomId, 'start emulator')
+        await this.backend.removeEmulator(roomId)
+        await this.backend.createEmulator(roomId)
       } else {
-        const { hostPort } = await this.backend.recreateAnchor({ roomId, internalPort: room.internalPort })
-        this.rooms.update(roomId, { hostPort, status: 'running' })
         // services join the anchor's netns, so a fresh anchor needs fresh service containers
         for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
           this.olog(roomId, `start service ${svc} ${cfg.version}`)
@@ -327,8 +340,9 @@ export class RoomOrchestrator {
     const recent = this.changes.list(roomId).slice(0, 15)
     return {
       room,
-      urls: { app: room.provider === 'android' ? '' : this.gateway.urlFor(room.domain, room.https) },
+      urls: { app: this.gateway.urlFor(room.domain, room.https) },
       dataDir: join(this.userData, 'rooms', room.id),
+      backups: this.listBackups(room.id),
       stackLine:
         room.provider === 'android'
           ? `JDK ${room.runtime.version} · gradle`
@@ -507,7 +521,6 @@ export class RoomOrchestrator {
 
   private async syncRouteFor(roomId: string): Promise<void> {
     const room = this.mustGet(roomId)
-    if (room.provider === 'android') return
     if (room.hostPort != null) {
       await this.gateway.setRoute({
         domain: room.domain,
@@ -578,6 +591,20 @@ export class RoomOrchestrator {
       createdAt: new Date().toISOString(),
       undoneAt: null
     })
+  }
+
+  private listBackups(roomId: string): { file: string; service: 'postgres' | 'redis'; size: number; createdAt: string }[] {
+    const dir = join(this.userData, 'rooms', roomId, 'backups')
+    if (!existsSync(dir)) return []
+    const out: { file: string; service: 'postgres' | 'redis'; size: number; createdAt: string }[] = []
+    for (const name of readdirSync(dir)) {
+      const m = /^(postgres|redis)-/.exec(name)
+      if (!m) continue
+      const full = join(dir, name)
+      const stat = statSync(full)
+      out.push({ file: full, service: m[1] as 'postgres' | 'redis', size: stat.size, createdAt: stat.mtime.toISOString() })
+    }
+    return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20)
   }
 
   private mustGet(roomId: string): RoomRecord {

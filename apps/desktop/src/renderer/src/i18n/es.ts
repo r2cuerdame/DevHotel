@@ -236,5 +236,11 @@ export const es: Translation = {
   'footprint.cleanUninstallConfirm': 'Esto elimina TODAS las habitaciones (contenedores, volúmenes, bases de datos), quita la confianza de la CA y el autoarranque, borra los datos de la app y lanza el desinstalador. No se puede deshacer. ¿Continuar?',
   'footprint.cleaning': 'Limpiando…',
   'android.lastBuild': 'Última compilación',
-  'android.openApkFolder': 'Abrir carpeta del APK'
+  'android.openApkFolder': 'Abrir carpeta del APK',
+  'android.run': 'Compilar y ejecutar',
+  'android.launching': 'Iniciando…',
+  'android.emulatorHint': 'La página Sitio muestra la pantalla del emulador: la app aparece allí tras compilar y ejecutar.',
+  'services.backupsTitle': 'Copias de seguridad',
+  'services.restore': 'Restaurar',
+  'services.restoreConfirm': '¿Restaurar esta copia? Los datos actuales se respaldan primero y la restauración se puede deshacer.'
 }

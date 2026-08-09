@@ -252,5 +252,11 @@ export const en = {
   'footprint.cleanUninstallConfirm': 'This deletes ALL rooms (containers, volumes, databases), removes CA trust and autostart, erases app data, and launches the uninstaller. This cannot be undone. Continue?',
   'footprint.cleaning': 'Cleaning up…',
   'android.lastBuild': 'Latest build',
-  'android.openApkFolder': 'Open APK folder'
+  'android.openApkFolder': 'Open APK folder',
+  'android.run': 'Build & run',
+  'android.launching': 'Launching…',
+  'android.emulatorHint': 'The Site page shows the emulator screen — the app appears there after Build & run.',
+  'services.backupsTitle': 'Backups',
+  'services.restore': 'Restore',
+  'services.restoreConfirm': 'Restore this backup? Current data is safety-backed-up first, and the restore itself can be undone.'
 } as const

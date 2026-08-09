@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { RoomRecord, ServiceKind } from '@devhotel/shared'
-import { statusLabel, useStore, useT } from '../../state/store'
+import { formatBytes, statusLabel, useStore, useT } from '../../state/store'
 import { api } from '../../api'
 import type { Translation } from '../../i18n'
 
@@ -89,10 +89,19 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
           </button>
         )}
 
-        <div className="hero-actions" style={android ? { gridTemplateColumns: '1fr 1fr 1fr' } : undefined}>
+        <div className="hero-actions">
           {android && (
             <button
               className={running ? 'btn primary' : 'btn'}
+              onClick={() => void run('run', () => applyChange(room.id, { kind: 'android-run' }))}
+              disabled={!running || !!busy || pending !== null}
+            >
+              {pending === 'run' ? t('android.launching') : t('android.run')}
+            </button>
+          )}
+          {android && (
+            <button
+              className="btn"
               onClick={() => void run('build', () => applyChange(room.id, { kind: 'android-build' }))}
               disabled={!running || !!busy || pending !== null}
             >
@@ -149,6 +158,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <span className="title">
               <span className="mono">{room.startCommand}</span>
               <div className="small muted">{t('android.apkHint')}</div>
+              <div className="small muted">{t('android.emulatorHint')}</div>
             </span>
           </div>
           <LatestBuild room={room} />
@@ -237,6 +247,34 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             </div>
           )}
           <p className="small muted">{t('services.servicesHint')}</p>
+          {inspection && inspection.backups.length > 0 && (
+            <>
+              <h3 style={{ marginTop: 14 }}>{t('services.backupsTitle')}</h3>
+              {inspection.backups.map((b) => (
+                <div key={b.file} className="change-item">
+                  <span className="title">
+                    <span className="mono small">{b.file.split('\\').pop()}</span>
+                    <div className="small muted">
+                      {new Date(b.createdAt).toLocaleString()} · {formatBytes(b.size)}
+                    </div>
+                  </span>
+                  <button
+                    className="btn"
+                    disabled={pending !== null || !running || !room.services[b.service]}
+                    onClick={() => {
+                      if (window.confirm(t('services.restoreConfirm'))) {
+                        void run(`restore-${b.file}`, () =>
+                          applyChange(room.id, { kind: 'db-restore', service: b.service, file: b.file })
+                        )
+                      }
+                    }}
+                  >
+                    {pending === `restore-${b.file}` ? t('common.applying') : t('services.restore')}
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
         </div>
       )}
     </>

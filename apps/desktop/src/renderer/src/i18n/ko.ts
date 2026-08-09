@@ -234,5 +234,11 @@ export const ko: Translation = {
   'footprint.cleanUninstallConfirm': '모든 객실(컨테이너·볼륨·데이터베이스)을 삭제하고, CA 신뢰와 자동 시작을 해제하고, 앱 데이터를 지운 뒤 제거 프로그램을 실행합니다. 되돌릴 수 없습니다. 계속할까요?',
   'footprint.cleaning': '정리 중…',
   'android.lastBuild': '최근 빌드',
-  'android.openApkFolder': 'APK 폴더 열기'
+  'android.openApkFolder': 'APK 폴더 열기',
+  'android.run': '빌드 후 실행',
+  'android.launching': '실행 중…',
+  'android.emulatorHint': '사이트 페이지가 에뮬레이터 화면입니다 — 빌드 후 실행하면 앱이 그 화면에 나타나요.',
+  'services.backupsTitle': '백업 목록',
+  'services.restore': '복원',
+  'services.restoreConfirm': '이 백업으로 복원할까요? 현재 데이터는 먼저 자동 백업되고, 복원도 되돌릴 수 있습니다.'
 }

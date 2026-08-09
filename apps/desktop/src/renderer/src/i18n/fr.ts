@@ -236,5 +236,11 @@ export const fr: Translation = {
   'footprint.cleanUninstallConfirm': 'Cela supprime TOUTES les chambres (conteneurs, volumes, bases de données), retire la confiance CA et le démarrage auto, efface les données puis lance le désinstalleur. Irréversible. Continuer ?',
   'footprint.cleaning': 'Nettoyage…',
   'android.lastBuild': 'Dernier build',
-  'android.openApkFolder': 'Ouvrir le dossier APK'
+  'android.openApkFolder': 'Ouvrir le dossier APK',
+  'android.run': 'Compiler et lancer',
+  'android.launching': 'Lancement…',
+  'android.emulatorHint': 'La page Site affiche l\'écran de l\'émulateur — l\'app y apparaît après compilation.',
+  'services.backupsTitle': 'Sauvegardes',
+  'services.restore': 'Restaurer',
+  'services.restoreConfirm': 'Restaurer cette sauvegarde ? Les données actuelles sont d’abord sauvegardées et la restauration est annulable.'
 }

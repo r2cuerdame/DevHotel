@@ -8,6 +8,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
   const [nodeVersion, setNodeVersion] = useState(room.runtime.version)
+  const [pm, setPm] = useState<'npm' | 'pnpm'>(room.packageManager.kind === 'pnpm' ? 'pnpm' : 'npm')
   const [command, setCommand] = useState(room.startCommand)
   const [domain, setDomain] = useState(room.domain)
   const [port, setPort] = useState(room.internalPort)
@@ -61,6 +62,23 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
             onClick={() => void run('node', () => applyChange(room.id, { kind: 'node-version', version: nodeVersion }))}
           >
             {pending === 'node' ? t('stack.changing') : t('stack.changeNode', { from: room.runtime.version, to: nodeVersion })}
+          </button>
+        </div>
+      </div>
+
+      <div className="panel-section">
+        <h3>{t('label.packageManager')}</h3>
+        <div className="row">
+          <select value={pm} onChange={(e) => setPm(e.target.value as 'npm' | 'pnpm')} style={{ width: 110 }}>
+            <option value="npm">npm</option>
+            <option value="pnpm">pnpm</option>
+          </select>
+          <button
+            className="btn"
+            disabled={pm === room.packageManager.kind || pending !== null}
+            onClick={() => void run('pm', () => applyChange(room.id, { kind: 'package-manager', pm }))}
+          >
+            {pending === 'pm' ? t('common.applying') : t('common.apply')}
           </button>
         </div>
       </div>

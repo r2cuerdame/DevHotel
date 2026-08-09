@@ -38,17 +38,13 @@ export function RoomPages({
   return (
     <div className="room-page">
       <nav className="panel-tabs page-nav">
-        {room.provider !== 'android' && (
-          <>
-            <button className="panel-tab" data-active={false} disabled={!running} onClick={() => onNavigate('site')} title={room.domain}>
-              <span className="tab-icon" aria-hidden>
-                ◉
-              </span>
-              {t('tabs.site')}
-            </button>
-            <span className="page-nav-sep" />
-          </>
-        )}
+        <button className="panel-tab" data-active={false} disabled={!running} onClick={() => onNavigate('site')} title={room.domain}>
+          <span className="tab-icon" aria-hidden>
+            ◉
+          </span>
+          {t('tabs.site')}
+        </button>
+        <span className="page-nav-sep" />
         {ROOM_PAGES.map(({ id, icon, key }) => (
           <button key={id} className="panel-tab" data-active={page === id} onClick={() => onNavigate(id)}>
             <span className="tab-icon" aria-hidden>

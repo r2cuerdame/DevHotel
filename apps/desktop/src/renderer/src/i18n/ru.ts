@@ -235,5 +235,11 @@ export const ru: Translation = {
   'footprint.cleanUninstallConfirm': 'Будут удалены ВСЕ номера (контейнеры, тома, базы данных), убраны доверие CA и автозапуск, стёрты данные приложения, затем запустится деинсталлятор. Это необратимо. Продолжить?',
   'footprint.cleaning': 'Очистка…',
   'android.lastBuild': 'Последняя сборка',
-  'android.openApkFolder': 'Открыть папку APK'
+  'android.openApkFolder': 'Открыть папку APK',
+  'android.run': 'Собрать и запустить',
+  'android.launching': 'Запуск…',
+  'android.emulatorHint': 'Страница «Сайт» показывает экран эмулятора — после сборки и запуска приложение появится там.',
+  'services.backupsTitle': 'Резервные копии',
+  'services.restore': 'Восстановить',
+  'services.restoreConfirm': 'Восстановить эту копию? Текущие данные сначала сохраняются, и восстановление можно откатить.'
 }
