@@ -13,6 +13,7 @@ export const IPC = {
   roomsRestartWeb: 'rooms:restartWeb',
   roomsInspect: 'rooms:inspect',
   roomsRename: 'rooms:rename',
+  roomsComponents: 'rooms:components',
   changesList: 'changes:list',
   changesApply: 'changes:apply',
   changesUndo: 'changes:undo',
@@ -53,6 +54,18 @@ export const IPC = {
 } as const
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC]
+
+/** One installed program/component of a room, with its live version when the room is awake. */
+export interface ComponentInfo {
+  id: string
+  label: string
+  version: string
+  /** 'live' = read from inside the room just now; 'recorded' = from the room record */
+  source: 'live' | 'recorded'
+  /** the change kind that switches this component's version, when switchable */
+  changeKind?: string
+  options?: string[]
+}
 
 export interface GatewayStatusInfo {
   running: boolean
@@ -114,6 +127,7 @@ export interface IpcApi {
     restartWeb(roomId: string): Promise<void>
     inspect(roomId: string): Promise<RoomInspection>
     rename(roomId: string, nickname: string): Promise<void>
+    components(roomId: string): Promise<import('./ipc').ComponentInfo[]>
   }
   changes: {
     list(roomId: string): Promise<ChangeEntry[]>

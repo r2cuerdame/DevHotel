@@ -463,6 +463,78 @@ export class RoomOrchestrator {
     })
   }
 
+  /** Installed programs of a room with live versions (read from inside the room when awake). */
+  async components(roomId: string): Promise<
+    { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
+  > {
+    const room = this.mustGet(roomId)
+    const awake =
+      (room.status === 'running' || room.status === 'ready' || room.status === 'attention') &&
+      (await this.backend.webState(roomId)) === 'running'
+    const liveWeb = async (cmd: string): Promise<string | null> => {
+      if (!awake) return null
+      const res = await this.backend.execInRoom(roomId, ['sh', '-lc', cmd], { timeoutMs: 20_000 })
+      const line = res.stdout.trim().split(/\r?\n/)[0] ?? ''
+      return res.code === 0 && line ? line : null
+    }
+    const out: { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[] = []
+
+    if (room.provider === 'android') {
+      const jdk = await liveWeb('java -version 2>&1 | head -1')
+      out.push({ id: 'jdk', label: 'JDK', version: jdk ?? `JDK ${room.runtime.version}`, source: jdk ? 'live' : 'recorded' })
+      const gradle = await liveWeb('gradle --version 2>/dev/null | grep -m1 Gradle')
+      out.push({ id: 'gradle', label: 'Gradle', version: gradle ?? 'gradle', source: gradle ? 'live' : 'recorded' })
+      out.push({
+        id: 'emulator',
+        label: 'Android Emulator',
+        version: `${room.android?.device ?? 'Samsung Galaxy S10'} · Android ${room.android?.version ?? '14.0'}`,
+        source: 'recorded'
+      })
+      return out
+    }
+
+    const node = await liveWeb('node --version')
+    out.push({
+      id: 'node',
+      label: 'Node.js',
+      version: node ? node.replace(/^v/, '') : room.runtime.version,
+      source: node ? 'live' : 'recorded',
+      changeKind: 'node-version',
+      options: ['18', '20', '22', '24']
+    })
+    const pm = await liveWeb(
+      `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; ${room.packageManager.kind} --version 2>/dev/null | head -1`
+    )
+    out.push({
+      id: 'pm',
+      label: room.packageManager.kind,
+      version: pm ?? room.packageManager.version ?? '—',
+      source: pm ? 'live' : 'recorded',
+      changeKind: 'package-manager',
+      options: ['npm', 'pnpm']
+    })
+    for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
+      let liveV: string | null = null
+      if (awake && (await this.backend.serviceState(roomId, svc)) === 'running') {
+        const res =
+          svc === 'postgres'
+            ? await this.backend.execInService(roomId, svc, ['psql', '--version'], { timeoutMs: 15_000 })
+            : await this.backend.execInService(roomId, svc, ['redis-server', '--version'], { timeoutMs: 15_000 })
+        const m = svc === 'postgres' ? /(\d+(?:\.\d+)*)/.exec(res.stdout) : /v=(\d+(?:\.\d+)*)/.exec(res.stdout)
+        if (res.code === 0 && m?.[1]) liveV = m[1]
+      }
+      out.push({
+        id: svc,
+        label: svc === 'postgres' ? 'PostgreSQL' : 'Redis',
+        version: liveV ?? cfg.version,
+        source: liveV ? 'live' : 'recorded',
+        changeKind: 'service-version',
+        options: svc === 'postgres' ? ['15', '16', '17'] : ['7', '8']
+      })
+    }
+    return out
+  }
+
   renameRoom(roomId: string, nickname: string): void {
     if (!nickname.trim()) throw new Error('Nickname cannot be empty')
     this.rooms.update(roomId, { nickname: nickname.trim() })

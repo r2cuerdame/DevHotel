@@ -192,6 +192,58 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
   }
 }
 
+export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; version: string }> = {
+  kind: 'service-version',
+  plan(ctx, p) {
+    const current = ctx.room().services[p.service]?.version
+    return {
+      title: `${SERVICE_LABEL[p.service]} ${current ?? '?'} → ${p.version}`,
+      component: SERVICE_LABEL[p.service],
+      before: { version: current },
+      after: { version: p.version },
+      undoable: true,
+      undoStrategy: 'backup-recreate-restore',
+      autoRollback: false
+    }
+  },
+  async preflight(ctx, p) {
+    const current = ctx.room().services[p.service]
+    if (!current) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
+    if (current.version === p.version) throw new Error(`${SERVICE_LABEL[p.service]} is already on ${p.version}`)
+    if (!ctx.isAwake()) throw new Error('Wake the room first — the data is backed up before switching')
+  },
+  async apply(ctx, p, steps) {
+    const prevVersion = ctx.room().services[p.service]!.version
+    steps.push('Back up the current data')
+    const backupFile = await backupServiceToFile(ctx, p.service)
+    steps.setCaptured({ prevVersion, backupFile })
+    ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [p.service]: { version: p.version } } })
+    steps.push(`Recreate ${SERVICE_LABEL[p.service]} ${p.version} with a fresh data volume`)
+    await ctx.backend.removeService(ctx.roomId, p.service, { volume: true })
+    await ctx.backend.createService(ctx.roomId, p.service, p.version)
+    const ping = await pingService(ctx, p.service)
+    if (!ping.ok) throw new Error(ping.detail)
+    steps.push('Restore the data into the new version')
+    await restoreServiceFromFile(ctx, p.service, backupFile)
+  },
+  async verify(ctx, p) {
+    return pingService(ctx, p.service)
+  },
+  async undo(ctx, entry) {
+    const captured = entry.captured as { prevVersion: string; backupFile: string } | null
+    const service = inferService(entry.title)
+    const prevVersion = captured?.prevVersion ?? SERVICE_DEFAULT_VERSIONS[service]
+    ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version: prevVersion } } })
+    if (ctx.isAwake()) {
+      await ctx.backend.removeService(ctx.roomId, service, { volume: true })
+      await ctx.backend.createService(ctx.roomId, service, prevVersion)
+      const ping = await pingService(ctx, service)
+      if (!ping.ok) throw new Error(ping.detail)
+      if (captured?.backupFile) await restoreServiceFromFile(ctx, service, captured.backupFile)
+    }
+  }
+}
+
 export const serviceRestartChange: ChangeDefinition<{ service: ServiceKind }> = {
   kind: 'service-restart',
   plan(ctx, p) {

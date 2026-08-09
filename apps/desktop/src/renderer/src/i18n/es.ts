@@ -244,5 +244,6 @@ export const es: Translation = {
   'services.restore': 'Restaurar',
   'services.restoreConfirm': '¿Restaurar esta copia? Los datos actuales se respaldan primero y la restauración se puede deshacer.',
   'android.emulator': 'Emulador',
-  'android.emulatorConfigHint': 'Cambiar la versión de Android descarga una imagen nueva (unos GB, una vez). Los cambios se pueden deshacer.'
+  'android.emulatorConfigHint': 'Cambiar la versión de Android descarga una imagen nueva (unos GB, una vez). Los cambios se pueden deshacer.',
+  'stack.installed': 'Programas instalados'
 }

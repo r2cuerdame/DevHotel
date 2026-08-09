@@ -243,5 +243,6 @@ export const ptBR: Translation = {
   'services.restore': 'Restaurar',
   'services.restoreConfirm': 'Restaurar este backup? Os dados atuais são salvos antes, e a restauração pode ser desfeita.',
   'android.emulator': 'Emulador',
-  'android.emulatorConfigHint': 'Mudar a versão do Android baixa uma nova imagem (alguns GB, uma vez). As mudanças podem ser desfeitas.'
+  'android.emulatorConfigHint': 'Mudar a versão do Android baixa uma nova imagem (alguns GB, uma vez). As mudanças podem ser desfeitas.',
+  'stack.installed': 'Programas instalados'
 }

@@ -1,16 +1,14 @@
-import { useState } from 'react'
-import type { RoomRecord } from '@devhotel/shared'
+import { useEffect, useState } from 'react'
+import type { ComponentInfo, RoomRecord } from '@devhotel/shared'
+import { api } from '../../api'
 import { useStore, useT } from '../../state/store'
 
-const NODE_MAJORS = ['18', '20', '22', '24']
 const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
 const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
 
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
-  const [nodeVersion, setNodeVersion] = useState(room.runtime.version)
-  const [pm, setPm] = useState<'npm' | 'pnpm'>(room.packageManager.kind === 'pnpm' ? 'pnpm' : 'npm')
   const [device, setDevice] = useState(room.android?.device ?? 'Samsung Galaxy S10')
   const [osVersion, setOsVersion] = useState(room.android?.version ?? '14.0')
   const [command, setCommand] = useState(room.startCommand)
@@ -30,6 +28,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   if (room.provider === 'android') {
     return (
       <>
+        <InstalledPrograms room={room} pending={pending} run={run} />
         <div className="panel-section">
           <h3>{t('android.emulator')}</h3>
           <div className="row wrap">
@@ -81,42 +80,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
 
   return (
     <>
-      <div className="panel-section">
-        <h3>Node.js</h3>
-        <div className="row">
-          <select value={nodeVersion} onChange={(e) => setNodeVersion(e.target.value)}>
-            {NODE_MAJORS.map((v) => (
-              <option key={v} value={v}>
-                Node {v}
-              </option>
-            ))}
-          </select>
-          <button
-            className="btn"
-            disabled={nodeVersion === room.runtime.version || pending !== null}
-            onClick={() => void run('node', () => applyChange(room.id, { kind: 'node-version', version: nodeVersion }))}
-          >
-            {pending === 'node' ? t('stack.changing') : t('stack.changeNode', { from: room.runtime.version, to: nodeVersion })}
-          </button>
-        </div>
-      </div>
-
-      <div className="panel-section">
-        <h3>{t('label.packageManager')}</h3>
-        <div className="row">
-          <select value={pm} onChange={(e) => setPm(e.target.value as 'npm' | 'pnpm')} style={{ width: 110 }}>
-            <option value="npm">npm</option>
-            <option value="pnpm">pnpm</option>
-          </select>
-          <button
-            className="btn"
-            disabled={pm === room.packageManager.kind || pending !== null}
-            onClick={() => void run('pm', () => applyChange(room.id, { kind: 'package-manager', pm }))}
-          >
-            {pending === 'pm' ? t('common.applying') : t('common.apply')}
-          </button>
-        </div>
-      </div>
+      <InstalledPrograms room={room} pending={pending} run={run} />
 
       <div className="panel-section">
         <h3>{t('label.startCommand')}</h3>
@@ -195,6 +159,95 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
         </div>
       </div>
     </>
+  )
+}
+
+/** Installed programs with live versions, a version switcher, and per-component undo. */
+function InstalledPrograms({
+  room,
+  pending,
+  run
+}: {
+  room: RoomRecord
+  pending: string | null
+  run: (kind: string, fn: () => Promise<unknown>) => Promise<void>
+}): React.JSX.Element {
+  const applyChange = useStore((s) => s.applyChange)
+  const undoChange = useStore((s) => s.undoChange)
+  const inspection = useStore((s) => s.inspections[room.id])
+  const t = useT()
+  const [components, setComponents] = useState<ComponentInfo[]>([])
+  const [selections, setSelections] = useState<Record<string, string>>({})
+
+  useEffect(() => {
+    let active = true
+    void api.rooms.components(room.id).then((c) => {
+      if (active) setComponents(c)
+    })
+    return () => {
+      active = false
+    }
+  }, [room.id, inspection, pending])
+
+  const componentEntry = (label: string) =>
+    inspection?.recentChanges.find(
+      (c) => c.component === label && c.undoable && (c.status === 'verified' || (c.status === 'applied' && c.verify))
+    )
+
+  const changeFor = (c: ComponentInfo, value: string) => {
+    if (c.changeKind === 'node-version') return { kind: 'node-version', version: value } as const
+    if (c.changeKind === 'package-manager') return { kind: 'package-manager', pm: value as 'npm' | 'pnpm' } as const
+    return { kind: 'service-version', service: c.id as 'postgres' | 'redis', version: value } as const
+  }
+
+  const labelForUndo: Record<string, string> = { node: 'Node.js', pm: 'Package Manager', postgres: 'PostgreSQL', redis: 'Redis' }
+
+  return (
+    <div className="panel-section">
+      <h3>{t('stack.installed')}</h3>
+      {components.map((c) => {
+        const current =
+          c.id === 'pm' ? c.label : ((c.options ?? []).find((o) => c.version.startsWith(o)) ?? c.version.split('.')[0] ?? c.version)
+        const sel = selections[c.id] ?? current
+        const undoable = componentEntry(labelForUndo[c.id] ?? c.label)
+        return (
+          <div key={c.id} className="change-item">
+            <span className="status-dot" data-status={c.source === 'live' ? 'ready' : 'sleeping'} title={c.source} />
+            <span className="title">
+              {c.label}
+              <div className="small muted mono">{c.version}</div>
+            </span>
+            {c.options && c.changeKind && (
+              <>
+                <select
+                  value={sel}
+                  onChange={(e) => setSelections({ ...selections, [c.id]: e.target.value })}
+                  style={{ width: 96 }}
+                >
+                  {c.options.map((o) => (
+                    <option key={o} value={o}>
+                      {o}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn"
+                  disabled={sel === current || pending !== null}
+                  onClick={() => void run(`comp-${c.id}`, () => applyChange(room.id, changeFor(c, sel)))}
+                >
+                  {pending === `comp-${c.id}` ? t('common.applying') : t('common.apply')}
+                </button>
+              </>
+            )}
+            {undoable && (
+              <button className="btn" disabled={pending !== null} onClick={() => void undoChange(room.id, undoable.id)}>
+                ↶
+              </button>
+            )}
+          </div>
+        )
+      })}
+    </div>
   )
 }
 

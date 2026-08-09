@@ -17,6 +17,7 @@ export type QuickChange =
   | { kind: 'os-settings'; os: import('./rooms').RoomOsSettings }
   | { kind: 'package-manager'; pm: 'npm' | 'pnpm'; version?: string }
   | { kind: 'emulator-config'; device: string; version: string }
+  | { kind: 'service-version'; service: 'postgres' | 'redis'; version: string }
 
 export type ChangeStatus = 'pending' | 'applied' | 'verified' | 'rolled-back' | 'undone' | 'failed'
 

@@ -40,23 +40,30 @@ export class ChangeEngine {
     ctx.log(`change ${entry.seq} [${kind}] ${planned.title} (${actor})`)
 
     const steps: string[] = []
+    let capturedOverride: { blob: unknown } | null = null
     const stepSink = {
       push: (s: string) => {
         steps.push(s)
         ctx.log(`  · ${s}`)
+      },
+      setCaptured: (blob: unknown) => {
+        capturedOverride = { blob }
       }
     }
 
     try {
       await def.apply(ctx, params, stepSink)
-      ctx.changes.setStatus(entry.id, 'applied', { steps })
+      ctx.changes.setStatus(entry.id, 'applied', {
+        steps,
+        ...(capturedOverride ? { captured: (capturedOverride as { blob: unknown }).blob } : {})
+      })
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
       ctx.log(`  apply failed: ${detail}`)
       ctx.changes.setStatus(entry.id, 'failed', { steps, verify: { ok: false, detail: `apply failed: ${detail}` } })
       if (planned.undoable && def.undo) {
         try {
-          await def.undo(ctx, { ...entry, captured, steps })
+          await def.undo(ctx, { ...entry, captured: capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured, steps })
           ctx.changes.setStatus(entry.id, 'rolled-back')
           ctx.log('  rolled back')
         } catch (undoErr) {
@@ -73,7 +80,7 @@ export class ChangeEngine {
     } else if (planned.autoRollback && planned.undoable && def.undo) {
       ctx.log(`  verify failed (${verify.detail}) — rolling back`)
       try {
-        await def.undo(ctx, { ...entry, captured, steps })
+        await def.undo(ctx, { ...entry, captured: capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured, steps })
         ctx.changes.setStatus(entry.id, 'rolled-back', { verify })
         ctx.log('  rolled back')
       } catch (undoErr) {

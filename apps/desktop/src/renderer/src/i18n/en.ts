@@ -260,5 +260,6 @@ export const en = {
   'services.restore': 'Restore',
   'services.restoreConfirm': 'Restore this backup? Current data is safety-backed-up first, and the restore itself can be undone.',
   'android.emulator': 'Emulator',
-  'android.emulatorConfigHint': 'Changing the Android version downloads a new image (a few GB, one-time). Device and version changes can be undone.'
+  'android.emulatorConfigHint': 'Changing the Android version downloads a new image (a few GB, one-time). Device and version changes can be undone.',
+  'stack.installed': 'Installed programs'
 } as const

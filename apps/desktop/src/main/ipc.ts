@@ -43,6 +43,7 @@ export function registerIpc(opts: {
   ipcMain.handle(IPC.roomsRestartWeb, (_e, roomId: string) => orch.restartWeb(roomId, 'user'))
   ipcMain.handle(IPC.roomsInspect, (_e, roomId: string) => orch.inspectRoom(roomId))
   ipcMain.handle(IPC.roomsRename, (_e, roomId: string, nickname: string) => orch.renameRoom(roomId, nickname))
+  ipcMain.handle(IPC.roomsComponents, (_e, roomId: string) => orch.components(roomId))
 
   /* changes / checks / diagnostics */
   ipcMain.handle(IPC.changesList, (_e, roomId: string) => orch.listChanges(roomId))

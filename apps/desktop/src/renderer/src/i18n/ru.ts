@@ -243,5 +243,6 @@ export const ru: Translation = {
   'services.restore': 'Восстановить',
   'services.restoreConfirm': 'Восстановить эту копию? Текущие данные сначала сохраняются, и восстановление можно откатить.',
   'android.emulator': 'Эмулятор',
-  'android.emulatorConfigHint': 'Смена версии Android скачивает новый образ (несколько ГБ, один раз). Изменения можно откатить.'
+  'android.emulatorConfigHint': 'Смена версии Android скачивает новый образ (несколько ГБ, один раз). Изменения можно откатить.',
+  'stack.installed': 'Установленные программы'
 }

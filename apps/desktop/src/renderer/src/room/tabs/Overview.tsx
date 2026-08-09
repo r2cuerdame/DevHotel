@@ -185,11 +185,6 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <dd className="mono">{room.domain}</dd>
           </>
         )}
-        <dt>{t('label.packageManager')}</dt>
-        <dd>
-          {room.packageManager.kind}
-          {room.packageManager.version ? ` ${room.packageManager.version}` : ''}
-        </dd>
       </dl>
 
       {!android && (

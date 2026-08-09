@@ -11,7 +11,8 @@ const api: IpcApi = {
     delete: (roomId) => ipcRenderer.invoke(IPC.roomsDelete, roomId),
     restartWeb: (roomId) => ipcRenderer.invoke(IPC.roomsRestartWeb, roomId),
     inspect: (roomId) => ipcRenderer.invoke(IPC.roomsInspect, roomId),
-    rename: (roomId, nickname) => ipcRenderer.invoke(IPC.roomsRename, roomId, nickname)
+    rename: (roomId, nickname) => ipcRenderer.invoke(IPC.roomsRename, roomId, nickname),
+    components: (roomId) => ipcRenderer.invoke(IPC.roomsComponents, roomId)
   },
   changes: {
     list: (roomId) => ipcRenderer.invoke(IPC.changesList, roomId),

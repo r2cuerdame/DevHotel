@@ -37,6 +37,8 @@ export interface ChangePlanned {
 
 export interface ChangeStep {
   push(step: string): void
+  /** replace the entry's captured safety-state from inside apply (e.g. a backup taken mid-apply) */
+  setCaptured(blob: unknown): void
 }
 
 export interface ChangeDefinition<P = unknown> {

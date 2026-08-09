@@ -244,5 +244,6 @@ export const fr: Translation = {
   'services.restore': 'Restaurer',
   'services.restoreConfirm': 'Restaurer cette sauvegarde ? Les données actuelles sont d’abord sauvegardées et la restauration est annulable.',
   'android.emulator': 'Émulateur',
-  'android.emulatorConfigHint': 'Changer de version d\'Android télécharge une nouvelle image (quelques Go, une fois). Les changements sont annulables.'
+  'android.emulatorConfigHint': 'Changer de version d\'Android télécharge une nouvelle image (quelques Go, une fois). Les changements sont annulables.',
+  'stack.installed': 'Programmes installés'
 }

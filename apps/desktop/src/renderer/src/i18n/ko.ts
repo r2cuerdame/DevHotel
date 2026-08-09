@@ -242,5 +242,6 @@ export const ko: Translation = {
   'services.restore': '복원',
   'services.restoreConfirm': '이 백업으로 복원할까요? 현재 데이터는 먼저 자동 백업되고, 복원도 되돌릴 수 있습니다.',
   'android.emulator': '에뮬레이터',
-  'android.emulatorConfigHint': 'Android 버전을 바꾸면 새 이미지를 받습니다(수 GB, 최초 1회). 기기·버전 변경은 되돌릴 수 있어요.'
+  'android.emulatorConfigHint': 'Android 버전을 바꾸면 새 이미지를 받습니다(수 GB, 최초 1회). 기기·버전 변경은 되돌릴 수 있어요.',
+  'stack.installed': '설치된 프로그램'
 }
