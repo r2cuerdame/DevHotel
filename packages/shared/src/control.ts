@@ -22,6 +22,11 @@ export const zQuickChange = z.discriminatedUnion('kind', [
     pm: z.enum(['npm', 'pnpm']),
     version: z.string().regex(/^\d+(\.\d+){0,2}$/).optional()
   }),
+  z.object({
+    kind: z.literal('emulator-config'),
+    device: z.string().regex(/^[A-Za-z0-9 ().-]{2,40}$/),
+    version: z.enum(['14.0', '13.0', '12.0', '11.0'])
+  }),
   z.object({ kind: z.literal('service-add'), service: zServiceKind, version: z.string().regex(/^\d+$/).optional() }),
   z.object({ kind: z.literal('service-remove'), service: zServiceKind }),
   z.object({ kind: z.literal('service-restart'), service: zServiceKind }),

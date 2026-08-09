@@ -40,6 +40,8 @@ export interface RoomRecord {
   status: RoomStatus
   services: RoomServices
   os: RoomOsSettings
+  /** android rooms: emulator device/OS selection */
+  android?: { device: string; version: string }
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */
   hostPort: number | null
   createdAt: string

@@ -258,5 +258,7 @@ export const en = {
   'android.emulatorHint': 'The Site page shows the emulator screen — the app appears there after Build & run.',
   'services.backupsTitle': 'Backups',
   'services.restore': 'Restore',
-  'services.restoreConfirm': 'Restore this backup? Current data is safety-backed-up first, and the restore itself can be undone.'
+  'services.restoreConfirm': 'Restore this backup? Current data is safety-backed-up first, and the restore itself can be undone.',
+  'android.emulator': 'Emulator',
+  'android.emulatorConfigHint': 'Changing the Android version downloads a new image (a few GB, one-time). Device and version changes can be undone.'
 } as const

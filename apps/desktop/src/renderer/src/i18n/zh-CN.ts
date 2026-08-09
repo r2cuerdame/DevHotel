@@ -236,5 +236,7 @@ export const zhCN: Translation = {
   'android.emulatorHint': '站点页面即模拟器屏幕 — 构建并运行后应用会显示在那里。',
   'services.backupsTitle': '备份列表',
   'services.restore': '恢复',
-  'services.restoreConfirm': '要从此备份恢复吗？当前数据会先自动备份，恢复操作也可以撤销。'
+  'services.restoreConfirm': '要从此备份恢复吗？当前数据会先自动备份，恢复操作也可以撤销。',
+  'android.emulator': '模拟器',
+  'android.emulatorConfigHint': '更改 Android 版本会下载新镜像(几 GB,仅一次)。设备和版本更改可以撤销。'
 }

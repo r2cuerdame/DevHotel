@@ -241,5 +241,7 @@ export const de: Translation = {
   'android.emulatorHint': 'Die Site-Seite zeigt den Emulator-Bildschirm — nach Bauen & starten erscheint die App dort.',
   'services.backupsTitle': 'Backups',
   'services.restore': 'Wiederherstellen',
-  'services.restoreConfirm': 'Dieses Backup wiederherstellen? Die aktuellen Daten werden zuerst gesichert, und die Wiederherstellung ist rückgängig machbar.'
+  'services.restoreConfirm': 'Dieses Backup wiederherstellen? Die aktuellen Daten werden zuerst gesichert, und die Wiederherstellung ist rückgängig machbar.',
+  'android.emulator': 'Emulator',
+  'android.emulatorConfigHint': 'Ein Android-Versionswechsel lädt ein neues Image (einige GB, einmalig). Änderungen sind rückgängig machbar.'
 }

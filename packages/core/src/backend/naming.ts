@@ -34,15 +34,28 @@ export function imageFor(spec: WebSpec): string {
 export type ServiceKind = 'postgres' | 'redis'
 
 /** Android emulator sidecar (KVM) — its noVNC screen is the room's "site". */
-export const EMULATOR_IMAGE = 'budtmo/docker-android:emulator_14.0'
+export const EMULATOR_DEFAULT_DEVICE = 'Samsung Galaxy S10'
+export const EMULATOR_DEFAULT_VERSION = '14.0'
+export const EMULATOR_IMAGE = emulatorImage(EMULATOR_DEFAULT_VERSION)
 export const EMULATOR_SCREEN_PORT = 6080
 export const EMULATOR_ADB_ADDR = 'localhost:5555'
+
+export function emulatorImage(version: string): string {
+  return `budtmo/docker-android:emulator_${version}`
+}
 
 export function emulatorName(roomId: string): string {
   return `dh-${roomId}-svc-emulator`
 }
 
-export function buildEmulatorArgs(roomId: string): string[] {
+export interface EmulatorOpts {
+  device: string
+  version: string
+}
+
+export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>): string[] {
+  const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
+  const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
   return [
     'run',
     '-d',
@@ -59,10 +72,10 @@ export function buildEmulatorArgs(roomId: string): string[] {
     '--device',
     '/dev/kvm',
     '-e',
-    'EMULATOR_DEVICE=Samsung Galaxy S10',
+    `EMULATOR_DEVICE=${device}`,
     '-e',
     'WEB_VNC=true',
-    EMULATOR_IMAGE
+    emulatorImage(version)
   ]
 }
 

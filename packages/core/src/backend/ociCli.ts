@@ -10,6 +10,7 @@ import {
   buildServiceArgs,
   buildWebCreateArgs,
   cacheVolume,
+  emulatorImage,
   emulatorName,
   effectiveDepsVolume,
   imageFor,
@@ -262,9 +263,9 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['cp', hostPath, `${svcName(roomId, svc)}:${containerPath}`]), `copy into ${svc}`)
   }
 
-  async createEmulator(roomId: string): Promise<void> {
-    await this.ensureImage(EMULATOR_IMAGE)
-    must(await runDocker(buildEmulatorArgs(roomId)), 'run emulator container')
+  async createEmulator(roomId: string, opts?: { device: string; version: string }): Promise<void> {
+    await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
+    must(await runDocker(buildEmulatorArgs(roomId, opts)), 'run emulator container')
   }
 
   async removeEmulator(roomId: string): Promise<void> {

@@ -38,7 +38,14 @@ import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
-const ANDROID_CHANGE_KINDS = new Set(['android-build', 'android-run', 'start-command', 'restart-web', 'os-settings'])
+const ANDROID_CHANGE_KINDS = new Set([
+  'android-build',
+  'android-run',
+  'emulator-config',
+  'start-command',
+  'restart-web',
+  'os-settings'
+])
 
 export interface OrchestratorEvent {
   roomId: string
@@ -226,7 +233,7 @@ export class RoomOrchestrator {
         }
         if (providerKind === 'android') {
           this.olog(id, 'start emulator')
-          await this.backend.createEmulator(id)
+          await this.backend.createEmulator(id, this.mustGet(id).android)
         }
         await this.syncRouteFor(id)
         const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
@@ -270,7 +277,7 @@ export class RoomOrchestrator {
       if (room.provider === 'android') {
         this.olog(roomId, 'start emulator')
         await this.backend.removeEmulator(roomId)
-        await this.backend.createEmulator(roomId)
+        await this.backend.createEmulator(roomId, room.android)
       } else {
         // services join the anchor's netns, so a fresh anchor needs fresh service containers
         for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
@@ -338,9 +345,11 @@ export class RoomOrchestrator {
   inspectRoom(roomId: string): RoomInspection {
     const room = this.mustGet(roomId)
     const recent = this.changes.list(roomId).slice(0, 15)
+    const baseUrl = this.gateway.urlFor(room.domain, room.https)
     return {
       room,
-      urls: { app: this.gateway.urlFor(room.domain, room.https) },
+      // android rooms open the emulator screen fullscreen and auto-connected
+      urls: { app: room.provider === 'android' ? `${baseUrl}/vnc.html?autoconnect=true&resize=scale` : baseUrl },
       dataDir: join(this.userData, 'rooms', room.id),
       backups: this.listBackups(room.id),
       stackLine:

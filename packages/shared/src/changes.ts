@@ -16,6 +16,7 @@ export type QuickChange =
   | { kind: 'db-restore'; service: 'postgres' | 'redis'; file: string }
   | { kind: 'os-settings'; os: import('./rooms').RoomOsSettings }
   | { kind: 'package-manager'; pm: 'npm' | 'pnpm'; version?: string }
+  | { kind: 'emulator-config'; device: string; version: string }
 
 export type ChangeStatus = 'pending' | 'applied' | 'verified' | 'rolled-back' | 'undone' | 'failed'
 

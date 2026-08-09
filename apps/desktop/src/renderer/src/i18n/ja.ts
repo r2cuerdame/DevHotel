@@ -240,5 +240,7 @@ export const ja: Translation = {
   'android.emulatorHint': 'サイトページがエミュレータ画面です。ビルドして実行するとアプリが表示されます。',
   'services.backupsTitle': 'バックアップ',
   'services.restore': '復元',
-  'services.restoreConfirm': 'このバックアップから復元しますか？現在のデータは先に自動バックアップされ、復元も元に戻せます。'
+  'services.restoreConfirm': 'このバックアップから復元しますか？現在のデータは先に自動バックアップされ、復元も元に戻せます。',
+  'android.emulator': 'エミュレータ',
+  'android.emulatorConfigHint': 'Android バージョンを変更すると新しいイメージを取得します(数GB・初回のみ)。変更は元に戻せます。'
 }

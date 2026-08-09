@@ -3,12 +3,16 @@ import type { RoomRecord } from '@devhotel/shared'
 import { useStore, useT } from '../../state/store'
 
 const NODE_MAJORS = ['18', '20', '22', '24']
+const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
+const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
 
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
   const [nodeVersion, setNodeVersion] = useState(room.runtime.version)
   const [pm, setPm] = useState<'npm' | 'pnpm'>(room.packageManager.kind === 'pnpm' ? 'pnpm' : 'npm')
+  const [device, setDevice] = useState(room.android?.device ?? 'Samsung Galaxy S10')
+  const [osVersion, setOsVersion] = useState(room.android?.version ?? '14.0')
   const [command, setCommand] = useState(room.startCommand)
   const [domain, setDomain] = useState(room.domain)
   const [port, setPort] = useState(room.internalPort)
@@ -25,7 +29,37 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
 
   if (room.provider === 'android') {
     return (
-      <div className="panel-section">
+      <>
+        <div className="panel-section">
+          <h3>{t('android.emulator')}</h3>
+          <div className="row wrap">
+            <select value={device} onChange={(e) => setDevice(e.target.value)} style={{ width: 190 }}>
+              {ANDROID_DEVICES.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+            <select value={osVersion} onChange={(e) => setOsVersion(e.target.value)} style={{ width: 140 }}>
+              {ANDROID_VERSIONS.map((v) => (
+                <option key={v} value={v}>
+                  Android {v}
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn"
+              disabled={pending !== null || (device === (room.android?.device ?? 'Samsung Galaxy S10') && osVersion === (room.android?.version ?? '14.0'))}
+              onClick={() => void run('emu', () => applyChange(room.id, { kind: 'emulator-config', device, version: osVersion }))}
+            >
+              {pending === 'emu' ? t('common.applying') : t('common.apply')}
+            </button>
+          </div>
+          <p className="small muted" style={{ marginTop: 6 }}>
+            {t('android.emulatorConfigHint')}
+          </p>
+        </div>
+        <div className="panel-section">
         <h3>{t('android.buildCommand')}</h3>
         <div className="row">
           <input className="mono" value={command} onChange={(e) => setCommand(e.target.value)} style={{ flex: 1 }} />
@@ -40,7 +74,8 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
         <p className="small muted" style={{ marginTop: 6 }}>
           {t('android.apkHint')}
         </p>
-      </div>
+        </div>
+      </>
     )
   }
 

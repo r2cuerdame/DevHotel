@@ -241,5 +241,7 @@ export const ptBR: Translation = {
   'android.emulatorHint': 'A página Site mostra a tela do emulador — o app aparece lá após compilar e executar.',
   'services.backupsTitle': 'Backups',
   'services.restore': 'Restaurar',
-  'services.restoreConfirm': 'Restaurar este backup? Os dados atuais são salvos antes, e a restauração pode ser desfeita.'
+  'services.restoreConfirm': 'Restaurar este backup? Os dados atuais são salvos antes, e a restauração pode ser desfeita.',
+  'android.emulator': 'Emulador',
+  'android.emulatorConfigHint': 'Mudar a versão do Android baixa uma nova imagem (alguns GB, uma vez). As mudanças podem ser desfeitas.'
 }

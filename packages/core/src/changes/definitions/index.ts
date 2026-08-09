@@ -11,6 +11,7 @@ import { androidRunChange } from './androidRun'
 import { dbBackupChange, dbRestoreChange, serviceAddChange, serviceRemoveChange, serviceRestartChange } from './services'
 import { osSettingsChange } from './osSettings'
 import { packageManagerChange } from './packageManager'
+import { emulatorConfigChange } from './emulatorConfig'
 
 export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(nodeVersionChange)
@@ -29,6 +30,7 @@ export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(dbRestoreChange)
   engine.register(osSettingsChange)
   engine.register(packageManagerChange)
+  engine.register(emulatorConfigChange)
 }
 
 export { pmInstallCommand, currentDepsGen, depsVolumeForGen, depsGenKey } from './deps'
