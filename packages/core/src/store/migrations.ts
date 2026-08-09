@@ -39,6 +39,7 @@ export const migrations: Migration[] = [
         id TEXT PRIMARY KEY,
         room_id TEXT NOT NULL,
         seq INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT '',
         title TEXT NOT NULL,
         actor TEXT NOT NULL,
         component TEXT NOT NULL,

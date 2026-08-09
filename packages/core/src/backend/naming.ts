@@ -57,10 +57,14 @@ function sourceMountArgs(spec: WebSpec): string[] {
   }
 }
 
+export function effectiveDepsVolume(spec: WebSpec): string {
+  return spec.depsVolumeOverride ?? depsVolume(spec.roomId, spec.nodeMajor)
+}
+
 function mountArgs(spec: WebSpec): string[] {
   const args = sourceMountArgs(spec)
   if (args.length > 0) {
-    args.push('-v', `${depsVolume(spec.roomId, spec.nodeMajor)}:/workspace/node_modules`)
+    args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
   return args

@@ -5,6 +5,7 @@ interface ChangeRow {
   id: string
   room_id: string
   seq: number
+  kind: string
   title: string
   actor: string
   component: string
@@ -35,6 +36,7 @@ function rowToEntry(row: ChangeRow): ChangeEntry {
     id: row.id,
     roomId: row.room_id,
     seq: row.seq,
+    kind: row.kind,
     title: row.title,
     actor: row.actor as Actor,
     component: row.component,
@@ -77,15 +79,16 @@ export function changesRepo(db: Db): ChangesRepo {
         sqlite
           .prepare(
             `INSERT INTO changes (
-              id, room_id, seq, title, actor, component, before_json, after_json,
+              id, room_id, seq, kind, title, actor, component, before_json, after_json,
               captured_json, steps_json, verify_json, undoable, undo_strategy,
               status, raw_log_path, created_at, undone_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             e.id,
             e.roomId,
             seq,
+            e.kind,
             e.title,
             e.actor,
             e.component,
@@ -153,7 +156,7 @@ export function changesRepo(db: Db): ChangesRepo {
       const row = sqlite
         .prepare(
           `SELECT * FROM changes
-           WHERE room_id = ? AND undoable = 1 AND status = 'verified'
+           WHERE room_id = ? AND undoable = 1 AND status IN ('verified', 'applied') AND verify_json IS NOT NULL
            ORDER BY seq DESC LIMIT 1`,
         )
         .get(roomId) as ChangeRow | undefined

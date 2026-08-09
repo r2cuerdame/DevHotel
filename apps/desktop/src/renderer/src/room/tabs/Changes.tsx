@@ -39,7 +39,7 @@ export function ChangesTab({ room }: { room: RoomRecord }): React.JSX.Element {
               </div>
             </span>
             {c.actor === 'agent' && <span className="actor-agent">agent</span>}
-            {c.undoable && c.status === 'verified' ? (
+            {c.undoable && (c.status === 'verified' || (c.status === 'applied' && c.verify)) ? (
               <button className="btn" onClick={() => void undoChange(room.id, c.id)}>
                 ↶ Undo
               </button>

@@ -1,0 +1,149 @@
+import { mkdtempSync } from 'node:fs'
+import { createServer, type Server } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { RoomRecord } from '@devhotel/shared'
+import type { ExecResult, IsolationBackend, WebSpec } from '../backend/types'
+import type { Gateway } from '../gateway/gateway'
+import type { Route } from '../gateway/routes'
+import { openDb, type Db } from '../store/db'
+
+export function tempDir(): string {
+  return mkdtempSync(join(tmpdir(), 'dh-test-'))
+}
+
+export function testDb(): Db {
+  return openDb(tempDir())
+}
+
+export function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
+  return {
+    id: 'room1abc',
+    project: 'demo',
+    nickname: 'dev',
+    roomNumber: 201,
+    provider: 'web',
+    sourceType: 'linked-folder',
+    sourceRef: 'C:\\code\\demo',
+    runtime: { kind: 'node', version: '22' },
+    packageManager: { kind: 'pnpm', version: '10' },
+    startCommand: 'pnpm dev',
+    internalPort: 3000,
+    domain: 'demo-dev.localhost',
+    https: false,
+    status: 'ready',
+    hostPort: null,
+    createdAt: '2026-08-10T10:00:00.000Z',
+    lastUsedAt: '2026-08-10T10:00:00.000Z',
+    thumbPath: null,
+    ...overrides
+  }
+}
+
+const ok: ExecResult = { code: 0, stdout: '', stderr: '' }
+
+export class FakeBackend implements IsolationBackend {
+  calls: string[] = []
+  webStateValue: 'running' | 'exited' | 'missing' = 'running'
+  oneShotResult: ExecResult = ok
+  execResult: ExecResult = ok
+  hostPort = 45000
+  lastWebSpec: WebSpec | null = null
+
+  async health() {
+    return { ok: true, detail: 'fake docker' }
+  }
+  async createRoomPod(spec: WebSpec) {
+    this.calls.push(`createRoomPod:${spec.roomId}`)
+    this.lastWebSpec = spec
+    return { hostPort: this.hostPort }
+  }
+  async startRoomPod(roomId: string) {
+    this.calls.push(`startRoomPod:${roomId}`)
+    return { hostPort: this.hostPort }
+  }
+  async stopRoomPod(roomId: string) {
+    this.calls.push(`stopRoomPod:${roomId}`)
+  }
+  async restartWeb(roomId: string) {
+    this.calls.push(`restartWeb:${roomId}`)
+  }
+  async recreateWeb(spec: WebSpec) {
+    this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
+    this.lastWebSpec = spec
+  }
+  async recreateAnchor(spec: { roomId: string; internalPort: number }) {
+    this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
+    return { hostPort: this.hostPort }
+  }
+  async deleteRoomPod(roomId: string) {
+    this.calls.push(`deleteRoomPod:${roomId}`)
+    return { reclaimedBytes: 1024 }
+  }
+  async execInRoom(): Promise<ExecResult> {
+    return this.execResult
+  }
+  async runOneShot(spec: WebSpec, cmd: string): Promise<ExecResult> {
+    this.calls.push(`runOneShot:${spec.depsVolumeOverride ?? 'default'}:${cmd}`)
+    return this.oneShotResult
+  }
+  async webState() {
+    return this.webStateValue
+  }
+  async listManagedContainers() {
+    return []
+  }
+  async cloneIntoVolume() {}
+  async volumeSizes() {
+    return {}
+  }
+  async imageExists() {
+    return true
+  }
+  async pullImage() {}
+}
+
+export class FakeGateway {
+  routes = new Map<string, Route>()
+  httpPort: number | null = 80
+  httpsPort: number | null = 443
+  failNextSetRoute = false
+
+  async start() {
+    return this.status()
+  }
+  async stop() {}
+  async setRoute(route: Route) {
+    if (this.failNextSetRoute) {
+      this.failNextSetRoute = false
+      throw new Error('route rejected')
+    }
+    this.routes.set(route.domain, route)
+  }
+  removeRoute(domain: string) {
+    this.routes.delete(domain)
+  }
+  status() {
+    return {
+      running: true,
+      httpPort: this.httpPort,
+      httpsPort: this.httpsPort,
+      routes: [...this.routes.values()].map((r) => ({ domain: r.domain, roomId: r.roomId, https: r.https }))
+    }
+  }
+  urlFor(domain: string, https: boolean) {
+    return `${https ? 'https' : 'http'}://${domain}`
+  }
+
+  asGateway(): Gateway {
+    return this as unknown as Gateway
+  }
+}
+
+/** Real TCP listener so verifyWebUp's port probe succeeds. */
+export async function listeningPort(): Promise<{ port: number; close: () => void }> {
+  const server: Server = createServer((socket) => socket.end())
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+  return { port, close: () => server.close() }
+}

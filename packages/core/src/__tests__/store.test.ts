@@ -50,6 +50,7 @@ function makeChange(overrides: Partial<Omit<ChangeEntry, 'seq'>> = {}): Omit<Cha
   return {
     id: `chg-${Math.random().toString(36).slice(2)}`,
     roomId: 'room-1',
+    kind: 'node-version',
     title: 'Switch node version',
     actor: 'user',
     component: 'runtime',
@@ -158,7 +159,7 @@ describe('changesRepo', () => {
     expect(changes.list('room-1').map((c) => c.id)).toEqual(['c2', 'c1'])
   })
 
-  it('lastUndoable skips undone, non-verified, and non-undoable entries', () => {
+  it('lastUndoable skips undone, pending, and non-undoable entries but keeps applied-with-failed-verify', () => {
     const changes = changesRepo(db)
     changes.append(makeChange({ id: 'c1' }))
     changes.append(makeChange({ id: 'c2', undoable: false }))
@@ -166,6 +167,9 @@ describe('changesRepo', () => {
     changes.append(makeChange({ id: 'c4', status: 'pending', verify: null }))
     changes.setStatus('c3', 'undone', { undoneAt: '2026-08-10T13:00:00.000Z' })
     expect(changes.lastUndoable('room-1')?.id).toBe('c1')
+    // a change whose apply succeeded but verify failed stays undoable (North Star demo §24)
+    changes.append(makeChange({ id: 'c5', status: 'applied', verify: { ok: false, detail: 'web exited' } }))
+    expect(changes.lastUndoable('room-1')?.id).toBe('c5')
     const undone = changes.get('c3')
     expect(undone?.status).toBe('undone')
     expect(undone?.undoneAt).toBe('2026-08-10T13:00:00.000Z')

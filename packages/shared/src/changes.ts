@@ -14,6 +14,8 @@ export interface ChangeEntry {
   id: string
   roomId: string
   seq: number
+  /** QuickChange kind or an internal kind like 'undo', 'restart-web', 'create-room' */
+  kind: string
   title: string
   actor: Actor
   component: string

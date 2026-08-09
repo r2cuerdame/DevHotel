@@ -7,7 +7,7 @@ import {
   buildOneShotArgs,
   buildWebCreateArgs,
   cacheVolume,
-  depsVolume,
+  effectiveDepsVolume,
   parsePortOutput,
   srcVolume,
   webImage,
@@ -61,10 +61,7 @@ export class OciCliBackend implements IsolationBackend {
       must(await runDocker(['volume', 'create', srcVolume(spec.roomId)]), 'create src volume')
     }
     if (spec.sourceType !== 'empty') {
-      must(
-        await runDocker(['volume', 'create', depsVolume(spec.roomId, spec.nodeMajor)]),
-        'create deps volume',
-      )
+      must(await runDocker(['volume', 'create', effectiveDepsVolume(spec)]), 'create deps volume')
     }
     must(await runDocker(['volume', 'create', cacheVolume(spec.roomId)]), 'create cache volume')
     if (spec.sourceType === 'managed-git') {
@@ -98,10 +95,7 @@ export class OciCliBackend implements IsolationBackend {
     await runDocker(['rm', '-f', webName(spec.roomId)])
     await this.ensureImage(webImage(spec.nodeMajor))
     if (spec.sourceType !== 'empty') {
-      must(
-        await runDocker(['volume', 'create', depsVolume(spec.roomId, spec.nodeMajor)]),
-        'create deps volume',
-      )
+      must(await runDocker(['volume', 'create', effectiveDepsVolume(spec)]), 'create deps volume')
     }
     must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
     must(await runDocker(['start', webName(spec.roomId)]), 'start web container')

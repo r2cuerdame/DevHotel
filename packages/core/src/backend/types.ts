@@ -8,6 +8,8 @@ export interface WebSpec {
   sourceRef: string
   startCommand: string
   env?: Record<string, string>
+  /** overrides the default deps volume name — used by clean-reinstall generations */
+  depsVolumeOverride?: string
 }
 
 export interface AnchorSpec {
