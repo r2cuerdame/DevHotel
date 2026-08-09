@@ -16,7 +16,7 @@ import type {
 import { runDocker } from './backend/cli'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import { ChangeEngine } from './changes/engine'
-import { registerQuickChanges, currentDepsGen as depsGenOf, depsVolumeForGen } from './changes/definitions/index'
+import { registerQuickChanges, depsVolumeForGen } from './changes/definitions/index'
 import type { ChangeCtx } from './changes/types'
 import { verifyWebUp } from './changes/types'
 import { runChecks as runCheckPipeline } from './checks/engine'
@@ -269,6 +269,7 @@ export class RoomOrchestrator {
     return {
       room,
       urls: { app: this.gateway.urlFor(room.domain, room.https) },
+      dataDir: join(this.userData, 'rooms', room.id),
       stackLine: `Node ${room.runtime.version} · ${room.packageManager.kind}`,
       latestCheck: this.checks.latest(roomId),
       recentChanges: recent,

@@ -15,7 +15,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r --if-present test",
     "lint": "eslint .",
-    "build:installer": "pnpm --filter @devhotel/desktop build:installer"
+    "build:installer": "pnpm --filter devhotel-mcp build && pnpm --filter @devhotel/desktop build:installer"
   },
   "devDependencies": {
     "@eslint/js": "^9.20.0",

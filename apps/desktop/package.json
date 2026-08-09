@@ -2,6 +2,8 @@
   "name": "@devhotel/desktop",
   "productName": "DevHotel",
   "version": "0.1.0",
+  "description": "Every project gets its own room — a browser for isolated local development servers.",
+  "author": "DevHotel contributors",
   "private": true,
   "type": "module",
   "main": "./out/main/index.js",

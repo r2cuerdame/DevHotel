@@ -63,6 +63,8 @@ export interface CreateRoomInput {
 export interface RoomInspection {
   room: RoomRecord
   urls: { app: string }
+  /** host folder holding this room's manifest.yaml, logs/, thumbnail */
+  dataDir: string
   stackLine: string
   latestCheck: import('./checks').CheckReport | null
   recentChanges: import('./changes').ChangeEntry[]
