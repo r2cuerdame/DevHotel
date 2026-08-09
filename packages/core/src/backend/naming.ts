@@ -75,6 +75,16 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     `EMULATOR_DEVICE=${device}`,
     '-e',
     'WEB_VNC=true',
+    // frameless phone screen on a phone-sized display — the site view shows
+    // just the device screen instead of a desktop with a skinned emulator
+    '-e',
+    'EMULATOR_NO_SKIN=true',
+    '-e',
+    'SCREEN_WIDTH=540',
+    '-e',
+    'SCREEN_HEIGHT=1140',
+    '-e',
+    'SCREEN_DEPTH=24',
     emulatorImage(version)
   ]
 }
