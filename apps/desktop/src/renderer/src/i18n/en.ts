@@ -165,8 +165,6 @@ export const en = {
   'services.webProcess': 'Web process',
   'services.processMeta': '{status} · internal port {port}',
   'services.databases': 'Databases',
-  'services.databasesHint':
-    'Per-room PostgreSQL and Redis arrive in a later release. Each room already has its own private network, so services will live inside the room at their standard ports without clashing with other rooms.',
 
   // Logs tab
   'logs.web': 'Web',
@@ -210,6 +208,34 @@ export const en = {
   'rename.title': 'Rename room',
   'rename.save': 'Save',
   'wizard.sourceAndroid': 'Android app',
-  'wizard.sourceAndroidHint': 'Coming after Web rooms are rock-solid',
-  'tabs.site': 'Site'
+  'wizard.sourceAndroidHint': 'JDK + Gradle room — builds APKs',
+  'tabs.site': 'Site',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Windows app',
+  'wizard.sourceWindowsHint': 'On the roadmap — after Android',
+  'android.buildApk': 'Build APK',
+  'android.building': 'Building…',
+  'android.buildCommand': 'Build command',
+  'android.apkHint': 'APKs land under app/build/outputs/apk in the project.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'Toggle DevTools (F12)',
+  'viewport.title': 'Preview viewport',
+  'viewport.auto': 'Auto',
+  'services.backup': 'Backup',
+  'services.remove': 'Remove',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    'Remove {service} from this room?\n\nA safety backup is taken automatically before removal — Undo restores the service with its data.',
+  'services.servicesHint':
+    'Services live inside the room at localhost:5432 / 6379 — credentials devhotel / devhotel, database devhotel. Backups land in the room data folder (Console → open room data).',
+  'footprint.title': 'Host footprint',
+  'footprint.app': 'The app itself in %LOCALAPPDATA%\\Programs — uninstall via Windows Apps.',
+  'footprint.appData': 'App data — room manifests, logs and backups — in %APPDATA%\\DevHotel. Delete the folder to remove it.',
+  'footprint.docker':
+    "Rooms' runtimes, dependencies and databases live only in Docker volumes and images — removed per room on delete, fully via Docker.",
+  'footprint.ca': 'Optional: the DevHotel Local CA in the Windows user certificate store — use Remove trust above.',
+  'footprint.autostart': 'Optional: a Start-with-Windows entry — toggle it from the tray icon.',
+  'footprint.nothingElse': 'Nothing else is installed on the host — no global Node, npm, JDK, or SDKs.'
 } as const

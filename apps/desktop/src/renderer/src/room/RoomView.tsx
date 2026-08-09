@@ -8,19 +8,20 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
   const t = useT()
   const running = !!room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
-  const [page, setPage] = useState<RoomPage>(running ? 'site' : 'overview')
+  const android = room?.provider === 'android'
+  const [page, setPage] = useState<RoomPage>(running && !android ? 'site' : 'overview')
   const prevRunning = useRef(running)
   const hostRef = useRef<HTMLDivElement>(null)
 
-  const showSite = running && page === 'site'
+  const showSite = running && !android && page === 'site'
 
   // a room that cannot show its site homes on Overview; when it wakes while
   // the user is still on Overview, "navigate" to the site like a browser would
   useEffect(() => {
-    if (!running && page === 'site') setPage('overview')
-    if (running && !prevRunning.current && page === 'overview') setPage('site')
+    if ((!running || android) && page === 'site') setPage('overview')
+    if (running && !android && !prevRunning.current && page === 'overview') setPage('site')
     prevRunning.current = running
-  }, [running, page])
+  }, [running, android, page])
 
   useEffect(() => {
     const el = hostRef.current

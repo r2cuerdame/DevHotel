@@ -29,8 +29,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>{t('settings.title')}</h2>
 
-        <div className="panel-section">
-          <h3>{t('settings.language')}</h3>
+        <div className="panel-section settings-card">
+          <h3>🌐 {t('settings.language')}</h3>
           <select value={lang} onChange={(e) => setLang(e.target.value as LocaleId)} style={{ width: 220 }}>
             {LOCALES.map((l) => (
               <option key={l.id} value={l.id}>
@@ -40,8 +40,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
           </select>
         </div>
 
-        <div className="panel-section">
-          <h3>{t('settings.mcpTitle')}</h3>
+        <div className="panel-section settings-card">
+          <h3>🤖 {t('settings.mcpTitle')}</h3>
           <p className="small muted" style={{ marginTop: 0 }}>
             {t('settings.mcpDesc')}
           </p>
@@ -91,8 +91,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
           )}
         </div>
 
-        <div className="panel-section">
-          <h3>{t('settings.httpsTitle')}</h3>
+        <div className="panel-section settings-card">
+          <h3>🔒 {t('settings.httpsTitle')}</h3>
           <p className="small muted" style={{ marginTop: 0 }}>
             {t('settings.httpsDesc')}
           </p>
@@ -129,8 +129,22 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
           </div>
         </div>
 
-        <div className="panel-section">
-          <h3>{t('settings.about')}</h3>
+        <div className="panel-section settings-card">
+          <h3>🧳 {t('footprint.title')}</h3>
+          <ul className="small muted" style={{ margin: 0, paddingLeft: 18 }}>
+            <li>{t('footprint.app')}</li>
+            <li>{t('footprint.appData')}</li>
+            <li>{t('footprint.docker')}</li>
+            <li>{t('footprint.ca')}</li>
+            <li>{t('footprint.autostart')}</li>
+          </ul>
+          <p className="small" style={{ margin: '8px 0 0' }}>
+            {t('footprint.nothingElse')}
+          </p>
+        </div>
+
+        <div className="panel-section settings-card">
+          <h3>ⓘ {t('settings.about')}</h3>
           <p className="small muted" style={{ margin: 0 }}>
             {t('settings.aboutLine', { version })}
           </p>

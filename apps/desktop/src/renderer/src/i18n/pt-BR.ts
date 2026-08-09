@@ -152,8 +152,6 @@ export const ptBR: Translation = {
   'services.webProcess': 'Processo web',
   'services.processMeta': '{status} · porta interna {port}',
   'services.databases': 'Bancos de dados',
-  'services.databasesHint':
-    'PostgreSQL e Redis por quarto chegam em uma versão futura. Cada quarto já tem sua própria rede privada, então os serviços vão viver dentro do quarto nas portas padrão, sem conflito com outros quartos.',
 
   'logs.web': 'Web',
   'logs.empty': 'Nenhuma saída ainda.',
@@ -193,6 +191,34 @@ export const ptBR: Translation = {
   'rename.title': 'Renomear quarto',
   'rename.save': 'Salvar',
   'wizard.sourceAndroid': 'App Android',
-  'wizard.sourceAndroidHint': 'Chega quando os quartos web estiverem estáveis',
-  'tabs.site': 'Site'
+  'wizard.sourceAndroidHint': 'Quarto com JDK + Gradle — gera APKs',
+  'tabs.site': 'Site',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'App Windows',
+  'wizard.sourceWindowsHint': 'No roadmap — depois do Android',
+  'android.buildApk': 'Gerar APK',
+  'android.building': 'Gerando…',
+  'android.buildCommand': 'Comando de build',
+  'android.apkHint': 'Os APKs ficam em app/build/outputs/apk dentro do projeto.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'Alternar DevTools (F12)',
+  'viewport.title': 'Viewport da prévia',
+  'viewport.auto': 'Automático',
+  'services.backup': 'Backup',
+  'services.remove': 'Remover',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    'Remover {service} deste quarto?\n\nUm backup de segurança é feito automaticamente antes da remoção — Desfazer restaura o serviço com seus dados.',
+  'services.servicesHint':
+    'Os serviços vivem dentro do quarto em localhost:5432 / 6379 — credenciais devhotel / devhotel, banco devhotel. Os backups ficam na pasta de dados do quarto (Console → abrir dados do quarto).',
+  'footprint.title': 'Pegada no computador',
+  'footprint.app': 'O app em %LOCALAPPDATA%\\Programs — desinstale em Aplicativos do Windows.',
+  'footprint.appData': 'Dados do app — manifestos dos quartos, logs e backups — em %APPDATA%\\DevHotel. Apague a pasta para remover.',
+  'footprint.docker':
+    'Runtimes, dependências e bancos dos quartos vivem apenas em volumes e imagens do Docker — removidos por quarto ao excluir, e por completo via Docker.',
+  'footprint.ca': 'Opcional: a CA local do DevHotel no repositório de certificados do usuário do Windows — use Remover confiança acima.',
+  'footprint.autostart': 'Opcional: uma entrada de inicialização com o Windows — alterne no ícone da bandeja.',
+  'footprint.nothingElse': 'Nada mais é instalado no computador — nenhum Node, npm, JDK ou SDK global.'
 }

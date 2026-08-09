@@ -151,8 +151,6 @@ export const ja: Translation = {
   'services.webProcess': 'Web プロセス',
   'services.processMeta': '{status} · 内部ポート {port}',
   'services.databases': 'データベース',
-  'services.databasesHint':
-    'ルームごとの PostgreSQL と Redis は今後のリリースで提供予定です。各ルームはすでに専用のプライベートネットワークを持っているため、サービスは他のルームと衝突せず、標準ポートのままルーム内で動作します。',
 
   'logs.web': 'Web',
   'logs.empty': 'まだ出力はありません。',
@@ -192,6 +190,34 @@ export const ja: Translation = {
   'rename.title': 'ルーム名を変更',
   'rename.save': '保存',
   'wizard.sourceAndroid': 'Android アプリ',
-  'wizard.sourceAndroidHint': 'Web ルームが安定した後に登場します',
-  'tabs.site': 'サイト'
+  'wizard.sourceAndroidHint': 'JDK + Gradle のルーム — APK をビルドします',
+  'tabs.site': 'サイト',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Windows アプリ',
+  'wizard.sourceWindowsHint': 'ロードマップにあります — Android の次',
+  'android.buildApk': 'APK をビルド',
+  'android.building': 'ビルド中…',
+  'android.buildCommand': 'ビルドコマンド',
+  'android.apkHint': 'APK はプロジェクト内の app/build/outputs/apk に出力されます。',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'DevTools を切り替え (F12)',
+  'viewport.title': 'プレビューのビューポート',
+  'viewport.auto': '自動',
+  'services.backup': 'バックアップ',
+  'services.remove': '削除',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    '{service} をこのルームから削除しますか?\n\n削除前に安全バックアップが自動で作成されます — 元に戻すとサービスとデータが復元されます。',
+  'services.servicesHint':
+    'サービスはルーム内の localhost:5432 / 6379 で動作します — 資格情報は devhotel / devhotel、データベースは devhotel。バックアップはルームのデータフォルダーに保存されます (コンソール → ルームデータを開く)。',
+  'footprint.title': 'ホストに残るもの',
+  'footprint.app': 'アプリ本体は %LOCALAPPDATA%\\Programs にあります — Windows の「アプリ」からアンインストールできます。',
+  'footprint.appData': 'アプリデータ (ルームの manifest・ログ・バックアップ) は %APPDATA%\\DevHotel にあります — フォルダーを削除すれば消えます。',
+  'footprint.docker':
+    'ルームのランタイム・依存関係・データベースは Docker のボリュームとイメージの中だけに存在します — ルーム削除時に一緒に消え、Docker から完全に削除できます。',
+  'footprint.ca': '任意: Windows ユーザー証明書ストアの DevHotel ローカル CA — 上の「信頼を解除」で削除できます。',
+  'footprint.autostart': '任意: Windows 起動時に実行するエントリ — トレイアイコンから切り替えられます。',
+  'footprint.nothingElse': 'ホストにはこれ以外何もインストールされません — グローバルな Node、npm、JDK、SDK は一切ありません。'
 }

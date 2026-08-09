@@ -151,8 +151,6 @@ export const ko: Translation = {
   'services.webProcess': '웹 프로세스',
   'services.processMeta': '{status} · 내부 포트 {port}',
   'services.databases': '데이터베이스',
-  'services.databasesHint':
-    '객실별 PostgreSQL과 Redis는 다음 릴리스에 제공됩니다. 각 객실은 이미 전용 네트워크를 갖고 있어, 서비스가 다른 객실과 충돌 없이 표준 포트 그대로 객실 안에서 동작하게 됩니다.',
 
   'logs.web': '웹',
   'logs.empty': '아직 출력이 없습니다.',
@@ -192,6 +190,34 @@ export const ko: Translation = {
   'rename.title': '객실 이름 바꾸기',
   'rename.save': '저장',
   'wizard.sourceAndroid': 'Android 앱',
-  'wizard.sourceAndroidHint': '웹 객실이 안정된 뒤에 제공돼요',
-  'tabs.site': '사이트'
+  'wizard.sourceAndroidHint': 'JDK + Gradle 객실 — APK를 빌드합니다',
+  'tabs.site': '사이트',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Windows 앱',
+  'wizard.sourceWindowsHint': '로드맵에 있어요 — Android 다음',
+  'android.buildApk': 'APK 빌드',
+  'android.building': '빌드 중…',
+  'android.buildCommand': '빌드 명령',
+  'android.apkHint': 'APK는 프로젝트 안 app/build/outputs/apk 아래에 생성됩니다.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': '개발자 도구 열기/닫기 (F12)',
+  'viewport.title': '미리보기 화면 크기',
+  'viewport.auto': '자동',
+  'services.backup': '백업',
+  'services.remove': '제거',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    '{service}를 이 객실에서 제거할까요?\n\n제거 전에 안전 백업이 자동으로 만들어집니다 — 되돌리기를 하면 서비스와 데이터가 복원됩니다.',
+  'services.servicesHint':
+    '서비스는 객실 안 localhost:5432 / 6379에서 동작합니다 — 계정 devhotel / devhotel, 데이터베이스 devhotel. 백업은 객실 데이터 폴더에 저장됩니다 (콘솔 → 객실 데이터 열기).',
+  'footprint.title': '호스트에 남는 것',
+  'footprint.app': '앱 본체는 %LOCALAPPDATA%\\Programs에 있습니다 — Windows 앱 설정에서 제거하세요.',
+  'footprint.appData': '앱 데이터(객실 manifest · 로그 · 백업)는 %APPDATA%\\DevHotel에 있습니다 — 폴더를 지우면 제거됩니다.',
+  'footprint.docker':
+    '객실의 런타임 · 의존성 · 데이터베이스는 오직 Docker 볼륨과 이미지에만 있습니다 — 객실 삭제 시 함께 제거되고, Docker에서 완전히 지울 수 있습니다.',
+  'footprint.ca': '선택 사항: Windows 사용자 인증서 저장소의 DevHotel 로컬 CA — 위의 신뢰 해제 버튼으로 제거하세요.',
+  'footprint.autostart': '선택 사항: Windows 시작 시 실행 항목 — 트레이 아이콘에서 켜고 끌 수 있습니다.',
+  'footprint.nothingElse': '호스트에는 그 외 아무것도 설치되지 않습니다 — 전역 Node, npm, JDK, SDK가 전혀 없습니다.'
 }

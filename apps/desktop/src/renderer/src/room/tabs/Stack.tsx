@@ -22,6 +22,27 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
     }
   }
 
+  if (room.provider === 'android') {
+    return (
+      <div className="panel-section">
+        <h3>{t('android.buildCommand')}</h3>
+        <div className="row">
+          <input className="mono" value={command} onChange={(e) => setCommand(e.target.value)} style={{ flex: 1 }} />
+          <button
+            className="btn"
+            disabled={command === room.startCommand || !command || pending !== null}
+            onClick={() => void run('cmd', () => applyChange(room.id, { kind: 'start-command', command }))}
+          >
+            {pending === 'cmd' ? t('common.applying') : t('common.apply')}
+          </button>
+        </div>
+        <p className="small muted" style={{ marginTop: 6 }}>
+          {t('android.apkHint')}
+        </p>
+      </div>
+    )
+  }
+
   return (
     <>
       <div className="panel-section">

@@ -152,8 +152,6 @@ export const de: Translation = {
   'services.webProcess': 'Web-Prozess',
   'services.processMeta': '{status} · interner Port {port}',
   'services.databases': 'Datenbanken',
-  'services.databasesHint':
-    'PostgreSQL und Redis pro Zimmer kommen in einer späteren Version. Jedes Zimmer hat bereits sein eigenes privates Netzwerk, sodass Dienste im Zimmer auf ihren Standardports laufen werden, ohne mit anderen Zimmern zu kollidieren.',
 
   'logs.web': 'Web',
   'logs.empty': 'Noch keine Ausgabe.',
@@ -193,6 +191,34 @@ export const de: Translation = {
   'rename.title': 'Zimmer umbenennen',
   'rename.save': 'Speichern',
   'wizard.sourceAndroid': 'Android-App',
-  'wizard.sourceAndroidHint': 'Kommt, sobald Web-Zimmer stabil laufen',
-  'tabs.site': 'Website'
+  'wizard.sourceAndroidHint': 'Zimmer mit JDK + Gradle — baut APKs',
+  'tabs.site': 'Website',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Windows-App',
+  'wizard.sourceWindowsHint': 'Auf der Roadmap — nach Android',
+  'android.buildApk': 'APK bauen',
+  'android.building': 'Wird gebaut…',
+  'android.buildCommand': 'Build-Befehl',
+  'android.apkHint': 'APKs landen im Projekt unter app/build/outputs/apk.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'DevTools umschalten (F12)',
+  'viewport.title': 'Vorschau-Viewport',
+  'viewport.auto': 'Auto',
+  'services.backup': 'Sichern',
+  'services.remove': 'Entfernen',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    '{service} aus diesem Zimmer entfernen?\n\nVorher wird automatisch ein Sicherheits-Backup angelegt — Rückgängig stellt den Dienst samt Daten wieder her.',
+  'services.servicesHint':
+    'Dienste laufen im Zimmer unter localhost:5432 / 6379 — Zugangsdaten devhotel / devhotel, Datenbank devhotel. Backups landen im Datenordner des Zimmers (Konsole → Zimmerdaten öffnen).',
+  'footprint.title': 'Spuren auf dem PC',
+  'footprint.app': 'Die App selbst in %LOCALAPPDATA%\\Programs — Deinstallation über Windows-Apps.',
+  'footprint.appData': 'App-Daten — Zimmer-Manifeste, Logs und Backups — in %APPDATA%\\DevHotel. Ordner löschen genügt.',
+  'footprint.docker':
+    'Laufzeiten, Abhängigkeiten und Datenbanken der Zimmer liegen ausschließlich in Docker-Volumes und -Images — beim Löschen je Zimmer entfernt, vollständig über Docker.',
+  'footprint.ca': 'Optional: die DevHotel Local CA im Windows-Benutzerzertifikatspeicher — oben über „Vertrauen entfernen“.',
+  'footprint.autostart': 'Optional: ein Autostart-Eintrag für Windows — über das Tray-Symbol umschaltbar.',
+  'footprint.nothingElse': 'Sonst wird nichts auf dem PC installiert — kein globales Node, npm, JDK oder SDK.'
 }

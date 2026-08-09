@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { PmKind, RoomPlan, SourceType } from '@devhotel/shared'
+import type { PmKind, ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import type { Translation } from '../i18n'
@@ -14,6 +14,7 @@ export function NewRoomWizard(): React.JSX.Element {
   const t = useT()
 
   const [step, setStep] = useState<'source' | 'plan'>('source')
+  const [provider, setProvider] = useState<ProviderKind>('web')
   const [sourceType, setSourceType] = useState<SourceType>('managed-git')
   const [sourceRef, setSourceRef] = useState('')
   const [project, setProject] = useState('')
@@ -29,7 +30,15 @@ export function NewRoomWizard(): React.JSX.Element {
   const [domain, setDomain] = useState('')
   const [https, setHttps] = useState(false)
 
-  const chooseSource = (type: SourceType): void => setSourceType(type)
+  const chooseSource = (type: SourceType): void => {
+    setProvider('web')
+    setSourceType(type)
+  }
+
+  const chooseAndroid = (): void => {
+    setProvider('android')
+    if (sourceType === 'empty') setSourceType('managed-git')
+  }
 
   async function pickFolder(): Promise<void> {
     const folder = await api.app.pickFolder()
@@ -49,7 +58,7 @@ export function NewRoomWizard(): React.JSX.Element {
     setProject(projectName)
     setLoading(true)
     try {
-      const p = await planRoom({ sourceType, sourceRef, nickname, project: projectName })
+      const p = await planRoom({ sourceType, sourceRef, nickname, project: projectName, provider })
       setPlan(p)
       setRuntimeVersion(p.runtime.value)
       setPmKind(p.packageManager.value)
@@ -74,6 +83,7 @@ export function NewRoomWizard(): React.JSX.Element {
         project,
         nickname,
         actor: 'user',
+        provider,
         planOverrides: { runtimeVersion, pmKind, startCommand, internalPort, domain, https }
       })
     } finally {
@@ -98,16 +108,37 @@ export function NewRoomWizard(): React.JSX.Element {
                   ['empty', 'wizard.sourceEmpty', 'wizard.sourceEmptyHint']
                 ] as [SourceType, keyof Translation, keyof Translation][]
               ).map(([type, label, hint]) => (
-                <button key={type} className="source-choice" data-active={sourceType === type} onClick={() => chooseSource(type)}>
+                <button
+                  key={type}
+                  className="source-choice"
+                  data-active={provider === 'web' && sourceType === type}
+                  disabled={type === 'empty' && provider === 'android'}
+                  onClick={() => chooseSource(type)}
+                >
                   <b>{t(label)}</b>
                   <small>{t(hint)}</small>
                 </button>
               ))}
-              <button className="source-choice" disabled title={t('wizard.sourceAndroidHint')}>
+              <button className="source-choice" data-active={provider === 'android'} onClick={chooseAndroid}>
                 <b>{t('wizard.sourceAndroid')}</b>
                 <small>{t('wizard.sourceAndroidHint')}</small>
               </button>
+              <button className="source-choice" disabled title={t('wizard.sourceWindowsHint')}>
+                <b>{t('wizard.sourceWindows')}</b>
+                <small>{t('wizard.sourceWindowsHint')}</small>
+              </button>
             </div>
+
+            {provider === 'android' && (
+              <div className="seg">
+                <button data-active={sourceType === 'managed-git'} onClick={() => setSourceType('managed-git')}>
+                  {t('wizard.sourceGit')}
+                </button>
+                <button data-active={sourceType === 'linked-folder'} onClick={() => setSourceType('linked-folder')}>
+                  {t('wizard.sourceFolder')}
+                </button>
+              </div>
+            )}
 
             {sourceType === 'managed-git' && (
               <div className="field">
@@ -170,67 +201,98 @@ export function NewRoomWizard(): React.JSX.Element {
                     <td>{plan.framework}</td>
                   </tr>
                 )}
-                <tr>
-                  <td>{t('label.runtime')}</td>
-                  <td>
-                    <div className="row">
-                      <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
-                        {NODE_MAJORS.map((v) => (
-                          <option key={v} value={v}>
-                            Node {v}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="src">{plan?.runtime.source}</span>
-                    </div>
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.packageManager')}</td>
-                  <td>
-                    <div className="row">
-                      <select value={pmKind} onChange={(e) => setPmKind(e.target.value as PmKind)} style={{ width: 110 }}>
-                        <option value="npm">npm</option>
-                        <option value="pnpm">pnpm</option>
-                      </select>
-                      <span className="src">{plan?.packageManager.source}</span>
-                    </div>
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.startCommand')}</td>
-                  <td>
-                    <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.internalPort')}</td>
-                  <td>
-                    <div className="row">
-                      <input
-                        type="number"
-                        value={internalPort}
-                        onChange={(e) => setInternalPort(Number(e.target.value))}
-                        style={{ width: 110 }}
-                      />
-                      <span className="src">{plan?.internalPort.source}</span>
-                    </div>
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.domain')}</td>
-                  <td>
-                    <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
-                  </td>
-                </tr>
-                <tr>
-                  <td>HTTPS</td>
-                  <td>
-                    <label className="row" style={{ gap: 6 }}>
-                      <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> {t('wizard.enable')}
-                    </label>
-                  </td>
-                </tr>
+                {provider === 'android' ? (
+                  <>
+                    <tr>
+                      <td>{t('label.runtime')}</td>
+                      <td>
+                        <div className="row">
+                          <span>JDK {runtimeVersion}</span>
+                          <span className="src">{plan?.runtime.source}</span>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('label.packageManager')}</td>
+                      <td>
+                        <div className="row">
+                          <span>{pmKind}</span>
+                          <span className="src">{plan?.packageManager.source}</span>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('android.buildCommand')}</td>
+                      <td>
+                        <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
+                      </td>
+                    </tr>
+                  </>
+                ) : (
+                  <>
+                    <tr>
+                      <td>{t('label.runtime')}</td>
+                      <td>
+                        <div className="row">
+                          <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
+                            {NODE_MAJORS.map((v) => (
+                              <option key={v} value={v}>
+                                Node {v}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="src">{plan?.runtime.source}</span>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('label.packageManager')}</td>
+                      <td>
+                        <div className="row">
+                          <select value={pmKind} onChange={(e) => setPmKind(e.target.value as PmKind)} style={{ width: 110 }}>
+                            <option value="npm">npm</option>
+                            <option value="pnpm">pnpm</option>
+                          </select>
+                          <span className="src">{plan?.packageManager.source}</span>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('label.startCommand')}</td>
+                      <td>
+                        <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('label.internalPort')}</td>
+                      <td>
+                        <div className="row">
+                          <input
+                            type="number"
+                            value={internalPort}
+                            onChange={(e) => setInternalPort(Number(e.target.value))}
+                            style={{ width: 110 }}
+                          />
+                          <span className="src">{plan?.internalPort.source}</span>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>{t('label.domain')}</td>
+                      <td>
+                        <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>HTTPS</td>
+                      <td>
+                        <label className="row" style={{ gap: 6 }}>
+                          <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> {t('wizard.enable')}
+                        </label>
+                      </td>
+                    </tr>
+                  </>
+                )}
               </tbody>
             </table>
 

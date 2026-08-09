@@ -150,8 +150,6 @@ export const zhCN: Translation = {
   'services.webProcess': 'Web 进程',
   'services.processMeta': '{status} · 内部端口 {port}',
   'services.databases': '数据库',
-  'services.databasesHint':
-    '按房间提供的 PostgreSQL 和 Redis 将在后续版本推出。每个房间已经拥有自己的私有网络，服务将以标准端口运行在房间内，不会与其他房间冲突。',
 
   'logs.web': 'Web',
   'logs.empty': '暂无输出。',
@@ -190,6 +188,32 @@ export const zhCN: Translation = {
   'rename.title': '重命名房间',
   'rename.save': '保存',
   'wizard.sourceAndroid': 'Android 应用',
-  'wizard.sourceAndroidHint': '将在 Web 房间稳定后推出',
-  'tabs.site': '站点'
+  'wizard.sourceAndroidHint': 'JDK + Gradle 房间 — 构建 APK',
+  'tabs.site': '站点',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Windows 应用',
+  'wizard.sourceWindowsHint': '已在路线图上 — Android 之后',
+  'android.buildApk': '构建 APK',
+  'android.building': '构建中…',
+  'android.buildCommand': '构建命令',
+  'android.apkHint': 'APK 会输出到项目内的 app/build/outputs/apk。',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': '开关 DevTools（F12）',
+  'viewport.title': '预览视口',
+  'viewport.auto': '自动',
+  'services.backup': '备份',
+  'services.remove': '移除',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm': '要把 {service} 从这个房间移除吗？\n\n移除前会自动创建安全备份 — 撤销即可恢复服务及其数据。',
+  'services.servicesHint':
+    '服务运行在房间内的 localhost:5432 / 6379 — 凭据 devhotel / devhotel，数据库 devhotel。备份保存在房间数据文件夹（控制台 → 打开房间数据）。',
+  'footprint.title': '主机占用',
+  'footprint.app': '应用本体位于 %LOCALAPPDATA%\\Programs — 在 Windows「应用」中卸载。',
+  'footprint.appData': '应用数据（房间 manifest、日志、备份）位于 %APPDATA%\\DevHotel — 删除该文件夹即可清除。',
+  'footprint.docker': '房间的运行时、依赖和数据库只存在于 Docker 卷和镜像中 — 删除房间时一并移除，也可通过 Docker 彻底清理。',
+  'footprint.ca': '可选：Windows 用户证书存储中的 DevHotel 本地 CA — 用上面的「移除信任」按钮移除。',
+  'footprint.autostart': '可选：开机自启动项 — 在托盘图标中开关。',
+  'footprint.nothingElse': '主机上不会安装其他任何东西 — 没有全局的 Node、npm、JDK 或 SDK。'
 }

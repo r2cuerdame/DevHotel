@@ -152,8 +152,6 @@ export const ru: Translation = {
   'services.webProcess': 'Веб-процесс',
   'services.processMeta': '{status} · внутренний порт {port}',
   'services.databases': 'Базы данных',
-  'services.databasesHint':
-    'PostgreSQL и Redis для каждого номера появятся в одном из следующих релизов. У каждого номера уже есть своя приватная сеть, так что сервисы будут жить внутри номера на стандартных портах, не конфликтуя с другими номерами.',
 
   'logs.web': 'Веб',
   'logs.empty': 'Пока нет вывода.',
@@ -193,6 +191,34 @@ export const ru: Translation = {
   'rename.title': 'Переименовать номер',
   'rename.save': 'Сохранить',
   'wizard.sourceAndroid': 'Android-приложение',
-  'wizard.sourceAndroidHint': 'Появится после стабилизации веб-номеров',
-  'tabs.site': 'Сайт'
+  'wizard.sourceAndroidHint': 'Номер с JDK + Gradle — собирает APK',
+  'tabs.site': 'Сайт',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'Приложение Windows',
+  'wizard.sourceWindowsHint': 'В планах — после Android',
+  'android.buildApk': 'Собрать APK',
+  'android.building': 'Сборка…',
+  'android.buildCommand': 'Команда сборки',
+  'android.apkHint': 'APK появляются в app/build/outputs/apk внутри проекта.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'Переключить DevTools (F12)',
+  'viewport.title': 'Размер области предпросмотра',
+  'viewport.auto': 'Авто',
+  'services.backup': 'Бэкап',
+  'services.remove': 'Убрать',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    'Убрать {service} из этого номера?\n\nПеред удалением автоматически создаётся страховочный бэкап — «Отменить» восстановит сервис вместе с данными.',
+  'services.servicesHint':
+    'Сервисы живут внутри номера на localhost:5432 / 6379 — логин и пароль devhotel / devhotel, база devhotel. Бэкапы складываются в папку данных номера (Консоль → открыть данные номера).',
+  'footprint.title': 'След на компьютере',
+  'footprint.app': 'Само приложение в %LOCALAPPDATA%\\Programs — удаляется через «Приложения» Windows.',
+  'footprint.appData': 'Данные приложения — манифесты номеров, логи, бэкапы — в %APPDATA%\\DevHotel. Удалите папку, чтобы стереть.',
+  'footprint.docker':
+    'Рантаймы, зависимости и базы номеров живут только в томах и образах Docker — удаляются вместе с номером, а полностью — через Docker.',
+  'footprint.ca': 'Необязательно: локальный CA DevHotel в пользовательском хранилище сертификатов Windows — кнопка «Убрать доверие» выше.',
+  'footprint.autostart': 'Необязательно: запись автозапуска с Windows — переключается в значке трея.',
+  'footprint.nothingElse': 'Больше на компьютер ничего не ставится — никаких глобальных Node, npm, JDK или SDK.'
 }

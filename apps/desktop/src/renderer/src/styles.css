@@ -998,6 +998,16 @@ code,
   font-size: 12px;
 }
 
+/* ---------- settings ---------- */
+
+.settings-card {
+  background: var(--walnut-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
 /* ---------- toasts ---------- */
 
 .toasts {

@@ -152,8 +152,6 @@ export const es: Translation = {
   'services.webProcess': 'Proceso web',
   'services.processMeta': '{status} · puerto interno {port}',
   'services.databases': 'Bases de datos',
-  'services.databasesHint':
-    'PostgreSQL y Redis por habitación llegarán en una versión posterior. Cada habitación ya tiene su propia red privada, así que los servicios vivirán dentro de la habitación en sus puertos estándar sin chocar con otras habitaciones.',
 
   'logs.web': 'Web',
   'logs.empty': 'Sin salida todavía.',
@@ -193,6 +191,35 @@ export const es: Translation = {
   'rename.title': 'Renombrar habitación',
   'rename.save': 'Guardar',
   'wizard.sourceAndroid': 'App Android',
-  'wizard.sourceAndroidHint': 'Llegará cuando las habitaciones web sean estables',
-  'tabs.site': 'Sitio'
+  'wizard.sourceAndroidHint': 'Habitación con JDK + Gradle — compila APKs',
+  'tabs.site': 'Sitio',
+
+  // Android rooms · services · viewport · host footprint
+  'wizard.sourceWindows': 'App de Windows',
+  'wizard.sourceWindowsHint': 'En la hoja de ruta — después de Android',
+  'android.buildApk': 'Compilar APK',
+  'android.building': 'Compilando…',
+  'android.buildCommand': 'Comando de compilación',
+  'android.apkHint': 'Los APK quedan en app/build/outputs/apk dentro del proyecto.',
+  'android.pill': '{project} / {nickname} — Android',
+  'bar.devtools': 'Alternar DevTools (F12)',
+  'viewport.title': 'Viewport de la vista previa',
+  'viewport.auto': 'Automático',
+  'services.backup': 'Copia de seguridad',
+  'services.remove': 'Quitar',
+  'services.addPostgres': '+ PostgreSQL 17',
+  'services.addRedis': '+ Redis 8',
+  'services.removeConfirm':
+    '¿Quitar {service} de esta habitación?\n\nAntes de quitarlo se crea automáticamente una copia de seguridad — Deshacer restaura el servicio con sus datos.',
+  'services.servicesHint':
+    'Los servicios viven dentro de la habitación en localhost:5432 / 6379 — credenciales devhotel / devhotel, base de datos devhotel. Las copias de seguridad quedan en la carpeta de datos de la habitación (Consola → abrir datos de la habitación).',
+  'footprint.title': 'Huella en el equipo',
+  'footprint.app': 'La app en %LOCALAPPDATA%\\Programs — desinstálala desde Aplicaciones de Windows.',
+  'footprint.appData':
+    'Datos de la app — manifiestos de habitaciones, registros y copias de seguridad — en %APPDATA%\\DevHotel. Borra la carpeta para eliminarlos.',
+  'footprint.docker':
+    'Los runtimes, dependencias y bases de datos de las habitaciones viven solo en volúmenes e imágenes de Docker — se quitan por habitación al eliminarla, y del todo desde Docker.',
+  'footprint.ca': 'Opcional: la CA local de DevHotel en el almacén de certificados del usuario de Windows — usa Quitar confianza arriba.',
+  'footprint.autostart': 'Opcional: una entrada de inicio con Windows — se activa desde el icono de la bandeja.',
+  'footprint.nothingElse': 'No se instala nada más en el equipo — sin Node, npm, JDK ni SDKs globales.'
 }
