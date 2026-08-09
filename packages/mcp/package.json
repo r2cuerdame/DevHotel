@@ -1,6 +1,6 @@
 {
   "name": "devhotel-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "MCP server for DevHotel — let agents use isolated Rooms instead of dirtying the host.",
   "license": "MIT",
   "type": "module",

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-08-10
+
+- **Installed programs** in Stack: every room lists its programs with live in-room versions; switch Node/npm↔pnpm/PostgreSQL/Redis versions in place, undo per component. Service version switches back up the data, recreate the service, and restore it.
+- Database lifecycle (add · version · backup · restart · remove · restore) lives in Stack; Overview is a clean summary.
+- Android rooms: the phone screen now fills its frame edge to edge (phone-aspect preview, frameless main window only, tool windows minimized).
+
 ## 0.2.1 — 2026-08-10
 
 ### Android rooms run your app on screen
