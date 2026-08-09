@@ -278,17 +278,10 @@ export class OciCliBackend implements IsolationBackend {
   async createEmulator(roomId: string, opts?: { device: string; version: string }): Promise<void> {
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
     must(await runDocker(buildEmulatorArgs(roomId, opts)), 'run emulator container')
-    // frameless fullscreen phone: openbox applies these rules when the
-    // emulator window maps, stripping decorations and margins
+    // frameless fullscreen phone: written before openbox starts inside the
+    // container, so it loads these rules and maps the emulator undecorated
     await runDocker(
-      [
-        'exec',
-        '-i',
-        emulatorName(roomId),
-        'sh',
-        '-c',
-        'mkdir -p ~/.config/openbox && cat > ~/.config/openbox/rc.xml && DISPLAY=:0 openbox --reconfigure || true'
-      ],
+      ['exec', '-i', emulatorName(roomId), 'sh', '-c', 'mkdir -p ~/.config/openbox && cat > ~/.config/openbox/rc.xml'],
       { input: OPENBOX_FRAMELESS_RC }
     )
   }
