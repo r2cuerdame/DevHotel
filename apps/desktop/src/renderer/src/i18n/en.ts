@@ -210,5 +210,6 @@ export const en = {
   'rename.title': 'Rename room',
   'rename.save': 'Save',
   'wizard.sourceAndroid': 'Android app',
-  'wizard.sourceAndroidHint': 'Coming after Web rooms are rock-solid'
+  'wizard.sourceAndroidHint': 'Coming after Web rooms are rock-solid',
+  'tabs.site': 'Site'
 } as const

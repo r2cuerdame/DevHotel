@@ -1,18 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import { statusLabel, useStore, useT } from '../state/store'
+import { useStore, useT } from '../state/store'
 import { BrowserBar } from './BrowserBar'
-import { DetailPanel } from './DetailPanel'
+import { RoomPages, type RoomPage } from './RoomPages'
 
 export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
-  const busy = useStore((s) => s.busy[roomId])
-  const roomAction = useStore((s) => s.roomAction)
   const t = useT()
-  const [panelOpen, setPanelOpen] = useState(false)
+  const running = !!room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
+  const [page, setPage] = useState<RoomPage>(running ? 'site' : 'overview')
+  const prevRunning = useRef(running)
   const hostRef = useRef<HTMLDivElement>(null)
 
-  const showSite = room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
+  const showSite = running && page === 'site'
+
+  // a room that cannot show its site homes on Overview; when it wakes while
+  // the user is still on Overview, "navigate" to the site like a browser would
+  useEffect(() => {
+    if (!running && page === 'site') setPage('overview')
+    if (running && !prevRunning.current && page === 'overview') setPage('site')
+    prevRunning.current = running
+  }, [running, page])
 
   useEffect(() => {
     const el = hostRef.current
@@ -35,7 +43,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       window.removeEventListener('resize', report)
       void api.preview.detach().catch(() => undefined)
     }
-  }, [roomId, showSite, panelOpen])
+  }, [roomId, showSite])
 
   if (!room) {
     return (
@@ -49,35 +57,13 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
 
   return (
     <div className="room-view">
-      <BrowserBar room={room} panelOpen={panelOpen} onTogglePanel={() => setPanelOpen((v) => !v)} />
+      <BrowserBar room={room} page={page} onNavigate={setPage} />
       <div className="room-body">
-        <div className="preview-host" ref={hostRef}>
-          {!showSite && (
-            <div className="preview-overlay">
-              <span className="plate">№ {room.roomNumber}</span>
-              {busy ? (
-                <span>{busy}</span>
-              ) : room.status === 'sleeping' ? (
-                <>
-                  <span>{t('room.asleepHint')}</span>
-                  <button className="btn primary" onClick={() => void roomAction(roomId, 'start')}>
-                    {t('room.wakeRoom')}
-                  </button>
-                </>
-              ) : room.status === 'preparing' ? (
-                <span>{t('room.preparingHint')}</span>
-              ) : (
-                <>
-                  <span>{t('room.unreachableHint', { status: statusLabel(t, room.status) })}</span>
-                  <button className="btn" onClick={() => setPanelOpen(true)}>
-                    {t('room.openDiagnostics')}
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-        </div>
-        {panelOpen && <DetailPanel room={room} />}
+        {showSite ? (
+          <div className="preview-host" ref={hostRef} />
+        ) : (
+          <RoomPages room={room} page={page === 'site' ? 'overview' : page} onNavigate={setPage} />
+        )}
       </div>
     </div>
   )

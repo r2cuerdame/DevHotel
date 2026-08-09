@@ -572,22 +572,73 @@ code,
   font-size: 16px;
 }
 
-.detail-panel {
-  width: 400px;
-  flex: none;
-  border-left: 1px solid var(--line);
-  background: var(--walnut);
+/* full-page room screens — the site and these pages take turns covering everything */
+.room-page {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  animation: slide-in 180ms ease-out;
+  background: var(--ink);
+  animation: page-in 160ms ease-out;
 }
 
-@keyframes slide-in {
+@keyframes page-in {
   from {
-    transform: translateX(24px);
+    transform: translateY(6px);
     opacity: 0;
   }
+}
+
+.room-page .page-nav {
+  justify-content: center;
+  border-bottom: 1px solid var(--line);
+  background: var(--ink);
+  padding: 10px 16px 0;
+}
+
+.page-nav-sep {
+  width: 1px;
+  background: var(--line);
+  margin: 4px 6px 8px;
+}
+
+.page-nav .panel-tab:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.room-page-inner {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 20px 24px 32px;
+  user-select: text;
+  display: flex;
+  flex-direction: column;
+}
+
+.bar-menu {
+  position: absolute;
+  right: 0;
+  top: 34px;
+  background: var(--walnut-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  z-index: 30;
+  width: 230px;
+  display: flex;
+  flex-direction: column;
+  animation: rise 140ms ease-out;
+}
+
+.bar-menu-sep {
+  height: 1px;
+  background: var(--line);
+  margin: 5px 4px;
 }
 
 .panel-tabs {

@@ -190,5 +190,6 @@ export const zhCN: Translation = {
   'rename.title': '重命名房间',
   'rename.save': '保存',
   'wizard.sourceAndroid': 'Android 应用',
-  'wizard.sourceAndroidHint': '将在 Web 房间稳定后推出'
+  'wizard.sourceAndroidHint': '将在 Web 房间稳定后推出',
+  'tabs.site': '站点'
 }

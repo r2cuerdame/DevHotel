@@ -193,5 +193,6 @@ export const ptBR: Translation = {
   'rename.title': 'Renomear quarto',
   'rename.save': 'Salvar',
   'wizard.sourceAndroid': 'App Android',
-  'wizard.sourceAndroidHint': 'Chega quando os quartos web estiverem estáveis'
+  'wizard.sourceAndroidHint': 'Chega quando os quartos web estiverem estáveis',
+  'tabs.site': 'Site'
 }

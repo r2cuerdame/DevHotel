@@ -192,5 +192,6 @@ export const ko: Translation = {
   'rename.title': '객실 이름 바꾸기',
   'rename.save': '저장',
   'wizard.sourceAndroid': 'Android 앱',
-  'wizard.sourceAndroidHint': '웹 객실이 안정된 뒤에 제공돼요'
+  'wizard.sourceAndroidHint': '웹 객실이 안정된 뒤에 제공돼요',
+  'tabs.site': '사이트'
 }

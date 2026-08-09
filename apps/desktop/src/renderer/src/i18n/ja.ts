@@ -192,5 +192,6 @@ export const ja: Translation = {
   'rename.title': 'ルーム名を変更',
   'rename.save': '保存',
   'wizard.sourceAndroid': 'Android アプリ',
-  'wizard.sourceAndroidHint': 'Web ルームが安定した後に登場します'
+  'wizard.sourceAndroidHint': 'Web ルームが安定した後に登場します',
+  'tabs.site': 'サイト'
 }

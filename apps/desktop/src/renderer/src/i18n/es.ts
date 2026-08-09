@@ -193,5 +193,6 @@ export const es: Translation = {
   'rename.title': 'Renombrar habitación',
   'rename.save': 'Guardar',
   'wizard.sourceAndroid': 'App Android',
-  'wizard.sourceAndroidHint': 'Llegará cuando las habitaciones web sean estables'
+  'wizard.sourceAndroidHint': 'Llegará cuando las habitaciones web sean estables',
+  'tabs.site': 'Sitio'
 }

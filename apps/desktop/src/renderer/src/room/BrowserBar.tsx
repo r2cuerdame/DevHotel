@@ -2,20 +2,22 @@ import { useEffect, useRef, useState } from 'react'
 import type { RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { statusLabel, useStore, useT } from '../state/store'
+import { ROOM_PAGES, type RoomPage } from './RoomPages'
 
 export function BrowserBar({
   room,
-  panelOpen,
-  onTogglePanel
+  page,
+  onNavigate
 }: {
   room: RoomRecord
-  panelOpen: boolean
-  onTogglePanel: () => void
+  page: RoomPage
+  onNavigate: (page: RoomPage) => void
 }): React.JSX.Element {
   const backToLobby = useStore((s) => s.backToLobby)
   const roomAction = useStore((s) => s.roomAction)
   const preview = useStore((s) => s.previews[room.id])
   const gateway = useStore((s) => s.gateway)
+  const busy = useStore((s) => s.busy[room.id])
   const t = useT()
   const [menuOpen, setMenuOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
@@ -32,13 +34,16 @@ export function BrowserBar({
   }, [menuOpen])
 
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+  const onSite = page === 'site'
   const httpsPort = gateway?.httpsPort
   const httpPort = gateway?.httpPort
   const url =
-    preview?.url ??
+    (onSite && preview?.url) ||
     (room.https
       ? `https://${room.domain}${httpsPort && httpsPort !== 443 ? `:${httpsPort}` : ''}`
       : `http://${room.domain}${httpPort && httpPort !== 80 ? `:${httpPort}` : ''}`)
+
+  const pageLabel = ROOM_PAGES.find((p) => p.id === page)
 
   return (
     <div className="browser-bar">
@@ -48,7 +53,7 @@ export function BrowserBar({
       <button
         className="icon-btn"
         title={t('common.back')}
-        disabled={!preview?.canGoBack}
+        disabled={!onSite || !preview?.canGoBack}
         onClick={() => void api.preview.nav(room.id, 'back')}
       >
         ←
@@ -56,41 +61,55 @@ export function BrowserBar({
       <button
         className="icon-btn"
         title={t('bar.forward')}
-        disabled={!preview?.canGoForward}
+        disabled={!onSite || !preview?.canGoForward}
         onClick={() => void api.preview.nav(room.id, 'forward')}
       >
         →
       </button>
-      <button className="icon-btn" title={t('bar.reload')} disabled={!running} onClick={() => void api.preview.nav(room.id, 'reload')}>
+      <button
+        className="icon-btn"
+        title={t('bar.reload')}
+        disabled={!onSite || !running}
+        onClick={() => void api.preview.nav(room.id, 'reload')}
+      >
         ⟳
       </button>
 
       <div className="domain-pill">
-        {room.https && <span title="HTTPS">🔒</span>}
-        <span className="url">{url}</span>
+        {onSite && room.https && <span title="HTTPS">🔒</span>}
+        <span className="url">{onSite ? url : `devhotel · ${pageLabel ? t(pageLabel.key) : ''} — ${room.project} / ${room.nickname}`}</span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} style={{ display: 'inline-block', marginRight: 6 }} />
-          {statusLabel(t, room.status)}
+          {busy ?? statusLabel(t, room.status)}
         </span>
       </div>
 
       {running ? (
         <>
-          <button className="btn" onClick={() => void roomAction(room.id, 'restart')}>
+          <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'restart')}>
             {t('common.restart')}
           </button>
-          <button className="btn" onClick={() => void roomAction(room.id, 'sleep')}>
+          <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'sleep')}>
             {t('bar.sleep')}
           </button>
         </>
       ) : (
-        <button className="btn primary" disabled={room.status === 'preparing'} onClick={() => void roomAction(room.id, 'start')}>
+        <button
+          className="btn primary"
+          disabled={room.status === 'preparing' || !!busy}
+          onClick={() => void roomAction(room.id, 'start')}
+        >
           {room.status === 'sleeping' ? t('bar.wake') : t('bar.start')}
         </button>
       )}
 
-      <button className="icon-btn" title={t('bar.roomDetails')} onClick={onTogglePanel} aria-pressed={panelOpen}>
-        {panelOpen ? '▤' : '☰'}
+      <button
+        className="icon-btn"
+        title={t('bar.roomDetails')}
+        onClick={() => onNavigate(onSite ? 'overview' : 'site')}
+        aria-pressed={!onSite}
+      >
+        {onSite ? '☰' : '◉'}
       </button>
 
       <div ref={menuRef} style={{ position: 'relative' }}>
@@ -98,21 +117,18 @@ export function BrowserBar({
           ⋯
         </button>
         {menuOpen && (
-          <div
-            style={{
-              position: 'absolute',
-              right: 0,
-              top: 34,
-              background: 'var(--walnut-2)',
-              border: '1px solid var(--line)',
-              borderRadius: 8,
-              padding: 6,
-              zIndex: 30,
-              width: 220,
-              display: 'flex',
-              flexDirection: 'column'
-            }}
-          >
+          <div className="bar-menu">
+            {ROOM_PAGES.map(({ id, icon, key }) => (
+              <MenuItem
+                key={id}
+                label={`${icon}  ${t(key)}`}
+                onClick={() => {
+                  onNavigate(id)
+                  setMenuOpen(false)
+                }}
+              />
+            ))}
+            <div className="bar-menu-sep" />
             <MenuItem
               label={t('bar.openExternal')}
               onClick={() => {
@@ -144,6 +160,7 @@ export function BrowserBar({
                 setMenuOpen(false)
               }}
             />
+            <div className="bar-menu-sep" />
             <MenuItem
               label={t('bar.deleteRoom')}
               danger

@@ -193,5 +193,6 @@ export const ru: Translation = {
   'rename.title': 'Переименовать номер',
   'rename.save': 'Сохранить',
   'wizard.sourceAndroid': 'Android-приложение',
-  'wizard.sourceAndroidHint': 'Появится после стабилизации веб-номеров'
+  'wizard.sourceAndroidHint': 'Появится после стабилизации веб-номеров',
+  'tabs.site': 'Сайт'
 }

@@ -193,5 +193,6 @@ export const de: Translation = {
   'rename.title': 'Zimmer umbenennen',
   'rename.save': 'Speichern',
   'wizard.sourceAndroid': 'Android-App',
-  'wizard.sourceAndroidHint': 'Kommt, sobald Web-Zimmer stabil laufen'
+  'wizard.sourceAndroidHint': 'Kommt, sobald Web-Zimmer stabil laufen',
+  'tabs.site': 'Website'
 }
