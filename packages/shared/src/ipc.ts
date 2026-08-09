@@ -95,7 +95,13 @@ export interface UpdateStatusInfo {
 export interface IpcApi {
   rooms: {
     list(): Promise<RoomRecord[]>
-    plan(input: { sourceType: SourceType; sourceRef: string; nickname: string; project?: string }): Promise<RoomPlan>
+    plan(input: {
+      sourceType: SourceType
+      sourceRef: string
+      nickname: string
+      project?: string
+      provider?: import('./rooms').ProviderKind
+    }): Promise<RoomPlan>
     create(input: CreateRoomInput): Promise<RoomRecord>
     start(roomId: string): Promise<void>
     sleep(roomId: string): Promise<void>

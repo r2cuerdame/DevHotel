@@ -53,6 +53,16 @@ export interface ChangeDefinition<P = unknown> {
 export async function verifyWebUp(ctx: ChangeCtx, opts?: { timeoutMs?: number }): Promise<{ ok: boolean; detail: string }> {
   const room = ctx.room()
   if (!ctx.isAwake()) return { ok: true, detail: 'applies on next wake (room is asleep)' }
+  if (room.provider === 'android') {
+    // build rooms have no served port — a running container is a healthy room
+    for (let i = 0; i < 5; i++) {
+      const state = await ctx.backend.webState(room.id)
+      if (state === 'running') return { ok: true, detail: 'build container running' }
+      if (state === 'missing') return { ok: false, detail: 'build container missing' }
+      await sleep(1000)
+    }
+    return { ok: false, detail: 'build container exited' }
+  }
   const timeoutMs = opts?.timeoutMs ?? 60_000
   const deadline = Date.now() + timeoutMs
   let lastState = 'unknown'

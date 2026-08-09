@@ -5,6 +5,8 @@ import { z } from 'zod'
 export const zSourceType = z.enum(['managed-git', 'linked-folder', 'empty'])
 export const zActor = z.enum(['user', 'devhotel', 'agent'])
 export const zPmKind = z.enum(['npm', 'pnpm'])
+export const zProviderKind = z.enum(['web', 'android'])
+export const zServiceKind = z.enum(['postgres', 'redis'])
 
 export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('node-version'), version: z.string().regex(/^\d+$/, 'major version like "22"') }),
@@ -12,14 +14,21 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('domain'), domain: z.string().regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$/) }),
   z.object({ kind: z.literal('https'), enabled: z.boolean() }),
   z.object({ kind: z.literal('internal-port'), port: z.number().int().min(1).max(65535) }),
-  z.object({ kind: z.literal('deps-install'), clean: z.boolean() })
+  z.object({ kind: z.literal('deps-install'), clean: z.boolean() }),
+  z.object({ kind: z.literal('android-build') }),
+  z.object({ kind: z.literal('service-add'), service: zServiceKind, version: z.string().regex(/^\d+$/).optional() }),
+  z.object({ kind: z.literal('service-remove'), service: zServiceKind }),
+  z.object({ kind: z.literal('service-restart'), service: zServiceKind }),
+  z.object({ kind: z.literal('db-backup'), service: zServiceKind }),
+  z.object({ kind: z.literal('db-restore'), service: zServiceKind, file: z.string().min(1) })
 ])
 
 export const zPlanRoomInput = z.object({
   sourceType: zSourceType,
   sourceRef: z.string(),
   nickname: z.string().min(1).max(60),
-  project: z.string().min(1).max(100).optional()
+  project: z.string().min(1).max(100).optional(),
+  provider: zProviderKind.optional()
 })
 
 export const zCreateRoomInput = z.object({
@@ -28,6 +37,7 @@ export const zCreateRoomInput = z.object({
   project: z.string().min(1).max(100),
   nickname: z.string().min(1).max(60),
   actor: zActor,
+  provider: zProviderKind.optional(),
   planOverrides: z
     .object({
       runtimeVersion: z.string().regex(/^\d+$/).optional(),

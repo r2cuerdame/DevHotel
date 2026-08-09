@@ -65,6 +65,10 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
     push({ step: 'source', status: 'healthy', summary: room.sourceType === 'empty' ? 'empty room' : 'skipped' })
   }
 
+  if (room.provider === 'android') {
+    return androidChecks(ctx, results, push, awake, backendOk)
+  }
+
   // 4 runtime
   if (!backendOk) {
     push({ step: 'runtime', status: 'unknown', summary: 'backend unavailable' })
@@ -129,7 +133,25 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   }
 
   // 8 services
-  push({ step: 'services', status: 'healthy', summary: 'no services configured' })
+  const serviceEntries = Object.entries(room.services ?? {}) as ['postgres' | 'redis', { version: string }][]
+  if (serviceEntries.length === 0) {
+    push({ step: 'services', status: 'healthy', summary: 'no services configured' })
+  } else if (!awake || !backendOk) {
+    push({ step: 'services', status: 'unknown', summary: 'room is asleep' })
+  } else {
+    const down: string[] = []
+    const up: string[] = []
+    for (const [svc, cfg] of serviceEntries) {
+      const state = await backend.serviceState(room.id, svc)
+      if (state === 'running') up.push(`${svc} ${cfg.version}`)
+      else down.push(svc)
+    }
+    push(
+      down.length === 0
+        ? { step: 'services', status: 'healthy', summary: up.join(', ') }
+        : { step: 'services', status: 'broken', summary: `${down.join(', ')} not running`, fix: { kind: 'start-services' } }
+    )
+  }
 
   // 9 start command
   push(
@@ -221,6 +243,56 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
     push({ step: 'http', status: 'unknown', summary: 'skipped — port not listening' })
   }
 
+  return finish(room.id, results)
+}
+
+/** Build rooms: no served port, no gateway route — runtime and process are what can break. */
+async function androidChecks(
+  ctx: CheckCtx,
+  results: CheckResult[],
+  push: (r: CheckResult) => void,
+  awake: boolean,
+  backendOk: boolean
+): Promise<CheckReport> {
+  const { room, backend } = ctx
+  const running = backendOk && awake && (await backend.webState(room.id)) === 'running'
+
+  if (running) {
+    const res = await backend.execInRoom(room.id, ['sh', '-lc', 'java -version 2>&1 | head -1'], { timeoutMs: 20_000 })
+    const line = (res.stdout || res.stderr).split(/\r?\n/)[0]?.trim() ?? ''
+    push(
+      res.code === 0 && line
+        ? { step: 'runtime', status: 'healthy', summary: line }
+        : { step: 'runtime', status: 'warning', summary: 'JDK not answering inside the room' }
+    )
+  } else {
+    push({ step: 'runtime', status: 'healthy', summary: `JDK ${room.runtime.version} (in the room image)` })
+  }
+  push({ step: 'package-manager', status: 'healthy', summary: 'gradle (in the room)' })
+  push({ step: 'dependencies', status: 'healthy', summary: 'gradle caches live in the room' })
+  push({ step: 'env', status: 'healthy', summary: 'not enforced for build rooms' })
+  push({ step: 'services', status: 'healthy', summary: 'no services configured' })
+  push(
+    room.startCommand.trim()
+      ? { step: 'start-command', status: 'healthy', summary: room.startCommand }
+      : { step: 'start-command', status: 'broken', summary: 'no build command configured' }
+  )
+
+  if (!awake || !backendOk) {
+    push({ step: 'process', status: 'unknown', summary: 'room is asleep' })
+  } else {
+    const state = await backend.webState(room.id)
+    push(
+      state === 'running'
+        ? { step: 'process', status: 'healthy', summary: 'build container running' }
+        : { step: 'process', status: 'broken', summary: 'build container not running', fix: { kind: 'restart-web' } }
+    )
+  }
+  const na: Pick<CheckResult, 'status' | 'summary'> = { status: 'healthy', summary: 'not applicable for build rooms' }
+  push({ step: 'port', ...na })
+  push({ step: 'gateway', ...na })
+  push({ step: 'https', ...na })
+  push({ step: 'http', ...na })
   return finish(room.id, results)
 }
 

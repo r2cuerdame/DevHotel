@@ -6,6 +6,8 @@ import { httpsChange } from './https'
 import { internalPortChange } from './internalPort'
 import { depsInstallChange } from './deps'
 import { restartWebChange } from './restartWeb'
+import { androidBuildChange } from './androidBuild'
+import { dbBackupChange, dbRestoreChange, serviceAddChange, serviceRemoveChange, serviceRestartChange } from './services'
 
 export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(nodeVersionChange)
@@ -15,6 +17,12 @@ export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(internalPortChange)
   engine.register(depsInstallChange)
   engine.register(restartWebChange)
+  engine.register(androidBuildChange)
+  engine.register(serviceAddChange)
+  engine.register(serviceRemoveChange)
+  engine.register(serviceRestartChange)
+  engine.register(dbBackupChange)
+  engine.register(dbRestoreChange)
 }
 
 export { pmInstallCommand, currentDepsGen, depsVolumeForGen, depsGenKey } from './deps'

@@ -178,6 +178,41 @@ describe('sleeping rooms', () => {
   })
 })
 
+describe('services', () => {
+  it('adds postgres, verifies it answers, and undo removes it with its volume', async () => {
+    const entry = await engine.execute(ctx(), 'service-add', { service: 'postgres' }, 'user')
+    expect(entry.status).toBe('verified')
+    expect(entry.title).toBe('PostgreSQL 17 added')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(backend.calls).toContain('createService:postgres:17')
+
+    await engine.undo(ctx(), entry.id, 'user')
+    expect(rooms.get('room1abc')!.services.postgres).toBeUndefined()
+    expect(backend.calls).toContain('removeService:postgres:with-volume')
+  })
+
+  it('remove captures a safety backup and undo restores service plus data', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    expect(entry.status).toBe('verified')
+    const captured = entry.captured as { backupFile: string | null; version: string }
+    expect(captured.version).toBe('8')
+    expect(captured.backupFile).toMatch(/redis-.*\.rdb$/)
+
+    await engine.undo(ctx(), entry.id, 'user')
+    expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '8' })
+    expect(backend.calls).toContain('copyToService:redis:/data/dump.rdb')
+  })
+
+  it('db-backup produces a non-empty dump file', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'postgres' }, 'user')
+    const c = ctx()
+    const entry = await engine.execute(c, 'db-backup', { service: 'postgres' }, 'user')
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toMatch(/postgres-.*\.sql/)
+  })
+})
+
 describe('engine safety', () => {
   it('rejects unknown change kinds', async () => {
     await expect(engine.execute(ctx(), 'format-host-disk', {}, 'agent')).rejects.toThrow(/Unknown change kind/)

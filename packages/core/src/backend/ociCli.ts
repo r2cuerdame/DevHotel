@@ -5,12 +5,16 @@ import {
   anchorName,
   buildAnchorArgs,
   buildOneShotArgs,
+  buildServiceArgs,
   buildWebCreateArgs,
   cacheVolume,
   effectiveDepsVolume,
+  imageFor,
   parsePortOutput,
   srcVolume,
-  webImage,
+  svcImage,
+  svcName,
+  svcVolume,
   webName,
 } from './naming'
 import type { AnchorSpec, ExecResult, IsolationBackend, WebSpec } from './types'
@@ -53,27 +57,29 @@ export class OciCliBackend implements IsolationBackend {
     return { ok: false, detail }
   }
 
-  async createRoomPod(spec: WebSpec): Promise<{ hostPort: number }> {
-    await this.ensureImage(ANCHOR_IMAGE)
-    await this.ensureImage(webImage(spec.nodeMajor))
+  async createRoomPod(spec: WebSpec): Promise<{ hostPort: number | null }> {
+    if (!spec.standalone) await this.ensureImage(ANCHOR_IMAGE)
+    await this.ensureImage(imageFor(spec))
     if (spec.sourceType === 'managed-git') {
       await this.ensureImage(CLONE_IMAGE)
       must(await runDocker(['volume', 'create', srcVolume(spec.roomId)]), 'create src volume')
     }
-    if (spec.sourceType !== 'empty') {
+    if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       must(await runDocker(['volume', 'create', effectiveDepsVolume(spec)]), 'create deps volume')
     }
     must(await runDocker(['volume', 'create', cacheVolume(spec.roomId)]), 'create cache volume')
     if (spec.sourceType === 'managed-git') {
       await this.cloneIntoVolume(spec.roomId, spec.sourceRef)
     }
-    must(
-      await runDocker(buildAnchorArgs({ roomId: spec.roomId, internalPort: spec.internalPort })),
-      'run anchor container',
-    )
+    if (!spec.standalone) {
+      must(
+        await runDocker(buildAnchorArgs({ roomId: spec.roomId, internalPort: spec.internalPort })),
+        'run anchor container',
+      )
+    }
     must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
     must(await runDocker(['start', webName(spec.roomId)]), 'start web container')
-    return { hostPort: await this.readHostPort(spec.roomId) }
+    return { hostPort: spec.standalone ? null : await this.readHostPort(spec.roomId) }
   }
 
   async startRoomPod(roomId: string): Promise<{ hostPort: number }> {
@@ -84,7 +90,10 @@ export class OciCliBackend implements IsolationBackend {
 
   async stopRoomPod(roomId: string): Promise<void> {
     await runDocker(['stop', '-t', '8', webName(roomId)])
-    await runDocker(['stop', '-t', '2', anchorName(roomId)])
+    // services and the anchor — everything else carrying the room label
+    const rest = await runDocker(['ps', '-q', '--filter', `label=devhotel.room=${roomId}`])
+    const ids = rest.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    if (ids.length > 0) await runDocker(['stop', '-t', '5', ...ids])
   }
 
   async restartWeb(roomId: string): Promise<void> {
@@ -93,8 +102,8 @@ export class OciCliBackend implements IsolationBackend {
 
   async recreateWeb(spec: WebSpec): Promise<void> {
     await runDocker(['rm', '-f', webName(spec.roomId)])
-    await this.ensureImage(webImage(spec.nodeMajor))
-    if (spec.sourceType !== 'empty') {
+    await this.ensureImage(imageFor(spec))
+    if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       must(await runDocker(['volume', 'create', effectiveDepsVolume(spec)]), 'create deps volume')
     }
     must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
@@ -118,7 +127,9 @@ export class OciCliBackend implements IsolationBackend {
         reclaimedBytes = 0
       }
     }
-    await runDocker(['rm', '-f', webName(roomId), anchorName(roomId)])
+    const all = await runDocker(['ps', '-aq', '--filter', `label=devhotel.room=${roomId}`])
+    const ids = all.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    await runDocker(['rm', '-f', webName(roomId), anchorName(roomId), ...ids])
     if (opts.volumes) {
       const volumes = await this.listRoomVolumes(roomId)
       if (volumes.length > 0) await runDocker(['volume', 'rm', '-f', ...volumes])
@@ -131,7 +142,7 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async runOneShot(spec: WebSpec, cmd: string, log?: (line: string) => void): Promise<ExecResult> {
-    await this.ensureImage(webImage(spec.nodeMajor), log)
+    await this.ensureImage(imageFor(spec), log)
     return runDocker(buildOneShotArgs(spec, cmd), { timeoutMs: LONG_TIMEOUT_MS, onLine: log })
   }
 
@@ -200,6 +211,52 @@ export class OciCliBackend implements IsolationBackend {
   async resetVolume(name: string): Promise<void> {
     await runDocker(['volume', 'rm', '-f', name])
     must(await runDocker(['volume', 'create', name]), `create volume ${name}`)
+  }
+
+  async createService(roomId: string, svc: 'postgres' | 'redis', version: string): Promise<void> {
+    await this.ensureImage(svcImage(svc, version))
+    must(await runDocker(['volume', 'create', svcVolume(roomId, svc)]), 'create service volume')
+    must(await runDocker(buildServiceArgs(roomId, svc, version)), `run ${svc} container`)
+  }
+
+  async startService(roomId: string, svc: 'postgres' | 'redis'): Promise<void> {
+    must(await runDocker(['start', svcName(roomId, svc)]), `start ${svc}`)
+  }
+
+  async stopService(roomId: string, svc: 'postgres' | 'redis'): Promise<void> {
+    await runDocker(['stop', '-t', '5', svcName(roomId, svc)])
+  }
+
+  async removeService(roomId: string, svc: 'postgres' | 'redis', opts: { volume: boolean }): Promise<void> {
+    await runDocker(['rm', '-f', svcName(roomId, svc)])
+    if (opts.volume) await runDocker(['volume', 'rm', '-f', svcVolume(roomId, svc)])
+  }
+
+  async serviceState(roomId: string, svc: 'postgres' | 'redis'): Promise<'running' | 'exited' | 'missing'> {
+    const result = await runDocker(['inspect', '--format', '{{.State.Status}}', svcName(roomId, svc)])
+    if (result.code !== 0) return 'missing'
+    return result.stdout.trim() === 'running' ? 'running' : 'exited'
+  }
+
+  async execInService(
+    roomId: string,
+    svc: 'postgres' | 'redis',
+    cmd: string[],
+    opts?: { timeoutMs?: number; input?: string }
+  ): Promise<ExecResult> {
+    const interactive = opts?.input !== undefined ? ['-i'] : []
+    return runDocker(['exec', ...interactive, svcName(roomId, svc), ...cmd], {
+      timeoutMs: opts?.timeoutMs ?? 120_000,
+      input: opts?.input
+    })
+  }
+
+  async copyFromService(roomId: string, svc: 'postgres' | 'redis', containerPath: string, hostPath: string): Promise<void> {
+    must(await runDocker(['cp', `${svcName(roomId, svc)}:${containerPath}`, hostPath]), `copy from ${svc}`)
+  }
+
+  async copyToService(roomId: string, svc: 'postgres' | 'redis', hostPath: string, containerPath: string): Promise<void> {
+    must(await runDocker(['cp', hostPath, `${svcName(roomId, svc)}:${containerPath}`]), `copy into ${svc}`)
   }
 
   async imageExists(image: string): Promise<boolean> {

@@ -1,24 +1,33 @@
 export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken'
 export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
-export type PmKind = 'npm' | 'pnpm'
+export type PmKind = 'npm' | 'pnpm' | 'gradle'
+export type ProviderKind = 'web' | 'android' | 'windows'
+
+export type ServiceKind = 'postgres' | 'redis'
+
+export interface RoomServices {
+  postgres?: { version: string }
+  redis?: { version: string }
+}
 
 export interface RoomRecord {
   id: string
   project: string
   nickname: string
   roomNumber: number
-  provider: 'web'
+  provider: ProviderKind
   sourceType: SourceType
   /** git URL for managed-git, host folder path for linked-folder, '' for empty */
   sourceRef: string
-  runtime: { kind: 'node'; version: string }
+  runtime: { kind: 'node' | 'jdk'; version: string }
   packageManager: { kind: PmKind; version?: string }
   startCommand: string
   internalPort: number
   domain: string
   https: boolean
   status: RoomStatus
+  services: RoomServices
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */
   hostPort: number | null
   createdAt: string
@@ -35,7 +44,7 @@ export interface Detected<T> {
 export interface RoomPlan {
   project: string
   framework: string | null
-  runtime: Detected<string> & { kind: 'node' }
+  runtime: Detected<string> & { kind: 'node' | 'jdk' }
   packageManager: Detected<PmKind> & { version?: string }
   startCommand: Detected<string>
   internalPort: Detected<number>
@@ -50,6 +59,8 @@ export interface CreateRoomInput {
   project: string
   nickname: string
   actor: Actor
+  /** room provider — defaults to 'web' */
+  provider?: ProviderKind
   planOverrides?: {
     runtimeVersion?: string
     pmKind?: PmKind

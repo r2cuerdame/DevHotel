@@ -7,6 +7,12 @@ export type QuickChange =
   | { kind: 'https'; enabled: boolean }
   | { kind: 'internal-port'; port: number }
   | { kind: 'deps-install'; clean: boolean }
+  | { kind: 'android-build' }
+  | { kind: 'service-add'; service: 'postgres' | 'redis'; version?: string }
+  | { kind: 'service-remove'; service: 'postgres' | 'redis' }
+  | { kind: 'service-restart'; service: 'postgres' | 'redis' }
+  | { kind: 'db-backup'; service: 'postgres' | 'redis' }
+  | { kind: 'db-restore'; service: 'postgres' | 'redis'; file: string }
 
 export type ChangeStatus = 'pending' | 'applied' | 'verified' | 'rolled-back' | 'undone' | 'failed'
 

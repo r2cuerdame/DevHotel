@@ -27,6 +27,62 @@ export function webImage(nodeMajor: string): string {
   return `node:${nodeMajor}-bookworm`
 }
 
+export function imageFor(spec: WebSpec): string {
+  return spec.imageOverride ?? webImage(spec.nodeMajor)
+}
+
+export type ServiceKind = 'postgres' | 'redis'
+
+export const SERVICE_DEFAULT_VERSIONS: Record<ServiceKind, string> = { postgres: '17', redis: '8' }
+/** In-room credentials for managed services — local-only, documented in the Services UI. */
+export const SERVICE_DB_USER = 'devhotel'
+export const SERVICE_DB_PASSWORD = 'devhotel'
+export const SERVICE_DB_NAME = 'devhotel'
+
+export function svcName(roomId: string, svc: ServiceKind): string {
+  return `dh-${roomId}-svc-${svc}`
+}
+
+export function svcVolume(roomId: string, svc: ServiceKind): string {
+  return `dh-${roomId}-svc-${svc}-data`
+}
+
+export function svcImage(svc: ServiceKind, version: string): string {
+  return svc === 'postgres' ? `postgres:${version}-alpine` : `redis:${version}-alpine`
+}
+
+export function buildServiceArgs(roomId: string, svc: ServiceKind, version: string): string[] {
+  const common = [
+    'run',
+    '-d',
+    '--name',
+    svcName(roomId, svc),
+    '--network',
+    `container:${anchorName(roomId)}`,
+    '-l',
+    `devhotel.room=${roomId}`,
+    '-l',
+    `devhotel.role=svc-${svc}`,
+    '-l',
+    'devhotel.managed=1'
+  ]
+  if (svc === 'postgres') {
+    return [
+      ...common,
+      '-v',
+      `${svcVolume(roomId, svc)}:/var/lib/postgresql/data`,
+      '-e',
+      `POSTGRES_USER=${SERVICE_DB_USER}`,
+      '-e',
+      `POSTGRES_PASSWORD=${SERVICE_DB_PASSWORD}`,
+      '-e',
+      `POSTGRES_DB=${SERVICE_DB_NAME}`,
+      svcImage(svc, version)
+    ]
+  }
+  return [...common, '-v', `${svcVolume(roomId, svc)}:/data`, svcImage(svc, version), 'redis-server', '--appendonly', 'no']
+}
+
 function labelArgs(roomId: string, role: 'anchor' | 'web'): string[] {
   return ['-l', `devhotel.room=${roomId}`, '-l', `devhotel.role=${role}`, '-l', 'devhotel.managed=1']
 }
@@ -63,7 +119,7 @@ export function effectiveDepsVolume(spec: WebSpec): string {
 
 function mountArgs(spec: WebSpec): string[] {
   const args = sourceMountArgs(spec)
-  if (args.length > 0) {
+  if (args.length > 0 && !spec.noDepsVolume) {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
@@ -87,14 +143,13 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
     'create',
     '--name',
     webName(spec.roomId),
-    '--network',
-    `container:${anchorName(spec.roomId)}`,
+    ...(spec.standalone ? [] : ['--network', `container:${anchorName(spec.roomId)}`]),
     ...labelArgs(spec.roomId, 'web'),
     ...mountArgs(spec),
     ...envArgs(spec),
     '-w',
     '/workspace',
-    webImage(spec.nodeMajor),
+    imageFor(spec),
     'sh',
     '-lc',
     wrapStartCommand(spec.startCommand),
@@ -110,7 +165,7 @@ export function buildOneShotArgs(spec: WebSpec, cmd: string): string[] {
     ...envArgs(spec),
     '-w',
     '/workspace',
-    webImage(spec.nodeMajor),
+    imageFor(spec),
     'sh',
     '-lc',
     wrapStartCommand(cmd),

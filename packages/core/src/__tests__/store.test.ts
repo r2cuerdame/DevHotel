@@ -38,6 +38,7 @@ function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
     domain: 'acme.dev.localhost',
     https: true,
     status: 'ready',
+    services: {},
     hostPort: 52341,
     createdAt: '2026-08-10T10:00:00.000Z',
     lastUsedAt: '2026-08-10T11:00:00.000Z',

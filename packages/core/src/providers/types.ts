@@ -3,7 +3,7 @@ import type { WebSpec } from '../backend/types'
 import type { DetectOptions } from '../detect/detector'
 import type { SourceReader } from '../detect/sourceReader'
 
-export type RoomProviderKind = 'web' | 'android'
+export type RoomProviderKind = 'web' | 'android' | 'windows'
 
 export interface RoomProviderInfo {
   kind: RoomProviderKind

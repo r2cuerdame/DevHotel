@@ -14,16 +14,16 @@ export function generateManifestYaml(room: RoomRecord): string {
   const doc = {
     project: room.project,
     nickname: room.nickname,
-    provider: 'web',
+    provider: room.provider,
     source,
-    runtime: { node: nodeMajor(room.runtime.version) },
+    runtime: room.runtime.kind === 'jdk' ? { jdk: room.runtime.version } : { node: nodeMajor(room.runtime.version) },
     packageManager: {
       type: room.packageManager.kind,
       ...(room.packageManager.version === undefined ? {} : { version: room.packageManager.version }),
     },
     web: { command: room.startCommand, internalPort: room.internalPort },
     domain: { host: room.domain, https: room.https },
-    services: {},
+    services: room.services ?? {},
   }
   return dump(doc, { lineWidth: 120 })
 }

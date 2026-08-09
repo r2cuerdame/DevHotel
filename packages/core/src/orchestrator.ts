@@ -7,12 +7,14 @@ import type {
   ChangeEntry,
   CheckReport,
   CreateRoomInput,
+  ProviderKind,
   QuickChange,
   RoomInspection,
   RoomPlan,
   RoomRecord,
   SourceType
 } from '@devhotel/shared'
+import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import { ChangeEngine } from './changes/engine'
@@ -20,7 +22,7 @@ import { registerQuickChanges, depsVolumeForGen } from './changes/definitions/in
 import type { ChangeCtx } from './changes/types'
 import { verifyWebUp } from './changes/types'
 import { runChecks as runCheckPipeline } from './checks/engine'
-import { detectProject, slugify } from './detect/detector'
+import { slugify } from './detect/detector'
 import type { SourceReader } from './detect/sourceReader'
 import { fsSourceReader } from './detect/sourceReader'
 import { buildDiagnostic } from './diagnostics/bundle'
@@ -35,6 +37,8 @@ import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
+
+const ANDROID_CHANGE_KINDS = new Set(['android-build', 'start-command', 'restart-web'])
 
 export interface OrchestratorEvent {
   roomId: string
@@ -140,21 +144,29 @@ export class RoomOrchestrator {
     return this.backend.health()
   }
 
-  async planRoom(input: { sourceType: SourceType; sourceRef: string; nickname: string; project?: string }): Promise<RoomPlan> {
+  async planRoom(input: {
+    sourceType: SourceType
+    sourceRef: string
+    nickname: string
+    project?: string
+    provider?: ProviderKind
+  }): Promise<RoomPlan> {
     const project = input.project ?? deriveProjectName(input.sourceType, input.sourceRef)
     const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
     try {
-      return await detectProject(reader, { project, nickname: input.nickname })
+      return await getProvider(input.provider ?? 'web').detect(reader, { project, nickname: input.nickname })
     } finally {
       cleanup()
     }
   }
 
   async createRoom(input: CreateRoomInput): Promise<RoomRecord> {
+    const providerKind: ProviderKind = input.provider ?? 'web'
+    const provider = getProvider(providerKind)
     const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
     let plan: RoomPlan
     try {
-      plan = await detectProject(reader, {
+      plan = await provider.detect(reader, {
         project: input.project,
         nickname: input.nickname,
         overrides: {
@@ -176,16 +188,17 @@ export class RoomOrchestrator {
       project: input.project,
       nickname: input.nickname,
       roomNumber: this.rooms.nextRoomNumber(),
-      provider: 'web',
+      provider: providerKind,
       sourceType: input.sourceType,
       sourceRef: input.sourceRef,
-      runtime: { kind: 'node', version: plan.runtime.value },
+      runtime: { kind: plan.runtime.kind, version: plan.runtime.value },
       packageManager: { kind: plan.packageManager.value, version: plan.packageManager.version },
       startCommand: plan.startCommand.value,
       internalPort: plan.internalPort.value,
       domain,
       https: input.planOverrides?.https ?? false,
       status: 'preparing',
+      services: {},
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
@@ -207,7 +220,7 @@ export class RoomOrchestrator {
         this.rooms.update(id, { hostPort, status: 'running' })
         this.logs.attach(id)
 
-        if (record.sourceType !== 'empty') {
+        if (providerKind === 'web' && record.sourceType !== 'empty') {
           await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
         }
         await this.syncRouteFor(id)
@@ -238,10 +251,20 @@ export class RoomOrchestrator {
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
     try {
-      // Recreate both containers from the current record so changes made while
+      // Recreate containers from the current record so changes made while
       // asleep (node version, command, port) are materialized on wake.
-      const { hostPort } = await this.backend.recreateAnchor({ roomId, internalPort: room.internalPort })
-      this.rooms.update(roomId, { hostPort, status: 'running' })
+      if (room.provider === 'android') {
+        this.rooms.update(roomId, { status: 'running' })
+      } else {
+        const { hostPort } = await this.backend.recreateAnchor({ roomId, internalPort: room.internalPort })
+        this.rooms.update(roomId, { hostPort, status: 'running' })
+        // services join the anchor's netns, so a fresh anchor needs fresh service containers
+        for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
+          this.olog(roomId, `start service ${svc} ${cfg.version}`)
+          await this.backend.removeService(roomId, svc, { volume: false })
+          await this.backend.createService(roomId, svc, cfg.version)
+        }
+      }
       await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
@@ -303,9 +326,12 @@ export class RoomOrchestrator {
     const recent = this.changes.list(roomId).slice(0, 15)
     return {
       room,
-      urls: { app: this.gateway.urlFor(room.domain, room.https) },
+      urls: { app: room.provider === 'android' ? '' : this.gateway.urlFor(room.domain, room.https) },
       dataDir: join(this.userData, 'rooms', room.id),
-      stackLine: `Node ${room.runtime.version} · ${room.packageManager.kind}`,
+      stackLine:
+        room.provider === 'android'
+          ? `JDK ${room.runtime.version} · gradle`
+          : `Node ${room.runtime.version} · ${room.packageManager.kind}`,
       latestCheck: this.checks.latest(roomId),
       recentChanges: recent,
       lastUndoable: this.changes.lastUndoable(roomId),
@@ -318,6 +344,13 @@ export class RoomOrchestrator {
   }
 
   applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
+    const room = this.mustGet(roomId)
+    if (room.provider === 'android' && !ANDROID_CHANGE_KINDS.has(change.kind)) {
+      throw new Error(`'${change.kind}' is not available for Android rooms`)
+    }
+    if (room.provider === 'web' && change.kind === 'android-build') {
+      throw new Error('Builds are only available in Android rooms')
+    }
     return this.withRoomLock(roomId, async () => {
       const entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
       this.syncStatusFromVerify(roomId, entry)
@@ -439,6 +472,7 @@ export class RoomOrchestrator {
   }
 
   private webSpecFor(room: RoomRecord, overrides?: Partial<WebSpec>): WebSpec {
+    if (room.provider === 'android') return getProvider('android').buildSpec(room, overrides)
     const gen = this.depsGen(room.id)
     return {
       roomId: room.id,
@@ -462,6 +496,7 @@ export class RoomOrchestrator {
 
   private async syncRouteFor(roomId: string): Promise<void> {
     const room = this.mustGet(roomId)
+    if (room.provider === 'android') return
     if (room.hostPort != null) {
       await this.gateway.setRoute({
         domain: room.domain,

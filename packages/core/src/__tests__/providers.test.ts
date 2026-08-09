@@ -11,15 +11,14 @@ function fixture(name: string): SourceReader {
 }
 
 describe('provider registry', () => {
-  it('lists web as available and android as honestly unavailable', () => {
+  it('lists web and android as available, windows as an honest roadmap stub', () => {
     const infos = providers()
-    expect(infos.map((i) => i.kind)).toEqual(['web', 'android'])
-    const web = infos.find((i) => i.kind === 'web')!
-    expect(web.available).toBe(true)
-    expect(web.unavailableReason).toBeUndefined()
-    const android = infos.find((i) => i.kind === 'android')!
-    expect(android.available).toBe(false)
-    expect(android.unavailableReason).toMatch(/goal\.md §21\.4/)
+    expect(infos.map((i) => i.kind)).toEqual(['web', 'android', 'windows'])
+    expect(infos.find((i) => i.kind === 'web')!.available).toBe(true)
+    expect(infos.find((i) => i.kind === 'android')!.available).toBe(true)
+    const windows = infos.find((i) => i.kind === 'windows')!
+    expect(windows.available).toBe(false)
+    expect(windows.unavailableReason).toBeTruthy()
   })
 
   it('returns the provider matching its kind', () => {
@@ -70,15 +69,30 @@ describe('WebRoomProvider', () => {
   })
 })
 
-describe('AndroidRoomProvider', () => {
-  it('detect rejects with a clear not-available error', async () => {
-    await expect(getProvider('android').detect(fixture('empty'), { project: 'x', nickname: 'dev' })).rejects.toThrow(
-      /not available yet/
-    )
+describe('AndroidRoomProvider (build rooms v1)', () => {
+  it('detect plans a JDK/gradle build room and warns when no gradle project exists', async () => {
+    const plan = await getProvider('android').detect(fixture('empty'), { project: 'MyApp', nickname: 'dev' })
+    expect(plan.runtime.kind).toBe('jdk')
+    expect(plan.packageManager.value).toBe('gradle')
+    expect(plan.startCommand.value).toMatch(/gradle assembleDebug/)
+    expect(plan.internalPort.value).toBe(0)
+    expect(plan.warnings.some((w) => /No Gradle project/.test(w))).toBe(true)
   })
 
-  it('buildSpec throws and no components are claimed', () => {
-    expect(() => getProvider('android').buildSpec(makeRoom())).toThrow(/not available yet/)
-    expect(getProvider('android').components()).toEqual([])
+  it('detect finds a gradle project without warnings', async () => {
+    const plan = await getProvider('android').detect(fixture('hello-android'), { project: 'hello', nickname: 'dev' })
+    expect(plan.warnings).toEqual([])
+    expect(plan.framework).toBe('android')
+  })
+
+  it('buildSpec is a standalone sdk container with gradle cache and keepalive command', () => {
+    const room = makeRoom({ provider: 'android', runtime: { kind: 'jdk', version: '17' } })
+    const spec = getProvider('android').buildSpec(room)
+    expect(spec.standalone).toBe(true)
+    expect(spec.noDepsVolume).toBe(true)
+    expect(spec.imageOverride).toMatch(/android/)
+    expect(spec.startCommand).toMatch(/sleep/)
+    expect(spec.env?.GRADLE_USER_HOME).toBe('/cache/gradle')
+    expect(getProvider('android').components()).toContain('Gradle')
   })
 })

@@ -1,4 +1,4 @@
-import type { PmKind, RoomRecord, RoomStatus, SourceType } from '@devhotel/shared'
+import type { PmKind, ProviderKind, RoomRecord, RoomServices, RoomStatus, SourceType } from '@devhotel/shared'
 import type { Db } from './db'
 
 interface RoomRow {
@@ -22,6 +22,15 @@ interface RoomRow {
   created_at: string
   last_used_at: string
   thumb_path: string | null
+  extra: string
+}
+
+function servicesFromExtra(extra: string): RoomServices {
+  try {
+    return (JSON.parse(extra) as { services?: RoomServices }).services ?? {}
+  } catch {
+    return {}
+  }
 }
 
 function rowToRoom(row: RoomRow): RoomRecord {
@@ -30,10 +39,10 @@ function rowToRoom(row: RoomRow): RoomRecord {
     project: row.project,
     nickname: row.nickname,
     roomNumber: row.room_number,
-    provider: 'web',
+    provider: row.provider as ProviderKind,
     sourceType: row.source_type as SourceType,
     sourceRef: row.source_ref,
-    runtime: { kind: 'node', version: row.runtime_version },
+    runtime: { kind: row.runtime_kind as 'node' | 'jdk', version: row.runtime_version },
     packageManager: {
       kind: row.pm_kind as PmKind,
       ...(row.pm_version === null ? {} : { version: row.pm_version }),
@@ -43,6 +52,7 @@ function rowToRoom(row: RoomRow): RoomRecord {
     domain: row.domain,
     https: row.https === 1,
     status: row.status as RoomStatus,
+    services: servicesFromExtra(row.extra),
     hostPort: row.host_port,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
@@ -73,6 +83,7 @@ function patchToColumns(patch: Partial<RoomRecord>): Record<string, ColumnValue>
   if (patch.domain !== undefined) cols['domain'] = patch.domain
   if (patch.https !== undefined) cols['https'] = patch.https ? 1 : 0
   if (patch.status !== undefined) cols['status'] = patch.status
+  if (patch.services !== undefined) cols['extra'] = JSON.stringify({ services: patch.services })
   if (patch.hostPort !== undefined) cols['host_port'] = patch.hostPort
   if (patch.createdAt !== undefined) cols['created_at'] = patch.createdAt
   if (patch.lastUsedAt !== undefined) cols['last_used_at'] = patch.lastUsedAt
@@ -99,8 +110,8 @@ export function roomsRepo(db: Db): RoomsRepo {
             id, project, nickname, room_number, provider, source_type, source_ref,
             runtime_kind, runtime_version, pm_kind, pm_version, start_command,
             internal_port, domain, https, status, host_port, created_at,
-            last_used_at, thumb_path
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            last_used_at, thumb_path, extra
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           r.id,
@@ -123,6 +134,7 @@ export function roomsRepo(db: Db): RoomsRepo {
           r.createdAt,
           r.lastUsedAt,
           r.thumbPath,
+          JSON.stringify({ services: r.services ?? {} }),
         )
     },
     get(id) {

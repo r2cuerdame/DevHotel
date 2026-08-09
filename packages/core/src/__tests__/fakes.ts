@@ -32,6 +32,7 @@ export function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
     domain: 'demo-dev.localhost',
     https: false,
     status: 'ready',
+    services: {},
     hostPort: null,
     createdAt: '2026-08-10T10:00:00.000Z',
     lastUsedAt: '2026-08-10T10:00:00.000Z',
@@ -103,6 +104,41 @@ export class FakeBackend implements IsolationBackend {
   async pullImage() {}
   async resetVolume(name: string) {
     this.calls.push(`resetVolume:${name}`)
+  }
+  serviceStates = new Map<string, 'running' | 'exited' | 'missing'>()
+  svcExecResult: ExecResult = ok
+  async createService(roomId: string, svc: 'postgres' | 'redis', version: string) {
+    this.calls.push(`createService:${svc}:${version}`)
+    this.serviceStates.set(svc, 'running')
+  }
+  async startService(_roomId: string, svc: 'postgres' | 'redis') {
+    this.calls.push(`startService:${svc}`)
+    this.serviceStates.set(svc, 'running')
+  }
+  async stopService(_roomId: string, svc: 'postgres' | 'redis') {
+    this.calls.push(`stopService:${svc}`)
+    this.serviceStates.set(svc, 'exited')
+  }
+  async removeService(_roomId: string, svc: 'postgres' | 'redis', opts: { volume: boolean }) {
+    this.calls.push(`removeService:${svc}:${opts.volume ? 'with-volume' : 'keep-volume'}`)
+    this.serviceStates.set(svc, 'missing')
+  }
+  async serviceState(_roomId: string, svc: 'postgres' | 'redis') {
+    return this.serviceStates.get(svc) ?? 'missing'
+  }
+  async execInService(_roomId: string, svc: 'postgres' | 'redis', cmd: string[]): Promise<ExecResult> {
+    this.calls.push(`execInService:${svc}:${cmd[0]}`)
+    if (cmd[0] === 'redis-cli' && cmd[1] === 'ping') return { code: 0, stdout: 'PONG', stderr: '' }
+    if (cmd[0] === 'pg_dump') return { code: 0, stdout: '-- fake dump\nCREATE TABLE t();', stderr: '' }
+    return this.svcExecResult
+  }
+  async copyFromService(_roomId: string, svc: 'postgres' | 'redis', containerPath: string, hostPath: string) {
+    this.calls.push(`copyFromService:${svc}:${containerPath}`)
+    const { writeFileSync } = await import('node:fs')
+    writeFileSync(hostPath, 'fake-rdb')
+  }
+  async copyToService(_roomId: string, svc: 'postgres' | 'redis', _hostPath: string, containerPath: string) {
+    this.calls.push(`copyToService:${svc}:${containerPath}`)
   }
 }
 

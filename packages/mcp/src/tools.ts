@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { zPmKind, zQuickChange, zSourceType } from '@devhotel/shared'
+import { zPmKind, zProviderKind, zQuickChange, zSourceType } from '@devhotel/shared'
 import type { ControlClient } from './client'
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
@@ -46,6 +46,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         sourceRef: z.string().describe('git URL for managed-git, absolute folder path for linked-folder, empty string for empty'),
         project: z.string().describe('project name, e.g. the repo name'),
         nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
+        provider: zProviderKind.optional().describe("'web' (default) or 'android' for a Gradle build room"),
         runtimeVersion: z.string().regex(/^\d+$/).optional().describe('Node major version override, e.g. "22"'),
         pmKind: zPmKind.optional(),
         startCommand: z.string().optional(),
@@ -58,6 +59,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           sourceRef: a.sourceRef,
           project: a.project,
           nickname: a.nickname,
+          provider: a.provider,
           planOverrides: {
             runtimeVersion: a.runtimeVersion,
             pmKind: a.pmKind,
