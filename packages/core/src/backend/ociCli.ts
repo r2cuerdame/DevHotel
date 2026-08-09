@@ -35,6 +35,9 @@ const OPENBOX_FRAMELESS_RC = `<?xml version="1.0" encoding="UTF-8"?>
       <maximized>yes</maximized>
       <position force="yes"><x>0</x><y>0</y></position>
     </application>
+    <application type="utility">
+      <iconic>yes</iconic>
+    </application>
   </applications>
 </openbox_config>
 `

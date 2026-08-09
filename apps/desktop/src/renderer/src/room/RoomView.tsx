@@ -31,9 +31,14 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
     }
     const report = (): void => {
       const r = el.getBoundingClientRect()
-      void api.preview
-        .setBounds(roomId, { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) })
-        .catch(() => undefined)
+      let bounds = { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }
+      if (room?.provider === 'android') {
+        // the emulator screen is portrait 540×1140 — pin the view to that aspect,
+        // full height and centered, so the phone fills its frame edge to edge
+        const width = Math.min(bounds.width, Math.round((bounds.height * 540) / 1140))
+        bounds = { x: bounds.x + Math.round((bounds.width - width) / 2), y: bounds.y, width, height: bounds.height }
+      }
+      void api.preview.setBounds(roomId, bounds).catch(() => undefined)
     }
     report()
     const ro = new ResizeObserver(report)
