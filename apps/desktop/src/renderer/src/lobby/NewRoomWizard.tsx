@@ -103,6 +103,10 @@ export function NewRoomWizard(): React.JSX.Element {
                   <small>{t(hint)}</small>
                 </button>
               ))}
+              <button className="source-choice" disabled title={t('wizard.sourceAndroidHint')}>
+                <b>{t('wizard.sourceAndroid')}</b>
+                <small>{t('wizard.sourceAndroidHint')}</small>
+              </button>
             </div>
 
             {sourceType === 'managed-git' && (

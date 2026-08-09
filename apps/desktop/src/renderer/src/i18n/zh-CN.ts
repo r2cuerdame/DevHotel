@@ -180,5 +180,15 @@ export const zhCN: Translation = {
   'console.openFailed': '无法在这个房间中打开终端：{error}',
   'console.mustBeAwake': '房间必须处于唤醒状态才能使用终端。',
   'console.shellHint': '这个 shell 运行在房间里，而不是你的电脑上。安装的工具只会留在房间内。',
-  'console.openRoomData': '打开房间数据（manifest · 日志）'
+  'console.openRoomData': '打开房间数据（manifest · 日志）',
+
+  // Panel redesign / rename / android
+  'tabs.activity': '活动',
+  'tabs.health': '健康',
+  'overview.openInBrowser': '在浏览器中打开',
+  'bar.rename': '重命名房间…',
+  'rename.title': '重命名房间',
+  'rename.save': '保存',
+  'wizard.sourceAndroid': 'Android 应用',
+  'wizard.sourceAndroidHint': '将在 Web 房间稳定后推出'
 }

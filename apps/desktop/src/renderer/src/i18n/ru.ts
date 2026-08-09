@@ -183,5 +183,15 @@ export const ru: Translation = {
   'console.openFailed': 'Не удалось открыть терминал в этом номере: {error}',
   'console.mustBeAwake': 'Для сеанса терминала номер должен быть разбужен.',
   'console.shellHint': 'Эта оболочка работает внутри номера, а не на вашем ПК. Установленные инструменты остаются в номере.',
-  'console.openRoomData': 'Открыть данные номера (manifest · логи)'
+  'console.openRoomData': 'Открыть данные номера (manifest · логи)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Активность',
+  'tabs.health': 'Состояние',
+  'overview.openInBrowser': 'Открыть в браузере',
+  'bar.rename': 'Переименовать номер…',
+  'rename.title': 'Переименовать номер',
+  'rename.save': 'Сохранить',
+  'wizard.sourceAndroid': 'Android-приложение',
+  'wizard.sourceAndroidHint': 'Появится после стабилизации веб-номеров'
 }

@@ -183,5 +183,15 @@ export const de: Translation = {
   'console.openFailed': 'Konnte kein Terminal in diesem Zimmer öffnen: {error}',
   'console.mustBeAwake': 'Das Zimmer muss wach sein, um ein Terminal zu öffnen.',
   'console.shellHint': 'Diese Shell läuft im Zimmer, nicht auf deinem PC. Installationen und Tools bleiben im Zimmer.',
-  'console.openRoomData': 'Zimmerdaten öffnen (manifest · Logs)'
+  'console.openRoomData': 'Zimmerdaten öffnen (manifest · Logs)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Aktivität',
+  'tabs.health': 'Zustand',
+  'overview.openInBrowser': 'Im Browser öffnen',
+  'bar.rename': 'Zimmer umbenennen…',
+  'rename.title': 'Zimmer umbenennen',
+  'rename.save': 'Speichern',
+  'wizard.sourceAndroid': 'Android-App',
+  'wizard.sourceAndroidHint': 'Kommt, sobald Web-Zimmer stabil laufen'
 }

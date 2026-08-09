@@ -182,5 +182,15 @@ export const ja: Translation = {
   'console.openFailed': 'このルームでターミナルを開けませんでした: {error}',
   'console.mustBeAwake': 'ターミナルを使うにはルームが起きている必要があります。',
   'console.shellHint': 'このシェルは PC ではなくルームの中で動いています。インストールしたツールはルーム内に留まります。',
-  'console.openRoomData': 'ルームデータを開く (manifest · ログ)'
+  'console.openRoomData': 'ルームデータを開く (manifest · ログ)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'アクティビティ',
+  'tabs.health': '状態',
+  'overview.openInBrowser': 'ブラウザで開く',
+  'bar.rename': 'ルーム名を変更…',
+  'rename.title': 'ルーム名を変更',
+  'rename.save': '保存',
+  'wizard.sourceAndroid': 'Android アプリ',
+  'wizard.sourceAndroidHint': 'Web ルームが安定した後に登場します'
 }

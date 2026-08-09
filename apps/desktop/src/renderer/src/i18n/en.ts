@@ -200,5 +200,15 @@ export const en = {
   'console.openFailed': 'Could not open a terminal in this room: {error}',
   'console.mustBeAwake': 'The room must be awake for a terminal session.',
   'console.shellHint': 'This shell runs inside the room, not on your PC. Installs and tools stay in the room.',
-  'console.openRoomData': 'Open room data (manifest · logs)'
+  'console.openRoomData': 'Open room data (manifest · logs)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Activity',
+  'tabs.health': 'Health',
+  'overview.openInBrowser': 'Open in browser',
+  'bar.rename': 'Rename room…',
+  'rename.title': 'Rename room',
+  'rename.save': 'Save',
+  'wizard.sourceAndroid': 'Android app',
+  'wizard.sourceAndroidHint': 'Coming after Web rooms are rock-solid'
 } as const

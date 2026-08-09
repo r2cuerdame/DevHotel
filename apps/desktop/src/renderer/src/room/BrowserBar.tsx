@@ -18,6 +18,8 @@ export function BrowserBar({
   const gateway = useStore((s) => s.gateway)
   const t = useT()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [nickname, setNickname] = useState(room.nickname)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -128,6 +130,14 @@ export function BrowserBar({
               />
             )}
             <MenuItem
+              label={t('bar.rename')}
+              onClick={() => {
+                setNickname(room.nickname)
+                setRenameOpen(true)
+                setMenuOpen(false)
+              }}
+            />
+            <MenuItem
               label={t('diag.copyDiagnostic')}
               onClick={() => {
                 void useStore.getState().copyDiagnostic(room.id)
@@ -147,6 +157,36 @@ export function BrowserBar({
           </div>
         )}
       </div>
+
+      {renameOpen && (
+        <div className="modal-backdrop" onClick={() => setRenameOpen(false)}>
+          <div className="modal" style={{ width: 380 }} onClick={(e) => e.stopPropagation()}>
+            <h2>{t('rename.title')}</h2>
+            <div className="field">
+              <label htmlFor="rename-nick">{t('wizard.nickname')}</label>
+              <input id="rename-nick" value={nickname} onChange={(e) => setNickname(e.target.value)} autoFocus />
+            </div>
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setRenameOpen(false)}>
+                {t('common.cancel')}
+              </button>
+              <button
+                className="btn primary"
+                disabled={!nickname.trim() || nickname.trim() === room.nickname}
+                onClick={() => {
+                  void api.rooms.rename(room.id, nickname.trim()).then(() => {
+                    setRenameOpen(false)
+                    void useStore.getState().refreshRooms()
+                    void useStore.getState().refreshInspection(room.id)
+                  })
+                }}
+              >
+                {t('rename.save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

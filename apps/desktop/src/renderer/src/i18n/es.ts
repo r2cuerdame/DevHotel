@@ -183,5 +183,15 @@ export const es: Translation = {
   'console.openFailed': 'No se pudo abrir una terminal en esta habitación: {error}',
   'console.mustBeAwake': 'La habitación debe estar despierta para abrir una terminal.',
   'console.shellHint': 'Esta shell se ejecuta dentro de la habitación, no en tu PC. Lo que instales se queda en la habitación.',
-  'console.openRoomData': 'Abrir datos de la habitación (manifest · registros)'
+  'console.openRoomData': 'Abrir datos de la habitación (manifest · registros)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Actividad',
+  'tabs.health': 'Salud',
+  'overview.openInBrowser': 'Abrir en el navegador',
+  'bar.rename': 'Renombrar habitación…',
+  'rename.title': 'Renombrar habitación',
+  'rename.save': 'Guardar',
+  'wizard.sourceAndroid': 'App Android',
+  'wizard.sourceAndroidHint': 'Llegará cuando las habitaciones web sean estables'
 }

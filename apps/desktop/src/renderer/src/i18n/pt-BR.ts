@@ -183,5 +183,15 @@ export const ptBR: Translation = {
   'console.openFailed': 'Não foi possível abrir um terminal neste quarto: {error}',
   'console.mustBeAwake': 'O quarto precisa estar acordado para uma sessão de terminal.',
   'console.shellHint': 'Este shell roda dentro do quarto, não no seu PC. Instalações e ferramentas ficam no quarto.',
-  'console.openRoomData': 'Abrir dados do quarto (manifest · logs)'
+  'console.openRoomData': 'Abrir dados do quarto (manifest · logs)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Atividade',
+  'tabs.health': 'Saúde',
+  'overview.openInBrowser': 'Abrir no navegador',
+  'bar.rename': 'Renomear quarto…',
+  'rename.title': 'Renomear quarto',
+  'rename.save': 'Salvar',
+  'wizard.sourceAndroid': 'App Android',
+  'wizard.sourceAndroidHint': 'Chega quando os quartos web estiverem estáveis'
 }

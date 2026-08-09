@@ -183,5 +183,15 @@ export const fr: Translation = {
   'console.openFailed': "Impossible d'ouvrir un terminal dans cette chambre : {error}",
   'console.mustBeAwake': 'La chambre doit être réveillée pour ouvrir un terminal.',
   'console.shellHint': "Ce shell s'exécute dans la chambre, pas sur votre PC. Les installations et outils restent dans la chambre.",
-  'console.openRoomData': 'Ouvrir les données de la chambre (manifest · journaux)'
+  'console.openRoomData': 'Ouvrir les données de la chambre (manifest · journaux)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': 'Activité',
+  'tabs.health': 'Santé',
+  'overview.openInBrowser': 'Ouvrir dans le navigateur',
+  'bar.rename': 'Renommer la chambre…',
+  'rename.title': 'Renommer la chambre',
+  'rename.save': 'Enregistrer',
+  'wizard.sourceAndroid': 'App Android',
+  'wizard.sourceAndroidHint': 'Arrivera quand les chambres web seront stables'
 }

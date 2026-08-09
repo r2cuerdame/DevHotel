@@ -182,5 +182,15 @@ export const ko: Translation = {
   'console.openFailed': '이 객실에서 터미널을 열 수 없습니다: {error}',
   'console.mustBeAwake': '터미널을 쓰려면 객실이 깨어 있어야 합니다.',
   'console.shellHint': '이 셸은 PC가 아니라 객실 안에서 실행됩니다. 설치한 도구는 객실 안에만 남습니다.',
-  'console.openRoomData': '객실 데이터 열기 (manifest · 로그)'
+  'console.openRoomData': '객실 데이터 열기 (manifest · 로그)',
+
+  // Panel redesign / rename / android
+  'tabs.activity': '활동',
+  'tabs.health': '상태',
+  'overview.openInBrowser': '브라우저에서 열기',
+  'bar.rename': '객실 이름 바꾸기…',
+  'rename.title': '객실 이름 바꾸기',
+  'rename.save': '저장',
+  'wizard.sourceAndroid': 'Android 앱',
+  'wizard.sourceAndroidHint': '웹 객실이 안정된 뒤에 제공돼요'
 }
