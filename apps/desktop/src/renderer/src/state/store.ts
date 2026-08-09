@@ -48,7 +48,13 @@ interface DhState {
   refreshRooms(): Promise<void>
   refreshInspection(roomId: string): Promise<void>
   refreshGateway(): Promise<void>
-  planRoom(input: { sourceType: CreateRoomInput['sourceType']; sourceRef: string; nickname: string; project?: string }): Promise<RoomPlan>
+  planRoom(input: {
+    sourceType: CreateRoomInput['sourceType']
+    sourceRef: string
+    nickname: string
+    project?: string
+    provider?: CreateRoomInput['provider']
+  }): Promise<RoomPlan>
   createRoom(input: CreateRoomInput): Promise<RoomRecord | null>
   roomAction(roomId: string, action: 'start' | 'sleep' | 'restart' | 'delete'): Promise<void>
   applyChange(roomId: string, change: QuickChange): Promise<ChangeEntry | null>
@@ -277,6 +283,7 @@ export function formatBytes(n: number): string {
 
 export function stackLine(room: RoomRecord): string {
   const pm = room.packageManager.kind + (room.packageManager.version ? ` ${room.packageManager.version.split('.')[0]}` : '')
+  if (room.runtime.kind === 'jdk') return `JDK ${room.runtime.version} · ${pm}`
   return `Node ${room.runtime.version} · ${pm}${room.https ? ' · HTTPS' : ''}`
 }
 

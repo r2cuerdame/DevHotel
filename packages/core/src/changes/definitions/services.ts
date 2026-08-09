@@ -57,13 +57,22 @@ async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: st
   if (svc === 'postgres') {
     const { readFileSync } = await import('node:fs')
     const sql = readFileSync(file, 'utf8')
-    const reset = await ctx.backend.execInService(
+    // separate -c invocations: DROP DATABASE refuses to run inside the implicit
+    // transaction psql wraps around a single multi-statement -c
+    const drop = await ctx.backend.execInService(
       ctx.roomId,
       'postgres',
-      ['psql', '-U', SERVICE_DB_USER, '-d', 'postgres', '-c', `DROP DATABASE IF EXISTS ${SERVICE_DB_NAME}; CREATE DATABASE ${SERVICE_DB_NAME};`],
+      ['psql', '-U', SERVICE_DB_USER, '-d', 'postgres', '-c', `DROP DATABASE IF EXISTS ${SERVICE_DB_NAME};`],
       { timeoutMs: 120_000 }
     )
-    if (reset.code !== 0) throw new Error(`database reset failed: ${reset.stderr.slice(-300)}`)
+    if (drop.code !== 0) throw new Error(`database reset failed: ${drop.stderr.slice(-300)}`)
+    const create = await ctx.backend.execInService(
+      ctx.roomId,
+      'postgres',
+      ['psql', '-U', SERVICE_DB_USER, '-d', 'postgres', '-c', `CREATE DATABASE ${SERVICE_DB_NAME};`],
+      { timeoutMs: 120_000 }
+    )
+    if (create.code !== 0) throw new Error(`database reset failed: ${create.stderr.slice(-300)}`)
     const res = await ctx.backend.execInService(ctx.roomId, 'postgres', ['psql', '-U', SERVICE_DB_USER, '-d', SERVICE_DB_NAME], {
       timeoutMs: 600_000,
       input: sql

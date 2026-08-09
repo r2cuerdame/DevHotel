@@ -50,7 +50,9 @@ const api: IpcApi = {
   preview: {
     setBounds: (roomId, bounds) => ipcRenderer.invoke(IPC.previewSetBounds, roomId, bounds),
     detach: () => ipcRenderer.invoke(IPC.previewDetach),
-    nav: (roomId, action) => ipcRenderer.invoke(IPC.previewNav, roomId, action)
+    nav: (roomId, action) => ipcRenderer.invoke(IPC.previewNav, roomId, action),
+    devtools: (roomId) => ipcRenderer.invoke(IPC.previewDevTools, roomId),
+    viewport: (roomId, size) => ipcRenderer.invoke(IPC.previewViewport, roomId, size)
   },
   on: (channel: IpcChannel, listener: (...args: any[]) => void) => {
     const wrapped = (_e: unknown, ...args: any[]): void => listener(...args)

@@ -115,4 +115,8 @@ export function registerIpc(opts: {
   ipcMain.handle(IPC.previewSetBounds, (_e, roomId: string, bounds) => previews.attach(roomId, bounds))
   ipcMain.handle(IPC.previewDetach, () => previews.detach())
   ipcMain.handle(IPC.previewNav, (_e, roomId: string, action) => previews.nav(roomId, action))
+  ipcMain.handle(IPC.previewDevTools, (_e, roomId: string) => previews.toggleDevTools(roomId))
+  ipcMain.handle(IPC.previewViewport, (_e, roomId: string, size: { width: number; height: number } | null) =>
+    previews.setViewport(roomId, size)
+  )
 }

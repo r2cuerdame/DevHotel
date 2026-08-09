@@ -10,9 +10,12 @@ const THUMB_INTERVAL_MS = 30_000
 
 export class PreviewManager {
   private view: WebContentsView | null = null
+  private devtools: WebContentsView | null = null
   private roomId: string | null = null
   private thumbTimer: NodeJS.Timeout | null = null
   private verifiedPartitions = new Set<string>()
+  private lastBounds: { x: number; y: number; width: number; height: number } | null = null
+  private viewportSize: { width: number; height: number } | null = null
 
   constructor(
     private readonly win: BrowserWindow,
@@ -60,17 +63,88 @@ export class PreviewManager {
       wc.on('did-navigate-in-page', pushState)
       wc.on('did-start-loading', pushState)
       wc.on('did-stop-loading', pushState)
+      wc.on('before-input-event', (_e, input) => {
+        if (input.type === 'keyDown' && input.key === 'F12') this.toggleDevTools(roomId)
+      })
       const url = this.homeUrl(roomId)
       if (url) void wc.loadURL(url).catch(() => undefined)
       this.thumbTimer = setInterval(() => void this.capture(), THUMB_INTERVAL_MS)
     }
-    this.view?.setBounds(bounds)
+    this.lastBounds = bounds
+    this.layout()
+  }
+
+  /** Splits the preview area between the site and a docked DevTools panel, and applies viewport emulation. */
+  private layout(): void {
+    if (!this.view || !this.lastBounds) return
+    const area = this.lastBounds
+    if (this.devtools) {
+      const siteWidth = Math.round(area.width * 0.6)
+      this.view.setBounds({ x: area.x, y: area.y, width: siteWidth, height: area.height })
+      this.devtools.setBounds({
+        x: area.x + siteWidth,
+        y: area.y,
+        width: area.width - siteWidth,
+        height: area.height
+      })
+    } else {
+      this.view.setBounds(area)
+    }
+    this.applyViewport()
+  }
+
+  private applyViewport(): void {
+    const wc = this.view?.webContents
+    if (!wc || wc.isDestroyed()) return
+    if (!this.viewportSize) {
+      wc.disableDeviceEmulation()
+      return
+    }
+    const siteBounds = this.view!.getBounds()
+    const scale = Math.min(1, siteBounds.width / this.viewportSize.width, siteBounds.height / this.viewportSize.height)
+    wc.enableDeviceEmulation({
+      screenPosition: this.viewportSize.width < 600 ? 'mobile' : 'desktop',
+      screenSize: this.viewportSize,
+      viewPosition: { x: 0, y: 0 },
+      viewSize: this.viewportSize,
+      deviceScaleFactor: 0,
+      scale
+    })
+  }
+
+  setViewport(roomId: string, size: { width: number; height: number } | null): void {
+    if (this.roomId !== roomId) return
+    this.viewportSize = size
+    this.applyViewport()
+  }
+
+  toggleDevTools(roomId: string): boolean {
+    if (this.roomId !== roomId || !this.view) return false
+    const wc = this.view.webContents
+    if (this.devtools) {
+      wc.closeDevTools()
+      this.win.contentView.removeChildView(this.devtools)
+      this.devtools.webContents.close()
+      this.devtools = null
+    } else {
+      this.devtools = new WebContentsView({ webPreferences: { sandbox: true } })
+      this.win.contentView.addChildView(this.devtools)
+      wc.setDevToolsWebContents(this.devtools.webContents)
+      wc.openDevTools({ mode: 'detach' })
+    }
+    this.layout()
+    return this.devtools !== null
   }
 
   detach(): void {
     if (this.thumbTimer) {
       clearInterval(this.thumbTimer)
       this.thumbTimer = null
+    }
+    if (this.devtools) {
+      this.win.contentView.removeChildView(this.devtools)
+      this.devtools.webContents.close()
+      this.devtools = null
     }
     if (this.view) {
       void this.capture()
@@ -79,6 +153,8 @@ export class PreviewManager {
       this.view = null
     }
     this.roomId = null
+    this.viewportSize = null
+    this.lastBounds = null
   }
 
   nav(roomId: string, action: PreviewNavAction): void {

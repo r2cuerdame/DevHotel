@@ -38,6 +38,8 @@ export const IPC = {
   previewSetBounds: 'preview:setBounds',
   previewDetach: 'preview:detach',
   previewNav: 'preview:nav',
+  previewDevTools: 'preview:devtools',
+  previewViewport: 'preview:viewport',
   evRoomsChanged: 'ev:roomsChanged',
   evRoomEvent: 'ev:roomEvent',
   evLogLine: 'ev:logLine',
@@ -148,6 +150,10 @@ export interface IpcApi {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>
     detach(): Promise<void>
     nav(roomId: string, action: PreviewNavAction): Promise<void>
+    /** toggle a docked Chrome DevTools panel; resolves to the new open state */
+    devtools(roomId: string): Promise<boolean>
+    /** emulate a viewport size (null = fill the area) */
+    viewport(roomId: string, size: { width: number; height: number } | null): Promise<void>
   }
   on(channel: IpcChannel, listener: (...args: any[]) => void): () => void
 }
