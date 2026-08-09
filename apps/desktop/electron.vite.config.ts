@@ -4,7 +4,11 @@ import { resolve } from 'node:path'
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ['@devhotel/core', '@devhotel/shared'] })],
+    // bundle workspace packages and their pure-JS deps so the packaged app
+    // needs no runtime node_modules resolution for them
+    plugins: [
+      externalizeDepsPlugin({ exclude: ['@devhotel/core', '@devhotel/shared', 'node-forge', 'js-yaml', 'nanoid', 'zod'] })
+    ],
     build: {
       rollupOptions: {
         input: { index: resolve(__dirname, 'src/main/index.ts') }
@@ -12,7 +16,7 @@ export default defineConfig({
     }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: ['@devhotel/shared', 'zod'] })],
     build: {
       rollupOptions: {
         input: { index: resolve(__dirname, 'src/preload/index.ts') },

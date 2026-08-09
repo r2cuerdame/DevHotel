@@ -1,19 +1,32 @@
-import { app, BrowserWindow, shell } from 'electron'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { app, BrowserWindow, net, protocol, shell } from 'electron'
+import { Gateway, OciCliBackend, openDb, RoomOrchestrator } from '@devhotel/core'
+import { registerIpc } from './ipc'
+import { PreviewManager } from './previewManager'
+import { TermManager } from './termManager'
+import { createTray } from './tray'
+import { setupUpdater } from './updater'
+import { startControlApi } from './controlApi'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
 let mainWindow: BrowserWindow | null = null
+let quitting = false
 
-function createWindow(): void {
-  mainWindow = new BrowserWindow({
+protocol.registerSchemesAsPrivileged([{ scheme: 'devhotel-thumb', privileges: { standard: true, secure: true } }])
+
+function createWindow(): BrowserWindow {
+  const win = new BrowserWindow({
     width: 1360,
     height: 860,
     minWidth: 960,
     minHeight: 600,
     title: 'DevHotel',
-    backgroundColor: '#111418',
+    backgroundColor: '#0f1216',
     autoHideMenuBar: true,
+    show: !process.argv.includes('--hidden'),
     webPreferences: {
       preload: join(import.meta.dirname, '../preload/index.cjs'),
       sandbox: false,
@@ -22,19 +35,90 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url)
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) void shell.openExternal(url)
     return { action: 'deny' }
   })
 
   if (isDev) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL as string)
+    void win.loadURL(process.env.ELECTRON_RENDERER_URL as string)
   } else {
-    void mainWindow.loadFile(join(import.meta.dirname, '../renderer/index.html'))
+    void win.loadFile(join(import.meta.dirname, '../renderer/index.html'))
   }
 
-  mainWindow.on('closed', () => {
-    mainWindow = null
+  win.on('close', (e) => {
+    if (!quitting) {
+      e.preventDefault()
+      win.hide()
+    }
+  })
+  return win
+}
+
+async function bootstrap(): Promise<void> {
+  const userData = app.getPath('userData')
+  const db = openDb(userData)
+  const gateway = new Gateway({ caDir: join(userData, 'ca') })
+  const backend = new OciCliBackend()
+  const orch = new RoomOrchestrator({ userData, backend, gateway, db, appVersion: app.getVersion() })
+
+  protocol.handle('devhotel-thumb', (request) => {
+    const url = new URL(request.url)
+    const roomId = url.hostname
+    if (!/^[a-z0-9]+$/.test(roomId)) return new Response('bad room id', { status: 400 })
+    const file = join(userData, 'rooms', roomId, 'thumb.png')
+    if (!existsSync(file)) return new Response('no thumbnail', { status: 404 })
+    return net.fetch(pathToFileURL(file).toString())
+  })
+
+  try {
+    await orch.init()
+  } catch (err) {
+    console.error('orchestrator init failed:', err)
+  }
+
+  const control = await startControlApi(orch, userData, app.getVersion()).catch((err) => {
+    console.error('control api failed to start:', err)
+    return null
+  })
+
+  mainWindow = createWindow()
+  const previews = new PreviewManager(mainWindow, orch, userData)
+  const terms = new TermManager(orch)
+  registerIpc({ win: mainWindow, orch, gateway, previews, terms, userData })
+  const updater = setupUpdater(mainWindow)
+
+  const quit = (): void => {
+    if (quitting) return
+    quitting = true
+    previews.dispose()
+    terms.dispose()
+    control?.stop()
+    void orch
+      .shutdown()
+      .catch(() => undefined)
+      .finally(() => app.exit(0))
+  }
+
+  createTray({
+    win: mainWindow,
+    orch,
+    onQuit: quit,
+    updateReady: updater.readyVersion,
+    installUpdate: () => {
+      quitting = true
+      previews.dispose()
+      terms.dispose()
+      control?.stop()
+      updater.install()
+    }
+  })
+
+  app.on('before-quit', (e) => {
+    if (!quitting) {
+      e.preventDefault()
+      quit()
+    }
   })
 }
 
@@ -45,18 +129,14 @@ if (!gotLock) {
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
       mainWindow.focus()
-    } else {
-      createWindow()
     }
   })
 
-  void app.whenReady().then(() => {
-    createWindow()
-  })
+  void app.whenReady().then(() => bootstrap())
 
   app.on('window-all-closed', () => {
-    // Tray-first app later; for now quit on close.
-    app.quit()
+    // tray app — stay alive until Quit
   })
 }
