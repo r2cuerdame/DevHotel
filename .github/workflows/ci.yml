@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm --filter devhotel-mcp build
+      - name: Package (no publish)
+        run: pnpm --filter @devhotel/desktop build && pnpm --filter @devhotel/desktop exec electron-builder --win nsis --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devhotel-installer
+          path: apps/desktop/release/*.exe
+          if-no-files-found: error

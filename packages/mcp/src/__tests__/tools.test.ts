@@ -1,0 +1,116 @@
+import { createServer, type Server } from 'node:http'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { ControlClient, DevHotelNotRunningError, loadControlInfo } from '../client'
+import { makeTools } from '../tools'
+
+const TOKEN = 'test-token'
+let server: Server
+let port: number
+const seen: { method: string; url: string; body: any }[] = []
+
+beforeAll(async () => {
+  server = createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401).end('unauthorized')
+      return
+    }
+    let raw = ''
+    req.on('data', (c) => (raw += c))
+    req.on('end', () => {
+      seen.push({ method: req.method!, url: req.url!, body: raw ? JSON.parse(raw) : null })
+      if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.1.0' }))
+      if (req.url === '/v1/rooms' && req.method === 'GET') {
+        return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
+      }
+      if (req.url === '/v1/rooms/abc12345/start') return void res.writeHead(204).end()
+      if (req.url === '/v1/rooms/abc12345/exec') {
+        return void res.end(JSON.stringify({ code: 0, stdout: 'ok', stderr: '' }))
+      }
+      if (req.url === '/v1/rooms/abc12345/diagnostic') {
+        return void res.end(JSON.stringify({ text: 'DevHotel Diagnostic Bundle\n...' }))
+      }
+      res.writeHead(404).end('not found')
+    })
+  })
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  port = (server.address() as { port: number }).port
+})
+
+afterAll(() => server.close())
+
+function client(): ControlClient {
+  return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.1.0' })
+}
+
+describe('ControlClient', () => {
+  it('authenticates and lists rooms', async () => {
+    const rooms = await client().listRooms()
+    expect(rooms).toHaveLength(1)
+  })
+
+  it('rejects with API error detail on failure status', async () => {
+    await expect(client().inspectRoom('missing')).rejects.toThrow(/404/)
+  })
+
+  it('sends bearer token (401 without)', async () => {
+    const bad = new ControlClient({ port, token: 'wrong', pid: 0, version: '0.1.0' })
+    await expect(bad.listRooms()).rejects.toThrow(/401/)
+  })
+
+  it('maps 204 to undefined', async () => {
+    await expect(client().startRoom('abc12345')).resolves.toBeUndefined()
+  })
+})
+
+describe('loadControlInfo', () => {
+  it('throws a friendly not-running error when file is missing', async () => {
+    await expect(loadControlInfo('Z:\\definitely\\missing\\control.json')).rejects.toBeInstanceOf(
+      DevHotelNotRunningError
+    )
+  })
+})
+
+describe('makeTools', () => {
+  const tools = makeTools(async () => client())
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
+
+  it('exposes exactly the goal.md §20 tool set', () => {
+    expect(Object.keys(byName).sort()).toEqual(
+      [
+        'apply_quick_change',
+        'check_room',
+        'copy_diagnostic',
+        'create_room',
+        'inspect_room',
+        'list_rooms',
+        'run_in_room',
+        'sleep_room',
+        'start_room',
+        'undo_change'
+      ].sort()
+    )
+  })
+
+  it('list_rooms returns JSON content', async () => {
+    const res = await byName.list_rooms!.handler({})
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]!.text).toContain('abc12345')
+  })
+
+  it('run_in_room forwards argv and returns exec result', async () => {
+    const res = await byName.run_in_room!.handler({ roomId: 'abc12345', cmd: ['pnpm', 'install'] })
+    expect(res.content[0]!.text).toContain('"code": 0')
+    const req = seen.find((s) => s.url === '/v1/rooms/abc12345/exec')
+    expect(req?.body.cmd).toEqual(['pnpm', 'install'])
+  })
+
+  it('copy_diagnostic returns plain text', async () => {
+    const res = await byName.copy_diagnostic!.handler({ roomId: 'abc12345' })
+    expect(res.content[0]!.text).toMatch(/^DevHotel Diagnostic Bundle/)
+  })
+
+  it('errors surface as isError content, not throws', async () => {
+    const res = await byName.inspect_room!.handler({ roomId: 'nope' })
+    expect(res.isError).toBe(true)
+  })
+})

@@ -52,3 +52,29 @@ export interface ControlInfo {
   pid: number
   version: string
 }
+
+/**
+ * Loopback control API surface (main process serves it; MCP consumes it).
+ * All routes are prefixed /v1 and require `Authorization: Bearer <token>`.
+ * Mutations through this API are always attributed to actor 'agent'.
+ */
+export const CONTROL_ROUTES = {
+  ping: { method: 'GET', path: '/v1/ping' },
+  listRooms: { method: 'GET', path: '/v1/rooms' },
+  createRoom: { method: 'POST', path: '/v1/rooms' },
+  inspectRoom: { method: 'GET', path: '/v1/rooms/:id' },
+  startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
+  sleepRoom: { method: 'POST', path: '/v1/rooms/:id/sleep' },
+  execInRoom: { method: 'POST', path: '/v1/rooms/:id/exec' },
+  runChecks: { method: 'POST', path: '/v1/rooms/:id/checks' },
+  applyChange: { method: 'POST', path: '/v1/rooms/:id/changes' },
+  undoChange: { method: 'POST', path: '/v1/rooms/:id/undo' },
+  diagnostic: { method: 'GET', path: '/v1/rooms/:id/diagnostic' }
+} as const
+
+export const zApplyChangeBody = z.object({ change: zQuickChange })
+export const zUndoChangeBody = z.object({ changeId: z.string().min(1) })
+export const zExecBody = z.object({
+  cmd: z.array(z.string()).min(1),
+  timeoutMs: z.number().int().positive().max(600_000).optional()
+})
