@@ -283,6 +283,10 @@ export class RoomOrchestrator {
 
   async applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
     const entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
+    const room = this.mustGet(roomId)
+    if (entry.verify && room.status !== 'sleeping' && room.status !== 'preparing') {
+      this.rooms.update(roomId, { status: entry.verify.ok ? 'ready' : 'attention' })
+    }
     await writeManifest(this.userData, this.mustGet(roomId))
     this.emit(roomId, 'change', entry.title)
     this.emit(roomId, 'status')

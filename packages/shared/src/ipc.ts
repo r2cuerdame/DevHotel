@@ -34,6 +34,7 @@ export const IPC = {
   openExternal: 'app:openExternal',
   openPath: 'app:openPath',
   pickFolder: 'app:pickFolder',
+  mcpInfo: 'app:mcpInfo',
   previewSetBounds: 'preview:setBounds',
   previewDetach: 'preview:detach',
   previewNav: 'preview:nav',
@@ -69,6 +70,19 @@ export interface RoomEvent {
   roomId: string
   kind: 'status' | 'change' | 'check' | 'log'
   detail?: string
+}
+
+export interface McpSetupInfo {
+  /** absolute path to the bundled devhotel-mcp entry script */
+  serverPath: string
+  /** whether the script exists on disk */
+  available: boolean
+  /** one-liner for Claude Code */
+  claudeCommand: string
+  /** mcpServers JSON snippet for generic MCP clients */
+  configJson: string
+  /** control API port currently serving MCP requests */
+  controlPort: number | null
 }
 
 export interface UpdateStatusInfo {
@@ -122,6 +136,7 @@ export interface IpcApi {
     openExternal(url: string): Promise<void>
     openPath(path: string): Promise<void>
     pickFolder(): Promise<string | null>
+    mcpInfo(): Promise<McpSetupInfo>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

@@ -1,12 +1,15 @@
+import { useState } from 'react'
 import { useStore } from '../state/store'
 import { RoomCard } from './RoomCard'
 import { NewRoomWizard } from './NewRoomWizard'
+import { SettingsModal } from './SettingsModal'
 
 export function Lobby(): React.JSX.Element {
   const rooms = useStore((s) => s.rooms)
   const gateway = useStore((s) => s.gateway)
   const wizardOpen = useStore((s) => s.wizardOpen)
   const openWizard = useStore((s) => s.openWizard)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   return (
     <div className="lobby">
@@ -21,6 +24,9 @@ export function Lobby(): React.JSX.Element {
             ? `Gateway on :${gateway.httpPort}${gateway.httpsPort ? ` · :${gateway.httpsPort}` : ''}`
             : 'Gateway offline'}
         </span>
+        <button className="icon-btn" title="Settings" onClick={() => setSettingsOpen(true)}>
+          ⚙
+        </button>
       </header>
 
       <main className="card-grid">
@@ -40,6 +46,7 @@ export function Lobby(): React.JSX.Element {
       </main>
 
       {wizardOpen && <NewRoomWizard />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </div>
   )
 }

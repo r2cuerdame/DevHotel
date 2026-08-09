@@ -7,6 +7,9 @@ files:
   - package.json
 asarUnpack:
   - out/main/chunks/**
+extraResources:
+  - from: ../../packages/mcp/dist/index.js
+    to: mcp/index.js
 win:
   target:
     - target: nsis

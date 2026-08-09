@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { CheckReport, CheckResult, CheckStatus, RoomRecord } from '@devhotel/shared'
 import type { IsolationBackend } from '../backend/types'
@@ -101,6 +101,8 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   // 6 dependencies
   if (room.sourceType === 'empty') {
     push({ step: 'dependencies', status: 'healthy', summary: 'no dependencies in an empty room' })
+  } else if (room.sourceType === 'linked-folder' && !declaresDependencies(room.sourceRef)) {
+    push({ step: 'dependencies', status: 'healthy', summary: 'project declares no dependencies' })
   } else if (backendOk) {
     const sizes = await backend.volumeSizes(room.id)
     const depsVol = depsVolumeForGen(room.id, room.runtime.version, ctx.depsGen)
@@ -220,6 +222,18 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   }
 
   return finish(room.id, results)
+}
+
+function declaresDependencies(sourceDir: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(sourceDir, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>
+      devDependencies?: Record<string, string>
+    }
+    return Object.keys(pkg.dependencies ?? {}).length > 0 || Object.keys(pkg.devDependencies ?? {}).length > 0
+  } catch {
+    return true // can't tell — keep the volume-size heuristic
+  }
 }
 
 async function httpProbe(port: number, host: string): Promise<{ ok: boolean; status?: number; detail: string }> {

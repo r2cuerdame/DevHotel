@@ -1,0 +1,7 @@
+{
+  "name": "hello-room-a",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js"
+  }
+}

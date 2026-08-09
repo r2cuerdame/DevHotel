@@ -1,6 +1,7 @@
-import { join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { app, dialog, ipcMain, shell, type BrowserWindow } from 'electron'
-import { IPC, type Actor, type CreateRoomInput, type QuickChange } from '@devhotel/shared'
+import { IPC, type Actor, type CreateRoomInput, type McpSetupInfo, type QuickChange } from '@devhotel/shared'
 import { caTrustStatus, ensureCa, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
 import type { PreviewManager } from './previewManager'
 import type { TermManager } from './termManager'
@@ -89,6 +90,25 @@ export function registerIpc(opts: {
   ipcMain.handle(IPC.pickFolder, async () => {
     const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
     return result.canceled ? null : (result.filePaths[0] ?? null)
+  })
+  ipcMain.handle(IPC.mcpInfo, (): McpSetupInfo => {
+    const serverPath = app.isPackaged
+      ? join(process.resourcesPath, 'mcp', 'index.js')
+      : resolve(app.getAppPath(), '..', '..', 'packages', 'mcp', 'dist', 'index.js')
+    let controlPort: number | null = null
+    try {
+      const control = JSON.parse(readFileSync(join(userData, 'control.json'), 'utf8')) as { port: number }
+      controlPort = control.port
+    } catch {
+      controlPort = null
+    }
+    return {
+      serverPath,
+      available: existsSync(serverPath),
+      claudeCommand: `claude mcp add devhotel -- node "${serverPath}"`,
+      configJson: JSON.stringify({ mcpServers: { devhotel: { command: 'node', args: [serverPath] } } }, null, 2),
+      controlPort
+    }
   })
 
   /* preview */

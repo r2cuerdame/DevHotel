@@ -44,7 +44,8 @@ const api: IpcApi = {
     version: () => ipcRenderer.invoke(IPC.appVersion),
     openExternal: (url) => ipcRenderer.invoke(IPC.openExternal, url),
     openPath: (path) => ipcRenderer.invoke(IPC.openPath, path),
-    pickFolder: () => ipcRenderer.invoke(IPC.pickFolder)
+    pickFolder: () => ipcRenderer.invoke(IPC.pickFolder),
+    mcpInfo: () => ipcRenderer.invoke(IPC.mcpInfo)
   },
   preview: {
     setBounds: (roomId, bounds) => ipcRenderer.invoke(IPC.previewSetBounds, roomId, bounds),
