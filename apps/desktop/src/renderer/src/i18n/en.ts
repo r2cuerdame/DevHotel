@@ -237,5 +237,18 @@ export const en = {
     "Rooms' runtimes, dependencies and databases live only in Docker volumes and images — removed per room on delete, fully via Docker.",
   'footprint.ca': 'Optional: the DevHotel Local CA in the Windows user certificate store — use Remove trust above.',
   'footprint.autostart': 'Optional: a Start-with-Windows entry — toggle it from the tray icon.',
-  'footprint.nothingElse': 'Nothing else is installed on the host — no global Node, npm, JDK, or SDKs.'
+  'footprint.nothingElse': 'Nothing else is installed on the host — no global Node, npm, JDK, or SDKs.',
+  'tabs.system': 'System',
+  'system.envVars': 'Environment variables',
+  'system.addVar': '+ Variable',
+  'system.cpus': 'CPU limit',
+  'system.memory': 'Memory limit',
+  'system.unlimited': 'Unlimited',
+  'system.timezone': 'Timezone',
+  'system.hint': 'Applying restarts the room process. Every setting can be undone from Changes.',
+  'footprint.openData': 'Open data folder',
+  'footprint.openApp': 'Open install folder',
+  'footprint.cleanUninstall': 'Uninstall & remove everything…',
+  'footprint.cleanUninstallConfirm': 'This deletes ALL rooms (containers, volumes, databases), removes CA trust and autostart, erases app data, and launches the uninstaller. This cannot be undone. Continue?',
+  'footprint.cleaning': 'Cleaning up…'
 } as const

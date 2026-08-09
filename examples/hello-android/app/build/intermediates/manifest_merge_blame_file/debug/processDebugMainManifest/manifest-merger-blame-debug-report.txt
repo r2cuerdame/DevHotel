@@ -1,0 +1,36 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="dev.hotel.hello"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="21"
+9        android:targetSdkVersion="34" />
+10
+11    <application
+11-->/workspace/app/src/main/AndroidManifest.xml:4:5-13:19
+12        android:debuggable="true"
+13        android:extractNativeLibs="true"
+14        android:label="Hello DevHotel" >
+14-->/workspace/app/src/main/AndroidManifest.xml:4:18-48
+15        <activity
+15-->/workspace/app/src/main/AndroidManifest.xml:5:9-12:20
+16            android:name="dev.hotel.hello.MainActivity"
+16-->/workspace/app/src/main/AndroidManifest.xml:6:13-41
+17            android:exported="true" >
+17-->/workspace/app/src/main/AndroidManifest.xml:7:13-36
+18            <intent-filter>
+18-->/workspace/app/src/main/AndroidManifest.xml:8:13-11:29
+19                <action android:name="android.intent.action.MAIN" />
+19-->/workspace/app/src/main/AndroidManifest.xml:9:17-69
+19-->/workspace/app/src/main/AndroidManifest.xml:9:25-66
+20
+21                <category android:name="android.intent.category.LAUNCHER" />
+21-->/workspace/app/src/main/AndroidManifest.xml:10:17-77
+21-->/workspace/app/src/main/AndroidManifest.xml:10:27-74
+22            </intent-filter>
+23        </activity>
+24    </application>
+25
+26</manifest>

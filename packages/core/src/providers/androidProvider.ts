@@ -4,8 +4,13 @@ import { slugifyDomain, type DetectOptions } from '../detect/detector'
 import type { SourceReader } from '../detect/sourceReader'
 import type { RoomProvider, RoomProviderInfo } from './types'
 
-/** Validated against a real containerized `gradle assembleDebug` (see examples/hello-android). */
-export const ANDROID_IMAGE = 'thyrlian/android-sdk:latest'
+/**
+ * Validated against a real containerized `gradle assembleDebug` (see examples/hello-android):
+ * Gradle 8.10.2, JDK 17, licenses pre-accepted so AGP auto-installs SDK components.
+ * Digest-pinned — the tag's Gradle version constrains the viable AGP range.
+ */
+export const ANDROID_IMAGE =
+  'thyrlian/android-sdk@sha256:bb9ed3686968550d927228777bca787dd7913e679f1e73e85525ba0094ea170d'
 /** Android rooms keep a long-lived container so the terminal and builds have a home. */
 export const ANDROID_KEEPALIVE_COMMAND = 'sleep 2147483647'
 export const ANDROID_DEFAULT_BUILD_COMMAND = 'gradle assembleDebug --no-daemon'
@@ -59,6 +64,9 @@ export class AndroidRoomProvider implements RoomProvider {
       imageOverride: ANDROID_IMAGE,
       standalone: true,
       noDepsVolume: true,
+      // persists AGP's auto-installed platforms/build-tools across container recreates;
+      // docker seeds the volume from the image (cmdline-tools + pre-accepted licenses)
+      extraVolumes: [{ volume: `dh-${room.id}-sdk`, path: '/opt/android-sdk' }],
       ...overrides
     }
   }

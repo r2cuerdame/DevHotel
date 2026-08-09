@@ -35,6 +35,9 @@ export const IPC = {
   openPath: 'app:openPath',
   pickFolder: 'app:pickFolder',
   mcpInfo: 'app:mcpInfo',
+  footprint: 'app:footprint',
+  autostartSet: 'app:autostartSet',
+  cleanUninstall: 'app:cleanUninstall',
   previewSetBounds: 'preview:setBounds',
   previewDetach: 'preview:detach',
   previewNav: 'preview:nav',
@@ -145,6 +148,10 @@ export interface IpcApi {
     openPath(path: string): Promise<void>
     pickFolder(): Promise<string | null>
     mcpInfo(): Promise<McpSetupInfo>
+    footprint(): Promise<{ dataDir: string; installDir: string; autostart: boolean }>
+    setAutostart(enabled: boolean): Promise<void>
+    /** deletes every room, removes CA trust and autostart, erases app data, launches the uninstaller */
+    cleanUninstall(): Promise<void>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

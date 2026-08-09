@@ -220,5 +220,18 @@ export const de: Translation = {
     'Laufzeiten, Abhängigkeiten und Datenbanken der Zimmer liegen ausschließlich in Docker-Volumes und -Images — beim Löschen je Zimmer entfernt, vollständig über Docker.',
   'footprint.ca': 'Optional: die DevHotel Local CA im Windows-Benutzerzertifikatspeicher — oben über „Vertrauen entfernen“.',
   'footprint.autostart': 'Optional: ein Autostart-Eintrag für Windows — über das Tray-Symbol umschaltbar.',
-  'footprint.nothingElse': 'Sonst wird nichts auf dem PC installiert — kein globales Node, npm, JDK oder SDK.'
+  'footprint.nothingElse': 'Sonst wird nichts auf dem PC installiert — kein globales Node, npm, JDK oder SDK.',
+  'tabs.system': 'System',
+  'system.envVars': 'Umgebungsvariablen',
+  'system.addVar': '+ Variable',
+  'system.cpus': 'CPU-Limit',
+  'system.memory': 'Speicherlimit',
+  'system.unlimited': 'Unbegrenzt',
+  'system.timezone': 'Zeitzone',
+  'system.hint': 'Beim Anwenden startet der Zimmer-Prozess neu. Alles ist über die Änderungen rückgängig machbar.',
+  'footprint.openData': 'Datenordner öffnen',
+  'footprint.openApp': 'Installationsordner öffnen',
+  'footprint.cleanUninstall': 'Alles entfernen & deinstallieren…',
+  'footprint.cleanUninstallConfirm': 'Löscht ALLE Zimmer (Container, Volumes, Datenbanken), entfernt CA-Vertrauen und Autostart, löscht App-Daten und startet den Deinstaller. Nicht rückgängig machbar. Fortfahren?',
+  'footprint.cleaning': 'Aufräumen…'
 }

@@ -215,5 +215,18 @@ export const zhCN: Translation = {
   'footprint.docker': '房间的运行时、依赖和数据库只存在于 Docker 卷和镜像中 — 删除房间时一并移除，也可通过 Docker 彻底清理。',
   'footprint.ca': '可选：Windows 用户证书存储中的 DevHotel 本地 CA — 用上面的「移除信任」按钮移除。',
   'footprint.autostart': '可选：开机自启动项 — 在托盘图标中开关。',
-  'footprint.nothingElse': '主机上不会安装其他任何东西 — 没有全局的 Node、npm、JDK 或 SDK。'
+  'footprint.nothingElse': '主机上不会安装其他任何东西 — 没有全局的 Node、npm、JDK 或 SDK。',
+  'tabs.system': '系统',
+  'system.envVars': '环境变量',
+  'system.addVar': '+ 变量',
+  'system.cpus': 'CPU 限制',
+  'system.memory': '内存限制',
+  'system.unlimited': '不限制',
+  'system.timezone': '时区',
+  'system.hint': '应用后房间进程将重启。所有设置都可以在变更记录中撤销。',
+  'footprint.openData': '打开数据文件夹',
+  'footprint.openApp': '打开安装文件夹',
+  'footprint.cleanUninstall': '全部清除并卸载…',
+  'footprint.cleanUninstallConfirm': '这将删除所有房间(容器、卷、数据库),移除 CA 信任和自启动,清除应用数据,然后启动卸载程序。此操作无法撤销。继续吗?',
+  'footprint.cleaning': '清理中…'
 }

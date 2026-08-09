@@ -4,14 +4,16 @@ import type { Translation } from '../i18n'
 import { OverviewTab } from './tabs/Overview'
 import { StackTab } from './tabs/Stack'
 import { ActivityTab } from './tabs/Activity'
+import { SystemTab } from './tabs/System'
 import { DiagnosticsTab } from './tabs/Diagnostics'
 import { ConsoleTab } from './tabs/Console'
 
-export type RoomPage = 'site' | 'overview' | 'stack' | 'activity' | 'health' | 'console'
+export type RoomPage = 'site' | 'overview' | 'stack' | 'activity' | 'system' | 'health' | 'console'
 
 export const ROOM_PAGES: { id: Exclude<RoomPage, 'site'>; icon: string; key: keyof Translation }[] = [
   { id: 'overview', icon: '⌂', key: 'tabs.overview' },
   { id: 'stack', icon: '⬢', key: 'tabs.stack' },
+  { id: 'system', icon: '⌘', key: 'tabs.system' },
   { id: 'activity', icon: '≡', key: 'tabs.activity' },
   { id: 'health', icon: '✚', key: 'tabs.health' },
   { id: 'console', icon: '❯', key: 'tabs.console' }
@@ -59,6 +61,7 @@ export function RoomPages({
       <div className="room-page-inner">
         {page === 'overview' && <OverviewTab room={room} onShowHealth={() => onNavigate('health')} />}
         {page === 'stack' && <StackTab room={room} />}
+        {page === 'system' && <SystemTab room={room} />}
         {page === 'activity' && <ActivityTab room={room} />}
         {page === 'health' && <DiagnosticsTab room={room} />}
         {page === 'console' && <ConsoleTab room={room} />}

@@ -219,5 +219,18 @@ export const ja: Translation = {
     'ルームのランタイム・依存関係・データベースは Docker のボリュームとイメージの中だけに存在します — ルーム削除時に一緒に消え、Docker から完全に削除できます。',
   'footprint.ca': '任意: Windows ユーザー証明書ストアの DevHotel ローカル CA — 上の「信頼を解除」で削除できます。',
   'footprint.autostart': '任意: Windows 起動時に実行するエントリ — トレイアイコンから切り替えられます。',
-  'footprint.nothingElse': 'ホストにはこれ以外何もインストールされません — グローバルな Node、npm、JDK、SDK は一切ありません。'
+  'footprint.nothingElse': 'ホストにはこれ以外何もインストールされません — グローバルな Node、npm、JDK、SDK は一切ありません。',
+  'tabs.system': 'システム',
+  'system.envVars': '環境変数',
+  'system.addVar': '+ 変数',
+  'system.cpus': 'CPU 制限',
+  'system.memory': 'メモリ制限',
+  'system.unlimited': '制限なし',
+  'system.timezone': 'タイムゾーン',
+  'system.hint': '適用するとルームのプロセスが再起動します。すべての設定は変更履歴から元に戻せます。',
+  'footprint.openData': 'データフォルダを開く',
+  'footprint.openApp': 'インストールフォルダを開く',
+  'footprint.cleanUninstall': 'すべて削除してアンインストール…',
+  'footprint.cleanUninstallConfirm': 'すべてのルーム(コンテナ・ボリューム・データベース)を削除し、CA 信頼と自動起動を解除し、アプリデータを消去してからアンインストーラーを起動します。元に戻せません。続行しますか?',
+  'footprint.cleaning': 'クリーンアップ中…'
 }

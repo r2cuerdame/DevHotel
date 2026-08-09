@@ -11,6 +11,17 @@ export interface RoomServices {
   redis?: { version: string }
 }
 
+/** Per-room "control panel" settings applied to the room's containers. */
+export interface RoomOsSettings {
+  env: Record<string, string>
+  /** CPU limit (docker --cpus); undefined = unlimited */
+  cpus?: number
+  /** memory limit in MB (docker --memory); undefined = unlimited */
+  memoryMB?: number
+  /** IANA timezone applied as TZ, e.g. Asia/Seoul */
+  timezone?: string
+}
+
 export interface RoomRecord {
   id: string
   project: string
@@ -28,6 +39,7 @@ export interface RoomRecord {
   https: boolean
   status: RoomStatus
   services: RoomServices
+  os: RoomOsSettings
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */
   hostPort: number | null
   createdAt: string

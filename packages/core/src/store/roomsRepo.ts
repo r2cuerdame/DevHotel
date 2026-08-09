@@ -1,4 +1,4 @@
-import type { PmKind, ProviderKind, RoomRecord, RoomServices, RoomStatus, SourceType } from '@devhotel/shared'
+import type { PmKind, ProviderKind, RoomOsSettings, RoomRecord, RoomServices, RoomStatus, SourceType } from '@devhotel/shared'
 import type { Db } from './db'
 
 interface RoomRow {
@@ -25,9 +25,14 @@ interface RoomRow {
   extra: string
 }
 
-function servicesFromExtra(extra: string): RoomServices {
+interface ExtraJson {
+  services?: RoomServices
+  os?: RoomOsSettings
+}
+
+function parseExtra(extra: string): ExtraJson {
   try {
-    return (JSON.parse(extra) as { services?: RoomServices }).services ?? {}
+    return JSON.parse(extra) as ExtraJson
   } catch {
     return {}
   }
@@ -52,7 +57,8 @@ function rowToRoom(row: RoomRow): RoomRecord {
     domain: row.domain,
     https: row.https === 1,
     status: row.status as RoomStatus,
-    services: servicesFromExtra(row.extra),
+    services: parseExtra(row.extra).services ?? {},
+    os: parseExtra(row.extra).os ?? { env: {} },
     hostPort: row.host_port,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
@@ -83,7 +89,6 @@ function patchToColumns(patch: Partial<RoomRecord>): Record<string, ColumnValue>
   if (patch.domain !== undefined) cols['domain'] = patch.domain
   if (patch.https !== undefined) cols['https'] = patch.https ? 1 : 0
   if (patch.status !== undefined) cols['status'] = patch.status
-  if (patch.services !== undefined) cols['extra'] = JSON.stringify({ services: patch.services })
   if (patch.hostPort !== undefined) cols['host_port'] = patch.hostPort
   if (patch.createdAt !== undefined) cols['created_at'] = patch.createdAt
   if (patch.lastUsedAt !== undefined) cols['last_used_at'] = patch.lastUsedAt
@@ -134,7 +139,7 @@ export function roomsRepo(db: Db): RoomsRepo {
           r.createdAt,
           r.lastUsedAt,
           r.thumbPath,
-          JSON.stringify({ services: r.services ?? {} }),
+          JSON.stringify({ services: r.services ?? {}, os: r.os ?? { env: {} } }),
         )
     },
     get(id) {
@@ -149,6 +154,13 @@ export function roomsRepo(db: Db): RoomsRepo {
     },
     update(id, patch) {
       const cols = patchToColumns(patch)
+      if (patch.services !== undefined || patch.os !== undefined) {
+        const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
+        const extra = parseExtra(row?.extra ?? '{}')
+        if (patch.services !== undefined) extra.services = patch.services
+        if (patch.os !== undefined) extra.os = patch.os
+        cols['extra'] = JSON.stringify(extra)
+      }
       const names = Object.keys(cols)
       if (names.length === 0) return
       const assignments = names.map((n) => `${n} = ?`).join(', ')

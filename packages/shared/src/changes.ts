@@ -13,6 +13,7 @@ export type QuickChange =
   | { kind: 'service-restart'; service: 'postgres' | 'redis' }
   | { kind: 'db-backup'; service: 'postgres' | 'redis' }
   | { kind: 'db-restore'; service: 'postgres' | 'redis'; file: string }
+  | { kind: 'os-settings'; os: import('./rooms').RoomOsSettings }
 
 export type ChangeStatus = 'pending' | 'applied' | 'verified' | 'rolled-back' | 'undone' | 'failed'
 

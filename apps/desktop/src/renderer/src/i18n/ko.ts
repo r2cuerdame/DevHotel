@@ -219,5 +219,18 @@ export const ko: Translation = {
     '객실의 런타임 · 의존성 · 데이터베이스는 오직 Docker 볼륨과 이미지에만 있습니다 — 객실 삭제 시 함께 제거되고, Docker에서 완전히 지울 수 있습니다.',
   'footprint.ca': '선택 사항: Windows 사용자 인증서 저장소의 DevHotel 로컬 CA — 위의 신뢰 해제 버튼으로 제거하세요.',
   'footprint.autostart': '선택 사항: Windows 시작 시 실행 항목 — 트레이 아이콘에서 켜고 끌 수 있습니다.',
-  'footprint.nothingElse': '호스트에는 그 외 아무것도 설치되지 않습니다 — 전역 Node, npm, JDK, SDK가 전혀 없습니다.'
+  'footprint.nothingElse': '호스트에는 그 외 아무것도 설치되지 않습니다 — 전역 Node, npm, JDK, SDK가 전혀 없습니다.',
+  'tabs.system': '시스템',
+  'system.envVars': '환경변수',
+  'system.addVar': '+ 변수',
+  'system.cpus': 'CPU 제한',
+  'system.memory': '메모리 제한',
+  'system.unlimited': '제한 없음',
+  'system.timezone': '시간대',
+  'system.hint': '적용하면 객실 프로세스가 재시작됩니다. 모든 설정은 변경 내역에서 되돌릴 수 있어요.',
+  'footprint.openData': '데이터 폴더 열기',
+  'footprint.openApp': '설치 폴더 열기',
+  'footprint.cleanUninstall': '모두 지우고 제거…',
+  'footprint.cleanUninstallConfirm': '모든 객실(컨테이너·볼륨·데이터베이스)을 삭제하고, CA 신뢰와 자동 시작을 해제하고, 앱 데이터를 지운 뒤 제거 프로그램을 실행합니다. 되돌릴 수 없습니다. 계속할까요?',
+  'footprint.cleaning': '정리 중…'
 }

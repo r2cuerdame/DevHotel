@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { app, dialog, ipcMain, shell, type BrowserWindow } from 'electron'
 import { IPC, type Actor, type CreateRoomInput, type McpSetupInfo, type QuickChange } from '@devhotel/shared'
 import { caTrustStatus, ensureCa, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
@@ -109,6 +110,38 @@ export function registerIpc(opts: {
       configJson: JSON.stringify({ mcpServers: { devhotel: { command: 'node', args: [serverPath] } } }, null, 2),
       controlPort
     }
+  })
+
+  ipcMain.handle(IPC.footprint, () => ({
+    dataDir: userData,
+    installDir: dirname(process.execPath),
+    autostart: app.getLoginItemSettings().openAtLogin
+  }))
+  ipcMain.handle(IPC.autostartSet, (_e, enabled: boolean) => {
+    app.setLoginItemSettings({ openAtLogin: enabled, args: ['--hidden'] })
+  })
+  ipcMain.handle(IPC.cleanUninstall, async () => {
+    for (const room of orch.listRooms()) {
+      try {
+        await orch.deleteRoom(room.id, 'user')
+      } catch {
+        // keep going — remove as much as possible
+      }
+    }
+    await untrustCaInWindows(caDir).catch(() => undefined)
+    app.setLoginItemSettings({ openAtLogin: false })
+    const installDir = dirname(process.execPath)
+    const uninstaller = readdirSync(installDir).find((f) => /^Uninstall.*\.exe$/i.test(f))
+    // erase app data after this process exits (the DB is open while we run)
+    spawn('cmd', ['/c', `ping 127.0.0.1 -n 4 > nul & rmdir /s /q "${userData}"`], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    }).unref()
+    if (uninstaller) {
+      spawn(join(installDir, uninstaller), [], { detached: true, stdio: 'ignore' }).unref()
+    }
+    setTimeout(() => app.quit(), 500)
   })
 
   /* preview */

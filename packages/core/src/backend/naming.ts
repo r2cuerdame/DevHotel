@@ -123,6 +123,9 @@ function mountArgs(spec: WebSpec): string[] {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
+  for (const extra of spec.extraVolumes ?? []) {
+    args.push('-v', `${extra.volume}:${extra.path}`)
+  }
   return args
 }
 
@@ -131,6 +134,13 @@ function envArgs(spec: WebSpec): string[] {
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }
+  return args
+}
+
+function limitArgs(spec: WebSpec): string[] {
+  const args: string[] = []
+  if (spec.cpus) args.push('--cpus', String(spec.cpus))
+  if (spec.memoryMB) args.push('--memory', `${spec.memoryMB}m`)
   return args
 }
 
@@ -147,6 +157,7 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
     ...labelArgs(spec.roomId, 'web'),
     ...mountArgs(spec),
     ...envArgs(spec),
+    ...limitArgs(spec),
     '-w',
     '/workspace',
     imageFor(spec),

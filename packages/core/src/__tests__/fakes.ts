@@ -33,6 +33,7 @@ export function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
     https: false,
     status: 'ready',
     services: {},
+    os: { env: {} },
     hostPort: null,
     createdAt: '2026-08-10T10:00:00.000Z',
     lastUsedAt: '2026-08-10T10:00:00.000Z',

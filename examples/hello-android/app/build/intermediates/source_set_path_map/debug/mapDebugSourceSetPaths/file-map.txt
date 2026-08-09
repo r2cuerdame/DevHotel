@@ -1,0 +1,7 @@
+dev.hotel.hello.app-pngs-0 /workspace/app/build/generated/res/pngs/debug
+dev.hotel.hello.app-resValues-1 /workspace/app/build/generated/res/resValues/debug
+dev.hotel.hello.app-packageDebugResources-2 /workspace/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+dev.hotel.hello.app-packageDebugResources-3 /workspace/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+dev.hotel.hello.app-debug-4 /workspace/app/build/intermediates/merged_res/debug/mergeDebugResources
+dev.hotel.hello.app-debug-5 /workspace/app/src/debug/res
+dev.hotel.hello.app-main-6 /workspace/app/src/main/res

@@ -20,7 +20,19 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('service-remove'), service: zServiceKind }),
   z.object({ kind: z.literal('service-restart'), service: zServiceKind }),
   z.object({ kind: z.literal('db-backup'), service: zServiceKind }),
-  z.object({ kind: z.literal('db-restore'), service: zServiceKind, file: z.string().min(1) })
+  z.object({ kind: z.literal('db-restore'), service: zServiceKind, file: z.string().min(1) }),
+  z.object({
+    kind: z.literal('os-settings'),
+    os: z.object({
+      env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(4096)),
+      cpus: z.number().positive().max(64).optional(),
+      memoryMB: z.number().int().min(256).max(131072).optional(),
+      timezone: z
+        .string()
+        .regex(/^[A-Za-z0-9_+\-/]{1,64}$/)
+        .optional()
+    })
+  })
 ])
 
 export const zPlanRoomInput = z.object({

@@ -8,6 +8,7 @@ import { depsInstallChange } from './deps'
 import { restartWebChange } from './restartWeb'
 import { androidBuildChange } from './androidBuild'
 import { dbBackupChange, dbRestoreChange, serviceAddChange, serviceRemoveChange, serviceRestartChange } from './services'
+import { osSettingsChange } from './osSettings'
 
 export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(nodeVersionChange)
@@ -23,6 +24,7 @@ export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(serviceRestartChange)
   engine.register(dbBackupChange)
   engine.register(dbRestoreChange)
+  engine.register(osSettingsChange)
 }
 
 export { pmInstallCommand, currentDepsGen, depsVolumeForGen, depsGenKey } from './deps'

@@ -38,7 +38,7 @@ import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
-const ANDROID_CHANGE_KINDS = new Set(['android-build', 'start-command', 'restart-web'])
+const ANDROID_CHANGE_KINDS = new Set(['android-build', 'start-command', 'restart-web', 'os-settings'])
 
 export interface OrchestratorEvent {
   roomId: string
@@ -199,6 +199,7 @@ export class RoomOrchestrator {
       https: input.planOverrides?.https ?? false,
       status: 'preparing',
       services: {},
+      os: { env: {} },
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
@@ -472,7 +473,16 @@ export class RoomOrchestrator {
   }
 
   private webSpecFor(room: RoomRecord, overrides?: Partial<WebSpec>): WebSpec {
-    if (room.provider === 'android') return getProvider('android').buildSpec(room, overrides)
+    const os = room.os ?? { env: {} }
+    const osOverlay: Partial<WebSpec> = {
+      cpus: os.cpus,
+      memoryMB: os.memoryMB
+    }
+    const osEnv = { ...os.env, ...(os.timezone ? { TZ: os.timezone } : {}) }
+    if (room.provider === 'android') {
+      const base = getProvider('android').buildSpec(room, osOverlay)
+      return { ...base, env: { ...base.env, ...osEnv }, ...overrides }
+    }
     const gen = this.depsGen(room.id)
     return {
       roomId: room.id,
@@ -481,8 +491,9 @@ export class RoomOrchestrator {
       sourceType: room.sourceType,
       sourceRef: room.sourceRef,
       startCommand: room.startCommand,
-      env: {},
+      env: osEnv,
       depsVolumeOverride: gen > 0 ? depsVolumeForGen(room.id, room.runtime.version, gen) : undefined,
+      ...osOverlay,
       ...overrides
     }
   }

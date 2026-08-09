@@ -16,6 +16,12 @@ export interface WebSpec {
   standalone?: boolean
   /** skip the /workspace/node_modules deps volume (non-node providers) */
   noDepsVolume?: boolean
+  /** additional named-volume mounts (docker seeds them from image content on first use) */
+  extraVolumes?: { volume: string; path: string }[]
+  /** docker --cpus limit */
+  cpus?: number
+  /** docker --memory limit in MB */
+  memoryMB?: number
 }
 
 export interface AnchorSpec {

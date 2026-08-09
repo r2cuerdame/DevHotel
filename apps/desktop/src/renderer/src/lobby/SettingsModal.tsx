@@ -13,10 +13,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
   const t = useT()
   const [mcp, setMcp] = useState<McpSetupInfo | null>(null)
   const [version, setVersion] = useState('')
+  const [footprint, setFootprint] = useState<{ dataDir: string; installDir: string; autostart: boolean } | null>(null)
+  const [autostart, setAutostart] = useState(false)
+  const [cleaning, setCleaning] = useState(false)
 
   useEffect(() => {
     void api.app.mcpInfo().then(setMcp)
     void api.app.version().then(setVersion)
+    void api.app.footprint().then((f) => {
+      setFootprint(f)
+      setAutostart(f.autostart)
+    })
   }, [])
 
   async function copy(text: string, whatKey: keyof Translation): Promise<void> {
@@ -141,6 +148,39 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
           <p className="small" style={{ margin: '8px 0 0' }}>
             {t('footprint.nothingElse')}
           </p>
+          <div className="row wrap" style={{ marginTop: 10 }}>
+            <button className="btn" onClick={() => footprint && void api.app.openPath(footprint.dataDir)}>
+              {t('footprint.openData')}
+            </button>
+            <button className="btn" onClick={() => footprint && void api.app.openPath(footprint.installDir)}>
+              {t('footprint.openApp')}
+            </button>
+            <label className="row small" style={{ gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={autostart}
+                onChange={(e) => {
+                  setAutostart(e.target.checked)
+                  void api.app.setAutostart(e.target.checked)
+                }}
+              />
+              {t('footprint.autostart')}
+            </label>
+          </div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <button
+              className="btn danger"
+              disabled={cleaning}
+              onClick={() => {
+                if (window.confirm(t('footprint.cleanUninstallConfirm'))) {
+                  setCleaning(true)
+                  void api.app.cleanUninstall()
+                }
+              }}
+            >
+              {cleaning ? t('footprint.cleaning') : t('footprint.cleanUninstall')}
+            </button>
+          </div>
         </div>
 
         <div className="panel-section settings-card">

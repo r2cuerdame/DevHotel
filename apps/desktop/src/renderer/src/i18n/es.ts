@@ -221,5 +221,18 @@ export const es: Translation = {
     'Los runtimes, dependencias y bases de datos de las habitaciones viven solo en volúmenes e imágenes de Docker — se quitan por habitación al eliminarla, y del todo desde Docker.',
   'footprint.ca': 'Opcional: la CA local de DevHotel en el almacén de certificados del usuario de Windows — usa Quitar confianza arriba.',
   'footprint.autostart': 'Opcional: una entrada de inicio con Windows — se activa desde el icono de la bandeja.',
-  'footprint.nothingElse': 'No se instala nada más en el equipo — sin Node, npm, JDK ni SDKs globales.'
+  'footprint.nothingElse': 'No se instala nada más en el equipo — sin Node, npm, JDK ni SDKs globales.',
+  'tabs.system': 'Sistema',
+  'system.envVars': 'Variables de entorno',
+  'system.addVar': '+ Variable',
+  'system.cpus': 'Límite de CPU',
+  'system.memory': 'Límite de memoria',
+  'system.unlimited': 'Sin límite',
+  'system.timezone': 'Zona horaria',
+  'system.hint': 'Al aplicar se reinicia el proceso de la habitación. Todo se puede deshacer desde Cambios.',
+  'footprint.openData': 'Abrir carpeta de datos',
+  'footprint.openApp': 'Abrir carpeta de instalación',
+  'footprint.cleanUninstall': 'Desinstalar y borrar todo…',
+  'footprint.cleanUninstallConfirm': 'Esto elimina TODAS las habitaciones (contenedores, volúmenes, bases de datos), quita la confianza de la CA y el autoarranque, borra los datos de la app y lanza el desinstalador. No se puede deshacer. ¿Continuar?',
+  'footprint.cleaning': 'Limpiando…'
 }

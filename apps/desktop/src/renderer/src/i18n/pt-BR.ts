@@ -220,5 +220,18 @@ export const ptBR: Translation = {
     'Runtimes, dependências e bancos dos quartos vivem apenas em volumes e imagens do Docker — removidos por quarto ao excluir, e por completo via Docker.',
   'footprint.ca': 'Opcional: a CA local do DevHotel no repositório de certificados do usuário do Windows — use Remover confiança acima.',
   'footprint.autostart': 'Opcional: uma entrada de inicialização com o Windows — alterne no ícone da bandeja.',
-  'footprint.nothingElse': 'Nada mais é instalado no computador — nenhum Node, npm, JDK ou SDK global.'
+  'footprint.nothingElse': 'Nada mais é instalado no computador — nenhum Node, npm, JDK ou SDK global.',
+  'tabs.system': 'Sistema',
+  'system.envVars': 'Variáveis de ambiente',
+  'system.addVar': '+ Variável',
+  'system.cpus': 'Limite de CPU',
+  'system.memory': 'Limite de memória',
+  'system.unlimited': 'Sem limite',
+  'system.timezone': 'Fuso horário',
+  'system.hint': 'Aplicar reinicia o processo do quarto. Tudo pode ser desfeito em Mudanças.',
+  'footprint.openData': 'Abrir pasta de dados',
+  'footprint.openApp': 'Abrir pasta de instalação',
+  'footprint.cleanUninstall': 'Desinstalar e remover tudo…',
+  'footprint.cleanUninstallConfirm': 'Isso exclui TODOS os quartos (contêineres, volumes, bancos de dados), remove a confiança da CA e o início automático, apaga os dados do app e abre o desinstalador. Não pode ser desfeito. Continuar?',
+  'footprint.cleaning': 'Limpando…'
 }

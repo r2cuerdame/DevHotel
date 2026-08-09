@@ -221,5 +221,18 @@ export const fr: Translation = {
     'Les runtimes, dépendances et bases des chambres vivent uniquement dans des volumes et images Docker — retirés chambre par chambre à la suppression, entièrement via Docker.',
   'footprint.ca': 'Optionnel : la CA locale DevHotel dans le magasin de certificats utilisateur Windows — bouton Retirer la confiance ci-dessus.',
   'footprint.autostart': "Optionnel : une entrée de démarrage avec Windows — à activer depuis l'icône de la barre système.",
-  'footprint.nothingElse': "Rien d'autre n'est installé sur le PC — pas de Node, npm, JDK ni SDK globaux."
+  'footprint.nothingElse': "Rien d'autre n'est installé sur le PC — pas de Node, npm, JDK ni SDK globaux.",
+  'tabs.system': 'Système',
+  'system.envVars': 'Variables d\'environnement',
+  'system.addVar': '+ Variable',
+  'system.cpus': 'Limite CPU',
+  'system.memory': 'Limite mémoire',
+  'system.unlimited': 'Illimité',
+  'system.timezone': 'Fuseau horaire',
+  'system.hint': 'L\'application redémarre le processus de la chambre. Tout est annulable depuis l\'historique.',
+  'footprint.openData': 'Ouvrir le dossier de données',
+  'footprint.openApp': 'Ouvrir le dossier d\'installation',
+  'footprint.cleanUninstall': 'Tout supprimer et désinstaller…',
+  'footprint.cleanUninstallConfirm': 'Cela supprime TOUTES les chambres (conteneurs, volumes, bases de données), retire la confiance CA et le démarrage auto, efface les données puis lance le désinstalleur. Irréversible. Continuer ?',
+  'footprint.cleaning': 'Nettoyage…'
 }
