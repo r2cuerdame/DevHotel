@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import type { ChangeEntry, RoomRecord } from '@devhotel/shared'
 import { api } from '../../api'
-import { useStore } from '../../state/store'
+import { useStore, useT } from '../../state/store'
+import type { LocaleId } from '../../i18n'
 
-function when(iso: string): string {
+function when(lang: LocaleId, iso: string): string {
   const d = new Date(iso)
-  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return d.toLocaleString(lang, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 export function ChangesTab({ room }: { room: RoomRecord }): React.JSX.Element {
@@ -13,13 +14,15 @@ export function ChangesTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const [expanded, setExpanded] = useState<string | null>(null)
   const undoChange = useStore((s) => s.undoChange)
   const inspections = useStore((s) => s.inspections)
+  const lang = useStore((s) => s.lang)
+  const t = useT()
 
   useEffect(() => {
     void api.changes.list(room.id).then(setChanges)
   }, [room.id, inspections])
 
   if (changes.length === 0) {
-    return <p className="muted">No changes yet. Changes made from Stack, fixes, and agent actions appear here.</p>
+    return <p className="muted">{t('changes.empty')}</p>
   }
 
   return (
@@ -32,19 +35,19 @@ export function ChangesTab({ room }: { room: RoomRecord }): React.JSX.Element {
                 {c.title}
               </button>
               <div className="small muted">
-                {when(c.createdAt)}
-                {c.status === 'undone' && ' · undone'}
-                {c.status === 'rolled-back' && ' · rolled back'}
-                {c.status === 'failed' && ' · failed'}
+                {when(lang, c.createdAt)}
+                {c.status === 'undone' && ` · ${t('changes.undone')}`}
+                {c.status === 'rolled-back' && ` · ${t('changes.rolledBack')}`}
+                {c.status === 'failed' && ` · ${t('changes.failed')}`}
               </div>
             </span>
-            {c.actor === 'agent' && <span className="actor-agent">agent</span>}
+            {c.actor === 'agent' && <span className="actor-agent">{t('changes.agent')}</span>}
             {c.undoable && (c.status === 'verified' || (c.status === 'applied' && c.verify)) ? (
               <button className="btn" onClick={() => void undoChange(room.id, c.id)}>
-                ↶ Undo
+                ↶ {t('common.undo')}
               </button>
             ) : (
-              !c.undoable && <span className="small muted">Undo unavailable</span>
+              !c.undoable && <span className="small muted">{t('changes.undoUnavailable')}</span>
             )}
           </div>
           {expanded === c.id && (

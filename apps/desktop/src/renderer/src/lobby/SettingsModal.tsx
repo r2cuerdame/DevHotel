@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react'
 import type { McpSetupInfo } from '@devhotel/shared'
 import { api } from '../api'
-import { useStore } from '../state/store'
+import { useStore, useT } from '../state/store'
+import { LOCALES } from '../i18n'
+import type { LocaleId, Translation } from '../i18n'
 
 export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.Element {
   const toast = useStore((s) => s.toast)
   const caStatus = useStore((s) => s.caStatus)
+  const lang = useStore((s) => s.lang)
+  const setLang = useStore((s) => s.setLang)
+  const t = useT()
   const [mcp, setMcp] = useState<McpSetupInfo | null>(null)
   const [version, setVersion] = useState('')
 
@@ -14,40 +19,50 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
     void api.app.version().then(setVersion)
   }, [])
 
-  async function copy(text: string, what: string): Promise<void> {
+  async function copy(text: string, whatKey: keyof Translation): Promise<void> {
     await navigator.clipboard.writeText(text)
-    toast('success', `${what} copied`)
+    toast('success', t('toast.copied', { what: t(whatKey) }))
   }
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Settings</h2>
+        <h2>{t('settings.title')}</h2>
 
         <div className="panel-section">
-          <h3>MCP — let agents use rooms</h3>
+          <h3>{t('settings.language')}</h3>
+          <select value={lang} onChange={(e) => setLang(e.target.value as LocaleId)} style={{ width: 220 }}>
+            {LOCALES.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="panel-section">
+          <h3>{t('settings.mcpTitle')}</h3>
           <p className="small muted" style={{ marginTop: 0 }}>
-            The DevHotel MCP server lets Claude Code and other agents create, run, and change rooms instead of installing
-            things on your PC. Every agent change shows up in the room's Changes list and can be undone.
+            {t('settings.mcpDesc')}
           </p>
           {mcp && !mcp.available && (
             <p className="small" style={{ color: 'var(--warn)' }}>
-              MCP server script not found — run <code>pnpm --filter devhotel-mcp build</code> in the repo first.
+              {t('settings.mcpMissingPre')} <code>pnpm --filter devhotel-mcp build</code> {t('settings.mcpMissingPost')}
             </p>
           )}
           {mcp?.available && (
             <>
               <div className="field">
-                <label>Claude Code — one command</label>
+                <label>{t('settings.claudeCommand')}</label>
                 <div className="row">
                   <input className="mono" readOnly value={mcp.claudeCommand} style={{ flex: 1 }} />
-                  <button className="btn" onClick={() => void copy(mcp.claudeCommand, 'Command')}>
-                    Copy
+                  <button className="btn" onClick={() => void copy(mcp.claudeCommand, 'settings.whatCommand')}>
+                    {t('common.copy')}
                   </button>
                 </div>
               </div>
               <div className="field">
-                <label>Any MCP client — mcpServers config</label>
+                <label>{t('settings.mcpClientConfig')}</label>
                 <div className="row" style={{ alignItems: 'stretch' }}>
                   <pre
                     className="mono"
@@ -64,29 +79,27 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                   >
                     {mcp.configJson}
                   </pre>
-                  <button className="btn" onClick={() => void copy(mcp.configJson, 'Config')}>
-                    Copy
+                  <button className="btn" onClick={() => void copy(mcp.configJson, 'settings.whatConfig')}>
+                    {t('common.copy')}
                   </button>
                 </div>
               </div>
               <p className="small muted">
-                {mcp.controlPort
-                  ? `The MCP server talks to this app on 127.0.0.1:${mcp.controlPort} — DevHotel must be running.`
-                  : 'DevHotel must be running for MCP tools to work.'}
+                {mcp.controlPort ? t('settings.mcpPortNote', { port: mcp.controlPort }) : t('settings.mcpRunningNote')}
               </p>
             </>
           )}
         </div>
 
         <div className="panel-section">
-          <h3>HTTPS certificates</h3>
+          <h3>{t('settings.httpsTitle')}</h3>
           <p className="small muted" style={{ marginTop: 0 }}>
-            Room previews trust DevHotel's local certificates automatically. Trust the DevHotel Local CA in Windows to
-            avoid warnings in external browsers.
+            {t('settings.httpsDesc')}
           </p>
           <div className="row">
             <span className="small">
-              CA status: <b>{caStatus === 'trusted' ? 'trusted' : caStatus === 'untrusted' ? 'not trusted' : 'not created yet'}</b>
+              {t('settings.caStatus')}{' '}
+              <b>{caStatus === 'trusted' ? t('settings.caTrusted') : caStatus === 'untrusted' ? t('settings.caUntrusted') : t('settings.caMissing')}</b>
             </span>
             {caStatus !== 'trusted' ? (
               <button
@@ -94,11 +107,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                 onClick={() => {
                   void api.ca
                     .trust()
-                    .then(() => toast('success', 'DevHotel Local CA trusted for your Windows user'))
+                    .then(() => toast('success', t('toast.caTrusted')))
                     .catch((err: unknown) => toast('error', String(err)))
                 }}
               >
-                Trust CA
+                {t('settings.trustCa')}
               </button>
             ) : (
               <button
@@ -106,26 +119,26 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                 onClick={() => {
                   void api.ca
                     .untrust()
-                    .then(() => toast('success', 'DevHotel Local CA removed from Windows trust'))
+                    .then(() => toast('success', t('toast.caUntrusted')))
                     .catch((err: unknown) => toast('error', String(err)))
                 }}
               >
-                Remove trust
+                {t('settings.untrustCa')}
               </button>
             )}
           </div>
         </div>
 
         <div className="panel-section">
-          <h3>About</h3>
+          <h3>{t('settings.about')}</h3>
           <p className="small muted" style={{ margin: 0 }}>
-            DevHotel {version} — every project gets its own room.
+            {t('settings.aboutLine', { version })}
           </p>
         </div>
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose}>
-            Close
+            {t('common.close')}
           </button>
         </div>
       </div>

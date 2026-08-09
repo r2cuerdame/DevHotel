@@ -83,18 +83,32 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/**
+ * Data-level probe: the room's socat relay completes a TCP handshake even when
+ * nothing listens on the internal port, so a bare connect proves nothing.
+ * We send a minimal HTTP request and require at least one response byte —
+ * socat closes with zero bytes when its onward connect is refused.
+ */
 export async function tcpAnswers(port: number, timeoutMs: number): Promise<boolean> {
   const net = await import('node:net')
   return new Promise((resolve) => {
+    let gotData = false
     const sock = net.connect({ host: '127.0.0.1', port, timeout: timeoutMs })
+    const finish = (ok: boolean): void => {
+      sock.destroy()
+      resolve(ok)
+    }
     sock.once('connect', () => {
-      sock.destroy()
-      resolve(true)
+      sock.write('HEAD / HTTP/1.0\r\nHost: devhotel-probe\r\n\r\n')
     })
-    sock.once('error', () => resolve(false))
-    sock.once('timeout', () => {
-      sock.destroy()
-      resolve(false)
+    sock.once('data', () => {
+      gotData = true
+      finish(true)
     })
+    sock.once('close', () => {
+      if (!gotData) resolve(false)
+    })
+    sock.once('error', () => finish(false))
+    sock.once('timeout', () => finish(false))
   })
 }

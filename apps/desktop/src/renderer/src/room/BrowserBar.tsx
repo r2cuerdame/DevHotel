@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
-import { STATUS_LABEL, useStore } from '../state/store'
+import { statusLabel, useStore, useT } from '../state/store'
 
 export function BrowserBar({
   room,
@@ -16,6 +16,7 @@ export function BrowserBar({
   const roomAction = useStore((s) => s.roomAction)
   const preview = useStore((s) => s.previews[room.id])
   const gateway = useStore((s) => s.gateway)
+  const t = useT()
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
@@ -39,12 +40,12 @@ export function BrowserBar({
 
   return (
     <div className="browser-bar">
-      <button className="icon-btn" title="Back to Lobby" onClick={backToLobby}>
+      <button className="icon-btn" title={t('bar.backToLobby')} onClick={backToLobby}>
         ⌂
       </button>
       <button
         className="icon-btn"
-        title="Back"
+        title={t('common.back')}
         disabled={!preview?.canGoBack}
         onClick={() => void api.preview.nav(room.id, 'back')}
       >
@@ -52,13 +53,13 @@ export function BrowserBar({
       </button>
       <button
         className="icon-btn"
-        title="Forward"
+        title={t('bar.forward')}
         disabled={!preview?.canGoForward}
         onClick={() => void api.preview.nav(room.id, 'forward')}
       >
         →
       </button>
-      <button className="icon-btn" title="Reload" disabled={!running} onClick={() => void api.preview.nav(room.id, 'reload')}>
+      <button className="icon-btn" title={t('bar.reload')} disabled={!running} onClick={() => void api.preview.nav(room.id, 'reload')}>
         ⟳
       </button>
 
@@ -67,31 +68,31 @@ export function BrowserBar({
         <span className="url">{url}</span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} style={{ display: 'inline-block', marginRight: 6 }} />
-          {STATUS_LABEL[room.status]}
+          {statusLabel(t, room.status)}
         </span>
       </div>
 
       {running ? (
         <>
           <button className="btn" onClick={() => void roomAction(room.id, 'restart')}>
-            Restart
+            {t('common.restart')}
           </button>
           <button className="btn" onClick={() => void roomAction(room.id, 'sleep')}>
-            Sleep
+            {t('bar.sleep')}
           </button>
         </>
       ) : (
         <button className="btn primary" disabled={room.status === 'preparing'} onClick={() => void roomAction(room.id, 'start')}>
-          {room.status === 'sleeping' ? 'Wake' : 'Start'}
+          {room.status === 'sleeping' ? t('bar.wake') : t('bar.start')}
         </button>
       )}
 
-      <button className="icon-btn" title="Room details" onClick={onTogglePanel} aria-pressed={panelOpen}>
+      <button className="icon-btn" title={t('bar.roomDetails')} onClick={onTogglePanel} aria-pressed={panelOpen}>
         {panelOpen ? '▤' : '☰'}
       </button>
 
       <div ref={menuRef} style={{ position: 'relative' }}>
-        <button className="icon-btn" title="More" onClick={() => setMenuOpen((v) => !v)}>
+        <button className="icon-btn" title={t('bar.more')} onClick={() => setMenuOpen((v) => !v)}>
           ⋯
         </button>
         {menuOpen && (
@@ -111,7 +112,7 @@ export function BrowserBar({
             }}
           >
             <MenuItem
-              label="Open in default browser"
+              label={t('bar.openExternal')}
               onClick={() => {
                 void api.app.openExternal(url)
                 setMenuOpen(false)
@@ -119,7 +120,7 @@ export function BrowserBar({
             />
             {room.sourceType === 'linked-folder' && (
               <MenuItem
-                label="Open source folder"
+                label={t('bar.openSourceFolder')}
                 onClick={() => {
                   void api.app.openPath(room.sourceRef)
                   setMenuOpen(false)
@@ -127,22 +128,18 @@ export function BrowserBar({
               />
             )}
             <MenuItem
-              label="Copy diagnostic"
+              label={t('diag.copyDiagnostic')}
               onClick={() => {
                 void useStore.getState().copyDiagnostic(room.id)
                 setMenuOpen(false)
               }}
             />
             <MenuItem
-              label="Delete room…"
+              label={t('bar.deleteRoom')}
               danger
               onClick={() => {
                 setMenuOpen(false)
-                if (
-                  window.confirm(
-                    `Delete ${room.project} / ${room.nickname}?\n\nThis removes the room's environment, dependencies and data. Sleeping keeps everything — deleting does not.`
-                  )
-                ) {
+                if (window.confirm(t('bar.deleteConfirm', { project: room.project, nickname: room.nickname }))) {
                   void roomAction(room.id, 'delete')
                 }
               }}

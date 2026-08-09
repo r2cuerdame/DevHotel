@@ -1,19 +1,21 @@
 import type { RoomRecord } from '@devhotel/shared'
-import { STATUS_LABEL, stackLine, useStore } from '../state/store'
+import type { TFunc } from '../i18n'
+import { stackLine, statusLabel, useStore, useT } from '../state/store'
 
-function relTime(iso: string): string {
+function relTime(t: TFunc, iso: string): string {
   const ms = Date.now() - new Date(iso).getTime()
   const min = Math.floor(ms / 60_000)
-  if (min < 1) return 'just now'
-  if (min < 60) return `${min}m ago`
+  if (min < 1) return t('time.justNow')
+  if (min < 60) return t('time.minutesAgo', { n: min })
   const h = Math.floor(min / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
+  if (h < 24) return t('time.hoursAgo', { n: h })
+  return t('time.daysAgo', { n: Math.floor(h / 24) })
 }
 
 export function RoomCard({ room }: { room: RoomRecord }): React.JSX.Element {
   const openRoom = useStore((s) => s.openRoom)
   const busy = useStore((s) => s.busy[room.id])
+  const t = useT()
   const asleep = room.status === 'sleeping'
 
   return (
@@ -38,9 +40,9 @@ export function RoomCard({ room }: { room: RoomRecord }): React.JSX.Element {
         </div>
         <div className="room-meta">
           <span className="status-dot" data-status={room.status} />
-          <span>{busy ?? STATUS_LABEL[room.status]}</span>
+          <span>{busy ?? statusLabel(t, room.status)}</span>
           <span className="sep" />
-          <span>{relTime(room.lastUsedAt)}</span>
+          <span>{relTime(t, room.lastUsedAt)}</span>
         </div>
         <div className="room-meta">{stackLine(room)}</div>
       </div>

@@ -40,4 +40,6 @@ export interface IsolationBackend {
   volumeSizes(roomId: string): Promise<Record<string, number>>
   imageExists(image: string): Promise<boolean>
   pullImage(image: string, log?: (line: string) => void): Promise<void>
+  /** force-remove and recreate a volume, guaranteeing it is empty */
+  resetVolume(name: string): Promise<void>
 }

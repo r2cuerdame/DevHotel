@@ -77,6 +77,9 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
         res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' })
         res.end(PAGE_502)
       })
+      res.on('close', () => {
+        if (!res.writableFinished) target.destroy()
+      })
       req.pipe(target)
     },
 

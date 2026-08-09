@@ -85,6 +85,9 @@ export async function issueLeafCert(
   caDir: string,
   domain: string
 ): Promise<{ keyPem: string; certPem: string }> {
+  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(domain) || domain.includes('..')) {
+    throw new Error(`refusing to issue a certificate for suspicious domain: ${JSON.stringify(domain)}`)
+  }
   const certsDir = path.join(caDir, 'certs')
   await mkdir(certsDir, { recursive: true })
   const certFile = path.join(certsDir, `${domain}.pem`)

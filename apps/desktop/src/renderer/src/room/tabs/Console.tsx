@@ -5,9 +5,17 @@ import '@xterm/xterm/css/xterm.css'
 import type { RoomRecord } from '@devhotel/shared'
 import { IPC } from '@devhotel/shared'
 import { api } from '../../api'
+import { useStore, useT } from '../../state/store'
+import { translate } from '../../i18n'
+import type { Translation } from '../../i18n'
+
+function tr(key: keyof Translation, vars?: Record<string, string | number>): string {
+  return translate(useStore.getState().lang, key, vars)
+}
 
 export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
+  const t = useT()
 
   useEffect(() => {
     const host = hostRef.current
@@ -29,7 +37,7 @@ export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
       if (id === termId) term.write(data)
     })
     const offExit = api.on(IPC.evTermExit, (id: string) => {
-      if (id === termId) term.write('\r\n\x1b[90m[session ended]\x1b[0m\r\n')
+      if (id === termId) term.write(`\r\n\x1b[90m${tr('console.sessionEnded')}\x1b[0m\r\n`)
     })
 
     void api.term
@@ -45,8 +53,8 @@ export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
         term.onResize(({ cols, rows }) => api.term.resize(id, cols, rows))
       })
       .catch((err: unknown) => {
-        term.write(`\x1b[31mCould not open a terminal in this room: ${String(err)}\x1b[0m\r\n`)
-        term.write('\x1b[90mThe room must be awake for a terminal session.\x1b[0m\r\n')
+        term.write(`\x1b[31m${tr('console.openFailed', { error: String(err) })}\x1b[0m\r\n`)
+        term.write(`\x1b[90m${tr('console.mustBeAwake')}\x1b[0m\r\n`)
       })
 
     const ro = new ResizeObserver(() => fit.fit())
@@ -62,12 +70,25 @@ export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
     }
   }, [room.id])
 
+  const inspection = useStore((s) => s.inspections[room.id])
   return (
     <div className="console-tab">
       <div ref={hostRef} className="term-host" />
       <p className="small muted" style={{ margin: 0 }}>
-        This shell runs inside the room, not on your PC. Installs and tools stay in the room.
+        {t('console.shellHint')}
       </p>
+      <div className="row wrap">
+        {room.sourceType === 'linked-folder' && (
+          <button className="btn" onClick={() => void api.app.openPath(room.sourceRef)}>
+            {t('bar.openSourceFolder')}
+          </button>
+        )}
+        {inspection && (
+          <button className="btn" onClick={() => void api.app.openPath(inspection.dataDir)}>
+            {t('console.openRoomData')}
+          </button>
+        )}
+      </div>
     </div>
   )
 }

@@ -60,7 +60,14 @@ export class Gateway {
         key: defaultLeaf.keyPem,
         cert: defaultLeaf.certPem + this.caCertPem,
         SNICallback: (servername, cb) => {
-          this.secureContextFor(servername.toLowerCase()).then(
+          const name = servername.toLowerCase()
+          // only mint/serve certificates for routed rooms — an arbitrary
+          // client-supplied SNI must not trigger keygen or disk writes
+          if (name !== DEFAULT_DOMAIN && !this.table.byDomain(name)) {
+            cb(new Error(`no room routed for ${name}`))
+            return
+          }
+          this.secureContextFor(name).then(
             (leaf) => cb(null, leaf.context),
             (err) => cb(err as Error)
           )

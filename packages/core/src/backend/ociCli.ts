@@ -197,6 +197,11 @@ export class OciCliBackend implements IsolationBackend {
     return sizes
   }
 
+  async resetVolume(name: string): Promise<void> {
+    await runDocker(['volume', 'rm', '-f', name])
+    must(await runDocker(['volume', 'create', name]), `create volume ${name}`)
+  }
+
   async imageExists(image: string): Promise<boolean> {
     const result = await runDocker(['image', 'inspect', '--format', '{{.Id}}', image])
     return result.code === 0

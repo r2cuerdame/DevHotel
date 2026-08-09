@@ -29,7 +29,13 @@ export async function reconcile(
 
   const roomsSlept: string[] = []
   for (const room of rooms.list()) {
-    if (room.status === 'sleeping' || room.status === 'broken') continue
+    if (room.status === 'sleeping') continue
+    if (room.status === 'broken') {
+      // broken rooms can still own running containers (e.g. anchor up, web crashed)
+      await backend.stopRoomPod(room.id)
+      rooms.update(room.id, { hostPort: null })
+      continue
+    }
     log(`reconcile: room ${room.id} was ${room.status} — putting to sleep after restart`)
     await backend.stopRoomPod(room.id)
     rooms.update(room.id, { status: 'sleeping', hostPort: null })

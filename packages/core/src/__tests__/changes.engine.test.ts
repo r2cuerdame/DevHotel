@@ -28,7 +28,7 @@ function ctx(roomId = 'room1abc'): ChangeCtx {
     room: () => rooms.get(roomId)!,
     webSpec: (overrides) => {
       const r = rooms.get(roomId)!
-      const gen = Number(settings.get(`depsGen:${roomId}`) ?? '0')
+      const gen = Number(settings.get(`depsGen:${roomId}:node${r.runtime.version}`) ?? '0')
       return {
         roomId,
         internalPort: r.internalPort,
@@ -136,12 +136,27 @@ describe('deps clean reinstall', () => {
   it('installs into a fresh generation volume and undo swaps back', async () => {
     const entry = await engine.execute(ctx(), 'deps-install', { clean: true }, 'user')
     expect(entry.status).toBe('verified')
-    expect(settings.get('depsGen:room1abc')).toBe('1')
+    expect(settings.get('depsGen:room1abc:node22')).toBe('1')
+    expect(backend.calls).toContain('resetVolume:dh-room1abc-deps-node22-g1')
     expect(backend.calls).toContain('runOneShot:dh-room1abc-deps-node22-g1:pnpm install')
     expect(backend.calls).toContain('recreateWeb:room1abc:node22:dh-room1abc-deps-node22-g1')
 
     await engine.undo(ctx(), entry.id, 'user')
-    expect(settings.get('depsGen:room1abc')).toBe('0')
+    expect(settings.get('depsGen:room1abc:node22')).toBe('0')
+  })
+
+  it('never recycles an undone generation volume', async () => {
+    const first = await engine.execute(ctx(), 'deps-install', { clean: true }, 'user')
+    await engine.undo(ctx(), first.id, 'user')
+    await engine.execute(ctx(), 'deps-install', { clean: true }, 'user')
+    expect(settings.get('depsGen:room1abc:node22')).toBe('2')
+    expect(backend.calls).toContain('resetVolume:dh-room1abc-deps-node22-g2')
+  })
+
+  it('refuses to undo a clean reinstall after the room switched node majors', async () => {
+    const entry = await engine.execute(ctx(), 'deps-install', { clean: true }, 'user')
+    await engine.execute(ctx(), 'node-version', { version: '24' }, 'user')
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/Node 22/)
   })
 
   it('plain install is honestly non-undoable', async () => {

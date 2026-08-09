@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import type { PmKind, RoomPlan, SourceType } from '@devhotel/shared'
 import { api } from '../api'
-import { useStore } from '../state/store'
+import { useStore, useT } from '../state/store'
+import type { Translation } from '../i18n'
 
 const NODE_MAJORS = ['18', '20', '22', '24']
 
@@ -10,6 +11,7 @@ export function NewRoomWizard(): React.JSX.Element {
   const planRoom = useStore((s) => s.planRoom)
   const createRoom = useStore((s) => s.createRoom)
   const toast = useStore((s) => s.toast)
+  const t = useT()
 
   const [step, setStep] = useState<'source' | 'plan'>('source')
   const [sourceType, setSourceType] = useState<SourceType>('managed-git')
@@ -27,7 +29,7 @@ export function NewRoomWizard(): React.JSX.Element {
   const [domain, setDomain] = useState('')
   const [https, setHttps] = useState(false)
 
-  const chooseSource = (t: SourceType): void => setSourceType(t)
+  const chooseSource = (type: SourceType): void => setSourceType(type)
 
   async function pickFolder(): Promise<void> {
     const folder = await api.app.pickFolder()
@@ -87,25 +89,25 @@ export function NewRoomWizard(): React.JSX.Element {
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         {step === 'source' ? (
           <>
-            <h2>New Room</h2>
+            <h2>{t('lobby.newRoom')}</h2>
             <div className="source-choices">
               {(
                 [
-                  ['managed-git', 'GitHub repository', 'Cloned into the room'],
-                  ['linked-folder', 'Local folder', 'Linked — your files stay put'],
-                  ['empty', 'Empty room', 'Start from nothing']
-                ] as [SourceType, string, string][]
-              ).map(([t, label, hint]) => (
-                <button key={t} className="source-choice" data-active={sourceType === t} onClick={() => chooseSource(t)}>
-                  <b>{label}</b>
-                  <small>{hint}</small>
+                  ['managed-git', 'wizard.sourceGit', 'wizard.sourceGitHint'],
+                  ['linked-folder', 'wizard.sourceFolder', 'wizard.sourceFolderHint'],
+                  ['empty', 'wizard.sourceEmpty', 'wizard.sourceEmptyHint']
+                ] as [SourceType, keyof Translation, keyof Translation][]
+              ).map(([type, label, hint]) => (
+                <button key={type} className="source-choice" data-active={sourceType === type} onClick={() => chooseSource(type)}>
+                  <b>{t(label)}</b>
+                  <small>{t(hint)}</small>
                 </button>
               ))}
             </div>
 
             {sourceType === 'managed-git' && (
               <div className="field">
-                <label htmlFor="src-url">Repository URL</label>
+                <label htmlFor="src-url">{t('wizard.repoUrl')}</label>
                 <input
                   id="src-url"
                   placeholder="https://github.com/you/project"
@@ -117,7 +119,7 @@ export function NewRoomWizard(): React.JSX.Element {
             )}
             {sourceType === 'linked-folder' && (
               <div className="field">
-                <label htmlFor="src-path">Project folder</label>
+                <label htmlFor="src-path">{t('wizard.projectFolder')}</label>
                 <div className="row">
                   <input
                     id="src-path"
@@ -127,7 +129,7 @@ export function NewRoomWizard(): React.JSX.Element {
                     style={{ flex: 1 }}
                   />
                   <button className="btn" onClick={() => void pickFolder()}>
-                    Browse…
+                    {t('wizard.browse')}
                   </button>
                 </div>
               </div>
@@ -135,39 +137,37 @@ export function NewRoomWizard(): React.JSX.Element {
 
             <div className="field-row">
               <div className="field">
-                <label htmlFor="proj">Project name</label>
-                <input id="proj" placeholder="auto" value={project} onChange={(e) => setProject(e.target.value)} />
+                <label htmlFor="proj">{t('wizard.projectName')}</label>
+                <input id="proj" placeholder={t('wizard.auto')} value={project} onChange={(e) => setProject(e.target.value)} />
               </div>
               <div className="field">
-                <label htmlFor="nick">Room nickname</label>
+                <label htmlFor="nick">{t('wizard.nickname')}</label>
                 <input id="nick" value={nickname} onChange={(e) => setNickname(e.target.value)} />
               </div>
             </div>
 
             <div className="modal-actions">
               <button className="btn" onClick={() => openWizard(false)}>
-                Cancel
+                {t('common.cancel')}
               </button>
               <button className="btn primary" disabled={!sourceValid || !nickname || loading} onClick={() => void analyze()}>
-                {loading ? 'Analyzing…' : 'Analyze project'}
+                {loading ? t('wizard.analyzing') : t('wizard.analyze')}
               </button>
             </div>
           </>
         ) : (
           <>
-            <h2>
-              Room plan — {project} / {nickname}
-            </h2>
+            <h2>{t('wizard.planTitle', { project, nickname })}</h2>
             <table className="plan-table">
               <tbody>
                 {plan?.framework && (
                   <tr>
-                    <td>Project</td>
+                    <td>{t('label.project')}</td>
                     <td>{plan.framework}</td>
                   </tr>
                 )}
                 <tr>
-                  <td>Runtime</td>
+                  <td>{t('label.runtime')}</td>
                   <td>
                     <div className="row">
                       <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
@@ -182,7 +182,7 @@ export function NewRoomWizard(): React.JSX.Element {
                   </td>
                 </tr>
                 <tr>
-                  <td>Package manager</td>
+                  <td>{t('label.packageManager')}</td>
                   <td>
                     <div className="row">
                       <select value={pmKind} onChange={(e) => setPmKind(e.target.value as PmKind)} style={{ width: 110 }}>
@@ -194,13 +194,13 @@ export function NewRoomWizard(): React.JSX.Element {
                   </td>
                 </tr>
                 <tr>
-                  <td>Start command</td>
+                  <td>{t('label.startCommand')}</td>
                   <td>
                     <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
                   </td>
                 </tr>
                 <tr>
-                  <td>Internal port</td>
+                  <td>{t('label.internalPort')}</td>
                   <td>
                     <div className="row">
                       <input
@@ -214,7 +214,7 @@ export function NewRoomWizard(): React.JSX.Element {
                   </td>
                 </tr>
                 <tr>
-                  <td>Domain</td>
+                  <td>{t('label.domain')}</td>
                   <td>
                     <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
                   </td>
@@ -223,7 +223,7 @@ export function NewRoomWizard(): React.JSX.Element {
                   <td>HTTPS</td>
                   <td>
                     <label className="row" style={{ gap: 6 }}>
-                      <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> Enable
+                      <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> {t('wizard.enable')}
                     </label>
                   </td>
                 </tr>
@@ -240,10 +240,10 @@ export function NewRoomWizard(): React.JSX.Element {
 
             <div className="modal-actions">
               <button className="btn" onClick={() => setStep('source')} disabled={loading}>
-                Back
+                {t('common.back')}
               </button>
               <button className="btn primary" onClick={() => void checkIn()} disabled={loading || !startCommand || !domain}>
-                {loading ? 'Preparing room…' : 'Check in'}
+                {loading ? t('wizard.preparingRoom') : t('wizard.checkIn')}
               </button>
             </div>
           </>

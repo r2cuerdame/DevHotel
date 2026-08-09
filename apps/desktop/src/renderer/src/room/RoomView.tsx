@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import { STATUS_LABEL, useStore } from '../state/store'
+import { statusLabel, useStore, useT } from '../state/store'
 import { BrowserBar } from './BrowserBar'
 import { DetailPanel } from './DetailPanel'
 
@@ -8,6 +8,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
   const busy = useStore((s) => s.busy[roomId])
   const roomAction = useStore((s) => s.roomAction)
+  const t = useT()
   const [panelOpen, setPanelOpen] = useState(false)
   const hostRef = useRef<HTMLDivElement>(null)
 
@@ -40,7 +41,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
     return (
       <div className="room-view">
         <div className="preview-overlay">
-          <span className="plate">Room not found</span>
+          <span className="plate">{t('room.notFound')}</span>
         </div>
       </div>
     )
@@ -58,20 +59,18 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
                 <span>{busy}</span>
               ) : room.status === 'sleeping' ? (
                 <>
-                  <span>This room is asleep. Everything is kept as you left it.</span>
+                  <span>{t('room.asleepHint')}</span>
                   <button className="btn primary" onClick={() => void roomAction(roomId, 'start')}>
-                    Wake room
+                    {t('room.wakeRoom')}
                   </button>
                 </>
               ) : room.status === 'preparing' ? (
-                <span>Preparing the room…</span>
+                <span>{t('room.preparingHint')}</span>
               ) : (
                 <>
-                  <span>
-                    {STATUS_LABEL[room.status]} — the site is not reachable. Open Diagnostics to see which check failed.
-                  </span>
+                  <span>{t('room.unreachableHint', { status: statusLabel(t, room.status) })}</span>
                   <button className="btn" onClick={() => setPanelOpen(true)}>
-                    Open diagnostics
+                    {t('room.openDiagnostics')}
                   </button>
                 </>
               )}

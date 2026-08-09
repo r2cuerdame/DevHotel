@@ -13,6 +13,8 @@ import type {
 } from '@devhotel/shared'
 import { IPC } from '@devhotel/shared'
 import { api } from '../api'
+import { detectLocale, isLocaleId, translate } from '../i18n'
+import type { LocaleId, TFunc, Translation } from '../i18n'
 
 export interface Toast {
   id: number
@@ -34,8 +36,10 @@ interface DhState {
   wizardOpen: boolean
   busy: Record<string, string>
   toasts: Toast[]
+  lang: LocaleId
 
   init(): void
+  setLang(l: LocaleId): void
   toast(kind: Toast['kind'], text: string): void
   dismissToast(id: number): void
   openRoom(roomId: string): void
@@ -69,8 +73,15 @@ export const useStore = create<DhState>((set, get) => ({
   wizardOpen: false,
   busy: {},
   toasts: [],
+  lang: detectLocale(),
 
   init() {
+    void api.settings
+      .get('lang')
+      .then((v) => {
+        if (v && isLocaleId(v)) set({ lang: v })
+      })
+      .catch(() => undefined)
     void get().refreshRooms()
     void get().refreshGateway()
     void api.ca.status().then((caStatus) => set({ caStatus })).catch(() => undefined)
@@ -90,6 +101,11 @@ export const useStore = create<DhState>((set, get) => ({
       set((s) => ({ previews: { ...s.previews, [p.roomId]: p } }))
     })
     api.on(IPC.evUpdate, (u: UpdateStatusInfo) => set({ update: u }))
+  },
+
+  setLang(l) {
+    set({ lang: l })
+    void api.settings.set('lang', l).catch(() => undefined)
   },
 
   toast(kind, text) {
@@ -149,21 +165,26 @@ export const useStore = create<DhState>((set, get) => ({
       get().openRoom(room.id)
       return room
     } catch (err) {
-      get().toast('error', `Check-in failed: ${err instanceof Error ? err.message : String(err)}`)
+      get().toast('error', translate(get().lang, 'toast.checkInFailed', { message: err instanceof Error ? err.message : String(err) }))
       return null
     }
   },
 
   async roomAction(roomId, action) {
-    const labels = { start: 'Waking room…', sleep: 'Putting room to sleep…', restart: 'Restarting…', delete: 'Checking out…' }
-    set((s) => ({ busy: { ...s.busy, [roomId]: labels[action] } }))
+    const labels: Record<typeof action, keyof Translation> = {
+      start: 'busy.waking',
+      sleep: 'busy.sleeping',
+      restart: 'busy.restarting',
+      delete: 'busy.deleting'
+    }
+    set((s) => ({ busy: { ...s.busy, [roomId]: translate(get().lang, labels[action]) } }))
     try {
       if (action === 'start') await api.rooms.start(roomId)
       else if (action === 'sleep') await api.rooms.sleep(roomId)
       else if (action === 'restart') await api.rooms.restartWeb(roomId)
       else {
         const { reclaimedBytes } = await api.rooms.delete(roomId)
-        get().toast('success', `Room deleted — ${formatBytes(reclaimedBytes)} reclaimed`)
+        get().toast('success', translate(get().lang, 'toast.roomDeleted', { size: formatBytes(reclaimedBytes) }))
         get().backToLobby()
       }
     } catch (err) {
@@ -182,7 +203,15 @@ export const useStore = create<DhState>((set, get) => ({
   async applyChange(roomId, change) {
     try {
       const entry = await api.changes.apply(roomId, change, 'user')
-      get().toast(entry.verify?.ok ? 'success' : 'error', entry.verify?.ok ? `${entry.title} ✓` : `${entry.title} failed — ${entry.verify?.detail ?? 'see diagnostics'}`)
+      get().toast(
+        entry.verify?.ok ? 'success' : 'error',
+        entry.verify?.ok
+          ? `${entry.title} ✓`
+          : translate(get().lang, 'toast.changeFailed', {
+              title: entry.title,
+              detail: entry.verify?.detail ?? translate(get().lang, 'toast.seeDiagnostics')
+            })
+      )
       await get().refreshInspection(roomId)
       return entry
     } catch (err) {
@@ -194,7 +223,7 @@ export const useStore = create<DhState>((set, get) => ({
   async undoChange(roomId, changeId) {
     try {
       const entry = await api.changes.undo(roomId, changeId)
-      get().toast('success', `Undone: ${entry.title}`)
+      get().toast('success', translate(get().lang, 'toast.undone', { title: entry.title }))
       await get().refreshInspection(roomId)
     } catch (err) {
       get().toast('error', err instanceof Error ? err.message : String(err))
@@ -216,7 +245,7 @@ export const useStore = create<DhState>((set, get) => ({
     try {
       const text = await api.diag.copy(roomId)
       await navigator.clipboard.writeText(text)
-      get().toast('success', 'Diagnostic copied — secrets redacted')
+      get().toast('success', translate(get().lang, 'toast.diagCopied'))
     } catch (err) {
       get().toast('error', err instanceof Error ? err.message : String(err))
     }
@@ -251,11 +280,20 @@ export function stackLine(room: RoomRecord): string {
   return `Node ${room.runtime.version} · ${pm}${room.https ? ' · HTTPS' : ''}`
 }
 
-export const STATUS_LABEL: Record<RoomRecord['status'], string> = {
-  preparing: 'Preparing',
-  running: 'Running',
-  ready: 'Ready',
-  sleeping: 'Sleeping',
-  attention: 'Needs attention',
-  broken: 'Broken'
+const STATUS_KEY: Record<RoomRecord['status'], keyof Translation> = {
+  preparing: 'status.preparing',
+  running: 'status.running',
+  ready: 'status.ready',
+  sleeping: 'status.sleeping',
+  attention: 'status.attention',
+  broken: 'status.broken'
+}
+
+export function statusLabel(t: TFunc, status: RoomRecord['status']): string {
+  return t(STATUS_KEY[status])
+}
+
+export function useT(): TFunc {
+  const lang = useStore((s) => s.lang)
+  return (key, vars) => translate(lang, key, vars)
 }

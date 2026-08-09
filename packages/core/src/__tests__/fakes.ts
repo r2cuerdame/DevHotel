@@ -101,6 +101,9 @@ export class FakeBackend implements IsolationBackend {
     return true
   }
   async pullImage() {}
+  async resetVolume(name: string) {
+    this.calls.push(`resetVolume:${name}`)
+  }
 }
 
 export class FakeGateway {
@@ -140,9 +143,11 @@ export class FakeGateway {
   }
 }
 
-/** Real TCP listener so verifyWebUp's port probe succeeds. */
+/** Real TCP listener answering with data so verifyWebUp's data-level probe succeeds. */
 export async function listeningPort(): Promise<{ port: number; close: () => void }> {
-  const server: Server = createServer((socket) => socket.end())
+  const server: Server = createServer((socket) => {
+    socket.on('data', () => socket.end('HTTP/1.0 200 OK\r\ncontent-length: 0\r\n\r\n'))
+  })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = (server.address() as { port: number }).port
   return { port, close: () => server.close() }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Actor, ChangeEntry } from '@devhotel/shared'
 import type { ChangeCtx, ChangeDefinition } from './types'
+import { verifyWebUp } from './types'
 
 export class ChangeEngine {
   private defs = new Map<string, ChangeDefinition<any>>()
@@ -103,6 +104,8 @@ export class ChangeEngine {
     await def.undo(ctx, entry)
     ctx.changes.setStatus(entry.id, 'undone', { undoneAt: new Date().toISOString() })
 
+    const verify = await verifyWebUp(ctx)
+    if (!verify.ok) ctx.log(`undo verify failed: ${verify.detail}`)
     return ctx.changes.append({
       id: randomUUID(),
       roomId: ctx.roomId,
@@ -114,10 +117,10 @@ export class ChangeEngine {
       after: entry.before,
       captured: null,
       steps: [`reverted change #${entry.seq} via ${entry.undoStrategy}`],
-      verify: { ok: true, detail: 'previous state restored' },
+      verify,
       undoable: false,
       undoStrategy: 'none',
-      status: 'verified',
+      status: verify.ok ? 'verified' : 'applied',
       rawLogPath: null,
       createdAt: new Date().toISOString(),
       undoneAt: null

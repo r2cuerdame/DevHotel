@@ -63,6 +63,7 @@ export class RoomOrchestrator {
   readonly logs: LogHub
   private readonly engine = new ChangeEngine()
   private readonly emitter = new EventEmitter()
+  private readonly roomOps = new Map<string, Promise<unknown>>()
   private readonly userData: string
   private readonly backend: IsolationBackend
   private readonly gateway: Gateway
@@ -93,16 +94,32 @@ export class RoomOrchestrator {
 
   async shutdown(): Promise<void> {
     for (const room of this.rooms.list()) {
-      if (room.status !== 'sleeping' && room.status !== 'broken') {
-        try {
+      if (room.status === 'sleeping') continue
+      try {
+        if (room.status === 'broken') {
+          // broken rooms may still own running containers — stop them but keep the status visible
+          await this.backend.stopRoomPod(room.id)
+          this.rooms.update(room.id, { hostPort: null })
+        } else {
           await this.sleepRoom(room.id, 'devhotel')
-        } catch {
-          // best effort on quit
         }
+      } catch {
+        // best effort on quit
       }
     }
     this.logs.dispose()
     await this.gateway.stop()
+  }
+
+  /** Serializes lifecycle mutations per room — concurrent UI/MCP calls queue instead of interleaving docker operations. */
+  private withRoomLock<T>(roomId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.roomOps.get(roomId) ?? Promise.resolve()
+    const next = prev.catch(() => undefined).then(fn)
+    this.roomOps.set(
+      roomId,
+      next.catch(() => undefined)
+    )
+    return next
   }
 
   onEvent(cb: (e: OrchestratorEvent) => void): () => void {
@@ -184,22 +201,24 @@ export class RoomOrchestrator {
     this.emit(id, 'created')
     this.olog(id, `create room ${record.project}/${record.nickname} (node ${record.runtime.version}, ${record.packageManager.kind})`)
 
-    try {
-      const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record))
-      this.rooms.update(id, { hostPort, status: 'running' })
-      this.logs.attach(id)
+    await this.withRoomLock(id, async () => {
+      try {
+        const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record))
+        this.rooms.update(id, { hostPort, status: 'running' })
+        this.logs.attach(id)
 
-      if (record.sourceType !== 'empty') {
-        await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
+        if (record.sourceType !== 'empty') {
+          await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
+        }
+        await this.syncRouteFor(id)
+        const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
+        this.rooms.update(id, { status: verify.ok ? 'ready' : 'attention', lastUsedAt: new Date().toISOString() })
+        this.olog(id, `room up: ${verify.detail}`)
+      } catch (err) {
+        this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
+        this.rooms.update(id, { status: 'broken' })
       }
-      await this.syncRouteFor(id)
-      const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
-      this.rooms.update(id, { status: verify.ok ? 'ready' : 'attention', lastUsedAt: new Date().toISOString() })
-      this.olog(id, `room up: ${verify.detail}`)
-    } catch (err) {
-      this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
-      this.rooms.update(id, { status: 'broken' })
-    }
+    })
 
     const room = this.rooms.get(id)!
     await writeManifest(this.userData, room)
@@ -207,9 +226,14 @@ export class RoomOrchestrator {
     return room
   }
 
-  async startRoom(roomId: string, _actor: Actor): Promise<void> {
+  startRoom(roomId: string, actor: Actor): Promise<void> {
+    return this.withRoomLock(roomId, () => this.startRoomLocked(roomId, actor))
+  }
+
+  private async startRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
-    if (room.status === 'running' || room.status === 'ready') return
+    // a 'ready' room with no hostPort cannot actually be up — fall through and wake it
+    if ((room.status === 'running' || room.status === 'ready') && room.hostPort != null) return
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
@@ -234,7 +258,11 @@ export class RoomOrchestrator {
     this.emit(roomId, 'status')
   }
 
-  async sleepRoom(roomId: string, _actor: Actor): Promise<void> {
+  sleepRoom(roomId: string, actor: Actor): Promise<void> {
+    return this.withRoomLock(roomId, () => this.sleepRoomLocked(roomId, actor))
+  }
+
+  private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'sleep room')
     this.logs.detach(roomId)
@@ -245,13 +273,20 @@ export class RoomOrchestrator {
     this.emit(roomId, 'status')
   }
 
-  async restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
-    const entry = await this.engine.execute(this.ctxFor(roomId), 'restart-web', {}, actor)
-    this.emit(roomId, 'change')
-    return entry
+  restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
+    return this.withRoomLock(roomId, async () => {
+      const entry = await this.engine.execute(this.ctxFor(roomId), 'restart-web', {}, actor)
+      this.reattachLogs(roomId)
+      this.emit(roomId, 'change')
+      return entry
+    })
   }
 
-  async deleteRoom(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
+  deleteRoom(roomId: string, actor: Actor): Promise<{ reclaimedBytes: number }> {
+    return this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+  }
+
+  private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
     this.logs.detach(roomId)
@@ -282,24 +317,46 @@ export class RoomOrchestrator {
     return this.changes.list(roomId)
   }
 
-  async applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
-    const entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
-    const room = this.mustGet(roomId)
-    if (entry.verify && room.status !== 'sleeping' && room.status !== 'preparing') {
-      this.rooms.update(roomId, { status: entry.verify.ok ? 'ready' : 'attention' })
-    }
-    await writeManifest(this.userData, this.mustGet(roomId))
-    this.emit(roomId, 'change', entry.title)
-    this.emit(roomId, 'status')
-    return entry
+  applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
+    return this.withRoomLock(roomId, async () => {
+      const entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
+      this.syncStatusFromVerify(roomId, entry)
+      this.reattachLogs(roomId)
+      await writeManifest(this.userData, this.mustGet(roomId))
+      this.emit(roomId, 'change', entry.title)
+      this.emit(roomId, 'status')
+      return entry
+    })
   }
 
-  async undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
-    const entry = await this.engine.undo(this.ctxFor(roomId), changeId, actor)
-    await writeManifest(this.userData, this.mustGet(roomId))
-    this.emit(roomId, 'change', entry.title)
-    this.emit(roomId, 'status')
-    return entry
+  undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
+    return this.withRoomLock(roomId, async () => {
+      const entry = await this.engine.undo(this.ctxFor(roomId), changeId, actor)
+      this.syncStatusFromVerify(roomId, entry)
+      this.reattachLogs(roomId)
+      await writeManifest(this.userData, this.mustGet(roomId))
+      this.emit(roomId, 'change', entry.title)
+      this.emit(roomId, 'status')
+      return entry
+    })
+  }
+
+  /** Only rooms that are actually awake take their status from a change verify — broken/sleeping rooms keep theirs. */
+  private syncStatusFromVerify(roomId: string, entry: ChangeEntry): void {
+    const room = this.mustGet(roomId)
+    const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+    if (entry.verify && awake) {
+      this.rooms.update(roomId, { status: entry.verify.ok ? 'ready' : 'attention' })
+    }
+  }
+
+  /** The `docker logs -f` pump dies with its container — re-arm it after operations that may have recreated the web container. */
+  private reattachLogs(roomId: string): void {
+    const room = this.rooms.get(roomId)
+    if (room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')) {
+      this.logs.detach(roomId)
+      this.logs.attach(roomId)
+    }
   }
 
   async runChecks(roomId: string): Promise<CheckReport> {
@@ -397,7 +454,9 @@ export class RoomOrchestrator {
   }
 
   private depsGen(roomId: string): number {
-    const raw = this.settings.get(`depsGen:${roomId}`)
+    const room = this.rooms.get(roomId)
+    const major = room?.runtime.version ?? ''
+    const raw = this.settings.get(`depsGen:${roomId}:node${major}`) ?? this.settings.get(`depsGen:${roomId}`)
     return raw ? Number.parseInt(raw, 10) : 0
   }
 
