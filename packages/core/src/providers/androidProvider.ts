@@ -19,18 +19,18 @@ export const ANDROID_DEFAULT_BUILD_COMMAND =
 const GRADLE_FILES = ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts']
 
 /**
- * Android build rooms (design doc v1): containerized JDK + SDK + Gradle with
- * per-room caches — build APKs without touching the host. Managed emulator and
- * preview are v2 (docs/superpowers/specs/2026-08-10-android-room-provider-design.md).
+ * Android rooms: containerized JDK + SDK + Gradle with per-room caches build
+ * APKs without touching the host, and a KVM-backed emulator sidecar serves the
+ * phone screen (noVNC) as the room's "site" through the anchor relay.
  */
 export class AndroidRoomProvider implements RoomProvider {
   readonly info: RoomProviderInfo = {
     kind: 'android',
-    label: 'Android Room (build)',
+    label: 'Android Room',
     available: true,
-    execution: 'build-only',
-    preview: 'none',
-    requiresKvm: false
+    execution: 'served',
+    preview: 'browser',
+    requiresKvm: true
   }
 
   async detect(src: SourceReader, opts: DetectOptions): Promise<RoomPlan> {
@@ -49,9 +49,7 @@ export class AndroidRoomProvider implements RoomProvider {
       runtime: { kind: 'jdk', value: '17', source: 'sdk image' },
       packageManager: { value: 'gradle', source: 'gradle project' },
       startCommand: { value: opts.overrides?.startCommand ?? ANDROID_DEFAULT_BUILD_COMMAND, source: opts.overrides?.startCommand ? 'user override' : 'default' },
-      // RoomRecord still carries a legacy port-shaped field, but build-only
-      // Android Rooms never publish or route it.
-      internalPort: { value: 6080, source: 'build-only compatibility metadata' },
+      internalPort: { value: 6080, source: 'emulator screen' },
       domain: slugifyDomain(opts.project, opts.nickname),
       https: false,
       warnings
@@ -61,8 +59,7 @@ export class AndroidRoomProvider implements RoomProvider {
   buildSpec(room: RoomRecord, overrides?: Partial<WebSpec>): WebSpec {
     return {
       roomId: room.id,
-      // Build-only Rooms own a network but never create an anchor, published
-      // port, browser preview, or KVM-backed emulator.
+      // the room's "site" is the emulator screen (noVNC) relayed by the anchor
       internalPort: room.internalPort || 6080,
       nodeMajor: room.runtime.version,
       sourceType: room.sourceType,
@@ -72,7 +69,6 @@ export class AndroidRoomProvider implements RoomProvider {
       startCommand: ANDROID_KEEPALIVE_COMMAND,
       env: { GRADLE_USER_HOME: '/cache/gradle' },
       imageOverride: ANDROID_IMAGE,
-      standalone: true,
       noDepsVolume: true,
       // persists AGP's auto-installed platforms/build-tools across container recreates;
       // docker seeds the volume from the image (cmdline-tools + pre-accepted licenses)

@@ -22,7 +22,7 @@ Quick Start · Quick Change
 - A working Web Room can be cloned into `stage` or `node24-test`, optionally including dependencies and service data; the clone receives a fresh isolated browser profile.
 - Quick Changes run as verified transactions with **action-level Undo**: `↶ Undo: Node 22 → 24`.
 - When something breaks, a 14-step check pipeline tells you *which* layer failed, and **Copy Diagnostic** produces a secret-redacted bundle you can paste into an issue or an LLM.
-- Web is the primary served-site provider. The Desktop client also exposes an Android build-only Room that needs no Host SDK, Host `adb`, emulator, or KVM; device execution remains a later Hotel Device Service.
+- Web is the primary served-site provider. The Desktop client also exposes an Android Room that builds APKs without any Host SDK or `adb` and shows a Room-owned KVM-backed emulator screen as its site; shared physical devices remain a later Hotel Device Service.
 
 See [goal.md](./goal.md) for the full product definition (Korean).
 
@@ -112,7 +112,7 @@ packages/mcp      devhotel-mcp — stdio MCP server over the control API
 packages/shared   Types and contracts
 ```
 
-Each served Web Room uses an **anchor** relay and a web runtime on its owned network. The gateway routes `<project>-<nickname>.localhost` domains to Rooms, so port numbers stay invisible. Android build-only Rooms instead run a standalone build runtime on an owned Room network and publish no port or preview. Dependency volumes are keyed by Node major (`…-deps-node22`, `…-deps-node24`), which is why a Node version change undoes instantly.
+Each served Room uses an **anchor** relay on its owned network. The gateway routes `<project>-<nickname>.localhost` domains to Rooms, so port numbers stay invisible. Web Rooms serve their site; Android Rooms run the build runtime plus a KVM-backed emulator sidecar in the same netns, and the emulator's noVNC screen is the Room's routed site. Dependency volumes are keyed by Node major (`…-deps-node22`, `…-deps-node24`), which is why a Node version change undoes instantly.
 
 This describes the current external-Docker developer preview. The target release architecture adds a DevHotel-owned runtime bootstrap, dedicated data root, storage cleanup, and uninstall manifest around the room backend.
 

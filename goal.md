@@ -217,7 +217,7 @@ Room 환경은 사용자의 명시적인 변경 또는 프로젝트 선언에 �
 
 첫 번째 제품의 일상 개발 UX와 격리 검증은 Web Room을 기준으로 한다.
 
-현재 Preview에는 Host SDK·`adb`·KVM·emulator 없이 APK를 만드는 Android **build-only Room**까지 포함한다. Android physical device/emulator 실행은 Hotel Device Service, lease/queue, permission과 artifact handoff가 준비된 뒤 연결하며 build Room에 Host `adb` 권한을 직접 주지 않는다.
+현재 Preview에는 Host SDK·`adb` 없이 APK를 만들고, Room 소유 KVM 기반 emulator sidecar의 화면(noVNC)을 Room의 사이트로 보여주는 **Android Room**까지 포함한다. 이 in-room emulator는 개발 편의를 위한 Room-scoped 기능이며, physical device와 공유 device pool 실행은 Hotel Device Service, lease/queue, permission과 artifact handoff가 준비된 뒤 연결한다. Room에 Host `adb` 권한을 직접 주지 않는다.
 
 ### 4.11 Agent first, Human supervised
 

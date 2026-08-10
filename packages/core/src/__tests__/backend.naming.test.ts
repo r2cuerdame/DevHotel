@@ -4,11 +4,13 @@ import {
   RELAY_PORT,
   anchorName,
   buildAnchorArgs,
+  buildEmulatorArgs,
   buildOneShotArgs,
   buildRoomNetworkCreateArgs,
   buildWebCreateArgs,
   cacheVolume,
   depsVolume,
+  emulatorAvdOverride,
   parsePortOutput,
   roomNetworkName,
   srcVolume,
@@ -158,6 +160,29 @@ describe('buildWebCreateArgs', () => {
     const i = args.indexOf('--network')
     expect(args[i + 1]).toBe('dh-r1-net')
     expect(args).not.toContain('container:dh-r1-anchor')
+  })
+
+  it('creates (not runs) the emulator in the anchor netns on the phone-sized screen', () => {
+    const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })
+    expect(args[0]).toBe('create')
+    expect(args).not.toContain('-d')
+    const net = args.indexOf('--network')
+    expect(args[net + 1]).toBe('container:dh-r1-anchor')
+    expect(args).toContain('SCREEN_WIDTH=540')
+    expect(args).toContain('SCREEN_HEIGHT=1140')
+    expect(args).toContain('EMULATOR_DEVICE=Samsung Galaxy S10')
+    expect(args).toContain('EMULATOR_CONFIG_PATH=/home/androidusr/devhotel-avd-override.ini')
+    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim')
+  })
+
+  it('scales the guest LCD per resolution preset for software rendering speed', () => {
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=1080')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=2280')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'fast')).toContain('hw.lcd.width=720')
+    expect(emulatorAvdOverride('Nexus 5', 'fast')).toContain('hw.lcd.height=960')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'native')).not.toContain('hw.lcd')
+    // default preset is 'balanced'
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.width=1080')
   })
 
   it('carries the devhotel labels', () => {

@@ -65,6 +65,10 @@ export const EMULATOR_DEFAULT_VERSION = '14.0'
 export const EMULATOR_IMAGE = emulatorImage(EMULATOR_DEFAULT_VERSION)
 export const EMULATOR_SCREEN_PORT = 6080
 export const EMULATOR_ADB_ADDR = 'localhost:5555'
+export const EMULATOR_SCREEN_WIDTH = 540
+export const EMULATOR_SCREEN_HEIGHT = 1140
+/** Where createEmulator stages the AVD override; docker-android appends it to config.ini at AVD creation. */
+export const EMULATOR_AVD_OVERRIDE_PATH = '/home/androidusr/devhotel-avd-override.ini'
 
 export function emulatorImage(version: string): string {
   return `budtmo/docker-android:emulator_${version}`
@@ -74,17 +78,54 @@ export function emulatorName(roomId: string): string {
   return `dh-${roomId}-svc-emulator`
 }
 
+export type EmulatorResolution = 'native' | 'balanced' | 'fast'
+
 export interface EmulatorOpts {
   device: string
   version: string
+  resolution?: EmulatorResolution
 }
 
+/** Native panel pixels and density of the AVD profiles offered in the Stack tab. */
+const EMULATOR_DEVICE_LCD: Record<string, { width: number; height: number; density: number }> = {
+  'Samsung Galaxy S10': { width: 1440, height: 3040, density: 640 },
+  'Samsung Galaxy S9': { width: 1440, height: 2960, density: 640 },
+  'Nexus 5': { width: 1080, height: 1920, density: 480 },
+  'Nexus 4': { width: 768, height: 1280, density: 320 },
+  'Nexus One': { width: 480, height: 800, density: 240 }
+}
+
+const EMULATOR_RESOLUTION_SCALE: Record<EmulatorResolution, number> = {
+  native: 1,
+  balanced: 0.75,
+  fast: 0.5
+}
+
+/**
+ * AVD config.ini override. The emulator has no GPU passthrough in the room
+ * (swiftshader renders in software), so shrinking the guest LCD is the single
+ * biggest speed lever; 'balanced' is the default for a usable phone.
+ */
+export function emulatorAvdOverride(device?: string, resolution: EmulatorResolution = 'balanced'): string {
+  const lcd = EMULATOR_DEVICE_LCD[device ?? EMULATOR_DEFAULT_DEVICE] ?? EMULATOR_DEVICE_LCD[EMULATOR_DEFAULT_DEVICE]!
+  const scale = EMULATOR_RESOLUTION_SCALE[resolution]
+  if (scale === 1) return '# DevHotel: native device resolution\n'
+  const even = (value: number): number => 2 * Math.round((value * scale) / 2)
+  return [
+    '# DevHotel: reduced guest LCD for software rendering speed',
+    `hw.lcd.width=${even(lcd.width)}`,
+    `hw.lcd.height=${even(lcd.height)}`,
+    `hw.lcd.density=${even(lcd.density)}`,
+    ''
+  ].join('\n')
+}
+
+/** `docker create` args — the container is started only after the openbox rules are staged inside. */
 export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
   return [
-    'run',
-    '-d',
+    'create',
     '--name',
     emulatorName(roomId),
     '--network',
@@ -108,9 +149,13 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     '-e',
     'EMULATOR_NO_SKIN=true',
     '-e',
-    'SCREEN_WIDTH=540',
+    `EMULATOR_CONFIG_PATH=${EMULATOR_AVD_OVERRIDE_PATH}`,
     '-e',
-    'SCREEN_HEIGHT=1140',
+    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim',
+    '-e',
+    `SCREEN_WIDTH=${EMULATOR_SCREEN_WIDTH}`,
+    '-e',
+    `SCREEN_HEIGHT=${EMULATOR_SCREEN_HEIGHT}`,
     '-e',
     'SCREEN_DEPTH=24',
     emulatorImage(version)

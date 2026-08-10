@@ -250,7 +250,7 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`copyToService:${svc}:${containerPath}`)
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
-  async createEmulator(roomId: string, opts?: { device: string; version: string }) {
+  async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }) {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)
     this.emulatorStateValue = 'running'
   }

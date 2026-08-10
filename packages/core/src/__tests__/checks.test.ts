@@ -66,21 +66,63 @@ describe('runChecks', () => {
     }
   })
 
-  it('checks Android as a build-only Room without preview, relay, emulator, or KVM probes', async () => {
+  it('checks an Android Room end to end including the relayed emulator screen', async () => {
+    const { port, close } = await listeningPort()
+    try {
+      const backend = new FakeBackend()
+      backend.emulatorStateValue = 'running'
+      backend.execInRoom = async (_roomId, cmd) => {
+        const command = cmd.join(' ')
+        if (command.includes('java -version')) {
+          return { code: 0, stdout: 'openjdk version "17.0.12"\n', stderr: '' }
+        }
+        if (command.includes('Gradle Wrapper')) {
+          return { code: 0, stdout: 'Gradle Wrapper', stderr: '' }
+        }
+        return { code: 1, stdout: '', stderr: 'unexpected command' }
+      }
+      const gateway = new FakeGateway()
+      const room = makeRoom({
+        provider: 'android',
+        sourceType: 'empty',
+        sourceRef: '',
+        workspaceMode: 'empty',
+        syncStatus: 'empty',
+        runtime: { kind: 'jdk', version: '17' },
+        packageManager: { kind: 'gradle' },
+        internalPort: 6080,
+        status: 'ready',
+        hostPort: port
+      })
+      const report = await runChecks(
+        ctxWith({
+          backend,
+          gateway: gateway.asGateway(),
+          room,
+          syncRoute: async () => {
+            await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: port, https: false })
+          }
+        })
+      )
+      const by = Object.fromEntries(report.results.map((result) => [result.step, result]))
+      expect(by.metadata!.summary).toContain(room.domain)
+      expect(by.runtime!.status).toBe('healthy')
+      expect(by['package-manager']!.summary).toBe('Gradle Wrapper')
+      expect(by.process!.summary).toBe('build container running')
+      expect(by.port!.status).toBe('healthy')
+      expect(by.port!.summary).toContain('emulator screen')
+      expect(by.gateway!.summary).toMatch(/restored/)
+      expect(by.http!.status).toBe('healthy')
+      expect(report.overall).toBe('healthy')
+    } finally {
+      close()
+    }
+  })
+
+  it('flags a missing emulator container on an awake Android Room', async () => {
     const backend = new FakeBackend()
-    backend.emulatorState = async () => {
-      throw new Error('Android checks must not probe KVM-backed emulator state')
-    }
-    backend.execInRoom = async (_roomId, cmd) => {
-      const command = cmd.join(' ')
-      if (command.includes('java -version')) {
-        return { code: 0, stdout: 'openjdk version "17.0.12"\n', stderr: '' }
-      }
-      if (command.includes('Gradle Wrapper')) {
-        return { code: 0, stdout: 'Gradle Wrapper', stderr: '' }
-      }
-      return { code: 1, stdout: '', stderr: 'unexpected command' }
-    }
+    backend.emulatorStateValue = 'missing'
+    backend.execInRoom = async () => ({ code: 0, stdout: 'ok', stderr: '' })
     const report = await runChecks(
       ctxWith({
         backend,
@@ -92,18 +134,14 @@ describe('runChecks', () => {
           syncStatus: 'empty',
           runtime: { kind: 'jdk', version: '17' },
           packageManager: { kind: 'gradle' },
+          internalPort: 6080,
           status: 'ready',
-          hostPort: null
+          hostPort: 45000
         })
       })
     )
-    const by = Object.fromEntries(report.results.map((result) => [result.step, result]))
-    expect(by.metadata!.summary).toContain('build-only · no preview')
-    expect(by.runtime!.status).toBe('healthy')
-    expect(by['package-manager']!.summary).toBe('Gradle Wrapper')
-    expect(by.process!.summary).toBe('build container running')
-    expect(by.gateway!.summary).toContain('no preview')
-    expect(by.http!.summary).toContain('no preview')
-    expect(report.overall).toBe('healthy')
+    const port = report.results.find((result) => result.step === 'port')!
+    expect(port.status).toBe('broken')
+    expect(port.summary).toContain('emulator container missing')
   })
 })

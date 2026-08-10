@@ -4,7 +4,7 @@ import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
 
-describe('Android build-only lifecycle', () => {
+describe('Android room lifecycle', () => {
   const dirs: string[] = []
   const dbs: Db[] = []
 
@@ -24,14 +24,8 @@ describe('Android build-only lifecycle', () => {
     return { backend, gateway, orch }
   }
 
-  it('creates a standalone Room with no relay, emulator, preview route, or KVM dependency', async () => {
+  it('creates a served Room whose site is the relayed emulator screen', async () => {
     const { backend, gateway, orch } = setup()
-    backend.createEmulator = async () => {
-      throw new Error('NO_KVM')
-    }
-    backend.removeEmulator = async () => {
-      throw new Error('emulator lifecycle must not be touched')
-    }
 
     const room = await orch.createRoom({
       provider: 'android',
@@ -42,15 +36,15 @@ describe('Android build-only lifecycle', () => {
       actor: 'user'
     })
 
-    expect(room).toMatchObject({ provider: 'android', status: 'ready', hostPort: null })
-    expect(backend.lastWebSpec).toMatchObject({ standalone: true, workspaceMode: 'empty' })
-    expect(backend.calls).not.toContain(expect.stringContaining('recreateAnchor'))
-    expect(backend.calls).not.toContain(expect.stringContaining('createEmulator'))
-    expect(gateway.status().routes).toEqual([])
-    expect(orch.inspectRoom(room.id).urls.app).toBe('about:blank')
+    expect(room).toMatchObject({ provider: 'android', status: 'ready', hostPort: backend.hostPort })
+    expect(backend.lastWebSpec).toMatchObject({ workspaceMode: 'empty', internalPort: 6080 })
+    expect(backend.lastWebSpec?.standalone).toBeUndefined()
+    expect(backend.calls.some((call) => call.startsWith('createEmulator:'))).toBe(true)
+    expect(gateway.status().routes).toEqual([{ domain: room.domain, roomId: room.id, https: false }])
+    expect(orch.inspectRoom(room.id).urls.app).toContain('/vnc.html?autoconnect=true')
   })
 
-  it('wakes a legacy Android record as build-only without touching retained emulator data', async () => {
+  it('wakes an Android record with a fresh anchor and a fresh emulator in its netns', async () => {
     const { backend, gateway, orch } = setup()
     const room = makeRoom({
       provider: 'android',
@@ -63,31 +57,49 @@ describe('Android build-only lifecycle', () => {
       startCommand: 'gradle assembleDebug --no-daemon',
       internalPort: 6080,
       status: 'sleeping',
-      hostPort: 45123,
-      android: { device: 'Samsung Galaxy S10', version: '14.0' }
+      hostPort: null,
+      android: { device: 'Pixel 6', version: '15.0' }
     })
     orch.rooms.create(room)
-    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 45123, https: false })
-    backend.recreateAnchor = async () => {
-      throw new Error('build-only wake must not recreate an anchor')
-    }
-    backend.createEmulator = async () => {
-      throw new Error('NO_KVM')
-    }
-    backend.removeEmulator = async () => {
-      throw new Error('retained emulator container/data must not be removed on wake')
-    }
 
     await orch.startRoom(room.id, 'user')
 
-    expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: null })
-    expect(backend.lastWebSpec?.standalone).toBe(true)
+    expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: backend.hostPort })
+    expect(backend.calls).toContain(`recreateAnchor:${room.id}:6080`)
+    const removeAt = backend.calls.indexOf(`removeEmulator:${room.id}`)
+    const createAt = backend.calls.indexOf(`createEmulator:${room.id}:Pixel 6:15.0`)
+    expect(removeAt).toBeGreaterThanOrEqual(0)
+    expect(createAt).toBeGreaterThan(removeAt)
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(true)
-    expect(gateway.status().routes).toEqual([])
+    expect(backend.calls.some((call) => call.startsWith('createService:'))).toBe(false)
+    expect(gateway.status().routes).toEqual([{ domain: room.domain, roomId: room.id, https: false }])
 
     const callsAfterWake = [...backend.calls]
     await orch.startRoom(room.id, 'user')
     expect(backend.calls).toEqual(callsAfterWake)
+  })
+
+  it('keeps the room usable for builds when the emulator cannot start (no KVM / pull failure)', async () => {
+    const { backend, orch } = setup()
+    backend.createEmulator = async () => {
+      throw new Error('NO_KVM: /dev/kvm cannot be found')
+    }
+
+    const room = await orch.createRoom({
+      provider: 'android',
+      sourceType: 'empty',
+      sourceRef: '',
+      project: 'android-nokvm',
+      nickname: 'dev',
+      actor: 'user'
+    })
+
+    expect(room.status).toBe('ready')
+    expect(backend.calls.some((call) => call.startsWith('recreateWeb:') || call.startsWith('createRoomPod:'))).toBe(true)
+
+    await orch.sleepRoom(room.id, 'user')
+    await orch.startRoom(room.id, 'user')
+    expect(orch.rooms.get(room.id)!.status).toBe('ready')
   })
 
   it('records an immutable APK build without marking the live working state as changed', async () => {

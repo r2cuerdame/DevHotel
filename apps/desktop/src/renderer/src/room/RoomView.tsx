@@ -1,17 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
+import { IPC, type PreviewLayout } from '@devhotel/shared'
 import { api } from '../api'
 import { statusLabel, useStore, useT } from '../state/store'
 import { BrowserBar } from './BrowserBar'
 import { RoomConfig, type ConfigTab } from './DetailPanel'
 import {
-  createSplitPreviewLayout,
+  clampSplitRatio,
+  createPreviewLayout,
   DEFAULT_DESKTOP_TABLET_PRESET,
   DEFAULT_MOBILE_PRESET,
   DESKTOP_TABLET_PRESETS,
   loadPreviewPresetId,
+  loadSplitEnabled,
+  loadSplitRatio,
   MOBILE_PRESETS,
-  savePreviewPresetId
+  PREVIEW_SPLIT_GUTTER,
+  savePreviewPresetId,
+  saveSplitEnabled,
+  saveSplitRatio,
+  splitLeftWidth
 } from './previewLayout'
+
+/** The emulator screen is portrait 540×1140 — the preview pins to that aspect. */
+const EMULATOR_ASPECT = { width: 540, height: 1140 }
 
 export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
@@ -22,21 +33,31 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const [configOpen, setConfigOpen] = useState(false)
   const [configTab, setConfigTab] = useState<ConfigTab>('overview')
   const [modalOpen, setModalOpen] = useState(false)
+  const [devtoolsOpen, setDevtoolsOpen] = useState(false)
   const [leftPreset, setLeftPreset] = useState(() =>
     loadPreviewPresetId(window.localStorage, roomId, 'left', DESKTOP_TABLET_PRESETS, DEFAULT_DESKTOP_TABLET_PRESET)
   )
   const [rightPreset, setRightPreset] = useState(() =>
     loadPreviewPresetId(window.localStorage, roomId, 'right', MOBILE_PRESETS, DEFAULT_MOBILE_PRESET)
   )
+  const [splitEnabled, setSplitEnabled] = useState(() => loadSplitEnabled(window.localStorage, roomId))
+  const [splitRatio, setSplitRatio] = useState(() => loadSplitRatio(window.localStorage, roomId))
+  /** non-null while the splitter is being dragged — native panes hide and DOM placeholders track the pointer */
+  const [dragRatio, setDragRatio] = useState<number | null>(null)
+  const [hostWidth, setHostWidth] = useState(0)
   const hostRef = useRef<HTMLDivElement>(null)
-  const previewLayout = createSplitPreviewLayout(leftPreset, rightPreset)
+
+  const android = room?.provider === 'android'
+  const previewLayout: PreviewLayout = android
+    ? { mode: 'single', leftViewport: null, rightViewport: { width: 390, height: 844 } }
+    : createPreviewLayout(leftPreset, rightPreset, splitEnabled, splitRatio)
   const previewLayoutRef = useRef(previewLayout)
   previewLayoutRef.current = previewLayout
 
-  const android = room?.provider === 'android'
-  const detailsOpen = android || configOpen
-  const showSite = running && !android
-  const previewVisible = showSite && !modalOpen && !detailsOpen
+  const detailsOpen = configOpen
+  const showSite = running
+  const dragging = dragRatio !== null
+  const previewVisible = showSite && !modalOpen && !detailsOpen && !dragging
 
   useEffect(() => {
     const el = hostRef.current
@@ -47,7 +68,14 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
     const report = (): void => {
       const r = el.getBoundingClientRect()
       if (r.width < 1 || r.height < 1) return
-      const bounds = { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }
+      setHostWidth(Math.round(r.width))
+      let bounds = { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }
+      if (android) {
+        // pin the phone screen to its aspect, full height and centered,
+        // so the device fills its frame edge to edge
+        const width = Math.min(bounds.width, Math.round((bounds.height * EMULATOR_ASPECT.width) / EMULATOR_ASPECT.height))
+        bounds = { x: bounds.x + Math.round((bounds.width - width) / 2), y: bounds.y, width, height: bounds.height }
+      }
       void api.preview
         .setBounds(roomId, bounds)
         .then(() => api.preview.layout(roomId, previewLayoutRef.current))
@@ -62,20 +90,29 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       window.removeEventListener('resize', report)
       void api.preview.detach().catch(() => undefined)
     }
-  }, [roomId, showSite])
+  }, [roomId, showSite, android])
 
   useEffect(() => {
-    if (!showSite) return
-    void api.preview.layout(roomId, previewLayout).catch(() => undefined)
-  }, [leftPreset, rightPreset, roomId, showSite])
+    if (!showSite || dragging) return
+    void api.preview.layout(roomId, previewLayoutRef.current).catch(() => undefined)
+  }, [leftPreset, rightPreset, splitEnabled, splitRatio, android, dragging, roomId, showSite])
 
   useEffect(() => savePreviewPresetId(window.localStorage, roomId, 'left', leftPreset), [leftPreset, roomId])
   useEffect(() => savePreviewPresetId(window.localStorage, roomId, 'right', rightPreset), [rightPreset, roomId])
+  useEffect(() => saveSplitEnabled(window.localStorage, roomId, splitEnabled), [splitEnabled, roomId])
+  useEffect(() => saveSplitRatio(window.localStorage, roomId, splitRatio), [splitRatio, roomId])
 
   useEffect(() => {
     if (!showSite) return
     void api.preview.setVisible(roomId, previewVisible).catch(() => undefined)
   }, [previewVisible, roomId, showSite])
+
+  useEffect(() => {
+    setDevtoolsOpen(false)
+    return api.on(IPC.evPreviewDevTools, (eventRoomId: string, open: boolean) => {
+      if (eventRoomId === roomId) setDevtoolsOpen(open)
+    })
+  }, [roomId])
 
   if (!room) {
     return (
@@ -87,13 +124,16 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
     )
   }
 
+  const splitterVisible = showSite && !android && splitEnabled && !devtoolsOpen && hostWidth > 60
+  const activeRatio = dragRatio ?? splitRatio
+  const splitterLeft = splitLeftWidth(hostWidth, activeRatio)
+
   return (
     <div className="room-view">
       <BrowserBar
         room={room}
         configOpen={detailsOpen}
         onToggleConfig={() => {
-          if (android) return
           if (!detailsOpen) void api.preview.setVisible(roomId, false).catch(() => undefined)
           setConfigOpen((open) => !open)
         }}
@@ -101,7 +141,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       />
       <div className="room-body">
         <div className={`preview-workbench${detailsOpen ? ' preview-host-hidden' : ''}`}>
-          {showSite && (
+          {showSite && !android && (
             <div className="preview-device-strip" aria-label={t('preview.responsiveViews')}>
               <PreviewSelector
                 icon="▣"
@@ -110,16 +150,61 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
                 presets={DESKTOP_TABLET_PRESETS}
                 onChange={setLeftPreset}
               />
-              <PreviewSelector
-                icon="▯"
-                label={t('preview.mobilePortrait')}
-                value={rightPreset}
-                presets={MOBILE_PRESETS}
-                onChange={setRightPreset}
-              />
+              <button
+                className="btn split-toggle"
+                data-active={splitEnabled || undefined}
+                aria-pressed={splitEnabled}
+                title={t('preview.splitHint')}
+                onClick={() => setSplitEnabled((enabled) => !enabled)}
+              >
+                <span aria-hidden>⿲</span> {t('preview.split')}
+              </button>
+              {splitEnabled && (
+                <PreviewSelector
+                  icon="▯"
+                  label={t('preview.mobilePortrait')}
+                  value={rightPreset}
+                  presets={MOBILE_PRESETS}
+                  onChange={setRightPreset}
+                />
+              )}
             </div>
           )}
           <div className="preview-host" ref={hostRef}>
+            {dragging && (
+              <div className="preview-drag-panes" aria-hidden>
+                <div className="preview-drag-pane" style={{ width: splitterLeft }} />
+                <div className="preview-drag-pane" style={{ left: splitterLeft + PREVIEW_SPLIT_GUTTER }} />
+              </div>
+            )}
+            {splitterVisible && (
+              <div
+                className="preview-splitter"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label={t('preview.splitHint')}
+                data-dragging={dragging || undefined}
+                style={{ left: splitterLeft }}
+                onPointerDown={(event) => {
+                  event.preventDefault()
+                  event.currentTarget.setPointerCapture(event.pointerId)
+                  setDragRatio(splitRatio)
+                }}
+                onPointerMove={(event) => {
+                  if (dragRatio === null) return
+                  const rect = hostRef.current?.getBoundingClientRect()
+                  if (!rect || rect.width <= PREVIEW_SPLIT_GUTTER + 2) return
+                  setDragRatio(clampSplitRatio((event.clientX - rect.x) / (rect.width - PREVIEW_SPLIT_GUTTER)))
+                }}
+                onPointerUp={() => {
+                  if (dragRatio !== null) setSplitRatio(dragRatio)
+                  setDragRatio(null)
+                }}
+                onPointerCancel={() => setDragRatio(null)}
+              >
+                <span className="preview-splitter-grip" aria-hidden>⋮</span>
+              </div>
+            )}
             {!showSite && (
               <div className="preview-overlay">
                 <span className="plate">№ {room.roomNumber}</span>
@@ -159,7 +244,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
             tab={configTab}
             onTabChange={setConfigTab}
             onClose={() => setConfigOpen(false)}
-            closable={!android}
+            closable
           />
         )}
       </div>

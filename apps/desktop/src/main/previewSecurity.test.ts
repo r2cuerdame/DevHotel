@@ -54,11 +54,13 @@ describe('preview boundary policy', () => {
     expect(roomPreviewPartition('room1abc')).toBe('persist:room-room1abc')
   })
 
-  it('permits native preview attachment only for live Web Rooms', () => {
+  it('permits native preview attachment only for live Web and Android Rooms', () => {
     expect(isPreviewableRoom({ provider: 'web', status: 'ready' })).toBe(true)
     expect(isPreviewableRoom({ provider: 'web', status: 'attention' })).toBe(true)
     expect(isPreviewableRoom({ provider: 'web', status: 'sleeping' })).toBe(false)
-    expect(isPreviewableRoom({ provider: 'android', status: 'ready' })).toBe(false)
+    expect(isPreviewableRoom({ provider: 'android', status: 'ready' })).toBe(true)
+    expect(isPreviewableRoom({ provider: 'android', status: 'sleeping' })).toBe(false)
+    expect(isPreviewableRoom({ provider: 'windows', status: 'ready' })).toBe(false)
     expect(isPreviewableRoom(undefined)).toBe(false)
   })
 })

@@ -76,15 +76,24 @@ describe('makeTools', () => {
   const tools = makeTools(async () => client())
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
 
-  it('exposes exactly the goal.md §20 tool set', () => {
+  it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
         'apply_quick_change',
         'check_room',
+        'clone_room',
         'copy_diagnostic',
         'create_room',
+        'delete_room',
+        'hotel_github_install',
+        'hotel_github_status',
         'inspect_room',
+        'list_changes',
         'list_rooms',
+        'rename_room',
+        'restart_web',
+        'room_components',
+        'room_logs',
         'run_in_room',
         'sleep_room',
         'start_room',
@@ -94,7 +103,7 @@ describe('makeTools', () => {
   })
 
   it('reports the package release metadata', () => {
-    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.4.1' })
+    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.4.2' })
   })
 
   it('list_rooms returns JSON content', async () => {
@@ -115,12 +124,18 @@ describe('makeTools', () => {
     expect(res.content[0]!.text).toMatch(/^DevHotel Diagnostic Bundle/)
   })
 
-  it('publishes a Web-only create contract', () => {
+  it('publishes a Web + Android create contract', () => {
     const schema = z.object(byName.create_room!.schema)
     const base = { sourceType: 'empty', sourceRef: '', project: 'demo', nickname: 'dev' }
     expect(schema.safeParse({ ...base, provider: 'web' }).success).toBe(true)
-    expect(schema.safeParse({ ...base, provider: 'android' }).success).toBe(false)
+    expect(schema.safeParse({ ...base, provider: 'android' }).success).toBe(true)
     expect(schema.safeParse({ ...base, provider: 'windows' }).success).toBe(false)
+  })
+
+  it('room_logs defaults to the web log and forwards the kind', async () => {
+    await byName.room_logs!.handler({ roomId: 'abc12345' })
+    const req = seen.find((s) => s.url === '/v1/rooms/abc12345/logs?kind=web')
+    expect(req?.method).toBe('GET')
   })
 
   it('errors surface as isError content, not throws', async () => {

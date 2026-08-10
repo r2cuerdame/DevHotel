@@ -155,7 +155,7 @@ describe('zCreateRoomInput', () => {
     expect(zAgentCreateRoomInput.safeParse({ ...linked, sourceType: 'managed-git', sourceRef: 'https://example.test/repo.git' }).success).toBe(true)
   })
 
-  it('allows user-approved Android build Rooms while keeping Agent creation Web-only', () => {
+  it('allows Web and Android Rooms for users and agents, never windows', () => {
     const create = {
       sourceType: 'empty' as const,
       sourceRef: '',
@@ -167,7 +167,8 @@ describe('zCreateRoomInput', () => {
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'web' }).success).toBe(true)
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'android' }).success).toBe(true)
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'windows' }).success).toBe(false)
-    expect(zAgentCreateRoomInput.safeParse({ ...create, provider: 'android' }).success).toBe(false)
+    expect(zAgentCreateRoomInput.safeParse({ ...create, provider: 'android' }).success).toBe(true)
+    expect(zAgentCreateRoomInput.safeParse({ ...create, provider: 'windows' }).success).toBe(false)
     expect(zRendererPlanRoomInput.safeParse({ ...plan, provider: 'android' }).success).toBe(true)
   })
 })

@@ -22,11 +22,59 @@ export const MOBILE_PRESETS: readonly PreviewPreset[] = [
 export const DEFAULT_DESKTOP_TABLET_PRESET = DESKTOP_TABLET_PRESETS[0]!.id
 export const DEFAULT_MOBILE_PRESET = MOBILE_PRESETS[0]!.id
 
+/** Mirrors the main-process split geometry (previewLayout.ts in src/main). */
+export const PREVIEW_SPLIT_GUTTER = 8
+export const DEFAULT_SPLIT_RATIO = 0.62
+
 type PreviewSide = 'left' | 'right'
 type PreviewSelectionStorage = Pick<Storage, 'getItem' | 'setItem'>
 
 function previewSelectionKey(roomId: string, side: PreviewSide): string {
   return `devhotel.preview.${roomId}.${side}`
+}
+
+export function clampSplitRatio(ratio: number): number {
+  if (Number.isNaN(ratio)) return DEFAULT_SPLIT_RATIO
+  return Math.min(0.85, Math.max(0.15, ratio))
+}
+
+/** Pixel width of the left pane for a given content width — must match the main process. */
+export function splitLeftWidth(contentWidth: number, ratio: number): number {
+  const gutter = Math.min(PREVIEW_SPLIT_GUTTER, contentWidth - 2)
+  return Math.floor((contentWidth - gutter) * clampSplitRatio(ratio))
+}
+
+export function loadSplitEnabled(storage: Pick<PreviewSelectionStorage, 'getItem'>, roomId: string): boolean {
+  try {
+    return storage.getItem(`devhotel.preview.${roomId}.split`) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function saveSplitEnabled(storage: Pick<PreviewSelectionStorage, 'setItem'>, roomId: string, enabled: boolean): void {
+  try {
+    storage.setItem(`devhotel.preview.${roomId}.split`, enabled ? '1' : '0')
+  } catch {
+    // Preview preferences are convenience state; storage failures must not hide the Room.
+  }
+}
+
+export function loadSplitRatio(storage: Pick<PreviewSelectionStorage, 'getItem'>, roomId: string): number {
+  try {
+    const stored = storage.getItem(`devhotel.preview.${roomId}.splitRatio`)
+    return stored === null ? DEFAULT_SPLIT_RATIO : clampSplitRatio(Number.parseFloat(stored))
+  } catch {
+    return DEFAULT_SPLIT_RATIO
+  }
+}
+
+export function saveSplitRatio(storage: Pick<PreviewSelectionStorage, 'setItem'>, roomId: string, ratio: number): void {
+  try {
+    storage.setItem(`devhotel.preview.${roomId}.splitRatio`, String(clampSplitRatio(ratio)))
+  } catch {
+    // best-effort, same as saveSplitEnabled
+  }
 }
 
 export function resolvePreviewPreset(presets: readonly PreviewPreset[], id: string): PreviewPreset {
@@ -63,14 +111,21 @@ export function savePreviewPresetId(
   }
 }
 
-export function createSplitPreviewLayout(leftPresetId: string, rightPresetId: string): {
-  mode: 'split'
+export function createPreviewLayout(
+  leftPresetId: string,
+  rightPresetId: string,
+  split: boolean,
+  splitRatio: number
+): {
+  mode: 'single' | 'split'
   leftViewport: PreviewViewport
   rightViewport: PreviewViewport
+  splitRatio: number
 } {
   return {
-    mode: 'split',
+    mode: split ? 'split' : 'single',
     leftViewport: resolvePreviewPreset(DESKTOP_TABLET_PRESETS, leftPresetId).viewport,
-    rightViewport: resolvePreviewPreset(MOBILE_PRESETS, rightPresetId).viewport
+    rightViewport: resolvePreviewPreset(MOBILE_PRESETS, rightPresetId).viewport,
+    splitRatio: clampSplitRatio(splitRatio)
   }
 }

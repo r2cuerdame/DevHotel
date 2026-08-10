@@ -4,12 +4,19 @@ import { api } from '../../api'
 import { useStore, useT } from '../../state/store'
 import { PackageStoreModal } from '../PackageStoreModal'
 
+const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
+const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
+const ANDROID_RESOLUTIONS = ['balanced', 'fast', 'native'] as const
+
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
   const [command, setCommand] = useState(room.startCommand)
   const [domain, setDomain] = useState(room.domain)
   const [port, setPort] = useState(room.internalPort)
+  const [device, setDevice] = useState(room.android?.device ?? ANDROID_DEVICES[0]!)
+  const [osVersion, setOsVersion] = useState(room.android?.version ?? ANDROID_VERSIONS[0]!)
+  const [resolution, setResolution] = useState<(typeof ANDROID_RESOLUTIONS)[number]>(room.android?.resolution ?? 'balanced')
   const [pending, setPending] = useState<string | null>(null)
 
   async function run(kind: string, fn: () => Promise<unknown>): Promise<void> {
@@ -42,15 +49,50 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
           </p>
         </div>
         <div className="panel-section">
-          <h3>{t('android.deviceService')}</h3>
-          <div className="change-item coming-next-card">
-            <span className="status-dot" data-status="sleeping" />
-            <span className="title">
-              {t('android.deviceService')}
-              <div className="small muted">{t('android.deviceServiceComingNext')}</div>
-            </span>
-            <span className="status-chip">{t('android.comingNext')}</span>
+          <h3>{t('android.emulator')}</h3>
+          <div className="row wrap">
+            <select value={device} onChange={(e) => setDevice(e.target.value)} style={{ width: 190 }}>
+              {ANDROID_DEVICES.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+            <select value={osVersion} onChange={(e) => setOsVersion(e.target.value)} style={{ width: 140 }}>
+              {ANDROID_VERSIONS.map((v) => (
+                <option key={v} value={v}>
+                  Android {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={resolution}
+              onChange={(e) => setResolution(e.target.value as (typeof ANDROID_RESOLUTIONS)[number])}
+              style={{ width: 150 }}
+              aria-label={t('android.resolution')}
+            >
+              <option value="balanced">{t('android.resBalanced')}</option>
+              <option value="fast">{t('android.resFast')}</option>
+              <option value="native">{t('android.resNative')}</option>
+            </select>
+            <button
+              className="btn"
+              disabled={
+                pending !== null ||
+                (device === (room.android?.device ?? ANDROID_DEVICES[0]) &&
+                  osVersion === (room.android?.version ?? ANDROID_VERSIONS[0]) &&
+                  resolution === (room.android?.resolution ?? 'balanced'))
+              }
+              onClick={() =>
+                void run('emu', () => applyChange(room.id, { kind: 'emulator-config', device, version: osVersion, resolution }))
+              }
+            >
+              {pending === 'emu' ? t('common.applying') : t('common.apply')}
+            </button>
           </div>
+          <p className="small muted" style={{ marginTop: 6 }}>
+            {t('android.emulatorConfigHint')} {t('android.resolutionHint')}
+          </p>
         </div>
       </>
     )

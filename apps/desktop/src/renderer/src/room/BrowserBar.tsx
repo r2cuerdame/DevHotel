@@ -58,7 +58,9 @@ export function BrowserBar({
 
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
   const web = room.provider === 'web'
-  const siteControlsEnabled = web && running && !configOpen
+  // android rooms serve the emulator screen — their bar behaves like a site too
+  const served = web || room.provider === 'android'
+  const siteControlsEnabled = served && running && !configOpen
   const httpsPort = gateway?.httpsPort
   const httpPort = gateway?.httpPort
   const url =
@@ -81,7 +83,7 @@ export function BrowserBar({
         </span>
       </div>
 
-      {web && (
+      {served && (
         <div className="browser-nav" aria-label={t('tabs.site')}>
           <button
             className="icon-btn"
@@ -110,9 +112,9 @@ export function BrowserBar({
         </div>
       )}
 
-      <div className={`domain-pill${web ? '' : ' build-room-pill'}`} title={web ? url : t('android.buildOnlyHint')}>
+      <div className={`domain-pill${served ? '' : ' build-room-pill'}`} title={served ? url : t('android.buildOnlyHint')}>
         {web && room.https && <span title="HTTPS">🔒</span>}
-        <span className="url">{web ? url : t('android.buildRoom')}</span>
+        <span className="url">{served ? url : t('android.buildRoom')}</span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} />
           {busy ?? statusLabel(t, room.status)}
@@ -177,8 +179,8 @@ export function BrowserBar({
                 </label>
               </>
             )}
-            {web && running && <div className="bar-menu-sep" />}
-            {web && running && (
+            {served && running && <div className="bar-menu-sep" />}
+            {served && running && (
               <MenuItem
                 label={t('bar.openExternal')}
                 onClick={() => {

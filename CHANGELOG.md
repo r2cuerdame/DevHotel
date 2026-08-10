@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.2 — 2026-08-11
+
+### Android emulator preview restored
+
+- Android Rooms are served Rooms again: a Room-owned KVM-backed emulator sidecar joins the anchor netns and its noVNC screen is routed as the Room's site, pinned to the phone's 540×1140 aspect in the preview.
+- **Build & run** builds the debug APK in the Room, waits for the emulator to boot, installs over the shared-netns `adb`, and launches the app on the visible screen; **Build APK** keeps the immutable provenance snapshot build.
+- Emulator device/OS selection is back in Stack with action-level Undo; checks probe the relayed emulator screen, gateway route, and HTTP response.
+- No Host SDK or Host `adb` is used; shared physical devices remain a later Hotel Device Service.
+- Emulator screen-resolution presets in Stack: Balanced (75%, new default), Fast (50%), and Native. The guest LCD is scaled at AVD creation, which is the biggest speed lever since the room emulator renders in software (no GPU passthrough); boot animation is skipped too. Device and Android OS version (11–14) stay selectable alongside, all undoable.
+- The phone screen is genuinely edge to edge now: window rules, a black backdrop, and a tiny libX11 fit daemon are staged into the *created* emulator container before its first start. The daemon keeps the qemu window at the full 540×1140 X screen (qemu ignores WM geometry rules at map time and its `-scale` flag is obsolete), openbox strips decorations at map, the toolbar stays hidden behind the full-screen phone, and stray qemu chrome (the floating collapsed-toolbar button) is swept off-screen.
+
+### Everything drivable over MCP
+
+- The control API and `devhotel-mcp` now cover the full room surface: `delete_room`, `restart_web`, `clone_room`, `rename_room`, `list_changes`, `room_components`, and `room_logs` (web/orchestrator tails) join the existing create/start/sleep/inspect/exec/check/change/undo/diagnostic tools.
+- Agents can create Android Rooms (`create_room` with `provider: 'android'`) and drive `android-build`, `android-run`, and `emulator-config` as quick changes.
+- Hotel Services reach agents read-safely: `hotel_github_status` and `hotel_github_install` provision the pinned `gh`; connecting a credential stays a human action in the app.
+
+### Fixes
+
+- The MCP setup card (Claude Code one-liner and `mcpServers` config with copy buttons) is back in Settings — the 0.4.1 renderer rewrite dropped it while the main-process API remained.
+
+### Manual, draggable Web preview split
+
+- The desktop/mobile split is now a manual toolbar toggle instead of always-on; each Room remembers whether it is split.
+- The divider between the two panes is draggable; the ratio is clamped to 15–85 % and persisted per Room.
+- The preview backdrop (letterboxing and gutter) is black on both the renderer and the native panes.
+
 ## 0.4.1 — 2026-08-10
 
 ### Dual responsive Web preview

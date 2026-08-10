@@ -38,16 +38,13 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   )
   const backendOk = health.ok
 
-  // 2 metadata
-  const buildOnly = room.provider === 'android'
-  const metaOk = buildOnly || (room.domain.endsWith('.localhost') && room.internalPort >= 1 && room.internalPort <= 65535)
+  // 2 metadata — android rooms created before the emulator screen carry
+  // internalPort 0 until the wake-time fixup assigns 6080; that is not damage.
+  const portShapeOk = (room.internalPort >= 1 && room.internalPort <= 65535) || (room.provider === 'android' && room.internalPort === 0)
+  const metaOk = room.domain.endsWith('.localhost') && portShapeOk
   push(
     metaOk
-      ? {
-          step: 'metadata',
-          status: 'healthy',
-          summary: buildOnly ? `room ${room.id} · build-only · no preview` : `room ${room.id} · ${room.domain}`
-        }
+      ? { step: 'metadata', status: 'healthy', summary: `room ${room.id} · ${room.domain}` }
       : { step: 'metadata', status: 'broken', summary: 'room record is inconsistent', detail: JSON.stringify(room) }
   )
 
@@ -271,7 +268,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   return finish(room.id, results)
 }
 
-/** Build rooms: no served port, no gateway route — runtime and process are what can break. */
+/** Android rooms: JDK/Gradle build container plus the emulator screen served through the relay. */
 async function androidChecks(
   ctx: CheckCtx,
   results: CheckResult[],
@@ -317,7 +314,7 @@ async function androidChecks(
   push(
     Object.keys(room.services).length === 0
       ? { step: 'services', status: 'healthy', summary: 'no services configured' }
-      : { step: 'services', status: 'warning', summary: 'managed services are unavailable in build-only Android Rooms' }
+      : { step: 'services', status: 'warning', summary: 'managed services are unavailable in Android Rooms' }
   )
   push(
     room.startCommand.trim()
@@ -326,23 +323,71 @@ async function androidChecks(
   )
 
   if (!awake || !backendOk) {
-    push({ step: 'process', status: 'unknown', summary: 'room is asleep' })
-  } else {
-    const state = await backend.webState(room.id)
+    push({ step: 'process', ...ASLEEP })
+    push({ step: 'port', ...ASLEEP })
+    push({ step: 'gateway', ...ASLEEP })
+    push({ step: 'https', status: 'healthy', summary: 'HTTPS off' })
+    push({ step: 'http', ...ASLEEP })
+    return finish(room.id, results)
+  }
+
+  const state = await backend.webState(room.id)
+  push(
+    state === 'running'
+      ? { step: 'process', status: 'healthy', summary: 'build container running' }
+      : { step: 'process', status: 'broken', summary: 'build container not running', fix: { kind: 'restart-web' } }
+  )
+
+  // the emulator screen (noVNC) is what the room serves through the relay
+  const emulator = await backend.emulatorState(room.id)
+  const relayToken = emulator === 'running' && room.hostPort != null ? await backend.relayToken(room.id) : undefined
+  const portOk =
+    emulator === 'running' &&
+    room.hostPort != null &&
+    relayToken !== undefined &&
+    (await tcpAnswers(room.hostPort, 2000, relayToken))
+  push(
+    portOk
+      ? { step: 'port', status: 'healthy', summary: `emulator screen on port ${room.internalPort}` }
+      : {
+          step: 'port',
+          status: emulator === 'running' ? 'warning' : 'broken',
+          summary:
+            emulator === 'running'
+              ? 'emulator screen not answering yet (still booting?)'
+              : `emulator container ${emulator}`
+        }
+  )
+
+  let routed = ctx.gateway.status().routes.some((r) => r.domain === room.domain)
+  if (!routed) {
+    try {
+      await ctx.syncRoute()
+      routed = ctx.gateway.status().routes.some((r) => r.domain === room.domain)
+    } catch {
+      routed = false
+    }
     push(
-      state === 'running'
-        ? { step: 'process', status: 'healthy', summary: 'build container running' }
-        : { step: 'process', status: 'broken', summary: 'build container not running', fix: { kind: 'restart-web' } }
+      routed
+        ? { step: 'gateway', status: 'healthy', summary: 'route was missing — restored' }
+        : { step: 'gateway', status: 'broken', summary: `no gateway route for ${room.domain}` }
     )
+  } else {
+    push({ step: 'gateway', status: 'healthy', summary: `${room.domain} routed` })
   }
-  const na: Pick<CheckResult, 'status' | 'summary'> = {
-    status: 'healthy',
-    summary: 'not applicable — build-only Room has no preview'
+
+  push({ step: 'https', status: 'healthy', summary: 'HTTPS off' })
+
+  if (portOk && room.hostPort != null) {
+    const res = await httpProbe(room.hostPort, room.domain, relayToken)
+    push(
+      res.ok
+        ? { step: 'http', status: 'healthy', summary: `HTTP ${res.status}` }
+        : { step: 'http', status: 'broken', summary: res.detail }
+    )
+  } else {
+    push({ step: 'http', status: 'unknown', summary: 'skipped — emulator screen not answering' })
   }
-  push({ step: 'port', ...na })
-  push({ step: 'gateway', ...na })
-  push({ step: 'https', ...na })
-  push({ step: 'http', ...na })
   return finish(room.id, results)
 }
 

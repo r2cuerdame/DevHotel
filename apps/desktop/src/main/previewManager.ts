@@ -22,8 +22,10 @@ import {
 import { PreviewSyncGuard } from './previewSync'
 
 const THUMB_INTERVAL_MS = 30_000
+// The split is manual (renderer button); until the renderer sends its stored
+// layout the preview stays a single full pane.
 const DEFAULT_LAYOUT: PreviewLayout = {
-  mode: 'split',
+  mode: 'single',
   leftViewport: null,
   rightViewport: { width: 390, height: 844 }
 }
@@ -106,7 +108,12 @@ export class PreviewManager {
   private layout(): void {
     if (!this.view || !this.lastBounds) return
     const effectiveMode = this.devtools ? 'single' : this.previewLayout.mode
-    const bounds = calculatePreviewBounds(this.lastBounds, effectiveMode, this.devtools !== null)
+    const bounds = calculatePreviewBounds(
+      this.lastBounds,
+      effectiveMode,
+      this.devtools !== null,
+      this.previewLayout.splitRatio
+    )
     this.view.setBounds(bounds.left)
     if (bounds.right && this.rightView) this.rightView.setBounds(bounds.right)
     if (bounds.devtools && this.devtools) this.devtools.setBounds(bounds.devtools)
@@ -145,7 +152,8 @@ export class PreviewManager {
     this.previewLayout = {
       mode: nextLayout.mode,
       leftViewport: nextLayout.leftViewport ? { ...nextLayout.leftViewport } : null,
-      rightViewport: { ...nextLayout.rightViewport }
+      rightViewport: { ...nextLayout.rightViewport },
+      splitRatio: nextLayout.splitRatio
     }
     if (nextLayout.mode === 'split') {
       this.ensureRightView()
@@ -241,6 +249,8 @@ export class PreviewManager {
     const view = new WebContentsView({
       webPreferences: { partition, sandbox: true, nodeIntegration: false, contextIsolation: true }
     })
+    // black letterboxing around emulated viewports, matching the renderer backdrop
+    view.setBackgroundColor('#000000')
     const wc = view.webContents
     if (side === 'right') wc.setUserAgent(mobilePreviewUserAgent(process.versions.chrome))
     wc.setWindowOpenHandler(() => ({ action: 'deny' }))

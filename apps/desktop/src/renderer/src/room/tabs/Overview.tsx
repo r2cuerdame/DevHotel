@@ -98,6 +98,15 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
           {android && (
             <button
               className={running ? 'btn primary' : 'btn'}
+              onClick={() => void run('run', () => applyChange(room.id, { kind: 'android-run' }))}
+              disabled={!running || !!busy || pending !== null}
+            >
+              {pending === 'run' ? t('android.launching') : t('android.run')}
+            </button>
+          )}
+          {android && (
+            <button
+              className="btn"
               onClick={() => void run('build', () => applyChange(room.id, { kind: 'android-build' }))}
               disabled={!running || !!busy || pending !== null}
             >
@@ -188,17 +197,10 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <span className="title">
               <span className="mono">{room.startCommand}</span>
               <div className="small muted">{t('android.apkHint')}</div>
+              <div className="small muted">{t('android.emulatorHint')}</div>
             </span>
           </div>
           <LatestBuild room={room} />
-          <div className="change-item coming-next-card">
-            <span className="status-dot" data-status="sleeping" />
-            <span className="title">
-              {t('android.deviceService')}
-              <div className="small muted">{t('android.deviceServiceComingNext')}</div>
-            </span>
-            <span className="status-chip">{t('android.comingNext')}</span>
-          </div>
         </div>
       ) : (
         <div className="panel-section">

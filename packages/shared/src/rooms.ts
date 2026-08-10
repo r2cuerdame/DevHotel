@@ -3,6 +3,8 @@ export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
 export type PmKind = 'npm' | 'pnpm' | 'gradle'
 export type ProviderKind = 'web' | 'android' | 'windows'
+/** Guest LCD scaling: swiftshader renders in software, so fewer pixels = a much faster phone. */
+export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 /** Where `/workspace` actually lives. Legacy host binds are compatibility-only. */
 export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
@@ -56,8 +58,8 @@ export interface RoomRecord {
   status: RoomStatus
   services: RoomServices
   os: RoomOsSettings
-  /** android rooms: emulator device/OS selection */
-  android?: { device: string; version: string }
+  /** android rooms: emulator device/OS/resolution selection */
+  android?: { device: string; version: string; resolution?: EmulatorResolution }
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */
   hostPort: number | null
   createdAt: string

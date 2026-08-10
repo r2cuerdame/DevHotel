@@ -4,8 +4,12 @@ export function roomPreviewPartition(roomId: string): string {
   return `persist:room-${roomId}`
 }
 
+/** Web rooms preview their site; Android rooms preview the relayed emulator screen. */
 export function isPreviewableRoom(room: Pick<RoomRecord, 'provider' | 'status'> | null | undefined): boolean {
-  return room?.provider === 'web' && ['running', 'ready', 'attention'].includes(room.status)
+  return (
+    (room?.provider === 'web' || room?.provider === 'android') &&
+    ['running', 'ready', 'attention'].includes(room.status)
+  )
 }
 
 /** Preview navigation remains on the exact Room gateway origin. */

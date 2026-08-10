@@ -14,12 +14,19 @@ export interface CalculatedPreviewBounds {
 }
 
 export const PREVIEW_SPLIT_GUTTER = 8
+export const DEFAULT_SPLIT_RATIO = 0.62
+
+export function clampSplitRatio(ratio: number | undefined): number {
+  if (ratio === undefined || Number.isNaN(ratio)) return DEFAULT_SPLIT_RATIO
+  return Math.min(0.85, Math.max(0.15, ratio))
+}
 
 /** Pure geometry shared by the native responsive panes and its focused tests. */
 export function calculatePreviewBounds(
   area: PreviewBounds,
   mode: PreviewLayout['mode'],
-  devtoolsOpen: boolean
+  devtoolsOpen: boolean,
+  splitRatio?: number
 ): CalculatedPreviewBounds {
   const contentWidth = devtoolsOpen ? Math.round(area.width * 0.6) : area.width
   const devtoolsWidth = area.width - contentWidth
@@ -37,7 +44,7 @@ export function calculatePreviewBounds(
 
   const gutter = Math.min(PREVIEW_SPLIT_GUTTER, contentWidth - 2)
   const panesWidth = contentWidth - gutter
-  const leftWidth = Math.floor(panesWidth * 0.62)
+  const leftWidth = Math.floor(panesWidth * clampSplitRatio(splitRatio))
   const rightWidth = contentWidth - gutter - leftWidth
   return {
     left: { x: area.x, y: area.y, width: leftWidth, height: area.height },

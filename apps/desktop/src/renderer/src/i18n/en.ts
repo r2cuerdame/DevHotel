@@ -127,6 +127,8 @@ export const en = {
   'preview.responsiveViews': 'Responsive previews',
   'preview.desktopTablet': 'PC / tablet',
   'preview.mobilePortrait': 'Mobile · portrait',
+  'preview.split': 'Split',
+  'preview.splitHint': 'Show the desktop and mobile previews side by side — drag the divider to resize',
 
   // Browser bar
   'bar.lobby': 'Lobby',
@@ -302,6 +304,11 @@ export const en = {
   'services.restoreConfirm': 'Restore this backup? Current data is safety-backed-up first, and the restore itself can be undone.',
   'android.emulator': 'Emulator',
   'android.emulatorConfigHint': 'Changing the Android version downloads a new image (a few GB, one-time). Device and version changes can be undone.',
+  'android.resolution': 'Screen resolution',
+  'android.resBalanced': 'Balanced (75%, recommended)',
+  'android.resFast': 'Fast (50%)',
+  'android.resNative': 'Native (slow)',
+  'android.resolutionHint': 'Lower resolutions render much faster because the emulator has no GPU passthrough.',
   'stack.installed': 'Installed programs',
   'packageStore.add': '+ Add app',
   'packageStore.title': 'Room App Store',

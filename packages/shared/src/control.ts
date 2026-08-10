@@ -70,7 +70,8 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('emulator-config'),
     device: z.string().regex(/^[A-Za-z0-9 ().-]{2,40}$/),
-    version: z.enum(['14.0', '13.0', '12.0', '11.0'])
+    version: z.enum(['14.0', '13.0', '12.0', '11.0']),
+    resolution: z.enum(['native', 'balanced', 'fast']).optional()
   }).strict(),
   z.object({ kind: z.literal('service-version'), service: zServiceKind, version: z.string().regex(/^\d+$/) }).strict(),
   z.object({ kind: z.literal('service-add'), service: zServiceKind, version: z.string().regex(/^\d+$/).optional() }).strict(),
@@ -123,18 +124,26 @@ export const zCreateRoomInput = z.object({
     .optional()
 }).strict()
 
-const zPublicWebCreateRoomInput = zCreateRoomInput
+const zPublicCreateRoomInput = zCreateRoomInput
   .omit({ actor: true })
-  .extend({ provider: z.literal('web').optional() })
+  .extend({ provider: z.enum(['web', 'android']).optional() })
   .strict()
 
 /** Agent calls cannot create a host bind mount until a future explicit grant API exists. */
-export const zAgentCreateRoomInput = zPublicWebCreateRoomInput
+export const zAgentCreateRoomInput = zPublicCreateRoomInput
   .refine((input) => input.sourceType !== 'linked-folder', {
     message: 'Agents cannot create linked-folder Rooms without a user-approved host-folder grant',
     path: ['sourceType']
   })
 export type AgentCreateRoomInput = z.infer<typeof zAgentCreateRoomInput>
+
+/** Room mutations agents may request through the control API, beyond create/change. */
+export const zAgentCloneBody = z.object({
+  nickname: zNickname,
+  copyDependencies: z.boolean(),
+  services: z.enum(['copy', 'empty', 'exclude'])
+}).strict()
+export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 
 export const zRendererCreateRoomInput = zCreateRoomInput.omit({ actor: true }).strict()
 export type RendererCreateRoomInput = z.infer<typeof zRendererCreateRoomInput>
@@ -227,6 +236,7 @@ export const zPreviewLayout = z
   .object({
     mode: z.enum(['single', 'split']),
     leftViewport: zOptionalPreviewViewport,
-    rightViewport: zPreviewViewport
+    rightViewport: zPreviewViewport,
+    splitRatio: z.number().finite().min(0.15).max(0.85).optional()
   })
   .strict()

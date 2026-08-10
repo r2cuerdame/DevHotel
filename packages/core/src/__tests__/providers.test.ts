@@ -71,7 +71,7 @@ describe('WebRoomProvider', () => {
   })
 })
 
-describe('AndroidRoomProvider (build rooms v1)', () => {
+describe('AndroidRoomProvider', () => {
   it('detect plans a JDK/gradle build room and warns when no gradle project exists', async () => {
     const plan = await getProvider('android').detect(fixture('empty'), { project: 'MyApp', nickname: 'dev' })
     expect(plan.runtime.kind).toBe('jdk')
@@ -88,12 +88,12 @@ describe('AndroidRoomProvider (build rooms v1)', () => {
     expect(plan.framework).toBe('android')
   })
 
-  it('buildSpec is a standalone build-only sdk container with no preview or KVM', () => {
+  it('buildSpec is an sdk container in the anchor netns relaying the emulator screen', () => {
     const room = makeRoom({ provider: 'android', runtime: { kind: 'jdk', version: '17' }, internalPort: 6080 })
     const provider = getProvider('android')
     const spec = provider.buildSpec(room)
-    expect(provider.info).toMatchObject({ execution: 'build-only', preview: 'none', requiresKvm: false })
-    expect(spec.standalone).toBe(true)
+    expect(provider.info).toMatchObject({ execution: 'served', preview: 'browser', requiresKvm: true })
+    expect(spec.standalone).toBeUndefined()
     expect(spec.internalPort).toBe(6080)
     expect(spec.noDepsVolume).toBe(true)
     expect(spec.imageOverride).toMatch(/android/)

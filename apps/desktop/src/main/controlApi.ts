@@ -3,15 +3,23 @@ import { writeFileSync, rmSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import {
+  zAgentCloneBody,
+  zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
   zExecBody,
+  zLogKind,
   zRoomId,
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
 import type { RoomOrchestrator } from '@devhotel/core'
-import type { RoomInspection, RoomRecord } from '@devhotel/shared'
+import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
+
+/** Hotel Services reachable by agents; populated after app startup wiring. */
+export interface HotelServicesRef {
+  github: { status(): Promise<GitHubServiceStatus>; install(): Promise<GitHubServiceStatus> } | null
+}
 
 /**
  * Loopback control API for the MCP server (and other local agents).
@@ -20,7 +28,8 @@ import type { RoomInspection, RoomRecord } from '@devhotel/shared'
 export async function startControlApi(
   orch: RoomOrchestrator,
   userData: string,
-  version: string
+  version: string,
+  hotel: HotelServicesRef = { github: null }
 ): Promise<{ server: Server; info: ControlInfo; stop: () => void }> {
   const token = randomBytes(24).toString('hex')
 
@@ -47,6 +56,21 @@ export async function startControlApi(
       return
     }
 
+    if (parts[1] === 'hotel' && parts[2] === 'github') {
+      if (!hotel.github) {
+        sendJson(res, 503, { error: 'Hotel services are still starting' })
+        return
+      }
+      if (!parts[3] && req.method === 'GET') {
+        sendJson(res, 200, await hotel.github.status())
+        return
+      }
+      if (parts[3] === 'install' && req.method === 'POST') {
+        sendJson(res, 200, await hotel.github.install())
+        return
+      }
+    }
+
     if (parts[1] === 'rooms') {
       const roomId = parts[2]
       const safeRoomId = roomId ? zRoomId.parse(roomId) : undefined
@@ -67,6 +91,17 @@ export async function startControlApi(
         sendJson(res, 200, { ...inspection, room: roomForAgent(inspection.room), dataDir: '[Hotel data hidden]' } satisfies RoomInspection)
         return
       }
+      if (safeRoomId && !op && req.method === 'DELETE') {
+        // Deletion is irreversible: rooms holding Host-linked working state
+        // (possibly with edits never synced back) stay a human decision.
+        const room = orch.rooms.get(safeRoomId)
+        if (room && (room.sourceType === 'linked-folder' || room.workspaceMode === 'legacy-host-bind')) {
+          sendJson(res, 403, { error: 'Agents cannot delete Host-linked Rooms. Delete it in the DevHotel app.' })
+          return
+        }
+        sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
+        return
+      }
       if (safeRoomId && op && req.method === 'POST') {
         switch (op) {
           case 'start':
@@ -77,6 +112,21 @@ export async function startControlApi(
             await orch.sleepRoom(safeRoomId, 'agent')
             res.writeHead(204).end()
             return
+          case 'restart-web':
+            sendJson(res, 200, await orch.restartWeb(safeRoomId, 'agent'))
+            return
+          case 'clone': {
+            const body = zAgentCloneBody.parse(await readBody(req))
+            const room = await orch.cloneRoom({ sourceRoomId: safeRoomId, ...body, actor: 'agent' })
+            sendJson(res, 200, roomForAgent(room))
+            return
+          }
+          case 'rename': {
+            const body = zAgentRenameBody.parse(await readBody(req))
+            await orch.renameRoom(safeRoomId, body.nickname)
+            res.writeHead(204).end()
+            return
+          }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
             sendJson(res, 200, await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs }, 'agent'))
@@ -97,9 +147,23 @@ export async function startControlApi(
           }
         }
       }
-      if (safeRoomId && op === 'diagnostic' && req.method === 'GET') {
-        sendJson(res, 200, { text: await orch.getDiagnostic(safeRoomId) })
-        return
+      if (safeRoomId && req.method === 'GET') {
+        switch (op) {
+          case 'diagnostic':
+            sendJson(res, 200, { text: await orch.getDiagnostic(safeRoomId) })
+            return
+          case 'changes':
+            sendJson(res, 200, orch.listChanges(safeRoomId))
+            return
+          case 'components':
+            sendJson(res, 200, await orch.components(safeRoomId))
+            return
+          case 'logs': {
+            const kind = zLogKind.parse(url.searchParams.get('kind') ?? 'web')
+            sendJson(res, 200, { lines: orch.logs.tail(safeRoomId, kind) })
+            return
+          }
+        }
       }
     }
     sendJson(res, 404, { error: 'not found' })

@@ -113,29 +113,38 @@ describe('node-version change', () => {
   })
 })
 
-describe('Android build-only boundaries', () => {
-  it('rejects run and emulator changes before any emulator backend operation', async () => {
+describe('Android emulator changes', () => {
+  it('android-run refuses to start while the emulator container is not running', async () => {
     rooms.update('room1abc', {
       provider: 'android',
       runtime: { kind: 'jdk', version: '17' },
       packageManager: { kind: 'gradle' },
-      hostPort: null
+      hostPort: 45000
     })
-    backend.emulatorState = async () => {
-      throw new Error('must not inspect emulator state')
-    }
-    backend.createEmulator = async () => {
-      throw new Error('NO_KVM')
-    }
-    backend.removeEmulator = async () => {
-      throw new Error('must not remove retained emulator data')
-    }
+    backend.emulatorStateValue = 'missing'
 
-    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(/build-only/)
-    await expect(
-      engine.execute(ctx(), 'emulator-config', { device: 'Samsung Galaxy S10', version: '14.0' }, 'user')
-    ).rejects.toThrow(/unavailable in build-only/)
-    expect(backend.calls).not.toContain(expect.stringContaining('Emulator'))
+    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(/emulator is not running/)
+    expect(changes.list('room1abc')).toHaveLength(0)
+  })
+
+  it('emulator-config swaps the emulator container and undo restores the previous device', async () => {
+    rooms.update('room1abc', {
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      hostPort: 45000,
+      android: { device: 'Samsung Galaxy S10', version: '14.0' }
+    })
+
+    const entry = await engine.execute(ctx(), 'emulator-config', { device: 'Pixel 6', version: '15.0', resolution: 'fast' }, 'user')
+    expect(entry.status).toBe('verified')
+    expect(rooms.get('room1abc')!.android).toEqual({ device: 'Pixel 6', version: '15.0', resolution: 'fast' })
+    expect(backend.calls).toContain('removeEmulator:room1abc')
+    expect(backend.calls).toContain('createEmulator:room1abc:Pixel 6:15.0')
+
+    await engine.undo(ctx(), entry.id, 'user')
+    expect(rooms.get('room1abc')!.android).toEqual({ device: 'Samsung Galaxy S10', version: '14.0' })
+    expect(backend.calls).toContain('createEmulator:room1abc:Samsung Galaxy S10:14.0')
   })
 })
 

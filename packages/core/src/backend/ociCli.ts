@@ -1,10 +1,14 @@
-import { createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
 import {
   ANCHOR_IMAGE,
+  EMULATOR_AVD_OVERRIDE_PATH,
   EMULATOR_IMAGE,
+  EMULATOR_SCREEN_HEIGHT,
+  EMULATOR_SCREEN_WIDTH,
   RELAY_PORT,
   anchorName,
   buildAnchorArgs,
@@ -15,6 +19,7 @@ import {
   buildWebCreateArgs,
   cacheVolume,
   depsVolume,
+  emulatorAvdOverride,
   emulatorImage,
   emulatorName,
   effectiveDepsVolume,
@@ -35,19 +40,160 @@ const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
 
+/**
+ * Matched by class+type because at map time the qemu windows are still titled
+ * plain "Emulator" — a title glob can never match there. The toolbar must not
+ * be iconified: qemu groups its windows, and openbox would iconify the whole
+ * group. decor applies reliably at map; geometry does not (qemu re-places
+ * itself), so FIT_EMULATOR_PY below enforces the full-screen size and the
+ * force-center rule snaps the frame back to 0,0 on that resize.
+ */
 const OPENBOX_FRAMELESS_RC = `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <applications>
-    <application title="Android Emulator*">
+    <application class="Emulator" type="normal">
       <decor>no</decor>
-      <maximized>yes</maximized>
-      <position force="yes"><x>0</x><y>0</y></position>
+      <position force="yes"><x>center</x><y>center</y></position>
+      <size><width>${EMULATOR_SCREEN_WIDTH}</width><height>${EMULATOR_SCREEN_HEIGHT}</height></size>
     </application>
-    <application type="utility">
-      <iconic>yes</iconic>
+    <application class="Emulator" type="utility">
+      <decor>no</decor>
+      <layer>below</layer>
+      <position force="yes"><x>${EMULATOR_SCREEN_WIDTH + 20}</x><y>0</y></position>
     </application>
   </applications>
 </openbox_config>
+`
+
+/**
+ * Replaces the image's wallpaper-only autostart: the noVNC backdrop stays
+ * black and the fit daemon keeps the phone edge to edge for the room's life.
+ */
+const OPENBOX_AUTOSTART = `# DevHotel: black backdrop; keep the emulator phone window filling the screen
+python3 "$HOME/.config/openbox/fit-emulator.py" >/dev/null 2>&1 &
+`
+
+/**
+ * The qemu window ignores WM size hints and per-app geometry at map time and
+ * the emulator's -scale flag is obsolete, so this tiny libX11 client (python3
+ * and libX11 ship in the image) forces the "Android Emulator*" window to the
+ * full X screen; Qt then rescales the device content edge to edge.
+ */
+const FIT_EMULATOR_PY = `import ctypes
+import time
+
+W, H = ${EMULATOR_SCREEN_WIDTH}, ${EMULATOR_SCREEN_HEIGHT}
+
+x11 = ctypes.CDLL("libX11.so.6")
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XDefaultRootWindow.restype = ctypes.c_ulong
+x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+x11.XQueryTree.argtypes = [
+    ctypes.c_void_p, ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint),
+]
+x11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+x11.XFree.argtypes = [ctypes.c_void_p]
+x11.XMoveResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_int] * 2 + [ctypes.c_uint] * 2
+x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XUnmapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int), ("y", ctypes.c_int),
+        ("width", ctypes.c_int), ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+        ("class_", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int), ("screen", ctypes.c_void_p),
+    ]
+
+
+x11.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XWindowAttributes)]
+
+
+def children_of(dpy, window):
+    root_ret = ctypes.c_ulong()
+    parent_ret = ctypes.c_ulong()
+    kids = ctypes.POINTER(ctypes.c_ulong)()
+    count = ctypes.c_uint()
+    if not x11.XQueryTree(dpy, window, ctypes.byref(root_ret), ctypes.byref(parent_ret), ctypes.byref(kids), ctypes.byref(count)):
+        return []
+    result = [kids[i] for i in range(count.value)]
+    if kids:
+        x11.XFree(kids)
+    return result
+
+
+def window_name(dpy, window):
+    name = ctypes.c_char_p()
+    if x11.XFetchName(dpy, window, ctypes.byref(name)) and name.value:
+        value = name.value.decode(errors="replace")
+        x11.XFree(name)
+        return value
+    return ""
+
+
+def scan_windows(dpy, root):
+    # openbox reparents clients one level under root frames
+    phone = 0
+    strays = []
+    for frame in children_of(dpy, root):
+        for win in [frame] + children_of(dpy, frame):
+            name = window_name(dpy, win)
+            if name.startswith("Android Emulator"):
+                phone = phone or win
+            elif name == "Emulator":
+                strays.append(win)
+    return phone, strays
+
+
+IS_VIEWABLE = 2
+
+
+def main():
+    dpy = None
+    while dpy is None:
+        dpy = x11.XOpenDisplay(b":0")
+        if dpy is None:
+            time.sleep(2)
+    root = x11.XDefaultRootWindow(dpy)
+    while True:
+        try:
+            phone, strays = scan_windows(dpy, root)
+            if phone:
+                attrs = XWindowAttributes()
+                if x11.XGetWindowAttributes(dpy, phone, ctypes.byref(attrs)):
+                    if attrs.width != W or attrs.height != H:
+                        x11.XMoveResizeWindow(dpy, phone, 0, 0, W, H)
+                        x11.XRaiseWindow(dpy, phone)
+                        x11.XSync(dpy, 0)
+            # qemu floats a small collapsed-toolbar button window ("Emulator",
+            # ~300x30) over the phone; hide it and any similar stray chrome
+            for stray in strays:
+                attrs = XWindowAttributes()
+                if not x11.XGetWindowAttributes(dpy, stray, ctypes.byref(attrs)):
+                    continue
+                if attrs.map_state == IS_VIEWABLE and 60 <= attrs.width <= 520 and attrs.height <= 80:
+                    x11.XUnmapWindow(dpy, stray)
+                    x11.XSync(dpy, 0)
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
 `
 
 function must(result: ExecResult, what: string): ExecResult {
@@ -873,16 +1019,33 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), `copy into ${svc}`)
   }
 
-  async createEmulator(roomId: string, opts?: { device: string; version: string }): Promise<void> {
+  async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
-    must(await runDocker(buildEmulatorArgs(roomId, opts)), 'run emulator container')
-    // frameless fullscreen phone: written before openbox starts inside the
-    // container, so it loads these rules and maps the emulator undecorated
-    await runDocker(
-      ['exec', '-i', emulatorName(roomId), 'sh', '-c', 'mkdir -p ~/.config/openbox && cat > ~/.config/openbox/rc.xml'],
-      { input: OPENBOX_FRAMELESS_RC }
-    )
+    // frameless fullscreen phone: rules, autostart, the fit daemon and the AVD
+    // resolution override are copied into the *created* (not yet started)
+    // container, so openbox can never win a race and map the emulator
+    // decorated, and the AVD is born at the requested LCD size.
+    must(await runDocker(buildEmulatorArgs(roomId, opts)), 'create emulator container')
+    const staging = mkdtempSync(join(tmpdir(), 'dh-openbox-'))
+    try {
+      mkdirSync(join(staging, 'openbox'))
+      writeFileSync(join(staging, 'openbox', 'rc.xml'), OPENBOX_FRAMELESS_RC)
+      writeFileSync(join(staging, 'openbox', 'autostart'), OPENBOX_AUTOSTART)
+      writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), FIT_EMULATOR_PY)
+      writeFileSync(join(staging, 'avd-override.ini'), emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced'))
+      must(
+        await runDocker(['cp', join(staging, 'openbox'), `${emulatorName(roomId)}:/home/androidusr/.config/`]),
+        'install emulator window rules'
+      )
+      must(
+        await runDocker(['cp', join(staging, 'avd-override.ini'), `${emulatorName(roomId)}:${EMULATOR_AVD_OVERRIDE_PATH}`]),
+        'install emulator resolution override'
+      )
+    } finally {
+      rmSync(staging, { recursive: true, force: true })
+    }
+    must(await runDocker(['start', emulatorName(roomId)]), 'start emulator container')
   }
 
   async removeEmulator(roomId: string): Promise<void> {

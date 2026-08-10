@@ -109,6 +109,8 @@ export interface PreviewLayout {
   /** null means fill the left pane instead of emulating a fixed desktop viewport */
   leftViewport: PreviewViewport | null
   rightViewport: PreviewViewport
+  /** left pane share of the split (0.15–0.85); the user drags the splitter to change it */
+  splitRatio?: number
 }
 
 export interface PreviewState {

@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
+import type { McpSetupInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import { LOCALES } from '../i18n'
-import type { LocaleId } from '../i18n'
+import type { LocaleId, Translation } from '../i18n'
 
 export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.Element {
   const toast = useStore((s) => s.toast)
@@ -10,18 +11,25 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
   const lang = useStore((s) => s.lang)
   const setLang = useStore((s) => s.setLang)
   const t = useT()
+  const [mcp, setMcp] = useState<McpSetupInfo | null>(null)
   const [version, setVersion] = useState('')
   const [footprint, setFootprint] = useState<{ dataDir: string; installDir: string; autostart: boolean } | null>(null)
   const [autostart, setAutostart] = useState(false)
   const [cleaning, setCleaning] = useState(false)
 
   useEffect(() => {
+    void api.app.mcpInfo().then(setMcp)
     void api.app.version().then(setVersion)
     void api.app.footprint().then((f) => {
       setFootprint(f)
       setAutostart(f.autostart)
     })
   }, [])
+
+  async function copy(text: string, whatKey: keyof Translation): Promise<void> {
+    await navigator.clipboard.writeText(text)
+    toast('success', t('toast.copied', { what: t(whatKey) }))
+  }
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -75,6 +83,45 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
               </button>
             )}
           </div>
+        </div>
+
+        <div className="panel-section settings-card">
+          <h3>🤖 {t('settings.mcpTitle')}</h3>
+          <p className="small muted" style={{ marginTop: 0 }}>
+            {t('settings.mcpDesc')}
+          </p>
+          {mcp && !mcp.available && (
+            <p className="small" style={{ color: 'var(--warn)' }}>
+              {t('settings.mcpMissingPre')} <code>pnpm --filter devhotel-mcp build</code> {t('settings.mcpMissingPost')}
+            </p>
+          )}
+          {mcp?.available && (
+            <>
+              <div className="field">
+                <label>{t('settings.claudeCommand')}</label>
+                <div className="row">
+                  <input className="mono" readOnly value={mcp.claudeCommand} style={{ flex: 1 }} />
+                  <button className="btn" onClick={() => void copy(mcp.claudeCommand, 'settings.whatCommand')}>
+                    {t('common.copy')}
+                  </button>
+                </div>
+              </div>
+              <div className="field">
+                <label>{t('settings.mcpClientConfig')}</label>
+                <div className="row" style={{ alignItems: 'stretch' }}>
+                  <pre className="mono" style={{ flex: 1, margin: 0 }}>
+                    {mcp.configJson}
+                  </pre>
+                  <button className="btn" onClick={() => void copy(mcp.configJson, 'settings.whatConfig')}>
+                    {t('common.copy')}
+                  </button>
+                </div>
+              </div>
+              <p className="small muted">
+                {mcp.controlPort ? t('settings.mcpPortNote', { port: mcp.controlPort }) : t('settings.mcpRunningNote')}
+              </p>
+            </>
+          )}
         </div>
 
         <div className="panel-section settings-card">

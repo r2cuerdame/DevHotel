@@ -1,7 +1,7 @@
 {
   "name": "devhotel",
   "productName": "DevHotel",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Give AI a room, not your computer — a local runtime for isolated development agents.",
   "author": "DevHotel contributors",
   "private": true,

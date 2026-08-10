@@ -46,7 +46,10 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
         project: z.string().describe('project name, e.g. the repo name'),
         nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
-        provider: z.literal('web').optional().describe("'web' (the only provider available in this release)"),
+        provider: z
+          .enum(['web', 'android'])
+          .optional()
+          .describe("'web' (default) serves the site; 'android' builds APKs and previews the room-owned emulator screen"),
         runtimeVersion: z.string().regex(/^\d+$/).optional().describe('Node major version override, e.g. "22"'),
         pmKind: zPmKind.optional(),
         startCommand: z.string().optional(),
@@ -115,15 +118,73 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'apply_quick_change',
       description:
-        'Apply a quick change to a room as a verified, undoable transaction: node-version, start-command, domain, https, internal-port, or deps-install.',
+        'Apply a quick change to a room as a verified, undoable transaction. Web rooms: node-version, package-manager, start-command, domain, https, internal-port, deps-install, service-install/version/restart/remove (postgres/redis), db-backup/restore, package-install. Android rooms: android-build (provenance APK), android-run (build, install and launch on the emulator screen), emulator-config (device/OS), start-command.',
       schema: { roomId: zRoomId, change: zQuickChange },
       handler: wrap(async (a) => (await getClient()).applyChange(a.roomId, a.change))
     },
     {
       name: 'undo_change',
-      description: 'Undo a previously applied change by id (see inspect_room / apply_quick_change results).',
+      description: 'Undo a previously applied change by id (see inspect_room / list_changes results).',
       schema: { roomId: zRoomId, changeId: zChangeId },
       handler: wrap(async (a) => (await getClient()).undoChange(a.roomId, a.changeId))
+    },
+    {
+      name: 'restart_web',
+      description: "Restart the room's main process (web server, or the Android build container).",
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).restartWeb(a.roomId))
+    },
+    {
+      name: 'clone_room',
+      description:
+        'Clone a Web room into a new nickname: copies environment and services, optionally dependencies and service data. The clone is an independent isolated room.',
+      schema: {
+        roomId: zRoomId,
+        nickname: z.string().describe('nickname for the clone, e.g. "stage", "node24-test"'),
+        copyDependencies: z.boolean().describe('copy the installed dependency volume instead of reinstalling'),
+        services: z.enum(['copy', 'empty', 'exclude']).describe('copy service data, start services empty, or leave services out')
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).cloneRoom(a.roomId, {
+          nickname: a.nickname,
+          copyDependencies: a.copyDependencies,
+          services: a.services
+        })
+      )
+    },
+    {
+      name: 'rename_room',
+      description: "Change a room's nickname.",
+      schema: { roomId: zRoomId, nickname: z.string() },
+      handler: wrap(async (a) => {
+        await (await getClient()).renameRoom(a.roomId, a.nickname)
+        return `Room ${a.roomId} renamed to ${a.nickname}.`
+      })
+    },
+    {
+      name: 'delete_room',
+      description:
+        'DESTRUCTIVE and irreversible: delete a room and all of its managed storage (dependencies, databases, browser profile). Returns reclaimed bytes.',
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).deleteRoom(a.roomId))
+    },
+    {
+      name: 'list_changes',
+      description: 'List the full change journal of a room: every change with status, before/after, and undoability.',
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).listChanges(a.roomId))
+    },
+    {
+      name: 'room_components',
+      description: 'List the installed programs of a room with live in-room versions (Node/JDK, package manager, services, emulator).',
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).components(a.roomId))
+    },
+    {
+      name: 'room_logs',
+      description: "Tail a room's logs: 'web' is the main process stdout/stderr, 'orchestrator' is DevHotel's lifecycle log for the room.",
+      schema: { roomId: zRoomId, kind: z.enum(['web', 'orchestrator']).optional().describe("defaults to 'web'") },
+      handler: wrap(async (a) => (await getClient()).logs(a.roomId, a.kind ?? 'web'))
     },
     {
       name: 'copy_diagnostic',
@@ -131,6 +192,19 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         'Get the secret-redacted diagnostic bundle for a room — paste it into an LLM or issue to debug startup failures.',
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await (await getClient()).diagnostic(a.roomId)).text)
+    },
+    {
+      name: 'hotel_github_status',
+      description:
+        'Status of the Hotel-owned GitHub Service: pinned gh provisioning state and credential connection state. Connecting a token stays a human action in the DevHotel app.',
+      schema: {},
+      handler: wrap(async () => (await getClient()).hotelGithubStatus())
+    },
+    {
+      name: 'hotel_github_install',
+      description: 'Provision (download, verify, pin) the Hotel-owned gh build. Does not touch credentials.',
+      schema: {},
+      handler: wrap(async () => (await getClient()).hotelGithubInstall())
     }
   ]
 }

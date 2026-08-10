@@ -18,7 +18,7 @@ import type {
 } from '@devhotel/shared'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
-import { srcVolume, svcVolume } from './backend/naming'
+import { EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -381,6 +381,16 @@ export class RoomOrchestrator {
         if (providerKind === 'web' && record.sourceType !== 'empty') {
           await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
         }
+        if (providerKind === 'android') {
+          this.olog(id, 'start emulator')
+          try {
+            await this.backend.createEmulator(id, this.mustGet(id).android)
+          } catch (err) {
+            // No KVM or a failed image pull must not brick the room — it can
+            // still build APKs; checks surface the missing emulator screen.
+            this.olog(id, `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        }
         await this.syncRouteFor(id)
         const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
         this.rooms.update(id, { status: verify.ok ? 'ready' : 'attention', lastUsedAt: new Date().toISOString() })
@@ -665,33 +675,42 @@ export class RoomOrchestrator {
   private async startRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
-    // Served Rooms need a relay port; standalone build Rooms deliberately do not.
-    if (alreadyAwake && (room.provider === 'android' || room.hostPort != null)) return
+    if (alreadyAwake && room.hostPort != null) return
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
     try {
       // Recreate containers from the current record so changes made while
-      // asleep are materialized on wake. Android is a standalone build Room:
-      // it owns a private network but has no anchor, relay, preview, or KVM.
+      // asleep are materialized on wake.
+      if (room.provider === 'android' && room.internalPort === 0) {
+        // rooms created before the emulator screen existed relayed nothing
+        this.rooms.update(roomId, { internalPort: 6080 })
+      }
+      const { hostPort } = await this.backend.recreateAnchor({
+        roomId,
+        internalPort: this.mustGet(roomId).internalPort
+      })
+      this.rooms.update(roomId, { hostPort, status: 'running' })
       if (room.provider === 'android') {
-        this.gateway.removeRoute(room.domain)
-        await this.backend.recreateWeb(this.webSpecFor(room))
-        this.rooms.update(roomId, { hostPort: null, status: 'running' })
+        // the emulator joins the fresh anchor's netns, so it is recreated with it
+        this.olog(roomId, 'start emulator')
+        try {
+          await this.backend.removeEmulator(roomId)
+          await this.backend.createEmulator(roomId, room.android)
+        } catch (err) {
+          // No KVM or a failed image pull must not brick the room — it can
+          // still build APKs; checks surface the missing emulator screen.
+          this.olog(roomId, `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`)
+        }
       } else {
-        const { hostPort } = await this.backend.recreateAnchor({
-          roomId,
-          internalPort: room.internalPort
-        })
-        this.rooms.update(roomId, { hostPort, status: 'running' })
         // services join the anchor's netns, so a fresh anchor needs fresh service containers
         for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
           this.olog(roomId, `start service ${svc} ${cfg.version}`)
           await this.backend.removeService(roomId, svc, { volume: false })
           await this.backend.createService(roomId, svc, cfg.version)
         }
-        await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       }
+      await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
       const verify = await verifyWebUp(this.ctxFor(roomId), { timeoutMs: 90_000 })
@@ -795,7 +814,8 @@ export class RoomOrchestrator {
     const baseUrl = this.gateway.urlFor(room.domain, room.https)
     return {
       room,
-      urls: { app: room.provider === 'android' ? 'about:blank' : baseUrl },
+      // android rooms open the emulator screen fullscreen and auto-connected
+      urls: { app: room.provider === 'android' ? `${baseUrl}/vnc.html?autoconnect=true&resize=scale` : baseUrl },
       dataDir: join(this.userData, 'rooms', room.id),
       backups: this.listBackups(room.id),
       stackLine:
@@ -1097,6 +1117,12 @@ export class RoomOrchestrator {
         "if [ -f ./gradlew ]; then sh ./gradlew --version 2>/dev/null; else gradle --version 2>/dev/null; fi | grep -m1 Gradle"
       )
       out.push({ id: 'gradle', label: 'Gradle', version: gradle ?? 'gradle', source: gradle ? 'live' : 'recorded' })
+      out.push({
+        id: 'emulator',
+        label: 'Android Emulator',
+        version: `${room.android?.device ?? EMULATOR_DEFAULT_DEVICE} · Android ${room.android?.version ?? EMULATOR_DEFAULT_VERSION}`,
+        source: 'recorded'
+      })
       return out
     }
 

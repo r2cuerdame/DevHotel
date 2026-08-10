@@ -718,13 +718,28 @@ code,
 }
 
 .preview-device-strip {
-  display: grid;
-  grid-template-columns: minmax(0, 62fr) minmax(320px, 38fr);
+  display: flex;
+  align-items: center;
   gap: 8px;
   min-height: 42px;
   padding: 5px 8px;
   background: var(--walnut-2);
   border-bottom: 1px solid var(--line);
+}
+
+.preview-device-strip .preview-device-control {
+  flex: 1;
+  min-width: 0;
+}
+
+.split-toggle {
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.split-toggle[data-active] {
+  color: var(--brass);
+  border-color: var(--brass);
 }
 
 .preview-device-control {
@@ -765,12 +780,57 @@ code,
   font-size: 11px;
 }
 
+/* Black backdrop: the native panes letterbox against it and it shows through the split gutter. */
 .preview-host {
   flex: 1;
   position: relative;
   min-width: 0;
   min-height: 0;
-  background: var(--line);
+  background: #000;
+}
+
+/* The 8px gutter between the two native panes belongs to the renderer — it doubles as the drag handle. */
+.preview-splitter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  touch-action: none;
+}
+
+.preview-splitter:hover,
+.preview-splitter[data-dragging] {
+  background: var(--brass);
+}
+
+.preview-splitter-grip {
+  color: var(--dim);
+  font-size: 11px;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* While dragging, the native panes hide and these placeholders track the pointer. */
+.preview-drag-panes {
+  position: absolute;
+  inset: 0;
+  background: #000;
+}
+
+.preview-drag-pane {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: #111;
+  border: 1px solid var(--line);
 }
 
 .preview-overlay {

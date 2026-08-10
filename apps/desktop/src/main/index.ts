@@ -120,7 +120,8 @@ async function bootstrap(): Promise<void> {
     console.error('orchestrator init failed:', err)
   }
 
-  const control = await startControlApi(orch, userData, app.getVersion()).catch((err) => {
+  const hotelForAgents: import('./controlApi').HotelServicesRef = { github: null }
+  const control = await startControlApi(orch, userData, app.getVersion(), hotelForAgents).catch((err) => {
     console.error('control api failed to start:', err)
     return null
   })
@@ -147,6 +148,7 @@ async function bootstrap(): Promise<void> {
       statusDetail: status.detail
     })
   )
+  hotelForAgents.github = github
   // A packaged Hotel provisions its built-in GitHub infrastructure without
   // waiting for the Store UI to be opened. Failure is retryable from there.
   void github.status().catch((error) => console.error('GitHub Service provisioning failed:', error))

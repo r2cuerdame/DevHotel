@@ -91,6 +91,27 @@ export class ControlClient {
       { cmd, timeoutMs }
     )
   }
+  deleteRoom(roomId: string) {
+    return this.req<{ reclaimedBytes: number }>('DELETE', `/v1/rooms/${encodeURIComponent(roomId)}`)
+  }
+  restartWeb(roomId: string) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/restart-web`)
+  }
+  cloneRoom(roomId: string, body: { nickname: string; copyDependencies: boolean; services: 'copy' | 'empty' | 'exclude' }) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/clone`, body)
+  }
+  renameRoom(roomId: string, nickname: string) {
+    return this.req<void>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/rename`, { nickname })
+  }
+  listChanges(roomId: string) {
+    return this.req<unknown[]>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/changes`)
+  }
+  components(roomId: string) {
+    return this.req<unknown[]>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/components`)
+  }
+  logs(roomId: string, kind: 'web' | 'orchestrator') {
+    return this.req<{ lines: string[] }>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/logs?kind=${kind}`)
+  }
   runChecks(roomId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/checks`)
   }
@@ -102,6 +123,12 @@ export class ControlClient {
   }
   diagnostic(roomId: string) {
     return this.req<{ text: string }>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/diagnostic`)
+  }
+  hotelGithubStatus() {
+    return this.req<unknown>('GET', '/v1/hotel/github')
+  }
+  hotelGithubInstall() {
+    return this.req<unknown>('POST', '/v1/hotel/github/install')
   }
 }
 
