@@ -1,8 +1,8 @@
 {
-  "name": "@devhotel/desktop",
+  "name": "devhotel",
   "productName": "DevHotel",
-  "version": "0.2.2",
-  "description": "Every project gets its own room — a browser for isolated local development servers.",
+  "version": "0.4.1",
+  "description": "Give AI a room, not your computer — a local runtime for isolated development agents.",
   "author": "DevHotel contributors",
   "private": true,
   "type": "module",
@@ -12,7 +12,8 @@
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "build:installer": "electron-vite build && electron-builder --win nsis"
+    "prepare:github": "node scripts/prepare-github-service.mjs",
+    "build:installer": "pnpm prepare:github && electron-vite build && electron-builder --win nsis"
   },
   "dependencies": {
     "@devhotel/core": "workspace:*",
@@ -20,6 +21,7 @@
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "electron-updater": "^6.3.9",
+    "extract-zip": "^2.0.1",
     "node-forge": "^1.3.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

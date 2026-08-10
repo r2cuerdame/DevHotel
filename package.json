@@ -1,21 +1,21 @@
 {
-  "name": "devhotel",
+  "name": "devhotel-workspace",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.4.1",
   "type": "module",
-  "description": "Every project gets its own room — a browser for isolated local development servers.",
+  "description": "Give AI a room, not your computer — a local runtime for isolated development agents.",
   "license": "MIT",
   "engines": {
     "node": ">=22"
   },
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "dev": "pnpm --filter @devhotel/desktop dev",
+    "dev": "pnpm --filter devhotel dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r --if-present test",
     "lint": "eslint .",
-    "build:installer": "pnpm --filter devhotel-mcp build && pnpm --filter @devhotel/desktop build:installer"
+    "build:installer": "pnpm --filter devhotel-mcp build && pnpm --filter devhotel build:installer"
   },
   "devDependencies": {
     "@eslint/js": "^9.20.0",

@@ -1,4 +1,5 @@
 import type { AnchorSpec, WebSpec } from './types'
+import { RELAY_PREAMBLE_PREFIX } from '../relayProtocol'
 
 export const ANCHOR_IMAGE = 'alpine/socat'
 export const RELAY_PORT = 3999
@@ -7,12 +8,37 @@ export function anchorName(roomId: string): string {
   return `dh-${roomId}-anchor`
 }
 
+export function roomNetworkName(roomId: string): string {
+  return `dh-${roomId}-net`
+}
+
 export function webName(roomId: string): string {
   return `dh-${roomId}-web`
 }
 
-export function srcVolume(roomId: string): string {
-  return `dh-${roomId}-src`
+export function jobName(roomId: string, jobId: string): string {
+  const compact = jobId.replaceAll('-', '').toLowerCase()
+  if (!/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/.test(compact)) {
+    throw new Error('invalid one-shot job ID')
+  }
+  return `dh-${roomId}-job-${compact}`
+}
+
+export function isJobName(roomId: string, name: string): boolean {
+  const prefix = `dh-${roomId}-job-`
+  if (!name.startsWith(prefix)) return false
+  return /^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/.test(name.slice(prefix.length))
+}
+
+export function srcVolume(roomId: string, revision = 0): string {
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid workspace volume revision')
+  return revision === 0 ? `dh-${roomId}-src` : `dh-${roomId}-src-r${revision}`
+}
+
+export function workspaceSnapshotVolume(roomId: string, operationId: string): string {
+  const compact = operationId.replaceAll('-', '').toLowerCase()
+  if (!/^[a-f0-9]{32}$/.test(compact)) throw new Error('invalid workspace snapshot operation ID')
+  return `dh-${roomId}-src-build-${compact}`
 }
 
 export function depsVolume(roomId: string, nodeMajor: string): string {
@@ -63,6 +89,8 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     emulatorName(roomId),
     '--network',
     `container:${anchorName(roomId)}`,
+    '--cap-drop',
+    'NET_RAW',
     '-l',
     `devhotel.room=${roomId}`,
     '-l',
@@ -115,6 +143,8 @@ export function buildServiceArgs(roomId: string, svc: ServiceKind, version: stri
     svcName(roomId, svc),
     '--network',
     `container:${anchorName(roomId)}`,
+    '--cap-drop',
+    'NET_RAW',
     '-l',
     `devhotel.room=${roomId}`,
     '-l',
@@ -139,30 +169,64 @@ export function buildServiceArgs(roomId: string, svc: ServiceKind, version: stri
   return [...common, '-v', `${svcVolume(roomId, svc)}:/data`, svcImage(svc, version), 'redis-server', '--appendonly', 'no']
 }
 
-function labelArgs(roomId: string, role: 'anchor' | 'web'): string[] {
+function labelArgs(roomId: string, role: 'anchor' | 'web' | 'job'): string[] {
   return ['-l', `devhotel.room=${roomId}`, '-l', `devhotel.role=${role}`, '-l', 'devhotel.managed=1']
 }
 
-export function buildAnchorArgs(spec: AnchorSpec): string[] {
+export function buildRoomNetworkCreateArgs(roomId: string): string[] {
+  return [
+    'network',
+    'create',
+    '--driver',
+    'bridge',
+    '--opt',
+    'com.docker.network.bridge.enable_icc=false',
+    '--label',
+    `devhotel.room=${roomId}`,
+    '--label',
+    'devhotel.role=network',
+    '--label',
+    'devhotel.managed=1',
+    roomNetworkName(roomId),
+  ]
+}
+
+export function buildAnchorArgs(spec: AnchorSpec, relayTokenSha256: string): string[] {
+  if (!/^[a-f0-9]{64}$/.test(relayTokenSha256)) throw new Error('invalid DevHotel relay verifier')
+  const relayGateScript = `IFS= read -r -t 2 line || exit 1; case "$line" in "${RELAY_PREAMBLE_PREFIX}"*) token=\${line#"${RELAY_PREAMBLE_PREFIX}"};; *) exit 1;; esac; [ "\${#token}" -eq 64 ] || exit 1; case "$token" in *[!0-9a-f]*) exit 1;; esac; actual=$(printf '%s' "$token" | sha256sum); actual=\${actual%% *}; expected=$DEVHOTEL_RELAY_TOKEN_SHA256; mismatch=0; i=0; while [ "$i" -lt 64 ]; do ac=\${actual%"\${actual#?}"}; ec=\${expected%"\${expected#?}"}; [ "$ac" = "$ec" ] || mismatch=1; actual=\${actual#?}; expected=\${expected#?}; i=$((i + 1)); done; [ "$mismatch" -eq 0 ] || exit 1; exec socat STDIO "TCP:127.0.0.1:$DEVHOTEL_INTERNAL_PORT"`
   return [
     'run',
     '-d',
     '--name',
     anchorName(spec.roomId),
+    '--network',
+    roomNetworkName(spec.roomId),
     ...labelArgs(spec.roomId, 'anchor'),
     '-p',
     `127.0.0.1:0:${RELAY_PORT}`,
+    '--cap-drop',
+    'NET_RAW',
+    '-e',
+    `DEVHOTEL_RELAY_TOKEN_SHA256=${relayTokenSha256}`,
+    '-e',
+    `DEVHOTEL_INTERNAL_PORT=${spec.internalPort}`,
+    '-e',
+    `DEVHOTEL_RELAY_GATE=${relayGateScript}`,
+    '--entrypoint',
+    '/bin/sh',
     ANCHOR_IMAGE,
+    '-c',
+    `umask 077; printf '#!/bin/sh\n%s\n' "$DEVHOTEL_RELAY_GATE" > /tmp/devhotel-relay-gate; chmod 500 /tmp/devhotel-relay-gate; exec socat "$0" "$1"`,
     `TCP-LISTEN:${RELAY_PORT},fork,reuseaddr`,
-    `TCP:127.0.0.1:${spec.internalPort}`,
+    'EXEC:/tmp/devhotel-relay-gate',
   ]
 }
 
 function sourceMountArgs(spec: WebSpec): string[] {
-  switch (spec.sourceType) {
-    case 'managed-git':
-      return ['-v', `${srcVolume(spec.roomId)}:/workspace`]
-    case 'linked-folder':
+  switch (spec.workspaceMode) {
+    case 'hotel':
+      return ['-v', `${spec.workspaceVolumeOverride ?? srcVolume(spec.roomId, spec.workspaceVolumeRevision)}:/workspace`]
+    case 'legacy-host-bind':
       return ['-v', `${spec.sourceRef}:/workspace`]
     case 'empty':
       return []
@@ -178,7 +242,7 @@ function mountArgs(spec: WebSpec): string[] {
   if (args.length > 0 && !spec.noDepsVolume) {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
-  args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
+  if (!spec.noCacheVolume) args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
   for (const extra of spec.extraVolumes ?? []) {
     args.push('-v', `${extra.volume}:${extra.path}`)
   }
@@ -200,8 +264,16 @@ function limitArgs(spec: WebSpec): string[] {
   return args
 }
 
+function quoteShellWord(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
 export function wrapStartCommand(startCommand: string): string {
-  return `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec ${startCommand}`
+  // `exec <text>` only works when <text> begins with a simple command. Room
+  // commands are shell programs and may begin with `if`, `for`, assignments,
+  // or pipelines. Execute an inner shell so those programs remain valid while
+  // it still replaces the container's PID 1 for correct signal handling.
+  return `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec sh -lc ${quoteShellWord(startCommand)}`
 }
 
 export function buildWebCreateArgs(spec: WebSpec): string[] {
@@ -209,7 +281,10 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
     'create',
     '--name',
     webName(spec.roomId),
-    ...(spec.standalone ? [] : ['--network', `container:${anchorName(spec.roomId)}`]),
+    '--network',
+    spec.standalone ? roomNetworkName(spec.roomId) : `container:${anchorName(spec.roomId)}`,
+    '--cap-drop',
+    'NET_RAW',
     ...labelArgs(spec.roomId, 'web'),
     ...mountArgs(spec),
     ...envArgs(spec),
@@ -223,11 +298,17 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
   ]
 }
 
-export function buildOneShotArgs(spec: WebSpec, cmd: string): string[] {
+export function buildOneShotArgs(spec: WebSpec, cmd: string, jobId: string): string[] {
   return [
     'run',
     '--rm',
-    ...labelArgs(spec.roomId, 'web'),
+    '--name',
+    jobName(spec.roomId, jobId),
+    '--network',
+    roomNetworkName(spec.roomId),
+    '--cap-drop',
+    'NET_RAW',
+    ...labelArgs(spec.roomId, 'job'),
     ...mountArgs(spec),
     ...envArgs(spec),
     '-w',

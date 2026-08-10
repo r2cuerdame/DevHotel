@@ -19,10 +19,11 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter devhotel prepare:github
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm --filter devhotel-mcp build
       - name: Build and publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm --filter @devhotel/desktop build && pnpm --filter @devhotel/desktop exec electron-builder --win nsis --publish always
+        run: pnpm --filter devhotel build && pnpm --filter devhotel exec electron-builder --win nsis --publish always

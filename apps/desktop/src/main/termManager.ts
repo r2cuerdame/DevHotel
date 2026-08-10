@@ -1,8 +1,8 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import type { WebContents } from 'electron'
 import { IPC } from '@devhotel/shared'
-import type { RoomOrchestrator } from '@devhotel/core'
+import { type RoomOrchestrator } from '@devhotel/core'
 
 interface TermSession {
   id: string
@@ -19,14 +19,9 @@ export class TermManager {
 
   constructor(private readonly orch: RoomOrchestrator) {}
 
-  open(roomId: string, sender: WebContents): { termId: string } {
-    const room = this.orch.rooms.get(roomId)
-    if (!room) throw new Error(`Room not found: ${roomId}`)
-    if (room.status === 'sleeping' || room.status === 'preparing') {
-      throw new Error('The room must be awake for a terminal session')
-    }
+  async open(roomId: string, sender: WebContents): Promise<{ termId: string }> {
     const id = randomUUID()
-    const child = spawn('docker', ['exec', '-i', `dh-${roomId}-web`, 'sh', '-li'], { windowsHide: true })
+    const child = await this.orch.spawnInteractiveExec(roomId, ['sh', '-li'])
     const forward = (chunk: Buffer): void => {
       if (!sender.isDestroyed()) sender.send(IPC.evTermData, id, chunk.toString('utf8').replaceAll('\n', '\r\n'))
     }

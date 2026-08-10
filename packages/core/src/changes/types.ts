@@ -4,6 +4,7 @@ import type { Gateway } from '../gateway/gateway'
 import type { ChangesRepo } from '../store/changesRepo'
 import type { RoomsRepo } from '../store/roomsRepo'
 import type { SettingsRepo } from '../store/settingsRepo'
+import { connectRelay } from '../relayProtocol'
 
 export interface ChangeCtx {
   roomId: string
@@ -41,13 +42,25 @@ export interface ChangeStep {
   setCaptured(blob: unknown): void
 }
 
+export interface ChangeOperation {
+  /** Stable ID shared by the Change entry, immutable input snapshot, and artifacts. */
+  id: string
+  createdAt: string
+}
+
 export interface ChangeDefinition<P = unknown> {
   kind: string
   plan(ctx: ChangeCtx, p: P): ChangePlanned
   preflight?(ctx: ChangeCtx, p: P): Promise<void>
-  capture?(ctx: ChangeCtx, p: P): Promise<unknown>
-  apply(ctx: ChangeCtx, p: P, steps: ChangeStep): Promise<void>
-  verify(ctx: ChangeCtx, p: P): Promise<{ ok: boolean; detail: string }>
+  capture?(ctx: ChangeCtx, p: P, operation: ChangeOperation): Promise<unknown>
+  apply(ctx: ChangeCtx, p: P, steps: ChangeStep, operation: ChangeOperation): Promise<void>
+  verify(ctx: ChangeCtx, p: P, captured: unknown, operation: ChangeOperation): Promise<{ ok: boolean; detail: string }>
+  /**
+   * Apply failures normally invoke undo. Definitions whose destructive phase
+   * starts only after a durable capture can veto rollback until that capture
+   * exists, so a failed safety-backup cannot destroy the still-good resource.
+   */
+  canRollbackApplyFailure?(ctx: ChangeCtx, p: P, captured: unknown): boolean
   undo?(ctx: ChangeCtx, entry: ChangeEntry): Promise<void>
 }
 
@@ -74,7 +87,8 @@ export async function verifyWebUp(ctx: ChangeCtx, opts?: { timeoutMs?: number })
     lastState = state
     if (state === 'running' && room.hostPort) {
       consecutiveExited = 0
-      if (await tcpAnswers(room.hostPort, 1500)) {
+      const relayToken = await ctx.backend.relayToken(room.id)
+      if (await tcpAnswers(room.hostPort, 1500, relayToken)) {
         return { ok: true, detail: `web process running, port ${room.internalPort} answering` }
       }
     }
@@ -101,11 +115,11 @@ export function sleep(ms: number): Promise<void> {
  * We send a minimal HTTP request and require at least one response byte —
  * socat closes with zero bytes when its onward connect is refused.
  */
-export async function tcpAnswers(port: number, timeoutMs: number): Promise<boolean> {
-  const net = await import('node:net')
+export async function tcpAnswers(port: number, timeoutMs: number, relayToken?: string): Promise<boolean> {
   return new Promise((resolve) => {
     let gotData = false
-    const sock = net.connect({ host: '127.0.0.1', port, timeout: timeoutMs })
+    const sock = connectRelay(port, relayToken)
+    sock.setTimeout(timeoutMs)
     const finish = (ok: boolean): void => {
       sock.destroy()
       resolve(ok)

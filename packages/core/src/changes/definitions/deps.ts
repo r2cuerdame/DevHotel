@@ -12,7 +12,7 @@ export function depsGenKey(roomId: string, nodeMajor: string): string {
   return `depsGen:${roomId}:node${nodeMajor}`
 }
 
-function depsGenMaxKey(roomId: string, nodeMajor: string): string {
+export function depsGenMaxKey(roomId: string, nodeMajor: string): string {
   return `depsGenMax:${roomId}:node${nodeMajor}`
 }
 
@@ -59,7 +59,7 @@ export const depsInstallChange: ChangeDefinition<{ clean: boolean }> = {
       const nextGen = (maxRaw ? Number.parseInt(maxRaw, 10) : currentDepsGen(ctx)) + 1
       const freshVolume = depsVolumeForGen(room.id, major, nextGen)
       steps.push('Create fresh dependency volume')
-      await ctx.backend.resetVolume(freshVolume)
+      await ctx.backend.resetVolume(ctx.roomId, freshVolume)
       steps.push(`Run ${installCmd} into the fresh volume`)
       const result = await ctx.backend.runOneShot(ctx.webSpec({ depsVolumeOverride: freshVolume }), installCmd, ctx.log)
       if (result.code !== 0) {

@@ -6,17 +6,30 @@ const api: IpcApi = {
     list: () => ipcRenderer.invoke(IPC.roomsList),
     plan: (input) => ipcRenderer.invoke(IPC.roomsPlan, input),
     create: (input) => ipcRenderer.invoke(IPC.roomsCreate, input),
+    clone: (sourceRoomId, options) => ipcRenderer.invoke(IPC.roomsClone, sourceRoomId, options),
     start: (roomId) => ipcRenderer.invoke(IPC.roomsStart, roomId),
     sleep: (roomId) => ipcRenderer.invoke(IPC.roomsSleep, roomId),
     delete: (roomId) => ipcRenderer.invoke(IPC.roomsDelete, roomId),
     restartWeb: (roomId) => ipcRenderer.invoke(IPC.roomsRestartWeb, roomId),
     inspect: (roomId) => ipcRenderer.invoke(IPC.roomsInspect, roomId),
     rename: (roomId, nickname) => ipcRenderer.invoke(IPC.roomsRename, roomId, nickname),
-    components: (roomId) => ipcRenderer.invoke(IPC.roomsComponents, roomId)
+    components: (roomId) => ipcRenderer.invoke(IPC.roomsComponents, roomId),
+    syncFromHost: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsSyncFromHost, roomId, approvedHostPath),
+    moveIntoHotel: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsMoveIntoHotel, roomId, approvedHostPath)
+  },
+  packages: {
+    search: (query, offset) => ipcRenderer.invoke(IPC.packagesSearch, query, offset)
+  },
+  hotel: {
+    githubStatus: () => ipcRenderer.invoke(IPC.hotelGithubStatus),
+    githubInstall: () => ipcRenderer.invoke(IPC.hotelGithubInstall),
+    githubConnect: (token) => ipcRenderer.invoke(IPC.hotelGithubConnect, token),
+    githubDisconnect: () => ipcRenderer.invoke(IPC.hotelGithubDisconnect),
+    mcpBrowse: (search, cursor) => ipcRenderer.invoke(IPC.hotelMcpBrowse, search, cursor)
   },
   changes: {
     list: (roomId) => ipcRenderer.invoke(IPC.changesList, roomId),
-    apply: (roomId, change, actor) => ipcRenderer.invoke(IPC.changesApply, roomId, change, actor),
+    apply: (roomId, change) => ipcRenderer.invoke(IPC.changesApply, roomId, change),
     undo: (roomId, changeId) => ipcRenderer.invoke(IPC.changesUndo, roomId, changeId)
   },
   checks: { run: (roomId) => ipcRenderer.invoke(IPC.checksRun, roomId) },
@@ -53,10 +66,12 @@ const api: IpcApi = {
   },
   preview: {
     setBounds: (roomId, bounds) => ipcRenderer.invoke(IPC.previewSetBounds, roomId, bounds),
+    setVisible: (roomId, visible) => ipcRenderer.invoke(IPC.previewSetVisible, roomId, visible),
     detach: () => ipcRenderer.invoke(IPC.previewDetach),
-    nav: (roomId, action) => ipcRenderer.invoke(IPC.previewNav, roomId, action),
+    nav: (roomId, action, target) => ipcRenderer.invoke(IPC.previewNav, roomId, action, target),
     devtools: (roomId) => ipcRenderer.invoke(IPC.previewDevTools, roomId),
-    viewport: (roomId, size) => ipcRenderer.invoke(IPC.previewViewport, roomId, size)
+    viewport: (roomId, size) => ipcRenderer.invoke(IPC.previewViewport, roomId, size),
+    layout: (roomId, layout) => ipcRenderer.invoke(IPC.previewLayout, roomId, layout)
   },
   on: (channel: IpcChannel, listener: (...args: any[]) => void) => {
     const wrapped = (_e: unknown, ...args: any[]): void => listener(...args)

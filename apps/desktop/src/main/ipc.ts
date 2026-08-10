@@ -1,11 +1,54 @@
-import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { app, dialog, ipcMain, shell, type BrowserWindow } from 'electron'
-import { IPC, type Actor, type CreateRoomInput, type McpSetupInfo, type QuickChange } from '@devhotel/shared'
+import {
+  IPC,
+  zAutostartEnabled,
+  zChangeId,
+  zExternalHttpUrl,
+  zGitHubToken,
+  zHostPath,
+  zLogKind,
+  zOptionalPreviewViewport,
+  zPreviewLayout,
+  zPackageSearchOffset,
+  zPackageSearchQuery,
+  zMcpRegistryCursor,
+  zMcpRegistrySearch,
+  zRendererPlanRoomInput,
+  zPreviewBounds,
+  zPreviewNavAction,
+  zPreviewTarget,
+  zPreviewVisible,
+  zQuickChange,
+  zRenameRoomInput,
+  zRendererCloneRoomInput,
+  zRendererCreateRoomInput,
+  zRendererSettingInput,
+  zRendererSettingKey,
+  zRoomId,
+  zTermId,
+  zTermInput,
+  zTermResize,
+  type McpSetupInfo
+} from '@devhotel/shared'
 import { caTrustStatus, ensureCa, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
 import type { PreviewManager } from './previewManager'
 import type { TermManager } from './termManager'
+import {
+  cleanRemovalConfirmation,
+  launchCleanRemovalCoordinator,
+  validateCleanRemovalUninstaller,
+  validateCleanRemovalTarget
+} from './cleanRemoval'
+import type { CleanRemovalOperation } from './cleanRemovalGate'
+import { assertTrustedMainFrame, type RendererIpcEvent } from './ipcSecurity'
+import { LinkedFolderGrants, requirePathWithinRoots } from './linkedFolderGrants'
+import { makeMcpSetupInfo } from './mcpSetup'
+import { searchNpmRegistry } from './npmRegistry'
+import type { GitHubService } from './githubService'
+import { browseMcpRegistry } from './mcpRegistry'
 
 export function registerIpc(opts: {
   win: BrowserWindow
@@ -14,10 +57,54 @@ export function registerIpc(opts: {
   previews: PreviewManager
   terms: TermManager
   userData: string
+  dataOwnershipId: string
+  github: GitHubService
+  runCleanRemoval: (operation: CleanRemovalOperation) => Promise<boolean>
+  finishCleanRemoval: () => void
 }): void {
-  const { win, orch, gateway, previews, terms, userData } = opts
+  const { win, orch, gateway, previews, terms, userData, dataOwnershipId, github, runCleanRemoval, finishCleanRemoval } = opts
   const caDir = join(userData, 'ca')
+  const installDir = dirname(process.execPath)
+  const packagedRendererUrl = pathToFileURL(join(import.meta.dirname, '../renderer/index.html')).toString()
   const activeTails = new Set<string>()
+  const folderGrants = new LinkedFolderGrants({
+    home: app.getPath('home'),
+    deniedTrees: [
+      app.getPath('appData'),
+      dirname(app.getPath('appData')),
+      userData,
+      ...(app.isPackaged ? [installDir] : []),
+      process.env.APPDATA ?? '',
+      process.env.LOCALAPPDATA ?? '',
+      process.env.SystemRoot ?? '',
+      process.env.ProgramFiles ?? '',
+      process.env['ProgramFiles(x86)'] ?? '',
+      process.env.ProgramData ?? ''
+    ].filter(Boolean)
+  })
+
+  type TrustedHandler = (event: RendererIpcEvent, ...args: unknown[]) => unknown
+  const handle = (channel: string, handler: TrustedHandler): void => {
+    ipcMain.handle(channel, (event, ...args) => {
+      assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
+      return handler(event, ...args)
+    })
+  }
+  const on = (channel: string, handler: TrustedHandler): void => {
+    ipcMain.on(channel, (event, ...args) => {
+      try {
+        assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
+        handler(event, ...args)
+      } catch (err) {
+        console.warn(`Rejected renderer IPC ${channel}:`, err)
+      }
+    })
+  }
+
+  const authorizeLinkedFolder = <T extends { sourceType: string; sourceRef: string }>(input: T): T =>
+    input.sourceType === 'linked-folder'
+      ? { ...input, sourceRef: folderGrants.requireApproved(input.sourceRef) }
+      : input
 
   const send = (channel: string, ...args: unknown[]): void => {
     if (!win.isDestroyed()) win.webContents.send(channel, ...args)
@@ -34,66 +121,126 @@ export function registerIpc(opts: {
   })
 
   /* rooms */
-  ipcMain.handle(IPC.roomsList, () => orch.listRooms())
-  ipcMain.handle(IPC.roomsPlan, (_e, input) => orch.planRoom(input))
-  ipcMain.handle(IPC.roomsCreate, (_e, input: CreateRoomInput) => orch.createRoom({ ...input, actor: 'user' }))
-  ipcMain.handle(IPC.roomsStart, (_e, roomId: string) => orch.startRoom(roomId, 'user'))
-  ipcMain.handle(IPC.roomsSleep, (_e, roomId: string) => orch.sleepRoom(roomId, 'user'))
-  ipcMain.handle(IPC.roomsDelete, (_e, roomId: string) => orch.deleteRoom(roomId, 'user'))
-  ipcMain.handle(IPC.roomsRestartWeb, (_e, roomId: string) => orch.restartWeb(roomId, 'user'))
-  ipcMain.handle(IPC.roomsInspect, (_e, roomId: string) => orch.inspectRoom(roomId))
-  ipcMain.handle(IPC.roomsRename, (_e, roomId: string, nickname: string) => orch.renameRoom(roomId, nickname))
-  ipcMain.handle(IPC.roomsComponents, (_e, roomId: string) => orch.components(roomId))
+  handle(IPC.roomsList, () => orch.listRooms())
+  handle(IPC.roomsPlan, (_event, input) => {
+    const parsed = authorizeLinkedFolder(zRendererPlanRoomInput.parse(input))
+    return orch.planRoom(parsed)
+  })
+  handle(IPC.roomsCreate, (_event, input) => {
+    const parsed = authorizeLinkedFolder(zRendererCreateRoomInput.parse(input))
+    return orch.createRoom({ ...parsed, actor: 'user' })
+  })
+  handle(IPC.roomsClone, (_event, sourceRoomId, options) => {
+    const parsed = zRendererCloneRoomInput.parse({ ...(options as object), sourceRoomId })
+    return orch.cloneRoom({ ...parsed, actor: 'user' })
+  })
+  handle(IPC.roomsStart, (_event, roomId) => orch.startRoom(zRoomId.parse(roomId), 'user'))
+  handle(IPC.roomsSleep, (_event, roomId) => orch.sleepRoom(zRoomId.parse(roomId), 'user'))
+  handle(IPC.roomsDelete, (_event, roomId) => orch.deleteRoom(zRoomId.parse(roomId), 'user'))
+  handle(IPC.roomsRestartWeb, (_event, roomId) => orch.restartWeb(zRoomId.parse(roomId), 'user'))
+  handle(IPC.roomsInspect, (_event, roomId) => orch.inspectRoom(zRoomId.parse(roomId)))
+  handle(IPC.roomsRename, (_event, roomId, nickname) => {
+    const parsed = zRenameRoomInput.parse({ roomId, nickname })
+    return orch.renameRoom(parsed.roomId, parsed.nickname)
+  })
+  handle(IPC.roomsComponents, (_event, roomId) => orch.components(zRoomId.parse(roomId)))
+  const reauthorizeRoomSource = (roomId: unknown, selectedPath: unknown): string => {
+    const safeRoomId = zRoomId.parse(roomId)
+    const approved = folderGrants.requireApproved(zHostPath.parse(selectedPath))
+    const recorded = orch.inspectRoom(safeRoomId).room.sourceRef
+    const comparable = (value: string): string =>
+      process.platform === 'win32' ? resolve(value).toLowerCase() : resolve(value)
+    if (comparable(approved) !== comparable(recorded)) {
+      throw new Error('Select the same Local Folder originally assigned to this Room')
+    }
+    return safeRoomId
+  }
+  handle(IPC.roomsSyncFromHost, (_event, roomId, selectedPath) =>
+    orch.syncFromHost(reauthorizeRoomSource(roomId, selectedPath), 'user')
+  )
+  handle(IPC.roomsMoveIntoHotel, (_event, roomId, selectedPath) =>
+    orch.moveIntoHotel(reauthorizeRoomSource(roomId, selectedPath), 'user')
+  )
+  handle(IPC.packagesSearch, (_event, query, offset) =>
+    searchNpmRegistry(zPackageSearchQuery.parse(query), fetch, zPackageSearchOffset.parse(offset ?? 0))
+  )
+  handle(IPC.hotelGithubStatus, () => github.status())
+  handle(IPC.hotelGithubInstall, () => github.install())
+  handle(IPC.hotelGithubConnect, (_event, token) => {
+    const parsed = zGitHubToken.safeParse(token)
+    if (!parsed.success) throw new Error('Enter a valid GitHub fine-grained personal access token')
+    return github.connect(parsed.data)
+  })
+  handle(IPC.hotelGithubDisconnect, () => github.disconnect())
+  handle(IPC.hotelMcpBrowse, (_event, search, cursor) =>
+    browseMcpRegistry(zMcpRegistrySearch.parse(search ?? ''), cursor ? zMcpRegistryCursor.parse(cursor) : '')
+  )
 
   /* changes / checks / diagnostics */
-  ipcMain.handle(IPC.changesList, (_e, roomId: string) => orch.listChanges(roomId))
-  ipcMain.handle(IPC.changesApply, (_e, roomId: string, change: QuickChange, actor: Actor) =>
-    orch.applyChange(roomId, change, actor === 'agent' ? 'agent' : 'user')
+  handle(IPC.changesList, (_event, roomId) => orch.listChanges(zRoomId.parse(roomId)))
+  handle(IPC.changesApply, (_event, roomId, change) =>
+    orch.applyChange(zRoomId.parse(roomId), zQuickChange.parse(change), 'user')
   )
-  ipcMain.handle(IPC.changesUndo, (_e, roomId: string, changeId: string) => orch.undoChange(roomId, changeId, 'user'))
-  ipcMain.handle(IPC.checksRun, (_e, roomId: string) => orch.runChecks(roomId))
-  ipcMain.handle(IPC.diagCopy, (_e, roomId: string) => orch.getDiagnostic(roomId))
+  handle(IPC.changesUndo, (_event, roomId, changeId) =>
+    orch.undoChange(zRoomId.parse(roomId), zChangeId.parse(changeId), 'user')
+  )
+  handle(IPC.checksRun, (_event, roomId) => orch.runChecks(zRoomId.parse(roomId)))
+  handle(IPC.diagCopy, (_event, roomId) => orch.getDiagnostic(zRoomId.parse(roomId)))
 
   /* logs */
-  ipcMain.handle(IPC.logsTailStart, (_e, roomId: string, kind: 'web' | 'orchestrator') => {
-    activeTails.add(`${roomId}:${kind}`)
-    return { lines: orch.logs.tail(roomId, kind) }
+  handle(IPC.logsTailStart, (_event, roomId, kind) => {
+    const safeRoomId = zRoomId.parse(roomId)
+    const safeKind = zLogKind.parse(kind)
+    activeTails.add(`${safeRoomId}:${safeKind}`)
+    return { lines: orch.logs.tail(safeRoomId, safeKind) }
   })
-  ipcMain.handle(IPC.logsTailStop, (_e, roomId: string, kind: 'web' | 'orchestrator') => {
-    activeTails.delete(`${roomId}:${kind}`)
+  handle(IPC.logsTailStop, (_event, roomId, kind) => {
+    activeTails.delete(`${zRoomId.parse(roomId)}:${zLogKind.parse(kind)}`)
   })
 
   /* terminal */
-  ipcMain.handle(IPC.termOpen, (e, roomId: string) => terms.open(roomId, e.sender))
-  ipcMain.on(IPC.termInput, (_e, termId: string, data: string) => terms.input(termId, data))
-  ipcMain.on(IPC.termResize, () => terms.resize())
-  ipcMain.on(IPC.termClose, (_e, termId: string) => terms.close(termId))
+  handle(IPC.termOpen, (event, roomId) => terms.open(zRoomId.parse(roomId), event.sender))
+  on(IPC.termInput, (_event, termId, data) => {
+    const parsed = zTermInput.parse({ termId, data })
+    terms.input(parsed.termId, parsed.data)
+  })
+  on(IPC.termResize, (_event, termId, cols, rows) => {
+    zTermResize.parse({ termId, cols, rows })
+    terms.resize()
+  })
+  on(IPC.termClose, (_event, termId) => terms.close(zTermId.parse(termId)))
 
   /* settings / gateway / ca */
-  ipcMain.handle(IPC.settingsGet, (_e, key: string) => orch.settings.get(key))
-  ipcMain.handle(IPC.settingsSet, (_e, key: string, value: string) => orch.settings.set(key, value))
-  ipcMain.handle(IPC.gatewayStatus, () => gateway.status())
-  ipcMain.handle(IPC.caStatus, () => caTrustStatus(caDir))
-  ipcMain.handle(IPC.caTrust, async () => {
+  handle(IPC.settingsGet, (_event, key) => orch.settings.get(zRendererSettingKey.parse(key)))
+  handle(IPC.settingsSet, (_event, key, value) => {
+    const parsed = zRendererSettingInput.parse({ key, value })
+    return orch.settings.set(parsed.key, parsed.value)
+  })
+  handle(IPC.gatewayStatus, () => gateway.status())
+  handle(IPC.caStatus, () => caTrustStatus(caDir))
+  handle(IPC.caTrust, async () => {
     await ensureCa(caDir)
     await trustCaInWindows(caDir)
   })
-  ipcMain.handle(IPC.caUntrust, () => untrustCaInWindows(caDir))
+  handle(IPC.caUntrust, () => untrustCaInWindows(caDir))
 
   /* app */
-  ipcMain.handle(IPC.appVersion, () => app.getVersion())
-  ipcMain.handle(IPC.openExternal, (_e, url: string) => {
-    if (/^https?:\/\//.test(url)) return shell.openExternal(url)
-    return Promise.resolve()
+  handle(IPC.appVersion, () => app.getVersion())
+  handle(IPC.openExternal, (_event, url) => shell.openExternal(zExternalHttpUrl.parse(url)))
+  handle(IPC.openPath, async (_event, path) => {
+    const allowedRoots = [
+      userData,
+      installDir,
+      ...orch.listRooms().filter((room) => room.sourceType === 'linked-folder').map((room) => room.sourceRef)
+    ]
+    await shell.openPath(requirePathWithinRoots(zHostPath.parse(path), allowedRoots))
   })
-  ipcMain.handle(IPC.openPath, async (_e, path: string) => {
-    await shell.openPath(path)
-  })
-  ipcMain.handle(IPC.pickFolder, async () => {
+  handle(IPC.pickFolder, async () => {
     const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
-    return result.canceled ? null : (result.filePaths[0] ?? null)
+    const selected = result.canceled ? null : (result.filePaths[0] ?? null)
+    return selected ? folderGrants.grant(selected) : null
   })
-  ipcMain.handle(IPC.mcpInfo, (): McpSetupInfo => {
+  handle(IPC.mcpInfo, (): McpSetupInfo => {
     const serverPath = app.isPackaged
       ? join(process.resourcesPath, 'mcp', 'index.js')
       : resolve(app.getAppPath(), '..', '..', 'packages', 'mcp', 'dist', 'index.js')
@@ -104,53 +251,90 @@ export function registerIpc(opts: {
     } catch {
       controlPort = null
     }
-    return {
+    return makeMcpSetupInfo({
       serverPath,
       available: existsSync(serverPath),
-      claudeCommand: `claude mcp add devhotel -- node "${serverPath}"`,
-      configJson: JSON.stringify({ mcpServers: { devhotel: { command: 'node', args: [serverPath] } } }, null, 2),
+      executablePath: process.execPath,
       controlPort
-    }
+    })
   })
 
-  ipcMain.handle(IPC.footprint, () => ({
+  handle(IPC.footprint, () => ({
     dataDir: userData,
-    installDir: dirname(process.execPath),
+    installDir,
     autostart: app.getLoginItemSettings().openAtLogin
   }))
-  ipcMain.handle(IPC.autostartSet, (_e, enabled: boolean) => {
-    app.setLoginItemSettings({ openAtLogin: enabled, args: ['--hidden'] })
+  handle(IPC.autostartSet, (_event, enabled) => {
+    app.setLoginItemSettings({ openAtLogin: zAutostartEnabled.parse(enabled), args: ['--hidden'] })
   })
-  ipcMain.handle(IPC.cleanUninstall, async () => {
-    for (const room of orch.listRooms()) {
-      try {
-        await orch.deleteRoom(room.id, 'user')
-      } catch {
-        // keep going — remove as much as possible
+  ipcMain.handle(IPC.cleanUninstall, async (event) => {
+    assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
+
+    return runCleanRemoval(async () => {
+      const uninstallers = readdirSync(installDir).filter((f) => /^Uninstall.*\.exe$/i.test(f))
+      if (uninstallers.length !== 1) {
+        throw new Error(
+          uninstallers.length === 0
+            ? 'DevHotel uninstaller was not found; no Room data was removed'
+            : 'Multiple DevHotel uninstallers were found; no Room data was removed'
+        )
       }
-    }
-    await untrustCaInWindows(caDir).catch(() => undefined)
-    app.setLoginItemSettings({ openAtLogin: false })
-    const installDir = dirname(process.execPath)
-    const uninstaller = readdirSync(installDir).find((f) => /^Uninstall.*\.exe$/i.test(f))
-    // erase app data after this process exits (the DB is open while we run)
-    spawn('cmd', ['/c', `ping 127.0.0.1 -n 4 > nul & rmdir /s /q "${userData}"`], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true
-    }).unref()
-    if (uninstaller) {
-      spawn(join(installDir, uninstaller), [], { detached: true, stdio: 'ignore' }).unref()
-    }
-    setTimeout(() => app.quit(), 500)
+      const uninstaller = uninstallers[0]!
+      validateCleanRemovalUninstaller(installDir, uninstaller)
+      const resolvedUserData = validateCleanRemovalTarget(userData, app.getPath('appData'), dataOwnershipId)
+
+      const confirmation = await dialog.showMessageBox(win, cleanRemovalConfirmation(orch.listRooms().length))
+      if (confirmation.response !== 1) return false
+
+      // This closes the orchestrator mutation gate, drains admitted work, and
+      // deletes one stable inventory. Failed Room ownership stays retryable.
+      await orch.deleteAllRooms('user')
+      try {
+        if ((await caTrustStatus(caDir)) === 'trusted') await untrustCaInWindows(caDir)
+      } catch (err) {
+        throw new Error(`Rooms were removed, but DevHotel CA trust could not be removed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      app.setLoginItemSettings({ openAtLogin: false })
+      // Re-check after the potentially long Room drain: never schedule a path
+      // that was swapped for a junction while confirmation/cleanup was running.
+      validateCleanRemovalTarget(resolvedUserData, app.getPath('appData'), dataOwnershipId)
+      const resolvedUninstaller = validateCleanRemovalUninstaller(installDir, uninstaller)
+      // One coordinator waits for this process (and its open DB) to exit, then
+      // runs the exact silent uninstaller and removes app data only on success.
+      const cleanupFailureLog = join(app.getPath('appData'), 'DevHotel-cleanup-error.log')
+      await launchCleanRemovalCoordinator({
+        parentPid: process.pid,
+        appData: app.getPath('appData'),
+        target: resolvedUserData,
+        ownershipId: dataOwnershipId,
+        uninstaller: resolvedUninstaller,
+        failureLog: cleanupFailureLog
+      })
+      finishCleanRemoval()
+      return true
+    })
   })
 
   /* preview */
-  ipcMain.handle(IPC.previewSetBounds, (_e, roomId: string, bounds) => previews.attach(roomId, bounds))
-  ipcMain.handle(IPC.previewDetach, () => previews.detach())
-  ipcMain.handle(IPC.previewNav, (_e, roomId: string, action) => previews.nav(roomId, action))
-  ipcMain.handle(IPC.previewDevTools, (_e, roomId: string) => previews.toggleDevTools(roomId))
-  ipcMain.handle(IPC.previewViewport, (_e, roomId: string, size: { width: number; height: number } | null) =>
-    previews.setViewport(roomId, size)
+  handle(IPC.previewSetBounds, (_event, roomId, bounds) =>
+    previews.attach(zRoomId.parse(roomId), zPreviewBounds.parse(bounds))
+  )
+  handle(IPC.previewSetVisible, (_event, roomId, visible) =>
+    previews.setVisible(zRoomId.parse(roomId), zPreviewVisible.parse(visible))
+  )
+  handle(IPC.previewDetach, () => previews.detach())
+  handle(IPC.previewNav, (_event, roomId, action, target) =>
+    previews.nav(
+      zRoomId.parse(roomId),
+      zPreviewNavAction.parse(action),
+      target === undefined ? 'both' : zPreviewTarget.parse(target)
+    )
+  )
+  handle(IPC.previewDevTools, (_event, roomId) => previews.toggleDevTools(zRoomId.parse(roomId)))
+  handle(IPC.previewViewport, (_event, roomId, size) =>
+    previews.setViewport(zRoomId.parse(roomId), zOptionalPreviewViewport.parse(size))
+  )
+  handle(IPC.previewLayout, (_event, roomId, layout) =>
+    previews.setLayout(zRoomId.parse(roomId), zPreviewLayout.parse(layout))
   )
 }

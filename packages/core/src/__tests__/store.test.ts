@@ -31,6 +31,13 @@ function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
     provider: 'web',
     sourceType: 'managed-git',
     sourceRef: 'https://github.com/acme/site.git',
+    workspaceMode: 'hotel',
+    stateRevision: 1,
+    workspaceVolumeRevision: 0,
+    syncStatus: 'synced',
+    lastSyncedAt: '2026-08-10T10:00:00.000Z',
+    hostSyncEnabled: false,
+    workspaceFingerprint: 'abc',
     runtime: { kind: 'node', version: '22.12.0' },
     packageManager: { kind: 'pnpm', version: '9.15.0' },
     startCommand: 'pnpm dev',
@@ -127,9 +134,29 @@ describe('roomsRepo', () => {
   it('deletes a room', () => {
     const rooms = roomsRepo(db)
     rooms.create(makeRoom())
+    changesRepo(db).append(makeChange())
+    checksRepo(db).saveReport({
+      roomId: 'room-1',
+      ranAt: '2026-08-10T12:00:00.000Z',
+      overall: 'healthy',
+      results: [{ step: 'http', status: 'healthy', summary: 'HTTP 200' }]
+    })
+    const settings = settingsRepo(db)
+    settings.set('depsGen:room-1', '1')
+    settings.set('depsGen:room-1:node22', '2')
+    settings.set('depsGenMax:room-1:node22', '3')
+    settings.set('workspaceGenMax:room-1', '4')
+    settings.set('theme', 'dark')
     rooms.delete('room-1')
     expect(rooms.get('room-1')).toBeNull()
     expect(rooms.list()).toEqual([])
+    expect(changesRepo(db).list('room-1')).toEqual([])
+    expect(checksRepo(db).latest('room-1')).toBeNull()
+    expect(settings.get('depsGen:room-1')).toBeNull()
+    expect(settings.get('depsGen:room-1:node22')).toBeNull()
+    expect(settings.get('depsGenMax:room-1:node22')).toBeNull()
+    expect(settings.get('workspaceGenMax:room-1')).toBeNull()
+    expect(settings.get('theme')).toBe('dark')
   })
 
   it('nextRoomNumber starts at 201 then increments from max', () => {

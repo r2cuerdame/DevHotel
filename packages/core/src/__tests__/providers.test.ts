@@ -52,6 +52,8 @@ describe('WebRoomProvider', () => {
       nodeMajor: room.runtime.version,
       sourceType: room.sourceType,
       sourceRef: room.sourceRef,
+      workspaceMode: room.workspaceMode,
+      workspaceVolumeRevision: room.workspaceVolumeRevision,
       startCommand: room.startCommand,
       env: {}
     })
@@ -74,7 +76,8 @@ describe('AndroidRoomProvider (build rooms v1)', () => {
     const plan = await getProvider('android').detect(fixture('empty'), { project: 'MyApp', nickname: 'dev' })
     expect(plan.runtime.kind).toBe('jdk')
     expect(plan.packageManager.value).toBe('gradle')
-    expect(plan.startCommand.value).toMatch(/gradle assembleDebug/)
+    expect(plan.startCommand.value).toContain('./gradlew assembleDebug')
+    expect(plan.startCommand.value).toContain('else gradle assembleDebug')
     expect(plan.internalPort.value).toBe(6080)
     expect(plan.warnings.some((w) => /No Gradle project/.test(w))).toBe(true)
   })
@@ -85,15 +88,18 @@ describe('AndroidRoomProvider (build rooms v1)', () => {
     expect(plan.framework).toBe('android')
   })
 
-  it('buildSpec is a pod-mode sdk container relaying the emulator screen', () => {
+  it('buildSpec is a standalone build-only sdk container with no preview or KVM', () => {
     const room = makeRoom({ provider: 'android', runtime: { kind: 'jdk', version: '17' }, internalPort: 6080 })
-    const spec = getProvider('android').buildSpec(room)
-    expect(spec.standalone).toBeUndefined()
+    const provider = getProvider('android')
+    const spec = provider.buildSpec(room)
+    expect(provider.info).toMatchObject({ execution: 'build-only', preview: 'none', requiresKvm: false })
+    expect(spec.standalone).toBe(true)
     expect(spec.internalPort).toBe(6080)
     expect(spec.noDepsVolume).toBe(true)
     expect(spec.imageOverride).toMatch(/android/)
     expect(spec.startCommand).toMatch(/sleep/)
     expect(spec.env?.GRADLE_USER_HOME).toBe('/cache/gradle')
     expect(getProvider('android').components()).toContain('Gradle')
+    expect(getProvider('android').components()).not.toContain('Emulator')
   })
 })

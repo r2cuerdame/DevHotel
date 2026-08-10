@@ -7,6 +7,7 @@ import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Gateway } from '../gateway/gateway'
+import { relayPreamble } from '../relayProtocol'
 
 interface SimpleResponse {
   status: number
@@ -44,7 +45,7 @@ function request(
   })
 }
 
-function listen(server: http.Server): Promise<number> {
+function listen(server: net.Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(0, '127.0.0.1', () => {
@@ -61,6 +62,8 @@ let httpPort: number
 let httpsPort: number
 let targetA: http.Server
 let targetB: http.Server
+let gatedTarget: net.Server
+const GATED_TOKEN = 'd'.repeat(64)
 const upgradeSockets = new Set<Duplex>()
 
 beforeAll(async () => {
@@ -83,6 +86,46 @@ beforeAll(async () => {
   })
   const portB = await listen(targetB)
 
+  gatedTarget = net.createServer((socket) => {
+    let buffer = ''
+    let authenticated = false
+    let upgraded = false
+    socket.setEncoding('utf8')
+    socket.on('data', (chunk: string) => {
+      buffer += chunk
+      if (!authenticated) {
+        const newline = buffer.indexOf('\n')
+        if (newline < 0) return
+        if (buffer.slice(0, newline + 1) !== relayPreamble(GATED_TOKEN)) {
+          socket.destroy()
+          return
+        }
+        authenticated = true
+        buffer = buffer.slice(newline + 1)
+      }
+      if (upgraded) {
+        socket.write(buffer)
+        buffer = ''
+        return
+      }
+      const headerEnd = buffer.indexOf('\r\n\r\n')
+      if (headerEnd < 0) return
+      const headers = buffer.slice(0, headerEnd + 4)
+      const remainder = buffer.slice(headerEnd + 4)
+      buffer = ''
+      if (/\r\nupgrade:\s*websocket\r\n/i.test(headers)) {
+        upgraded = true
+        upgradeSockets.add(socket)
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+        if (remainder) socket.write(remainder)
+        return
+      }
+      const body = 'gated-room'
+      socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`)
+    })
+  })
+  const gatedPort = await listen(gatedTarget)
+
   gateway = new Gateway({ caDir, httpPorts: [0], httpsPorts: [0] })
   const status = await gateway.start()
   expect(status.running).toBe(true)
@@ -93,6 +136,13 @@ beforeAll(async () => {
 
   await gateway.setRoute({ domain: 'a.localhost', roomId: 'room-a', targetPort: portA, https: false })
   await gateway.setRoute({ domain: 'b.localhost', roomId: 'room-b', targetPort: portB, https: true })
+  await gateway.setRoute({
+    domain: 'gated.localhost',
+    roomId: 'room-gated',
+    targetPort: gatedPort,
+    https: false,
+    relayToken: GATED_TOKEN
+  })
 }, 120000)
 
 afterAll(async () => {
@@ -102,6 +152,7 @@ afterAll(async () => {
   targetB.closeAllConnections()
   await new Promise((r) => targetA.close(r))
   await new Promise((r) => targetB.close(r))
+  await new Promise<void>((resolve) => gatedTarget.close(() => resolve()))
   await rm(caDir, { recursive: true, force: true })
 }, 30000)
 
@@ -175,5 +226,54 @@ describe('gateway e2e', () => {
     sock.write('ping-echo-42')
     await waitFor(() => buffer.includes('ping-echo-42'))
     sock.destroy()
+  }, 30000)
+
+  it('sends the relay capability before a gated WebSocket handshake and preserves upgraded bytes', async () => {
+    const sock = net.connect(httpPort, '127.0.0.1')
+    await new Promise<void>((resolve, reject) => {
+      sock.once('connect', resolve)
+      sock.once('error', reject)
+    })
+
+    let buffer = ''
+    const waitFor = (needle: string) =>
+      new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`timed out waiting for ${needle}`)), 5000)
+        const onData = (data: Buffer) => {
+          buffer += data.toString('utf8')
+          if (!buffer.includes(needle)) return
+          clearTimeout(timeout)
+          sock.removeListener('data', onData)
+          resolve()
+        }
+        sock.on('data', onData)
+        sock.once('error', reject)
+      })
+
+    sock.write(
+      'GET /gated-ws HTTP/1.1\r\nHost: gated.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+    )
+    await waitFor('101 Switching Protocols')
+    buffer = ''
+    sock.write('gated-ping-42')
+    await waitFor('gated-ping-42')
+    sock.destroy()
+  }, 30000)
+
+  it('authenticates gated relays and retains their host-only capability across a gateway restart', async () => {
+    const first = await request('http', httpPort, 'gated.localhost')
+    expect(first).toMatchObject({ status: 200, body: 'gated-room' })
+    expect(gateway.status().routes.find((route) => route.roomId === 'room-gated')).toEqual({
+      domain: 'gated.localhost',
+      roomId: 'room-gated',
+      https: false
+    })
+
+    await gateway.stop()
+    const restarted = await gateway.start()
+    httpPort = restarted.httpPort!
+    httpsPort = restarted.httpsPort!
+    const second = await request('http', httpPort, 'gated.localhost')
+    expect(second).toMatchObject({ status: 200, body: 'gated-room' })
   }, 30000)
 })

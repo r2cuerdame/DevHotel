@@ -1,10 +1,12 @@
 import { useState } from 'react'
-import type { PmKind, ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
+import type { ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import type { Translation } from '../i18n'
 
 const NODE_MAJORS = ['18', '20', '22', '24']
+type WebPmKind = 'npm' | 'pnpm'
+type CreatableProvider = Extract<ProviderKind, 'web' | 'android'>
 
 export function NewRoomWizard(): React.JSX.Element {
   const openWizard = useStore((s) => s.openWizard)
@@ -14,7 +16,7 @@ export function NewRoomWizard(): React.JSX.Element {
   const t = useT()
 
   const [step, setStep] = useState<'source' | 'plan'>('source')
-  const [provider, setProvider] = useState<ProviderKind>('web')
+  const [provider, setProvider] = useState<CreatableProvider>('web')
   const [sourceType, setSourceType] = useState<SourceType>('managed-git')
   const [sourceRef, setSourceRef] = useState('')
   const [project, setProject] = useState('')
@@ -24,20 +26,14 @@ export function NewRoomWizard(): React.JSX.Element {
 
   // editable plan fields
   const [runtimeVersion, setRuntimeVersion] = useState('22')
-  const [pmKind, setPmKind] = useState<PmKind>('npm')
+  const [pmKind, setPmKind] = useState<WebPmKind>('npm')
   const [startCommand, setStartCommand] = useState('')
   const [internalPort, setInternalPort] = useState(3000)
   const [domain, setDomain] = useState('')
   const [https, setHttps] = useState(false)
 
   const chooseSource = (type: SourceType): void => {
-    setProvider('web')
     setSourceType(type)
-  }
-
-  const chooseAndroid = (): void => {
-    setProvider('android')
-    if (sourceType === 'empty') setSourceType('managed-git')
   }
 
   async function pickFolder(): Promise<void> {
@@ -61,7 +57,9 @@ export function NewRoomWizard(): React.JSX.Element {
       const p = await planRoom({ sourceType, sourceRef, nickname, project: projectName, provider })
       setPlan(p)
       setRuntimeVersion(p.runtime.value)
-      setPmKind(p.packageManager.value)
+      if (provider === 'web' && (p.packageManager.value === 'npm' || p.packageManager.value === 'pnpm')) {
+        setPmKind(p.packageManager.value)
+      }
       setStartCommand(p.startCommand.value)
       setInternalPort(p.internalPort.value)
       setDomain(p.domain)
@@ -77,14 +75,17 @@ export function NewRoomWizard(): React.JSX.Element {
   async function checkIn(): Promise<void> {
     setLoading(true)
     try {
+      const planOverrides =
+        provider === 'android'
+          ? { startCommand }
+          : { runtimeVersion, pmKind, startCommand, internalPort, domain, https }
       await createRoom({
         sourceType,
         sourceRef,
         project,
         nickname,
-        actor: 'user',
         provider,
-        planOverrides: { runtimeVersion, pmKind, startCommand, internalPort, domain, https }
+        planOverrides
       })
     } finally {
       setLoading(false)
@@ -100,6 +101,19 @@ export function NewRoomWizard(): React.JSX.Element {
         {step === 'source' ? (
           <>
             <h2>{t('lobby.newRoom')}</h2>
+            <div className="field">
+              <label>{t('wizard.roomType')}</label>
+              <div className="provider-choices">
+                <button className="source-choice" data-active={provider === 'web'} onClick={() => setProvider('web')}>
+                  <b>{t('wizard.webRoom')}</b>
+                  <small>{t('wizard.webRoomHint')}</small>
+                </button>
+                <button className="source-choice" data-active={provider === 'android'} onClick={() => setProvider('android')}>
+                  <b>{t('android.buildRoom')}</b>
+                  <small>{t('wizard.sourceAndroidHint')}</small>
+                </button>
+              </div>
+            </div>
             <div className="source-choices">
               {(
                 [
@@ -111,34 +125,14 @@ export function NewRoomWizard(): React.JSX.Element {
                 <button
                   key={type}
                   className="source-choice"
-                  data-active={provider === 'web' && sourceType === type}
-                  disabled={type === 'empty' && provider === 'android'}
+                  data-active={sourceType === type}
                   onClick={() => chooseSource(type)}
                 >
                   <b>{t(label)}</b>
                   <small>{t(hint)}</small>
                 </button>
               ))}
-              <button className="source-choice" data-active={provider === 'android'} onClick={chooseAndroid}>
-                <b>{t('wizard.sourceAndroid')}</b>
-                <small>{t('wizard.sourceAndroidHint')}</small>
-              </button>
-              <button className="source-choice" disabled title={t('wizard.sourceWindowsHint')}>
-                <b>{t('wizard.sourceWindows')}</b>
-                <small>{t('wizard.sourceWindowsHint')}</small>
-              </button>
             </div>
-
-            {provider === 'android' && (
-              <div className="seg">
-                <button data-active={sourceType === 'managed-git'} onClick={() => setSourceType('managed-git')}>
-                  {t('wizard.sourceGit')}
-                </button>
-                <button data-active={sourceType === 'linked-folder'} onClick={() => setSourceType('linked-folder')}>
-                  {t('wizard.sourceFolder')}
-                </button>
-              </div>
-            )}
 
             {sourceType === 'managed-git' && (
               <div className="field">
@@ -160,7 +154,7 @@ export function NewRoomWizard(): React.JSX.Element {
                     id="src-path"
                     placeholder="C:\code\my-project"
                     value={sourceRef}
-                    onChange={(e) => setSourceRef(e.target.value)}
+                    readOnly
                     style={{ flex: 1 }}
                   />
                   <button className="btn" onClick={() => void pickFolder()}>
@@ -201,68 +195,49 @@ export function NewRoomWizard(): React.JSX.Element {
                     <td>{plan.framework}</td>
                   </tr>
                 )}
-                {provider === 'android' ? (
+                <tr>
+                  <td>{t('label.runtime')}</td>
+                  <td>
+                    <div className="row">
+                      {provider === 'android' ? (
+                        <span>JDK {runtimeVersion}</span>
+                      ) : (
+                        <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
+                          {NODE_MAJORS.map((v) => (
+                            <option key={v} value={v}>
+                              Node {v}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <span className="src">{plan?.runtime.source}</span>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td>{t('label.packageManager')}</td>
+                  <td>
+                    <div className="row">
+                      {provider === 'android' ? (
+                        <span>Gradle</span>
+                      ) : (
+                        <select value={pmKind} onChange={(e) => setPmKind(e.target.value as WebPmKind)} style={{ width: 110 }}>
+                          <option value="npm">npm</option>
+                          <option value="pnpm">pnpm</option>
+                        </select>
+                      )}
+                      <span className="src">{plan?.packageManager.source}</span>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td>{t('label.startCommand')}</td>
+                  <td>
+                    <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
+                  </td>
+                </tr>
+                {provider === 'web' && (
                   <>
-                    <tr>
-                      <td>{t('label.runtime')}</td>
-                      <td>
-                        <div className="row">
-                          <span>JDK {runtimeVersion}</span>
-                          <span className="src">{plan?.runtime.source}</span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>{t('label.packageManager')}</td>
-                      <td>
-                        <div className="row">
-                          <span>{pmKind}</span>
-                          <span className="src">{plan?.packageManager.source}</span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>{t('android.buildCommand')}</td>
-                      <td>
-                        <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
-                      </td>
-                    </tr>
-                  </>
-                ) : (
-                  <>
-                    <tr>
-                      <td>{t('label.runtime')}</td>
-                      <td>
-                        <div className="row">
-                          <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
-                            {NODE_MAJORS.map((v) => (
-                              <option key={v} value={v}>
-                                Node {v}
-                              </option>
-                            ))}
-                          </select>
-                          <span className="src">{plan?.runtime.source}</span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>{t('label.packageManager')}</td>
-                      <td>
-                        <div className="row">
-                          <select value={pmKind} onChange={(e) => setPmKind(e.target.value as PmKind)} style={{ width: 110 }}>
-                            <option value="npm">npm</option>
-                            <option value="pnpm">pnpm</option>
-                          </select>
-                          <span className="src">{plan?.packageManager.source}</span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>{t('label.startCommand')}</td>
-                      <td>
-                        <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
-                      </td>
-                    </tr>
                     <tr>
                       <td>{t('label.internalPort')}</td>
                       <td>
@@ -296,6 +271,8 @@ export function NewRoomWizard(): React.JSX.Element {
               </tbody>
             </table>
 
+            {provider === 'android' && <p className="small muted">{t('android.buildOnlyHint')}</p>}
+
             {plan && plan.warnings.length > 0 && (
               <ul className="plan-warnings">
                 {plan.warnings.map((w, i) => (
@@ -308,7 +285,11 @@ export function NewRoomWizard(): React.JSX.Element {
               <button className="btn" onClick={() => setStep('source')} disabled={loading}>
                 {t('common.back')}
               </button>
-              <button className="btn primary" onClick={() => void checkIn()} disabled={loading || !startCommand || !domain}>
+              <button
+                className="btn primary"
+                onClick={() => void checkIn()}
+                disabled={loading || !startCommand || (provider === 'web' && !domain)}
+              >
                 {loading ? t('wizard.preparingRoom') : t('wizard.checkIn')}
               </button>
             </div>

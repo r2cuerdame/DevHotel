@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { ControlInfo, CreateRoomInput, QuickChange } from '@devhotel/shared'
+import type { AgentCreateRoomInput, ControlInfo, QuickChange } from '@devhotel/shared'
 
 export function defaultControlFile(): string {
   if (process.env.DEVHOTEL_CONTROL_FILE) return process.env.DEVHOTEL_CONTROL_FILE
@@ -72,7 +72,7 @@ export class ControlClient {
   listRooms() {
     return this.req<unknown[]>('GET', '/v1/rooms')
   }
-  createRoom(input: Omit<CreateRoomInput, 'actor'>) {
+  createRoom(input: AgentCreateRoomInput) {
     return this.req<unknown>('POST', '/v1/rooms', input)
   }
   inspectRoom(roomId: string) {

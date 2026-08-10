@@ -3,16 +3,14 @@ import type { RoomRecord } from '@devhotel/shared'
 import { statusLabel, useStore, useT } from '../../state/store'
 import { api } from '../../api'
 
-/** Persistent card for the newest successful APK build, with a jump to the file on disk. */
+/** Latest verified Room-owned APK path. Artifact export arrives with the Device Service. */
 function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
   const inspection = useStore((s) => s.inspections[room.id])
   const t = useT()
   const build = inspection?.recentChanges.find((c) => c.kind === 'android-build' && c.verify?.ok)
   if (!build?.verify) return null
   const containerPath = build.verify.detail.replace(/^APK ready: /, '')
-  const rel = containerPath.replace(/^\/workspace\//, '').replaceAll('/', '\\')
-  const hostFile = room.sourceType === 'linked-folder' ? `${room.sourceRef}\\${rel}` : null
-  const hostDir = hostFile ? hostFile.slice(0, hostFile.lastIndexOf('\\')) : null
+  const roomPath = containerPath.replace(/^\/workspace\//, '')
   return (
     <div className="change-item" style={{ marginTop: 8 }}>
       <span className="status-dot" data-status="ready" />
@@ -20,13 +18,8 @@ function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
         <span className="eyebrow" style={{ display: 'block', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'var(--brass)' }}>
           {t('android.lastBuild')}
         </span>
-        <span className="mono small">{hostFile ?? containerPath}</span>
+        <span className="mono small">{roomPath}</span>
       </span>
-      {hostDir && (
-        <button className="btn" onClick={() => void api.app.openPath(hostDir)}>
-          {t('android.openApkFolder')}
-        </button>
-      )}
     </div>
   )
 }
@@ -36,6 +29,9 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
   const undoChange = useStore((s) => s.undoChange)
   const roomAction = useStore((s) => s.roomAction)
   const applyChange = useStore((s) => s.applyChange)
+  const refreshInspection = useStore((s) => s.refreshInspection)
+  const refreshRooms = useStore((s) => s.refreshRooms)
+  const toast = useStore((s) => s.toast)
   const busy = useStore((s) => s.busy[room.id])
   const t = useT()
   const url = inspection?.urls.app
@@ -50,6 +46,21 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
     } finally {
       setPending(null)
     }
+  }
+
+  async function workingStateAction(kind: 'sync' | 'migrate'): Promise<void> {
+    await run(kind, async () => {
+      try {
+        const approvedHostPath = await api.app.pickFolder()
+        if (!approvedHostPath) return
+        if (kind === 'sync') await api.rooms.syncFromHost(room.id, approvedHostPath)
+        else await api.rooms.moveIntoHotel(room.id, approvedHostPath)
+        await Promise.all([refreshInspection(room.id), refreshRooms()])
+        toast('success', kind === 'sync' ? t('working.synced') : t('working.roomOwned'))
+      } catch (err) {
+        toast('error', err instanceof Error ? err.message : String(err))
+      }
+    })
   }
 
   return (
@@ -87,15 +98,6 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
           {android && (
             <button
               className={running ? 'btn primary' : 'btn'}
-              onClick={() => void run('run', () => applyChange(room.id, { kind: 'android-run' }))}
-              disabled={!running || !!busy || pending !== null}
-            >
-              {pending === 'run' ? t('android.launching') : t('android.run')}
-            </button>
-          )}
-          {android && (
-            <button
-              className="btn"
               onClick={() => void run('build', () => applyChange(room.id, { kind: 'android-build' }))}
               disabled={!running || !!busy || pending !== null}
             >
@@ -144,6 +146,40 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
         </button>
       )}
 
+      {room.sourceType === 'linked-folder' && (
+        <div className="panel-section">
+          <h3>{t('working.title')}</h3>
+          <div className="change-item">
+            <span className="status-dot" data-status={room.syncStatus === 'modified' ? 'attention' : 'ready'} />
+            <span className="title">
+              {room.workspaceMode === 'legacy-host-bind'
+                ? t('working.legacy')
+                : room.hostSyncEnabled
+                  ? t('working.roomOwned')
+                  : t('working.detached')}
+              <div className="small muted">
+                {room.syncStatus === 'modified' ? t('working.modifiedHint') : `${t('working.synced')} · R${room.stateRevision}`}
+              </div>
+            </span>
+            {room.workspaceMode === 'legacy-host-bind' && room.hostSyncEnabled && (
+              <button className="btn primary" disabled={pending !== null} onClick={() => void workingStateAction('migrate')}>
+                {t('working.moveIntoHotel')}
+              </button>
+            )}
+            {room.workspaceMode === 'hotel' && room.hostSyncEnabled && (
+              <button
+                className="btn"
+                disabled={pending !== null}
+                title={room.syncStatus === 'modified' ? t('working.modifiedHint') : undefined}
+                onClick={() => void workingStateAction('sync')}
+              >
+                {t('working.syncFromHost')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {android ? (
         <div className="panel-section">
           <h3>{t('android.buildCommand')}</h3>
@@ -152,10 +188,17 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <span className="title">
               <span className="mono">{room.startCommand}</span>
               <div className="small muted">{t('android.apkHint')}</div>
-              <div className="small muted">{t('android.emulatorHint')}</div>
             </span>
           </div>
           <LatestBuild room={room} />
+          <div className="change-item coming-next-card">
+            <span className="status-dot" data-status="sleeping" />
+            <span className="title">
+              {t('android.deviceService')}
+              <div className="small muted">{t('android.deviceServiceComingNext')}</div>
+            </span>
+            <span className="status-chip">{t('android.comingNext')}</span>
+          </div>
         </div>
       ) : (
         <div className="panel-section">
@@ -172,7 +215,15 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
 
       <dl className="kv">
         <dt>{t('label.source')}</dt>
-        <dd className="mono">{room.sourceType === 'empty' ? t('overview.emptyRoom') : room.sourceRef}</dd>
+        <dd className="mono">
+          {room.workspaceMode === 'hotel'
+            ? `${t('working.roomOwned')} · R${room.stateRevision}`
+            : room.sourceType === 'empty'
+            ? t('overview.emptyRoom')
+            : room.sourceType === 'linked-folder' && !room.hostSyncEnabled
+              ? t('working.detached')
+              : room.sourceRef}
+        </dd>
         {!android && (
           <>
             <dt>{t('label.domain')}</dt>

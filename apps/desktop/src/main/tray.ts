@@ -28,6 +28,7 @@ export function createTray(opts: {
   orch: RoomOrchestrator
   onQuit: () => void
   updateReady: () => string | null
+  onUpdateReady: (listener: () => void) => () => void
   installUpdate: () => void
 }): Tray {
   const { win, orch, onQuit } = opts
@@ -83,6 +84,7 @@ export function createTray(opts: {
 
   void rebuild()
   orch.onEvent(() => void rebuild())
+  opts.onUpdateReady(() => void rebuild())
   tray.on('click', show)
   return tray
 }

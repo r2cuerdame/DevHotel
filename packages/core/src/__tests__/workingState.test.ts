@@ -1,0 +1,466 @@
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { srcVolume } from '../backend/naming'
+import { depsGenKey, depsGenMaxKey, depsVolumeForGen } from '../changes/definitions/deps'
+import { RoomOrchestrator } from '../orchestrator'
+import { buildDiagnostic } from '../diagnostics/bundle'
+import type { Db } from '../store/db'
+import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
+import { workspaceGenMaxKey } from '../workingState'
+
+describe('Room-owned working state', () => {
+  let db: Db
+  let userData: string
+  let sourceDir: string
+  let backend: FakeBackend
+  let orch: RoomOrchestrator
+  let closePort: () => void
+
+  beforeEach(async () => {
+    db = testDb()
+    userData = tempDir()
+    sourceDir = join(tempDir(), 'project')
+    mkdirSync(sourceDir, { recursive: true })
+    writeFileSync(join(sourceDir, 'package.json'), JSON.stringify({ name: 'demo', scripts: { dev: 'node server.js' } }))
+    backend = new FakeBackend()
+    const listener = await listeningPort()
+    backend.hostPort = listener.port
+    closePort = listener.close
+    orch = new RoomOrchestrator({
+      userData,
+      backend,
+      gateway: new FakeGateway().asGateway(),
+      db,
+      appVersion: 'test'
+    })
+  })
+
+  afterEach(() => {
+    closePort()
+    db.close()
+    rmSync(userData, { recursive: true, force: true })
+    rmSync(sourceDir, { recursive: true, force: true })
+  })
+
+  it('imports a new Local Folder through the backend and runs on an owned volume', async () => {
+    const room = await orch.createRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      project: 'demo',
+      nickname: 'dev',
+      actor: 'user'
+    })
+
+    expect(room.workspaceMode).toBe('hotel')
+    expect(room.workspaceVolumeRevision).toBe(1)
+    expect(room.hostSyncEnabled).toBe(true)
+    expect(room.workspaceFingerprint).toBe('fake-workspace-fingerprint')
+    expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r1`)
+    expect(backend.lastWebSpec?.workspaceMode).toBe('hotel')
+    expect(backend.lastWebSpec?.workspaceVolumeRevision).toBe(1)
+  })
+
+  it('blocks Agent commands before they can mutate a legacy Host bind', async () => {
+    const room = makeRoom()
+    orch.rooms.create(room)
+
+    await expect(orch.execInRoom(room.id, ['sh', '-lc', 'touch owned-by-agent'], undefined, 'agent')).rejects.toThrow(
+      /legacy Host-bound/
+    )
+    expect(backend.calls).not.toContain(expect.stringContaining('execInRoom'))
+  })
+
+  it('never includes a linked Host absolute path in copied diagnostics', () => {
+    const room = makeRoom({ sourceRef: 'C:\\Users\\private\\secret-project' })
+    const text = buildDiagnostic({
+      room,
+      appVersion: 'test',
+      report: null,
+      recentChanges: [],
+      gateway: { running: false, httpPort: null, httpsPort: null, routes: [] },
+      webLogTail: [],
+      customPatterns: []
+    })
+
+    expect(text).not.toContain(room.sourceRef)
+    expect(text).toContain('legacy Host-bound compatibility mode')
+  })
+
+  it('blocks Agent Quick Changes on a legacy Host bind', async () => {
+    const room = makeRoom()
+    orch.rooms.create(room)
+
+    await expect(
+      orch.applyChange(room.id, { kind: 'start-command', command: 'node other.js' }, 'agent')
+    ).rejects.toThrow(/legacy Host-bound/)
+    expect(orch.rooms.get(room.id)?.startCommand).toBe(room.startCommand)
+    expect(orch.changes.list(room.id)).toEqual([])
+  })
+
+  it('refuses Host sync when an untracked terminal or process edit changed the Room tree', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'synced',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'previous-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'current-fingerprint'
+
+    await expect(orch.syncFromHost(room.id, 'user')).rejects.toThrow(/Room files changed/)
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('modified')
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('publishes a successfully staged Host import as a new source generation', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'synced',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'same-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'same-fingerprint'
+
+    const synced = await orch.syncFromHost(room.id, 'user')
+
+    expect(synced.workspaceVolumeRevision).toBe(2)
+    expect(synced.stateRevision).toBe(5)
+    expect(synced.syncStatus).toBe('synced')
+    expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r2`)
+    expect(backend.lastWebSpec?.workspaceVolumeRevision).toBe(2)
+    expect(backend.calls).toContain('removeWorkspaceVolume:r1')
+  })
+
+  it('never reuses a failed Host-sync workspace generation', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'same-fingerprint',
+      hostPort: backend.hostPort
+    })
+    orch.rooms.create(room)
+    orch.settings.set(workspaceGenMaxKey(room.id), '1')
+    backend.workspaceFingerprintValue = 'same-fingerprint'
+    const importHostFolder = backend.importHostFolder.bind(backend)
+    let failed = false
+    backend.importHostFolder = async (roomId, hostPath, revision) => {
+      if (!failed) {
+        failed = true
+        backend.calls.push(`importHostFolder:${hostPath}:r${revision}`)
+        throw new Error('staged import failed')
+      }
+      await importHostFolder(roomId, hostPath, revision)
+    }
+
+    await expect(orch.syncFromHost(room.id, 'user')).rejects.toThrow(/staged import failed/)
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(orch.settings.get(workspaceGenMaxKey(room.id))).toBe('2')
+
+    const synced = await orch.syncFromHost(room.id, 'user')
+    expect(synced.workspaceVolumeRevision).toBe(3)
+    expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r3`)
+  })
+
+  it('restores the prior runtime and metadata when publishing a staged sync fails', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 9,
+      syncStatus: 'synced',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'same-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'same-fingerprint'
+    let failedPublish = false
+    backend.recreateWeb = async (spec) => {
+      backend.calls.push(`recreateWeb:r${spec.workspaceVolumeRevision}`)
+      backend.lastWebSpec = spec
+      if (spec.workspaceVolumeRevision === 2 && !failedPublish) {
+        failedPublish = true
+        throw new Error('publish failed')
+      }
+    }
+
+    await expect(orch.syncFromHost(room.id, 'user')).rejects.toThrow(/publish failed/)
+
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 9,
+      syncStatus: 'synced',
+      workspaceFingerprint: 'same-fingerprint'
+    })
+    expect(backend.calls).toContain('recreateWeb:r2')
+    expect(backend.calls).toContain('recreateWeb:r1')
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(backend.calls).not.toContain('removeWorkspaceVolume:r1')
+  })
+
+  it('clones an imported Local Folder volume but detaches the target from the Host path', async () => {
+    const source = makeRoom({
+      id: 'source01',
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 3,
+      syncStatus: 'modified',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'fingerprint'
+    })
+    orch.rooms.create(source)
+
+    const cloned = await orch.cloneRoom({
+      sourceRoomId: source.id,
+      nickname: 'agent-branch',
+      copyDependencies: false,
+      services: 'exclude',
+      actor: 'user'
+    })
+
+    expect(cloned.workspaceMode).toBe('hotel')
+    expect(cloned.hostSyncEnabled).toBe(false)
+    expect(cloned.sourceType).toBe('linked-folder')
+    expect(backend.calls).toContain(
+      `copyVolume:${srcVolume(source.id, 1)}:${srcVolume(cloned.id, 1)}`
+    )
+  })
+
+  function packageRoom() {
+    const room = makeRoom({
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/demo.git',
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 7,
+      syncStatus: 'synced',
+      hostSyncEnabled: false,
+      workspaceFingerprint: 'synced-baseline',
+      hostPort: backend.hostPort
+    })
+    orch.rooms.create(room)
+    orch.settings.set(workspaceGenMaxKey(room.id), '1')
+    return room
+  }
+
+  it('publishes package manifest/lock and dependencies as one fresh Room generation', async () => {
+    const room = packageRoom()
+    const entry = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    expect(entry).toMatchObject({ status: 'verified', undoable: true })
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceVolumeRevision: 2,
+      stateRevision: 8,
+      syncStatus: 'modified',
+      workspaceFingerprint: 'synced-baseline'
+    })
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('1')
+    expect(orch.settings.get(workspaceGenMaxKey(room.id))).toBe('2')
+    expect(orch.settings.get(depsGenMaxKey(room.id, '22'))).toBe('1')
+    expect(backend.calls).toContain(`pauseWeb:${room.id}`)
+    expect(backend.calls).toContain(`copyVolume:${srcVolume(room.id, 1)}:${srcVolume(room.id, 2)}`)
+    expect(backend.calls).toContain(`unpauseWeb:${room.id}`)
+    expect(backend.calls).toContain(`resetVolume:${depsVolumeForGen(room.id, '22', 1)}`)
+    expect(backend.calls).toContain(`runOneShot:${depsVolumeForGen(room.id, '22', 1)}:pnpm add --save-exact zod@4.0.0`)
+    expect(backend.lastWebSpec).toMatchObject({ workspaceVolumeRevision: 2, depsVolumeOverride: depsVolumeForGen(room.id, '22', 1) })
+  })
+
+  it('cleans both staged generations and preserves every published pointer when install fails', async () => {
+    const room = packageRoom()
+    backend.oneShotResult = { code: 1, stdout: '', stderr: 'registry unavailable after partial staging' }
+
+    const entry = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    expect(entry.status).toBe('rolled-back')
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceVolumeRevision: 1,
+      stateRevision: 7,
+      syncStatus: 'synced',
+      workspaceFingerprint: 'synced-baseline'
+    })
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBeNull()
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(backend.calls).toContain('removeDependencyVolume:node22:g1')
+  })
+
+  it('recreates the previously published web runtime when source unpause fails', async () => {
+    const room = packageRoom()
+    backend.unpauseWeb = async (roomId: string) => {
+      backend.calls.push(`unpauseWeb:${roomId}`)
+      throw new Error('container could not be unpaused')
+    }
+
+    const entry = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    expect(entry.status).toBe('rolled-back')
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceVolumeRevision: 1,
+      stateRevision: 7,
+      syncStatus: 'synced'
+    })
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBeNull()
+    expect(backend.calls).toContain(`recreateWeb:${room.id}:node22:default`)
+    expect(backend.lastWebSpec).toMatchObject({ workspaceVolumeRevision: 1, depsVolumeOverride: undefined })
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(backend.calls).toContain('removeDependencyVolume:node22:g1')
+  })
+
+  it('rejects publish when the live workspace changes during staged package installation', async () => {
+    const room = packageRoom()
+    let fingerprintCall = 0
+    backend.fingerprintWorkspace = async () => {
+      fingerprintCall += 1
+      if (fingerprintCall <= 2) return 'old-generation-at-copy'
+      if (fingerprintCall === 3) return 'installed-staged-generation'
+      return 'old-generation-with-concurrent-terminal-edit'
+    }
+
+    const entry = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    expect(entry).toMatchObject({
+      status: 'rolled-back',
+      verify: { ok: false, detail: expect.stringContaining('Room workspace changed') }
+    })
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceVolumeRevision: 1,
+      stateRevision: 8,
+      syncStatus: 'modified',
+      workspaceFingerprint: 'synced-baseline'
+    })
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBeNull()
+    expect(backend.calls.filter((call) => call === `pauseWeb:${room.id}`)).toHaveLength(2)
+    expect(backend.calls.filter((call) => call === `unpauseWeb:${room.id}`)).toHaveLength(2)
+    expect(backend.calls.some((call) => call.startsWith(`recreateWeb:${room.id}:`))).toBe(false)
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(backend.calls).toContain('removeDependencyVolume:node22:g1')
+  })
+
+  it('publishes while sleeping and wakes on the installed workspace and dependency generations', async () => {
+    const room = packageRoom()
+    orch.rooms.update(room.id, { status: 'sleeping', hostPort: null })
+    backend.calls.length = 0
+    backend.lastWebSpec = null
+
+    const entry = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    expect(entry.status).toBe('verified')
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      status: 'sleeping',
+      workspaceVolumeRevision: 2,
+      stateRevision: 8,
+      syncStatus: 'modified'
+    })
+    expect(backend.calls).not.toContain(`pauseWeb:${room.id}`)
+    expect(backend.calls).not.toContain(`unpauseWeb:${room.id}`)
+    expect(backend.calls.some((call) => call.startsWith(`recreateWeb:${room.id}:`))).toBe(false)
+
+    await orch.startRoom(room.id, 'user')
+
+    expect(orch.rooms.get(room.id)?.status).toBe('ready')
+    expect(backend.lastWebSpec).toMatchObject({
+      workspaceVolumeRevision: 2,
+      depsVolumeOverride: depsVolumeForGen(room.id, '22', 1)
+    })
+  })
+
+  it('immediately undoes a package install by swapping both pointers back', async () => {
+    const room = packageRoom()
+    const installed = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+
+    const undone = await orch.undoChange(room.id, installed.id, 'user')
+
+    expect(undone.status).toBe('verified')
+    expect(orch.rooms.get(room.id)).toMatchObject({ workspaceVolumeRevision: 1, stateRevision: 9, syncStatus: 'modified' })
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('0')
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(backend.calls).toContain('removeDependencyVolume:node22:g1')
+  })
+
+  it('rejects package Undo after a later workspace revision', async () => {
+    const room = packageRoom()
+    const installed = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+    orch.rooms.update(room.id, { stateRevision: 9, syncStatus: 'modified' })
+
+    await expect(orch.undoChange(room.id, installed.id, 'user')).rejects.toThrow(/discard later workspace edits/)
+    expect(orch.rooms.get(room.id)?.workspaceVolumeRevision).toBe(2)
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('1')
+  })
+
+  it('rejects package Undo after an untracked terminal edit changes the workspace fingerprint', async () => {
+    const room = packageRoom()
+    backend.workspaceFingerprintValue = 'package-generation'
+    const installed = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+    backend.workspaceFingerprintValue = 'later-terminal-edit'
+
+    await expect(orch.undoChange(room.id, installed.id, 'user')).rejects.toThrow(/workspace files changed/)
+    expect(orch.rooms.get(room.id)?.workspaceVolumeRevision).toBe(2)
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('1')
+  })
+
+  it('never reuses failed or undone package generations', async () => {
+    const room = packageRoom()
+    backend.oneShotResult = { code: 1, stdout: '', stderr: 'first generation failed' }
+    await orch.applyChange(room.id, { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false }, 'user')
+
+    backend.oneShotResult = { code: 0, stdout: '', stderr: '' }
+    await orch.applyChange(room.id, { kind: 'package-install', name: 'zod', version: '4.0.1', dev: false }, 'user')
+
+    expect(orch.rooms.get(room.id)?.workspaceVolumeRevision).toBe(3)
+    expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('2')
+    expect(backend.calls).toContain(`copyVolume:${srcVolume(room.id, 1)}:${srcVolume(room.id, 3)}`)
+    expect(backend.calls).toContain(`resetVolume:${depsVolumeForGen(room.id, '22', 2)}`)
+  })
+})

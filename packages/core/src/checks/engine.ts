@@ -7,6 +7,7 @@ import { caTrustStatus, ensureCa } from '../gateway/ca'
 import type { Gateway } from '../gateway/gateway'
 import { tcpAnswers } from '../changes/types'
 import { depsVolumeForGen } from '../changes/definitions/deps'
+import { createHttpRelayConnection } from '../relayProtocol'
 
 export interface CheckCtx {
   room: RoomRecord
@@ -38,28 +39,33 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   const backendOk = health.ok
 
   // 2 metadata
-  const metaOk = room.domain.endsWith('.localhost') && room.internalPort >= 1 && room.internalPort <= 65535
+  const buildOnly = room.provider === 'android'
+  const metaOk = buildOnly || (room.domain.endsWith('.localhost') && room.internalPort >= 1 && room.internalPort <= 65535)
   push(
     metaOk
-      ? { step: 'metadata', status: 'healthy', summary: `room ${room.id} · ${room.domain}` }
+      ? {
+          step: 'metadata',
+          status: 'healthy',
+          summary: buildOnly ? `room ${room.id} · build-only · no preview` : `room ${room.id} · ${room.domain}`
+        }
       : { step: 'metadata', status: 'broken', summary: 'room record is inconsistent', detail: JSON.stringify(room) }
   )
 
   // 3 source
-  if (room.sourceType === 'linked-folder') {
+  if (room.workspaceMode === 'legacy-host-bind') {
     const ok = existsSync(room.sourceRef)
     push(
       ok
         ? { step: 'source', status: 'healthy', summary: `linked folder present` }
         : { step: 'source', status: 'broken', summary: `linked folder missing: ${room.sourceRef}` }
     )
-  } else if (room.sourceType === 'managed-git' && backendOk) {
+  } else if (room.workspaceMode === 'hotel' && backendOk) {
     const sizes = await backend.volumeSizes(room.id)
-    const size = sizes[srcVolume(room.id)]
+    const size = sizes[srcVolume(room.id, room.workspaceVolumeRevision)]
     push(
       size && size > 500
-        ? { step: 'source', status: 'healthy', summary: 'managed workspace present' }
-        : { step: 'source', status: 'broken', summary: 'managed workspace volume is missing or empty' }
+        ? { step: 'source', status: 'healthy', summary: `Room-owned workspace r${room.stateRevision} present` }
+        : { step: 'source', status: 'broken', summary: 'Room-owned workspace volume is missing or empty' }
     )
   } else {
     push({ step: 'source', status: 'healthy', summary: room.sourceType === 'empty' ? 'empty room' : 'skipped' })
@@ -119,7 +125,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   // 6 dependencies
   if (room.sourceType === 'empty') {
     push({ step: 'dependencies', status: 'healthy', summary: 'no dependencies in an empty room' })
-  } else if (room.sourceType === 'linked-folder' && !declaresDependencies(room.sourceRef)) {
+  } else if (room.workspaceMode === 'legacy-host-bind' && !declaresDependencies(room.sourceRef)) {
     push({ step: 'dependencies', status: 'healthy', summary: 'project declares no dependencies' })
   } else if (backendOk) {
     const sizes = await backend.volumeSizes(room.id)
@@ -140,7 +146,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   }
 
   // 7 env
-  if (room.sourceType === 'linked-folder' && existsSync(join(room.sourceRef, '.env.example')) && !existsSync(join(room.sourceRef, '.env'))) {
+  if (room.workspaceMode === 'legacy-host-bind' && existsSync(join(room.sourceRef, '.env.example')) && !existsSync(join(room.sourceRef, '.env'))) {
     push({ step: 'env', status: 'warning', summary: '.env.example exists but .env is missing' })
   } else {
     push({ step: 'env', status: 'healthy', summary: 'no missing env profile detected' })
@@ -198,7 +204,12 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   )
 
   // 11 internal port (via the room's loopback relay)
-  const portOk = state === 'running' && room.hostPort != null && (await tcpAnswers(room.hostPort, 2000))
+  const relayToken = state === 'running' && room.hostPort != null ? await backend.relayToken(room.id) : undefined
+  const portOk =
+    state === 'running' &&
+    room.hostPort != null &&
+    relayToken !== undefined &&
+    (await tcpAnswers(room.hostPort, 2000, relayToken))
   push(
     portOk
       ? { step: 'port', status: 'healthy', summary: `port ${room.internalPort} listening` }
@@ -247,7 +258,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
 
   // 14 http response through the gateway target
   if (portOk && room.hostPort != null) {
-    const res = await httpProbe(room.hostPort, room.domain)
+    const res = await httpProbe(room.hostPort, room.domain, relayToken)
     push(
       res.ok
         ? { step: 'http', status: 'healthy', summary: `HTTP ${res.status}` }
@@ -282,10 +293,32 @@ async function androidChecks(
   } else {
     push({ step: 'runtime', status: 'healthy', summary: `JDK ${room.runtime.version} (in the room image)` })
   }
-  push({ step: 'package-manager', status: 'healthy', summary: 'gradle (in the room)' })
-  push({ step: 'dependencies', status: 'healthy', summary: 'gradle caches live in the room' })
+  if (running) {
+    const gradle = await backend.execInRoom(
+      room.id,
+      [
+        'sh',
+        '-lc',
+        "if [ -f ./gradlew ]; then printf 'Gradle Wrapper'; elif command -v gradle >/dev/null 2>&1; then gradle --version 2>/dev/null | grep -m1 Gradle; else exit 1; fi"
+      ],
+      { timeoutMs: 20_000 }
+    )
+    const summary = gradle.stdout.trim().split(/\r?\n/)[0] ?? ''
+    push(
+      gradle.code === 0 && summary
+        ? { step: 'package-manager', status: 'healthy', summary }
+        : { step: 'package-manager', status: 'broken', summary: 'Gradle Wrapper and image Gradle are both unavailable' }
+    )
+  } else {
+    push({ step: 'package-manager', status: 'healthy', summary: 'Gradle (Room image)' })
+  }
+  push({ step: 'dependencies', status: 'healthy', summary: 'Gradle cache is Room-owned' })
   push({ step: 'env', status: 'healthy', summary: 'not enforced for build rooms' })
-  push({ step: 'services', status: 'healthy', summary: 'no services configured' })
+  push(
+    Object.keys(room.services).length === 0
+      ? { step: 'services', status: 'healthy', summary: 'no services configured' }
+      : { step: 'services', status: 'warning', summary: 'managed services are unavailable in build-only Android Rooms' }
+  )
   push(
     room.startCommand.trim()
       ? { step: 'start-command', status: 'healthy', summary: room.startCommand }
@@ -302,7 +335,10 @@ async function androidChecks(
         : { step: 'process', status: 'broken', summary: 'build container not running', fix: { kind: 'restart-web' } }
     )
   }
-  const na: Pick<CheckResult, 'status' | 'summary'> = { status: 'healthy', summary: 'not applicable for build rooms' }
+  const na: Pick<CheckResult, 'status' | 'summary'> = {
+    status: 'healthy',
+    summary: 'not applicable — build-only Room has no preview'
+  }
   push({ step: 'port', ...na })
   push({ step: 'gateway', ...na })
   push({ step: 'https', ...na })
@@ -322,11 +358,23 @@ function declaresDependencies(sourceDir: string): boolean {
   }
 }
 
-async function httpProbe(port: number, host: string): Promise<{ ok: boolean; status?: number; detail: string }> {
+async function httpProbe(
+  port: number,
+  host: string,
+  relayToken: string
+): Promise<{ ok: boolean; status?: number; detail: string }> {
   const http = await import('node:http')
   return new Promise((resolve) => {
     const req = http.request(
-      { host: '127.0.0.1', port, path: '/', method: 'GET', headers: { host }, timeout: 8000 },
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/',
+        method: 'GET',
+        headers: { host },
+        timeout: 8000,
+        createConnection: (_options, oncreate) => createHttpRelayConnection(port, relayToken, oncreate)
+      },
       (res) => {
         res.resume()
         resolve({ ok: true, status: res.statusCode ?? 0, detail: `HTTP ${res.statusCode}` })

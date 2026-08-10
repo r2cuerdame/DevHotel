@@ -10,12 +10,22 @@ function nodeMajor(version: string): string {
 export function generateManifestYaml(room: RoomRecord): string {
   const source: Record<string, string> = { type: room.sourceType }
   if (room.sourceType === 'managed-git') source['repository'] = room.sourceRef
-  else if (room.sourceType === 'linked-folder') source['path'] = room.sourceRef
+  else if (room.sourceType === 'linked-folder') {
+    source['hostSync'] = room.hostSyncEnabled ? 'enabled' : 'detached'
+    if (room.hostSyncEnabled) source['path'] = room.sourceRef
+  }
   const doc = {
     project: room.project,
     nickname: room.nickname,
     provider: room.provider,
     source,
+    workingState: {
+      owner: room.workspaceMode === 'hotel' ? 'room' : room.workspaceMode === 'legacy-host-bind' ? 'host-compatibility' : 'none',
+      revision: room.stateRevision,
+      volumeRevision: room.workspaceVolumeRevision,
+      syncStatus: room.syncStatus,
+      ...(room.lastSyncedAt ? { lastSyncedAt: room.lastSyncedAt } : {})
+    },
     runtime: room.runtime.kind === 'jdk' ? { jdk: room.runtime.version } : { node: nodeMajor(room.runtime.version) },
     packageManager: {
       type: room.packageManager.kind,

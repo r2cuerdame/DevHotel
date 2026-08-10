@@ -3,8 +3,12 @@ export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
 export type PmKind = 'npm' | 'pnpm' | 'gradle'
 export type ProviderKind = 'web' | 'android' | 'windows'
+/** Where `/workspace` actually lives. Legacy host binds are compatibility-only. */
+export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
+export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
 
 export type ServiceKind = 'postgres' | 'redis'
+export type CloneServiceMode = 'copy' | 'empty' | 'exclude'
 
 export interface RoomServices {
   postgres?: { version: string }
@@ -31,6 +35,18 @@ export interface RoomRecord {
   sourceType: SourceType
   /** git URL for managed-git, host folder path for linked-folder, '' for empty */
   sourceRef: string
+  /** Runtime boundary for `/workspace`; never infer this from sourceType. */
+  workspaceMode: WorkspaceMode
+  /** Monotonic logical revision advanced by tracked DevHotel sync/mutation operations. */
+  stateRevision: number
+  /** Selects the owned source volume generation; 0 keeps the original volume name. */
+  workspaceVolumeRevision: number
+  syncStatus: WorkspaceSyncStatus
+  lastSyncedAt: string | null
+  /** Fingerprint of the last published/synced Room-owned source tree. */
+  workspaceFingerprint: string | null
+  /** Whether this Room may explicitly import again from sourceRef. Clones detach by default. */
+  hostSyncEnabled: boolean
   runtime: { kind: 'node' | 'jdk'; version: string }
   packageManager: { kind: PmKind; version?: string }
   startCommand: string
@@ -85,8 +101,19 @@ export interface CreateRoomInput {
   }
 }
 
+/** Options for making an independent environment from an existing Web room. */
+export interface CloneRoomInput {
+  sourceRoomId: string
+  nickname: string
+  copyDependencies: boolean
+  /** copy service configuration and data, start with empty data, or omit services */
+  services: CloneServiceMode
+  actor: Actor
+}
+
 export interface BackupInfo {
-  file: string
+  /** Opaque Room-scoped filename; never an absolute Host path. */
+  id: string
   service: ServiceKind
   size: number
   createdAt: string

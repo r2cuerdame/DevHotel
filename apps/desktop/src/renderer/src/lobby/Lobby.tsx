@@ -3,14 +3,15 @@ import { useStore, useT } from '../state/store'
 import { RoomCard } from './RoomCard'
 import { NewRoomWizard } from './NewRoomWizard'
 import { SettingsModal } from './SettingsModal'
+import { HotelServicesModal } from './HotelServicesModal'
 
 export function Lobby(): React.JSX.Element {
   const rooms = useStore((s) => s.rooms)
-  const gateway = useStore((s) => s.gateway)
   const wizardOpen = useStore((s) => s.wizardOpen)
   const openWizard = useStore((s) => s.openWizard)
   const t = useT()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [servicesOpen, setServicesOpen] = useState(false)
 
   return (
     <div className="lobby">
@@ -19,12 +20,7 @@ export function Lobby(): React.JSX.Element {
           Dev<b>Hotel</b>
         </span>
         <span className="spacer" />
-        <span className="backend-pill" title={t('lobby.gatewayTitle')}>
-          <span className="status-dot" data-status={gateway?.running ? 'ready' : 'broken'} />
-          {gateway?.running
-            ? t('lobby.gatewayOn', { ports: `:${gateway.httpPort}${gateway.httpsPort ? ` · :${gateway.httpsPort}` : ''}` })
-            : t('lobby.gatewayOffline')}
-        </span>
+        <button className="btn hotel-services-entry" onClick={() => setServicesOpen(true)}>{t('hotelServices.title')}</button>
         <button className="icon-btn" title={t('lobby.settings')} onClick={() => setSettingsOpen(true)}>
           ⚙
         </button>
@@ -48,6 +44,7 @@ export function Lobby(): React.JSX.Element {
 
       {wizardOpen && <NewRoomWizard />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {servicesOpen && <HotelServicesModal onClose={() => setServicesOpen(false)} />}
     </div>
   )
 }

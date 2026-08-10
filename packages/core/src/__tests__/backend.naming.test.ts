@@ -5,13 +5,18 @@ import {
   anchorName,
   buildAnchorArgs,
   buildOneShotArgs,
+  buildRoomNetworkCreateArgs,
   buildWebCreateArgs,
   cacheVolume,
   depsVolume,
   parsePortOutput,
+  roomNetworkName,
   srcVolume,
   webImage,
   webName,
+  isJobName,
+  jobName,
+  workspaceSnapshotVolume,
   wrapStartCommand,
 } from '../backend/naming'
 import type { WebSpec } from '../backend/types'
@@ -23,6 +28,8 @@ function spec(overrides: Partial<WebSpec> = {}): WebSpec {
     nodeMajor: '22',
     sourceType: 'managed-git',
     sourceRef: 'https://example.com/repo.git',
+    workspaceMode: 'hotel',
+    workspaceVolumeRevision: 0,
     startCommand: 'npm run dev',
     ...overrides,
   }
@@ -39,6 +46,7 @@ function envs(args: string[]): string[] {
 describe('names and images', () => {
   it('derives container, volume, and image names', () => {
     expect(anchorName('r1')).toBe('dh-r1-anchor')
+    expect(roomNetworkName('r1')).toBe('dh-r1-net')
     expect(webName('r1')).toBe('dh-r1-web')
     expect(srcVolume('r1')).toBe('dh-r1-src')
     expect(depsVolume('r1', '22')).toBe('dh-r1-deps-node22')
@@ -49,25 +57,63 @@ describe('names and images', () => {
   })
 })
 
-describe('buildAnchorArgs', () => {
-  it('runs socat relay with ephemeral loopback publish and labels', () => {
-    expect(buildAnchorArgs({ roomId: 'r1', internalPort: 5173 })).toEqual([
-      'run',
-      '-d',
-      '--name',
-      'dh-r1-anchor',
-      '-l',
+describe('buildRoomNetworkCreateArgs', () => {
+  it('creates a labeled user-defined bridge owned by one Room', () => {
+    expect(buildRoomNetworkCreateArgs('r1')).toEqual([
+      'network',
+      'create',
+      '--driver',
+      'bridge',
+      '--opt',
+      'com.docker.network.bridge.enable_icc=false',
+      '--label',
       'devhotel.room=r1',
-      '-l',
-      'devhotel.role=anchor',
-      '-l',
+      '--label',
+      'devhotel.role=network',
+      '--label',
       'devhotel.managed=1',
-      '-p',
-      '127.0.0.1:0:3999',
-      'alpine/socat',
-      'TCP-LISTEN:3999,fork,reuseaddr',
-      'TCP:127.0.0.1:5173',
+      'dh-r1-net',
     ])
+  })
+})
+
+describe('buildAnchorArgs', () => {
+  it('gates the loopback-published relay with only a token verifier in the container', () => {
+    const verifier = 'b'.repeat(64)
+    const args = buildAnchorArgs({ roomId: 'r1', internalPort: 5173 }, verifier)
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '--network',
+        'dh-r1-net',
+        '--cap-drop',
+        'NET_RAW',
+        '-p',
+        '127.0.0.1:0:3999',
+        '-e',
+        `DEVHOTEL_RELAY_TOKEN_SHA256=${verifier}`,
+        '-e',
+        'DEVHOTEL_INTERNAL_PORT=5173',
+        '--entrypoint',
+        '/bin/sh',
+        'alpine/socat',
+        'TCP-LISTEN:3999,fork,reuseaddr'
+      ])
+    )
+    expect(args.at(-1)).toBe('EXEC:/tmp/devhotel-relay-gate')
+    expect(args).toContain(
+      `umask 077; printf '#!/bin/sh\n%s\n' "$DEVHOTEL_RELAY_GATE" > /tmp/devhotel-relay-gate; chmod 500 /tmp/devhotel-relay-gate; exec socat "$0" "$1"`
+    )
+    const gate = args.find((arg) => arg.startsWith('DEVHOTEL_RELAY_GATE=')) ?? ''
+    expect(gate).toContain('read -r -t 2 line')
+    expect(gate).toContain('sha256sum')
+    expect(gate).toContain('while [ "$i" -lt 64 ]')
+    expect(gate).not.toContain('b'.repeat(64).replace(/^/, 'DEVHOTEL/1 '))
+  })
+
+  it('rejects malformed relay verifiers before creating a container', () => {
+    expect(() => buildAnchorArgs({ roomId: 'r1', internalPort: 5173 }, 'not-a-digest')).toThrow(
+      /relay verifier/
+    )
   })
 })
 
@@ -83,7 +129,9 @@ describe('buildWebCreateArgs', () => {
   })
 
   it('linked-folder bind-mounts the host path with deps volume overlay', () => {
-    const args = buildWebCreateArgs(spec({ sourceType: 'linked-folder', sourceRef: 'C:\\proj\\app' }))
+    const args = buildWebCreateArgs(
+      spec({ sourceType: 'linked-folder', sourceRef: 'C:\\proj\\app', workspaceMode: 'legacy-host-bind' })
+    )
     expect(mounts(args)).toEqual([
       'C:\\proj\\app:/workspace',
       'dh-r1-deps-node22:/workspace/node_modules',
@@ -92,7 +140,7 @@ describe('buildWebCreateArgs', () => {
   })
 
   it('empty source has no src mount and no deps volume, cache only', () => {
-    const args = buildWebCreateArgs(spec({ sourceType: 'empty', sourceRef: '' }))
+    const args = buildWebCreateArgs(spec({ sourceType: 'empty', sourceRef: '', workspaceMode: 'empty' }))
     expect(mounts(args)).toEqual(['dh-r1-cache:/cache'])
   })
 
@@ -100,6 +148,16 @@ describe('buildWebCreateArgs', () => {
     const args = buildWebCreateArgs(spec())
     const i = args.indexOf('--network')
     expect(args[i + 1]).toBe('container:dh-r1-anchor')
+    expect(args).not.toContain('--pid')
+    expect(args).toContain('NET_RAW')
+    expect(args.some((arg) => arg.startsWith('DEVHOTEL_RELAY_'))).toBe(false)
+  })
+
+  it('puts standalone build containers on their owned Room network', () => {
+    const args = buildWebCreateArgs(spec({ standalone: true }))
+    const i = args.indexOf('--network')
+    expect(args[i + 1]).toBe('dh-r1-net')
+    expect(args).not.toContain('container:dh-r1-anchor')
   })
 
   it('carries the devhotel labels', () => {
@@ -119,7 +177,7 @@ describe('buildWebCreateArgs', () => {
     expect(args.slice(-3)).toEqual([
       'sh',
       '-lc',
-      "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec npm run dev",
+      wrapStartCommand('npm run dev'),
     ])
     expect(args).toContain('node:22-bookworm')
     const w = args.indexOf('-w')
@@ -128,14 +186,62 @@ describe('buildWebCreateArgs', () => {
 })
 
 describe('buildOneShotArgs', () => {
+  const jobId = '11111111-2222-4333-8444-555555555555'
+
   it('uses run --rm with the same mounts and env as the web container', () => {
     const web = buildWebCreateArgs(spec())
-    const oneShot = buildOneShotArgs(spec(), 'npm install')
+    const oneShot = buildOneShotArgs(spec(), 'npm install', jobId)
     expect(oneShot.slice(0, 2)).toEqual(['run', '--rm'])
     expect(mounts(oneShot)).toEqual(mounts(web))
     expect(envs(oneShot)).toEqual(envs(web))
-    expect(oneShot).not.toContain('--network')
+    const network = oneShot.indexOf('--network')
+    expect(oneShot[network + 1]).toBe('dh-r1-net')
+    expect(oneShot).toContain('NET_RAW')
+    expect(oneShot).toContain(jobName('r1', jobId))
+    expect(oneShot.flatMap((arg, i) => arg === '-l' ? [oneShot[i + 1]] : [])).toContain('devhotel.role=job')
+    expect(oneShot).not.toContain('devhotel.role=web')
     expect(oneShot.slice(-3)).toEqual(['sh', '-lc', wrapStartCommand('npm install')])
+  })
+
+  it('preserves compound shell programs behind a PID-1 inner shell', () => {
+    const command = "if [ -f ./gradlew ]; then sh ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi"
+    const wrapped = wrapStartCommand(command)
+    expect(wrapped).toContain("exec sh -lc 'if [ -f ./gradlew ]; then")
+    expect(wrapped).not.toContain('exec if ')
+    expect(buildOneShotArgs(spec({ standalone: true }), command, jobId).slice(-1)).toEqual([wrapped])
+  })
+
+  it('shell-quotes apostrophes in Room commands', () => {
+    expect(wrapStartCommand("printf '%s\\n' ok")).toContain(`exec sh -lc 'printf '"'"'%s\\n'"'"' ok'`)
+  })
+
+  it('keeps standalone one-shots off Docker default bridge', () => {
+    const args = buildOneShotArgs(spec({ standalone: true }), 'gradle tasks', jobId)
+    const network = args.indexOf('--network')
+    expect(args[network + 1]).toBe('dh-r1-net')
+  })
+
+  it('mounts an immutable build snapshot instead of the live workspace', () => {
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const snapshot = workspaceSnapshotVolume('r1', operationId)
+    const args = buildOneShotArgs(
+      spec({ workspaceVolumeOverride: snapshot, standalone: true, noCacheVolume: true, extraVolumes: [] }),
+      'gradle assembleDebug',
+      jobId
+    )
+    expect(args).toContain(`${snapshot}:/workspace`)
+    expect(args).not.toContain('dh-r1-src:/workspace')
+    expect(args).not.toContain('dh-r1-cache:/cache')
+    expect(() => workspaceSnapshotVolume('r1', '../escape')).toThrow(/invalid workspace snapshot operation ID/)
+  })
+
+  it('uses a strict Room-scoped UUID job name', () => {
+    const name = jobName('r1', jobId)
+    expect(name).toBe('dh-r1-job-11111111222243338444555555555555')
+    expect(isJobName('r1', name)).toBe(true)
+    expect(isJobName('r2', name)).toBe(false)
+    expect(isJobName('r1', 'dh-r1-job-not-a-uuid')).toBe(false)
+    expect(() => jobName('r1', '../escape')).toThrow(/invalid one-shot job ID/)
   })
 })
 

@@ -1,26 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RoomRecord } from '@devhotel/shared'
+import { IPC, type RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { statusLabel, useStore, useT } from '../state/store'
-import { ROOM_PAGES, type RoomPage } from './RoomPages'
-
-const VIEWPORTS: { id: string; label: string | null; size: { width: number; height: number } | null }[] = [
-  { id: 'auto', label: null, size: null },
-  { id: 'desktop', label: '1920×1080', size: { width: 1920, height: 1080 } },
-  { id: 'laptop', label: '1366×768', size: { width: 1366, height: 768 } },
-  { id: 'ipad', label: 'iPad 820×1180', size: { width: 820, height: 1180 } },
-  { id: 'iphone', label: 'iPhone 390×844', size: { width: 390, height: 844 } },
-  { id: 'galaxy', label: 'Galaxy 412×915', size: { width: 412, height: 915 } }
-]
+import { CloneRoomModal } from './CloneRoomModal'
 
 export function BrowserBar({
   room,
-  page,
-  onNavigate
+  configOpen,
+  onToggleConfig,
+  onModalChange
 }: {
   room: RoomRecord
-  page: RoomPage
-  onNavigate: (page: RoomPage) => void
+  configOpen: boolean
+  onToggleConfig: () => void
+  onModalChange: (open: boolean) => void
 }): React.JSX.Element {
   const backToLobby = useStore((s) => s.backToLobby)
   const roomAction = useStore((s) => s.roomAction)
@@ -30,15 +23,15 @@ export function BrowserBar({
   const t = useT()
   const [menuOpen, setMenuOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
+  const [cloneOpen, setCloneOpen] = useState(false)
   const [nickname, setNickname] = useState(room.nickname)
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
-  const [viewport, setViewport] = useState('auto')
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!menuOpen) return
-    const close = (e: MouseEvent): void => {
-      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false)
+    const close = (event: MouseEvent): void => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false)
     }
     window.addEventListener('mousedown', close)
     return () => window.removeEventListener('mousedown', close)
@@ -46,31 +39,54 @@ export function BrowserBar({
 
   useEffect(() => {
     setDevtoolsOpen(false)
-    setViewport('auto')
   }, [room.id])
 
+  useEffect(
+    () =>
+      api.on(IPC.evPreviewDevTools, (roomId: string, open: boolean) => {
+        if (roomId === room.id) setDevtoolsOpen(open)
+      }),
+    [room.id]
+  )
+
+  useEffect(() => {
+    // WebContentsView is a native child above renderer DOM. Hide it while any
+    // toolbar overlay is open so the menu/modal can actually be seen.
+    onModalChange(menuOpen || renameOpen || cloneOpen)
+    return () => onModalChange(false)
+  }, [cloneOpen, menuOpen, onModalChange, renameOpen])
+
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
-  const onSite = page === 'site'
+  const web = room.provider === 'web'
+  const siteControlsEnabled = web && running && !configOpen
   const httpsPort = gateway?.httpsPort
   const httpPort = gateway?.httpPort
   const url =
-    (onSite && preview?.url) ||
+    preview?.url ??
     (room.https
       ? `https://${room.domain}${httpsPort && httpsPort !== 443 ? `:${httpsPort}` : ''}`
       : `http://${room.domain}${httpPort && httpPort !== 80 ? `:${httpPort}` : ''}`)
 
-  const pageLabel = ROOM_PAGES.find((p) => p.id === page)
-
   return (
     <div className="browser-bar">
-      <button className="icon-btn" title={t('bar.backToLobby')} onClick={backToLobby}>
-        ⌂
+      <button className="btn browser-lobby" title={t('bar.backToLobby')} onClick={backToLobby}>
+        <span aria-hidden>←</span>
+        <span>{t('bar.lobby')}</span>
       </button>
-      <>
+
+      <div className="room-identity" title={`${room.project} / ${room.nickname}`}>
+        <span className="room-no">№ {room.roomNumber}</span>
+        <span>
+          {room.project} <i>/ {room.nickname}</i>
+        </span>
+      </div>
+
+      {web && (
+        <div className="browser-nav" aria-label={t('tabs.site')}>
           <button
             className="icon-btn"
             title={t('common.back')}
-            disabled={!onSite || !preview?.canGoBack}
+            disabled={!siteControlsEnabled || !preview?.canGoBack}
             onClick={() => void api.preview.nav(room.id, 'back')}
           >
             ←
@@ -78,7 +94,7 @@ export function BrowserBar({
           <button
             className="icon-btn"
             title={t('bar.forward')}
-            disabled={!onSite || !preview?.canGoForward}
+            disabled={!siteControlsEnabled || !preview?.canGoForward}
             onClick={() => void api.preview.nav(room.id, 'forward')}
           >
             →
@@ -86,64 +102,27 @@ export function BrowserBar({
           <button
             className="icon-btn"
             title={t('bar.reload')}
-            disabled={!onSite || !running}
+            disabled={!siteControlsEnabled}
             onClick={() => void api.preview.nav(room.id, 'reload')}
           >
             ⟳
           </button>
-        </>
+        </div>
+      )}
 
-      <div className="domain-pill">
-        {onSite && room.https && <span title="HTTPS">🔒</span>}
-        <span className="url">
-          {onSite ? url : `devhotel · ${pageLabel ? t(pageLabel.key) : ''} — ${room.project} / ${room.nickname}`}
-        </span>
+      <div className={`domain-pill${web ? '' : ' build-room-pill'}`} title={web ? url : t('android.buildOnlyHint')}>
+        {web && room.https && <span title="HTTPS">🔒</span>}
+        <span className="url">{web ? url : t('android.buildRoom')}</span>
         <span className="status-label">
-          <span className="status-dot" data-status={room.status} style={{ display: 'inline-block', marginRight: 6 }} />
+          <span className="status-dot" data-status={room.status} />
           {busy ?? statusLabel(t, room.status)}
         </span>
       </div>
 
-      {room.provider === 'web' && onSite && running && (
-        <>
-          <button
-            className="icon-btn"
-            title={t('bar.devtools')}
-            aria-pressed={devtoolsOpen}
-            style={devtoolsOpen ? { border: '1px solid var(--brass)', color: 'var(--brass)' } : undefined}
-            onClick={() => void api.preview.devtools(room.id).then(setDevtoolsOpen)}
-          >
-            {'</>'}
-          </button>
-          <select
-            className="btn"
-            title={t('viewport.title')}
-            value={viewport}
-            onChange={(e) => {
-              const id = e.target.value
-              setViewport(id)
-              const vp = VIEWPORTS.find((v) => v.id === id)
-              void api.preview.viewport(room.id, vp?.size ?? null)
-            }}
-          >
-            {VIEWPORTS.map((v) => (
-              <option key={v.id} value={v.id}>
-                {v.label ?? t('viewport.auto')}
-              </option>
-            ))}
-          </select>
-        </>
-      )}
-
       {running ? (
-        <>
-          <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'restart')}>
-            {t('common.restart')}
-          </button>
-          <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'sleep')}>
-            {t('bar.sleep')}
-          </button>
-        </>
+        <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'restart')}>
+          {t('common.restart')}
+        </button>
       ) : (
         <button
           className="btn primary"
@@ -154,28 +133,60 @@ export function BrowserBar({
         </button>
       )}
 
-      <button
+      <div ref={menuRef} className="bar-menu-anchor">
+        <button
           className="icon-btn"
-          title={t('bar.roomDetails')}
-          onClick={() => onNavigate(onSite ? 'overview' : 'site')}
-          aria-pressed={!onSite}
+          title={t('bar.more')}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
+          onClick={() => setMenuOpen((open) => !open)}
         >
-          {onSite ? '☰' : '◉'}
-        </button>
-
-      <div ref={menuRef} style={{ position: 'relative' }}>
-        <button className="icon-btn" title={t('bar.more')} onClick={() => setMenuOpen((v) => !v)}>
-          ⋯
+          ☰
         </button>
         {menuOpen && (
-          <div className="bar-menu">
+          <div className="bar-menu" role="menu">
             <MenuItem
+              label={t('bar.roomDetails')}
+              active={configOpen}
+              onClick={() => {
+                setMenuOpen(false)
+                onToggleConfig()
+              }}
+            />
+            <div className="bar-menu-sep" />
+            {running && (
+              <MenuItem
+                label={t('bar.sleep')}
+                onClick={() => {
+                  setMenuOpen(false)
+                  void roomAction(room.id, 'sleep')
+                }}
+              />
+            )}
+            {web && (
+              <>
+                <label className="bar-menu-switch" data-disabled={!siteControlsEnabled || undefined}>
+                  <span>{t('bar.devtools')}</span>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={devtoolsOpen}
+                    disabled={!siteControlsEnabled}
+                    onChange={() => void api.preview.devtools(room.id).then(setDevtoolsOpen)}
+                  />
+                </label>
+              </>
+            )}
+            {web && running && <div className="bar-menu-sep" />}
+            {web && running && (
+              <MenuItem
                 label={t('bar.openExternal')}
                 onClick={() => {
                   void api.app.openExternal(url)
                   setMenuOpen(false)
                 }}
               />
+            )}
             {room.sourceType === 'linked-folder' && (
               <MenuItem
                 label={t('bar.openSourceFolder')}
@@ -193,6 +204,15 @@ export function BrowserBar({
                 setMenuOpen(false)
               }}
             />
+            {web && (
+              <MenuItem
+                label={t('bar.cloneRoom')}
+                onClick={() => {
+                  setCloneOpen(true)
+                  setMenuOpen(false)
+                }}
+              />
+            )}
             <MenuItem
               label={t('diag.copyDiagnostic')}
               onClick={() => {
@@ -217,51 +237,58 @@ export function BrowserBar({
 
       {renameOpen && (
         <div className="modal-backdrop" onClick={() => setRenameOpen(false)}>
-          <div className="modal" style={{ width: 380 }} onClick={(e) => e.stopPropagation()}>
+          <form
+            className="modal compact-modal"
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (!nickname.trim() || nickname.trim() === room.nickname) return
+              void api.rooms.rename(room.id, nickname.trim()).then(() => {
+                setRenameOpen(false)
+                void useStore.getState().refreshRooms()
+                void useStore.getState().refreshInspection(room.id)
+              }).catch((error: unknown) => {
+                useStore.getState().toast('error', error instanceof Error ? error.message : String(error))
+              })
+            }}
+          >
             <h2>{t('rename.title')}</h2>
             <div className="field">
               <label htmlFor="rename-nick">{t('wizard.nickname')}</label>
-              <input id="rename-nick" value={nickname} onChange={(e) => setNickname(e.target.value)} autoFocus />
+              <input id="rename-nick" value={nickname} maxLength={60} onChange={(event) => setNickname(event.target.value)} autoFocus />
             </div>
             <div className="modal-actions">
-              <button className="btn" onClick={() => setRenameOpen(false)}>
+              <button type="button" className="btn" onClick={() => setRenameOpen(false)}>
                 {t('common.cancel')}
               </button>
-              <button
-                className="btn primary"
-                disabled={!nickname.trim() || nickname.trim() === room.nickname}
-                onClick={() => {
-                  void api.rooms.rename(room.id, nickname.trim()).then(() => {
-                    setRenameOpen(false)
-                    void useStore.getState().refreshRooms()
-                    void useStore.getState().refreshInspection(room.id)
-                  })
-                }}
-              >
+              <button type="submit" className="btn primary" disabled={!nickname.trim() || nickname.trim() === room.nickname}>
                 {t('rename.save')}
               </button>
             </div>
-          </div>
+          </form>
         </div>
       )}
+
+      {cloneOpen && <CloneRoomModal room={room} onClose={() => setCloneOpen(false)} />}
     </div>
   )
 }
 
-function MenuItem({ label, onClick, danger }: { label: string; onClick: () => void; danger?: boolean }): React.JSX.Element {
+function MenuItem({
+  label,
+  onClick,
+  danger,
+  active
+}: {
+  label: string
+  onClick: () => void
+  danger?: boolean
+  active?: boolean
+}): React.JSX.Element {
   return (
-    <button
-      onClick={onClick}
-      style={{
-        textAlign: 'left',
-        padding: '8px 10px',
-        borderRadius: 6,
-        color: danger ? 'var(--bad)' : undefined
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--walnut)')}
-      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-    >
-      {label}
+    <button className="bar-menu-item" data-active={active || undefined} data-danger={danger || undefined} onClick={onClick}>
+      <span>{label}</span>
+      {active && <span aria-hidden>✓</span>}
     </button>
   )
 }

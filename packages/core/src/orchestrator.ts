@@ -4,8 +4,10 @@ import { join } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
   Actor,
+  BackupInfo,
   ChangeEntry,
   CheckReport,
+  CloneRoomInput,
   CreateRoomInput,
   ProviderKind,
   QuickChange,
@@ -16,9 +18,18 @@ import type {
 } from '@devhotel/shared'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
+import { srcVolume, svcVolume } from './backend/naming'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import { ChangeEngine } from './changes/engine'
-import { registerQuickChanges, depsVolumeForGen } from './changes/definitions/index'
+import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
+import {
+  backupServiceToFile,
+  pingService,
+  resolveRoomBackupFile,
+  restoreServiceFromFile,
+  serviceForBackupId,
+  validatePostgresLogicalClone
+} from './changes/definitions/services'
 import type { ChangeCtx } from './changes/types'
 import { verifyWebUp } from './changes/types'
 import { runChecks as runCheckPipeline } from './checks/engine'
@@ -35,6 +46,7 @@ import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
 import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
+import { nextWorkspaceVolumeRevision, workspaceGenMaxKey } from './workingState'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
@@ -46,6 +58,8 @@ const ANDROID_CHANGE_KINDS = new Set([
   'restart-web',
   'os-settings'
 ])
+
+const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'android-run'])
 
 export interface OrchestratorEvent {
   roomId: string
@@ -75,6 +89,10 @@ export class RoomOrchestrator {
   private readonly engine = new ChangeEngine()
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
+  private readonly activeMutations = new Set<Promise<unknown>>()
+  private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
+  private shutdownTask: Promise<void> | null = null
+  private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
   private readonly userData: string
   private readonly backend: IsolationBackend
   private readonly gateway: Gateway
@@ -89,7 +107,7 @@ export class RoomOrchestrator {
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
     this.settings = settingsRepo(opts.db)
-    this.logs = new LogHub(opts.userData)
+    this.logs = new LogHub(opts.userData, opts.backend)
     registerQuickChanges(this.engine)
   }
 
@@ -100,10 +118,57 @@ export class RoomOrchestrator {
     if (health.ok) {
       reconciled = await reconcile(this.backend, this.rooms, (l) => this.olog('system', l))
     }
+    await this.markInterruptedChanges()
     return { backendOk: health.ok, reconciled }
   }
 
-  async shutdown(): Promise<void> {
+  private async markInterruptedChanges(): Promise<void> {
+    for (const room of this.rooms.list()) {
+      const pending = this.changes.list(room.id).filter((entry) => entry.status === 'pending')
+      if (pending.length === 0) continue
+      for (const entry of pending) {
+        if (entry.kind === 'android-build') {
+          try {
+            await this.backend.removeWorkspaceSnapshot(room.id, entry.id)
+          } catch (error) {
+            const detail = `interrupted Android build snapshot cleanup will retry on next startup: ${error instanceof Error ? error.message : String(error)}`
+            this.changes.setStatus(entry.id, 'pending', { verify: { ok: false, detail } })
+            this.olog(room.id, detail)
+            continue
+          }
+        }
+        const detail = `interrupted while applying change #${entry.seq}; captured safety data was preserved`
+        this.changes.setStatus(entry.id, 'failed', { verify: { ok: false, detail } })
+        this.olog(room.id, detail)
+      }
+      const current = this.rooms.get(room.id)
+      if (current && current.status !== 'broken') this.rooms.update(room.id, { status: 'attention' })
+    }
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownTask) return this.shutdownTask
+    this.mutationGate = 'shutdown'
+    this.shutdownTask = this.shutdownLocked()
+    return this.shutdownTask
+  }
+
+  private async shutdownLocked(): Promise<void> {
+    const failures: Error[] = []
+    // A clean-removal request owns the inventory while it runs. Quitting waits
+    // for it, then handles anything it deliberately left behind after failure.
+    const deleteAllTask = this.deleteAllTask
+    if (deleteAllTask) {
+      try {
+        await deleteAllTask
+      } catch (error) {
+        failures.push(asShutdownError('Clean removal failed before shutdown', error))
+      }
+    }
+    // createRoom can still be detecting a source before it has a room ID, while
+    // all other lifecycle work is represented in roomOps. The global gate above
+    // prevents new work; waiting for both sets makes the room list stable.
+    await this.drainRoomMutations()
     for (const room of this.rooms.list()) {
       if (room.status === 'sleeping') continue
       try {
@@ -112,18 +177,35 @@ export class RoomOrchestrator {
           await this.backend.stopRoomPod(room.id)
           this.rooms.update(room.id, { hostPort: null })
         } else {
-          await this.sleepRoom(room.id, 'devhotel')
+          // The shutdown gate rejects public lifecycle calls. All admitted work
+          // has settled, so shutdown owns the lifecycle and can call the locked
+          // implementation directly without queueing behind itself.
+          await this.sleepRoomLocked(room.id, 'devhotel')
         }
-      } catch {
-        // best effort on quit
+      } catch (error) {
+        failures.push(asShutdownError(`Room ${room.project} / ${room.nickname} could not be stopped`, error))
       }
     }
-    this.logs.dispose()
-    await this.gateway.stop()
+    try {
+      this.logs.dispose()
+    } catch (error) {
+      failures.push(asShutdownError('Room log streams could not be disposed', error))
+    }
+    try {
+      await this.gateway.stop()
+    } catch (error) {
+      failures.push(asShutdownError('Gateway could not be stopped', error))
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `DevHotel shutdown incomplete (${failures.length} failure${failures.length === 1 ? '' : 's'})`)
+    }
   }
 
   /** Serializes lifecycle mutations per room — concurrent UI/MCP calls queue instead of interleaving docker operations. */
-  private withRoomLock<T>(roomId: string, fn: () => Promise<T>): Promise<T> {
+  private withRoomLock<T>(roomId: string, fn: () => Promise<T>, admittedBeforeGate = false): Promise<T> {
+    if (this.mutationGate !== 'open' && !admittedBeforeGate) {
+      return Promise.reject(new Error('DevHotel is shutting down or removing its data; no new room changes can start'))
+    }
     const prev = this.roomOps.get(roomId) ?? Promise.resolve()
     const next = prev.catch(() => undefined).then(fn)
     this.roomOps.set(
@@ -131,6 +213,45 @@ export class RoomOrchestrator {
       next.catch(() => undefined)
     )
     return next
+  }
+
+  /**
+   * Reserve a newly-created Room ID while another Room's operation is still
+   * materializing it. Public target operations queue behind this barrier, and
+   * global shutdown/delete-all drains it through roomOps like any other lock.
+   */
+  private reserveRoomBarrier(roomId: string): () => void {
+    const previous = this.roomOps.get(roomId) ?? Promise.resolve()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const barrier = previous.catch(() => undefined).then(() => held)
+    this.roomOps.set(roomId, barrier.catch(() => undefined))
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      release()
+    }
+  }
+
+  /** Tracks mutations which begin before a room ID/lock exists (currently room creation). */
+  private trackMutation<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.mutationGate !== 'open') {
+      return Promise.reject(new Error('DevHotel is shutting down or removing its data; no new room changes can start'))
+    }
+    const task = Promise.resolve().then(fn)
+    this.activeMutations.add(task)
+    void task.then(
+      () => this.activeMutations.delete(task),
+      () => this.activeMutations.delete(task)
+    )
+    return task
+  }
+
+  private async drainRoomMutations(): Promise<void> {
+    await Promise.allSettled([...this.activeMutations, ...this.roomOps.values()])
   }
 
   onEvent(cb: (e: OrchestratorEvent) => void): () => void {
@@ -167,7 +288,11 @@ export class RoomOrchestrator {
     }
   }
 
-  async createRoom(input: CreateRoomInput): Promise<RoomRecord> {
+  createRoom(input: CreateRoomInput): Promise<RoomRecord> {
+    return this.trackMutation(() => this.createRoomAdmitted(input))
+  }
+
+  private async createRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
     const providerKind: ProviderKind = input.provider ?? 'web'
     const provider = getProvider(providerKind)
     const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
@@ -190,6 +315,8 @@ export class RoomOrchestrator {
     const id = newRoomId()
     const now = new Date().toISOString()
     const domain = this.uniqueDomain(input.planOverrides?.domain ?? plan.domain)
+    const workspaceMode = input.sourceType === 'empty' ? 'empty' : 'hotel'
+    const workspaceVolumeRevision = input.sourceType === 'linked-folder' ? 1 : 0
     const record: RoomRecord = {
       id,
       project: input.project,
@@ -198,6 +325,13 @@ export class RoomOrchestrator {
       provider: providerKind,
       sourceType: input.sourceType,
       sourceRef: input.sourceRef,
+      workspaceMode,
+      stateRevision: input.sourceType === 'empty' ? 0 : 1,
+      workspaceVolumeRevision,
+      syncStatus: input.sourceType === 'empty' ? 'empty' : 'synced',
+      lastSyncedAt: null,
+      hostSyncEnabled: input.sourceType === 'linked-folder',
+      workspaceFingerprint: null,
       runtime: { kind: plan.runtime.kind, version: plan.runtime.value },
       packageManager: { kind: plan.packageManager.value, version: plan.packageManager.version },
       startCommand: plan.startCommand.value,
@@ -213,27 +347,39 @@ export class RoomOrchestrator {
       thumbPath: null
     }
     this.rooms.create(record)
+    if (record.workspaceVolumeRevision > 0) {
+      this.settings.set(workspaceGenMaxKey(id), String(record.workspaceVolumeRevision))
+    }
     mkdirSync(join(this.userData, 'rooms', id, 'logs'), { recursive: true })
     this.appendJournal(id, 'create-room', `Room created — ${record.project} / ${record.nickname}`, input.actor, 'Room', null, {
-      runtime: `node ${record.runtime.version}`,
+      runtime: `${record.runtime.kind} ${record.runtime.version}`,
       packageManager: record.packageManager.kind,
       domain: record.domain
     })
     this.emit(id, 'created')
-    this.olog(id, `create room ${record.project}/${record.nickname} (node ${record.runtime.version}, ${record.packageManager.kind})`)
+    this.olog(
+      id,
+      `create room ${record.project}/${record.nickname} (${record.runtime.kind} ${record.runtime.version}, ${record.packageManager.kind})`
+    )
 
     await this.withRoomLock(id, async () => {
       try {
+        if (record.sourceType === 'linked-folder') {
+          this.olog(id, 'import Host source into Room-owned workspace')
+          await this.backend.importHostFolder(id, record.sourceRef, record.workspaceVolumeRevision, (line) => this.olog(id, line))
+          const fingerprint = await this.backend.fingerprintWorkspace(id, record.workspaceVolumeRevision)
+          this.rooms.update(id, { workspaceFingerprint: fingerprint, lastSyncedAt: new Date().toISOString() })
+        }
         const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record))
-        this.rooms.update(id, { hostPort, status: 'running' })
+        this.rooms.update(id, {
+          hostPort,
+          status: 'running',
+          ...(record.sourceType === 'managed-git' ? { lastSyncedAt: new Date().toISOString() } : {})
+        })
         this.logs.attach(id)
 
         if (providerKind === 'web' && record.sourceType !== 'empty') {
           await this.engine.execute(this.ctxFor(id), 'deps-install', { clean: false }, 'devhotel')
-        }
-        if (providerKind === 'android') {
-          this.olog(id, 'start emulator')
-          await this.backend.createEmulator(id, this.mustGet(id).android)
         }
         await this.syncRouteFor(id)
         const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
@@ -243,12 +389,273 @@ export class RoomOrchestrator {
         this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
         this.rooms.update(id, { status: 'broken' })
       }
-    })
+    }, true)
 
     const room = this.rooms.get(id)!
     await writeManifest(this.userData, room)
     this.emit(id, 'status')
     return room
+  }
+
+  cloneRoom(input: CloneRoomInput): Promise<RoomRecord> {
+    return this.withRoomLock(input.sourceRoomId, () => this.cloneRoomLocked(input))
+  }
+
+  private async cloneRoomLocked(input: CloneRoomInput): Promise<RoomRecord> {
+    const source = this.mustGet(input.sourceRoomId)
+    if (source.provider !== 'web') throw new Error('Clone Room currently supports Web rooms only')
+    if (source.status === 'preparing') throw new Error('Wait for the source room to finish preparing before cloning it')
+    if (source.workspaceMode === 'legacy-host-bind') {
+      throw new Error('Move this legacy Host-bound Room into the Hotel before cloning it')
+    }
+
+    const nickname = input.nickname.trim()
+    if (!nickname) throw new Error('Nickname cannot be empty')
+    const duplicate = this.rooms
+      .list()
+      .some((room) => room.project.toLowerCase() === source.project.toLowerCase() && room.nickname.toLowerCase() === nickname.toLowerCase())
+    if (duplicate) throw new Error(`${source.project} already has a room named ${nickname}`)
+
+    let id = newRoomId()
+    while (this.rooms.get(id)) id = newRoomId()
+    const now = new Date().toISOString()
+    const roomNumber = this.rooms.nextRoomNumber()
+    const domainProject = slugify(source.project) || 'room'
+    const domainNickname = slugify(nickname) || String(roomNumber)
+    const services =
+      input.services === 'exclude'
+        ? {}
+        : Object.fromEntries(
+            Object.entries(source.services).map(([kind, config]) => [kind, { ...config }])
+          )
+    const record: RoomRecord = {
+      id,
+      project: source.project,
+      nickname,
+      roomNumber,
+      provider: 'web',
+      sourceType: source.sourceType,
+      sourceRef: source.sourceRef,
+      workspaceMode: source.workspaceMode,
+      stateRevision: source.stateRevision,
+      workspaceVolumeRevision: source.workspaceVolumeRevision,
+      syncStatus: source.syncStatus,
+      lastSyncedAt: source.lastSyncedAt,
+      hostSyncEnabled: false,
+      workspaceFingerprint: source.workspaceFingerprint,
+      runtime: { ...source.runtime },
+      packageManager: { ...source.packageManager },
+      startCommand: source.startCommand,
+      internalPort: source.internalPort,
+      domain: this.uniqueDomain(`${domainProject}-${domainNickname}.localhost`),
+      https: source.https,
+      status: 'preparing',
+      services,
+      os: { ...source.os, env: { ...source.os.env } },
+      hostPort: null,
+      createdAt: now,
+      lastUsedAt: now,
+      thumbPath: null
+    }
+
+    // Persist ownership before creating Docker resources. Crash recovery can
+    // then surface an interrupted clone instead of treating its containers as strays.
+    this.rooms.create(record)
+    if (record.workspaceVolumeRevision > 0) {
+      this.settings.set(workspaceGenMaxKey(id), String(record.workspaceVolumeRevision))
+    }
+    mkdirSync(join(this.userData, 'rooms', id, 'logs'), { recursive: true })
+    this.olog(id, `clone from ${source.project}/${source.nickname} (${source.id})`)
+    // The clone itself is serialized by the source lock. Reserve the target as
+    // well before the first await after publishing its preparing row, so a
+    // caller that discovers it through listRooms cannot mutate partial state.
+    const releaseTargetBarrier = this.reserveRoomBarrier(id)
+
+    let sourceWebPaused = false
+    const resumeSourceWeb = async (): Promise<void> => {
+      if (!sourceWebPaused) return
+      await this.backend.unpauseWeb(source.id)
+      sourceWebPaused = false
+    }
+    try {
+      const serviceEntries = Object.entries(record.services) as ['postgres' | 'redis', { version: string }][]
+      const copyingWebVolumes = source.workspaceMode === 'hotel' || (input.copyDependencies && source.sourceType !== 'empty')
+      const copyingServiceData = input.services === 'copy' && serviceEntries.length > 0
+      if (copyingWebVolumes && !(await this.backend.imageExists('alpine'))) {
+        this.olog(id, 'prepare volume-copy helper image')
+        await this.backend.pullImage('alpine', (line) => this.olog(id, line))
+      }
+      if (
+        (copyingWebVolumes || copyingServiceData) &&
+        source.status !== 'sleeping' &&
+        (await this.backend.webState(source.id)) === 'running'
+      ) {
+        this.olog(id, 'briefly pause source web process for a consistent Room copy')
+        await this.backend.pauseWeb(source.id)
+        sourceWebPaused = true
+      }
+      if (source.workspaceMode === 'hotel') {
+        this.olog(id, 'copy Room-owned workspace')
+        await this.backend.copyVolume(
+          source.id,
+          srcVolume(source.id, source.workspaceVolumeRevision),
+          id,
+          srcVolume(id, record.workspaceVolumeRevision),
+          (line) => this.olog(id, line)
+        )
+      }
+
+      if (input.copyDependencies && source.sourceType !== 'empty') {
+        const sourceDeps = depsVolumeForGen(source.id, source.runtime.version, this.depsGen(source.id))
+        const targetDeps = depsVolumeForGen(id, source.runtime.version, 0)
+        this.olog(id, `copy dependencies from ${sourceDeps}`)
+        await this.backend.copyVolume(source.id, sourceDeps, id, targetDeps, (line) => this.olog(id, line))
+      }
+
+      const logicalBackups = new Map<'postgres' | 'redis', string>()
+      if (input.services === 'copy') {
+        for (const [service] of serviceEntries) {
+          if (source.status === 'sleeping') {
+            const state = await this.backend.serviceState(source.id, service)
+            if (state === 'running') {
+              throw new Error(`Cannot copy ${service} volume because the sleeping source still has a running service`)
+            }
+            this.olog(id, `copy stopped ${service} data volume`)
+            await this.backend.copyVolume(
+              source.id,
+              svcVolume(source.id, service),
+              id,
+              svcVolume(id, service),
+              (line) => this.olog(id, line)
+            )
+            continue
+          }
+          if ((await this.backend.serviceState(source.id, service)) !== 'running') {
+            throw new Error(`Cannot copy ${service} data because the source service is not running`)
+          }
+          if (service === 'postgres') await validatePostgresLogicalClone(this.ctxFor(source.id))
+          this.olog(id, `create consistent ${service} backup`)
+          const file = await backupServiceToFile(this.ctxFor(source.id), service)
+          logicalBackups.set(service, file)
+        }
+      }
+      // Keep the application quiesced until every sequential logical service
+      // backup is complete, so code, dependencies and databases share one cut.
+      await resumeSourceWeb()
+
+      const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record), {
+        initializeManagedSource: source.workspaceMode !== 'hotel',
+        startWeb: false
+      })
+      this.rooms.update(id, { hostPort })
+
+      if (!input.copyDependencies && source.sourceType !== 'empty') {
+        const target = this.mustGet(id)
+        const installCommand = pmInstallCommand(target)
+        this.olog(id, `install fresh dependencies with ${installCommand}`)
+        const installed = await this.backend.runOneShot(this.webSpecFor(target), installCommand, (line) => this.olog(id, line))
+        if (installed.code !== 0) {
+          throw new Error(`${installCommand} failed: ${installed.stderr.slice(-400) || `exit ${installed.code}`}`)
+        }
+      }
+
+      for (const [service, config] of serviceEntries) {
+        this.olog(id, `start ${service} ${config.version}`)
+        await this.backend.createService(id, service, config.version)
+        const ready = await pingService(this.ctxFor(id), service)
+        if (!ready.ok) throw new Error(ready.detail)
+        const backup = logicalBackups.get(service)
+        if (backup) {
+          this.olog(id, `restore copied ${service} data`)
+          await restoreServiceFromFile(this.ctxFor(id), service, backup)
+          const restored = await pingService(this.ctxFor(id), service)
+          if (!restored.ok) throw new Error(restored.detail)
+        }
+      }
+
+      // The target application must never observe an empty/partially restored
+      // database. Its container was created stopped and is started exactly once
+      // after dependencies and every service restore are complete.
+      this.olog(id, 'start cloned web process')
+      await this.backend.startWeb(id)
+      this.rooms.update(id, { status: 'running' })
+      this.logs.attach(id)
+
+      await this.syncRouteFor(id)
+      const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
+      this.rooms.update(id, {
+        status: verify.ok ? 'ready' : 'attention',
+        lastUsedAt: new Date().toISOString()
+      })
+      const cloned = this.mustGet(id)
+      await writeManifest(this.userData, cloned)
+      this.appendJournal(
+        id,
+        'clone-room',
+        `Cloned from ${source.project} / ${source.nickname}`,
+        input.actor,
+        'Room',
+        null,
+        {
+          sourceRoomId: source.id,
+          dependencies: source.sourceType === 'empty' ? 'none' : input.copyDependencies ? 'copied' : 'fresh',
+          services: input.services
+        }
+      )
+      this.olog(id, `clone ready: ${verify.detail}`)
+      this.emit(id, 'created')
+      this.emit(id, 'status')
+      return cloned
+    } catch (err) {
+      this.olog(id, `clone failed: ${err instanceof Error ? err.message : String(err)}`)
+      try {
+        await resumeSourceWeb()
+      } catch (resumeError) {
+        this.olog(source.id, `could not resume source web after clone failure: ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`)
+      }
+      this.logs.detach(id)
+      this.gateway.removeRoute(record.domain)
+      try {
+        await this.backend.deleteRoomPod(id, { volumes: true })
+        // deleteRoomPod performs a post-delete ownership check. Only after that
+        // succeeds is it safe to discard the target's recovery metadata.
+        rmSync(join(this.userData, 'rooms', id), { recursive: true, force: true })
+        this.rooms.delete(id)
+      } catch (cleanupError) {
+        const detail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+        this.rooms.update(id, { status: 'broken' })
+        this.appendJournal(
+          id,
+          'clone-room-cleanup-required',
+          `Clone failed; cleanup required for target ${id}`,
+          input.actor,
+          'Room',
+          { sourceRoomId: source.id },
+          { error: err instanceof Error ? err.message : String(err), cleanupError: detail }
+        )
+        this.olog(id, `automatic cleanup failed; target ownership retained for retry: ${detail}`)
+        try {
+          await writeManifest(this.userData, this.mustGet(id))
+        } catch {
+          // The database row remains the authoritative ownership record.
+        }
+        this.emit(id, 'created')
+        this.emit(id, 'status')
+        throw new Error(
+          `Clone failed: ${err instanceof Error ? err.message : String(err)}. Automatic cleanup of target ${id} also failed: ${detail}`
+        )
+      }
+      throw err
+    } finally {
+      if (sourceWebPaused) {
+        try {
+          await resumeSourceWeb()
+        } catch (err) {
+          this.olog(source.id, `could not resume source web after clone: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      releaseTargetBarrier()
+    }
   }
 
   startRoom(roomId: string, actor: Actor): Promise<void> {
@@ -257,36 +664,34 @@ export class RoomOrchestrator {
 
   private async startRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
-    // a 'ready' room with no hostPort cannot actually be up — fall through and wake it
-    if ((room.status === 'running' || room.status === 'ready') && room.hostPort != null) return
+    const alreadyAwake = room.status === 'running' || room.status === 'ready'
+    // Served Rooms need a relay port; standalone build Rooms deliberately do not.
+    if (alreadyAwake && (room.provider === 'android' || room.hostPort != null)) return
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
     try {
       // Recreate containers from the current record so changes made while
-      // asleep (node version, command, port) are materialized on wake.
-      if (room.provider === 'android' && room.internalPort === 0) {
-        // rooms created before the emulator screen existed relayed nothing
-        this.rooms.update(roomId, { internalPort: 6080 })
-      }
-      const { hostPort } = await this.backend.recreateAnchor({
-        roomId,
-        internalPort: this.mustGet(roomId).internalPort
-      })
-      this.rooms.update(roomId, { hostPort, status: 'running' })
+      // asleep are materialized on wake. Android is a standalone build Room:
+      // it owns a private network but has no anchor, relay, preview, or KVM.
       if (room.provider === 'android') {
-        this.olog(roomId, 'start emulator')
-        await this.backend.removeEmulator(roomId)
-        await this.backend.createEmulator(roomId, room.android)
+        this.gateway.removeRoute(room.domain)
+        await this.backend.recreateWeb(this.webSpecFor(room))
+        this.rooms.update(roomId, { hostPort: null, status: 'running' })
       } else {
+        const { hostPort } = await this.backend.recreateAnchor({
+          roomId,
+          internalPort: room.internalPort
+        })
+        this.rooms.update(roomId, { hostPort, status: 'running' })
         // services join the anchor's netns, so a fresh anchor needs fresh service containers
         for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
           this.olog(roomId, `start service ${svc} ${cfg.version}`)
           await this.backend.removeService(roomId, svc, { volume: false })
           await this.backend.createService(roomId, svc, cfg.version)
         }
+        await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       }
-      await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
       const verify = await verifyWebUp(this.ctxFor(roomId), { timeoutMs: 90_000 })
@@ -330,6 +735,48 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
   }
 
+  /**
+   * Exclusively removes every Room for the "remove DevHotel and all data"
+   * workflow. The gate is kept closed after success so renderer/MCP requests
+   * cannot recreate data before the process exits. A failed cleanup reopens the
+   * gate and keeps failed Room records, making an explicit retry possible.
+   */
+  deleteAllRooms(actor: Actor): Promise<{ deletedRooms: number; reclaimedBytes: number }> {
+    if (this.deleteAllTask) return this.deleteAllTask
+    if (this.mutationGate !== 'open') {
+      return Promise.reject(new Error('DevHotel is shutting down; all Room data cannot be removed now'))
+    }
+    this.mutationGate = 'delete-all'
+    const task = this.deleteAllRoomsLocked(actor)
+    this.deleteAllTask = task
+    void task.catch(() => {
+      if (this.mutationGate === 'delete-all') this.mutationGate = 'open'
+      if (this.deleteAllTask === task) this.deleteAllTask = null
+    })
+    return task
+  }
+
+  private async deleteAllRoomsLocked(actor: Actor): Promise<{ deletedRooms: number; reclaimedBytes: number }> {
+    // Mutations admitted before the gate may still be creating a row or target
+    // volume. Drain them before taking the one stable inventory used below.
+    await this.drainRoomMutations()
+    const inventory = this.rooms.list()
+    let deletedRooms = 0
+    let reclaimedBytes = 0
+    const failures: string[] = []
+    for (const room of inventory) {
+      try {
+        const result = await this.deleteRoomLocked(room.id, actor)
+        deletedRooms += 1
+        reclaimedBytes += result.reclaimedBytes
+      } catch (err) {
+        failures.push(`${room.project} / ${room.nickname}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    if (failures.length > 0) throw new Error(`Could not remove every Room:\n${failures.join('\n')}`)
+    return { deletedRooms, reclaimedBytes }
+  }
+
   private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
@@ -348,8 +795,7 @@ export class RoomOrchestrator {
     const baseUrl = this.gateway.urlFor(room.domain, room.https)
     return {
       room,
-      // android rooms open the emulator screen fullscreen and auto-connected
-      urls: { app: room.provider === 'android' ? `${baseUrl}/vnc.html?autoconnect=true&resize=scale` : baseUrl },
+      urls: { app: room.provider === 'android' ? 'about:blank' : baseUrl },
       dataDir: join(this.userData, 'rooms', room.id),
       backups: this.listBackups(room.id),
       stackLine:
@@ -361,6 +807,123 @@ export class RoomOrchestrator {
       lastUndoable: this.changes.lastUndoable(roomId),
       storage: null
     }
+  }
+
+  syncFromHost(roomId: string, actor: Actor): Promise<RoomRecord> {
+    return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
+  }
+
+  moveIntoHotel(roomId: string, actor: Actor): Promise<RoomRecord> {
+    return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, true))
+  }
+
+  private async replaceWorkspaceFromHostLocked(roomId: string, actor: Actor, migrateLegacy: boolean): Promise<RoomRecord> {
+    if (actor !== 'user') throw new Error('Importing Host files requires an explicit user action')
+    const room = this.mustGet(roomId)
+    if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
+      throw new Error('This Room is detached from its original Host folder')
+    }
+    if (migrateLegacy !== (room.workspaceMode === 'legacy-host-bind')) {
+      throw new Error(
+        room.workspaceMode === 'legacy-host-bind'
+          ? 'Move this legacy Room into the Hotel before syncing'
+          : 'This Room already owns its workspace; use Sync from Host'
+      )
+    }
+    if (room.workspaceMode === 'empty') throw new Error('Empty Rooms cannot sync from Host')
+    const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+    if (!awake || (await this.backend.webState(roomId)) !== 'running') {
+      throw new Error('Wake the Room before importing Host changes')
+    }
+    if (!migrateLegacy) {
+      const currentFingerprint = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
+      if (!room.workspaceFingerprint || currentFingerprint !== room.workspaceFingerprint) {
+        this.rooms.update(roomId, { syncStatus: 'modified' })
+        throw new Error('Room files changed since the last Host sync. Export or commit them before replacing Room state.')
+      }
+    }
+
+    const nextVolumeRevision = nextWorkspaceVolumeRevision(
+      room.workspaceVolumeRevision,
+      this.settings.get(workspaceGenMaxKey(room.id))
+    )
+    // Reserve before import. A failed/staged generation must never be reused.
+    this.settings.set(workspaceGenMaxKey(room.id), String(nextVolumeRevision))
+    this.olog(roomId, `${migrateLegacy ? 'move into Hotel' : 'sync from Host'}: stage workspace r${nextVolumeRevision}`)
+    let nextFingerprint: string
+    try {
+      await this.backend.importHostFolder(roomId, room.sourceRef, nextVolumeRevision, (line) => this.olog(roomId, line))
+      nextFingerprint = await this.backend.fingerprintWorkspace(roomId, nextVolumeRevision)
+    } catch (err) {
+      await this.backend.removeWorkspaceVolume(roomId, nextVolumeRevision).catch(() => undefined)
+      throw err
+    }
+
+    const previousSpec = this.webSpecFor(room)
+    const nextSpec = this.webSpecFor(room, {
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: nextVolumeRevision
+    })
+    try {
+      await this.backend.recreateWeb(nextSpec)
+    } catch (switchError) {
+      try {
+        await this.backend.recreateWeb(previousSpec)
+      } catch (rollbackError) {
+        this.rooms.update(roomId, { status: 'broken' })
+        throw new Error(
+          `Workspace import failed and the previous runtime could not be restored: ${
+            rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+          }`,
+          { cause: switchError }
+        )
+      }
+      try {
+        await this.backend.removeWorkspaceVolume(roomId, nextVolumeRevision)
+      } catch (cleanupError) {
+        this.rooms.update(roomId, { status: 'broken' })
+        throw new Error(
+          `Workspace import failed; the previous runtime was restored, but staged generation r${nextVolumeRevision} requires cleanup: ${
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }`,
+          { cause: switchError }
+        )
+      }
+      throw switchError
+    }
+
+    const syncedAt = new Date().toISOString()
+    this.rooms.update(roomId, {
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: nextVolumeRevision,
+      stateRevision: room.stateRevision + 1,
+      syncStatus: 'synced',
+      lastSyncedAt: syncedAt,
+      workspaceFingerprint: nextFingerprint,
+      lastUsedAt: syncedAt
+    })
+    const updated = this.mustGet(roomId)
+    await writeManifest(this.userData, updated)
+    this.appendJournal(
+      roomId,
+      migrateLegacy ? 'move-into-hotel' : 'sync-from-host',
+      migrateLegacy ? 'Moved workspace into the Hotel' : 'Synced workspace from Host',
+      actor,
+      'Working State',
+      { revision: room.stateRevision, mode: room.workspaceMode },
+      { revision: updated.stateRevision, mode: updated.workspaceMode }
+    )
+    this.emit(roomId, 'change')
+    this.emit(roomId, 'status')
+
+    if (room.workspaceMode === 'hotel') {
+      try {
+        await this.backend.removeWorkspaceVolume(roomId, room.workspaceVolumeRevision)
+      } catch (err) {
+        this.olog(roomId, `old workspace generation retained for cleanup: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    return updated
   }
 
   listChanges(roomId: string): ChangeEntry[] {
@@ -376,7 +939,27 @@ export class RoomOrchestrator {
       throw new Error('Builds are only available in Android rooms')
     }
     return this.withRoomLock(roomId, async () => {
-      const entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
+      const current = this.mustGet(roomId)
+      if (actor === 'agent' && current.workspaceMode === 'legacy-host-bind') {
+        throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
+      }
+      let entry: ChangeEntry
+      try {
+        entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
+      } catch (error) {
+        if (
+          change.kind !== 'package-install' &&
+          (change.kind === 'deps-install' || change.kind === 'android-run')
+        ) this.markWorkspaceModified(roomId)
+        throw error
+      }
+      if (change.kind !== 'package-install' && WORKSPACE_MUTATION_KINDS.has(change.kind)) {
+        const applied = entry.status === 'verified' || entry.status === 'applied'
+        const possiblyPartialFailure =
+          entry.status === 'failed' &&
+          ((change.kind === 'deps-install' && !change.clean) || change.kind === 'android-run')
+        if (applied || possiblyPartialFailure) this.markWorkspaceModified(roomId)
+      }
       this.syncStatusFromVerify(roomId, entry)
       this.reattachLogs(roomId)
       await writeManifest(this.userData, this.mustGet(roomId))
@@ -388,7 +971,14 @@ export class RoomOrchestrator {
 
   undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
     return this.withRoomLock(roomId, async () => {
+      if (actor === 'agent' && this.mustGet(roomId).workspaceMode === 'legacy-host-bind') {
+        throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
+      }
+      const original = this.changes.get(changeId)
       const entry = await this.engine.undo(this.ctxFor(roomId), changeId, actor)
+      if (original && original.kind !== 'package-install' && WORKSPACE_MUTATION_KINDS.has(original.kind)) {
+        this.markWorkspaceModified(roomId)
+      }
       this.syncStatusFromVerify(roomId, entry)
       this.reattachLogs(roomId)
       await writeManifest(this.userData, this.mustGet(roomId))
@@ -416,7 +1006,11 @@ export class RoomOrchestrator {
     }
   }
 
-  async runChecks(roomId: string): Promise<CheckReport> {
+  runChecks(roomId: string): Promise<CheckReport> {
+    return this.withRoomLock(roomId, () => this.runChecksLocked(roomId))
+  }
+
+  private async runChecksLocked(roomId: string): Promise<CheckReport> {
     const room = this.mustGet(roomId)
     const report = await runCheckPipeline({
       room,
@@ -438,9 +1032,26 @@ export class RoomOrchestrator {
     return report
   }
 
-  execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
-    this.mustGet(roomId)
-    return this.backend.execInRoom(roomId, cmd, opts)
+  execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }, actor: Actor = 'agent'): Promise<ExecResult> {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (actor === 'agent' && room.workspaceMode === 'legacy-host-bind') {
+        throw new Error('Agent commands are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
+      }
+      this.markWorkspaceModified(roomId)
+      return this.backend.execInRoom(roomId, cmd, opts)
+    })
+  }
+
+  spawnInteractiveExec(roomId: string, cmd: string[]) {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (room.status === 'sleeping' || room.status === 'preparing') {
+        throw new Error('The room must be awake for a terminal session')
+      }
+      this.markWorkspaceModified(roomId)
+      return this.backend.spawnInteractiveExec(roomId, cmd)
+    })
   }
 
   async getDiagnostic(roomId: string): Promise<string> {
@@ -482,14 +1093,10 @@ export class RoomOrchestrator {
     if (room.provider === 'android') {
       const jdk = await liveWeb('java -version 2>&1 | head -1')
       out.push({ id: 'jdk', label: 'JDK', version: jdk ?? `JDK ${room.runtime.version}`, source: jdk ? 'live' : 'recorded' })
-      const gradle = await liveWeb('gradle --version 2>/dev/null | grep -m1 Gradle')
+      const gradle = await liveWeb(
+        "if [ -f ./gradlew ]; then sh ./gradlew --version 2>/dev/null; else gradle --version 2>/dev/null; fi | grep -m1 Gradle"
+      )
       out.push({ id: 'gradle', label: 'Gradle', version: gradle ?? 'gradle', source: gradle ? 'live' : 'recorded' })
-      out.push({
-        id: 'emulator',
-        label: 'Android Emulator',
-        version: `${room.android?.device ?? 'Samsung Galaxy S10'} · Android ${room.android?.version ?? '14.0'}`,
-        source: 'recorded'
-      })
       return out
     }
 
@@ -535,13 +1142,16 @@ export class RoomOrchestrator {
     return out
   }
 
-  renameRoom(roomId: string, nickname: string): void {
-    if (!nickname.trim()) throw new Error('Nickname cannot be empty')
-    this.rooms.update(roomId, { nickname: nickname.trim() })
-    this.emit(roomId, 'status')
+  renameRoom(roomId: string, nickname: string): Promise<void> {
+    return this.withRoomLock(roomId, async () => {
+      if (!nickname.trim()) throw new Error('Nickname cannot be empty')
+      this.rooms.update(roomId, { nickname: nickname.trim() })
+      this.emit(roomId, 'status')
+    })
   }
 
   setThumbnail(roomId: string, thumbPath: string): void {
+    if (this.mutationGate !== 'open') return
     if (this.rooms.get(roomId)) this.rooms.update(roomId, { thumbPath })
   }
 
@@ -585,6 +1195,8 @@ export class RoomOrchestrator {
       nodeMajor: room.runtime.version,
       sourceType: room.sourceType,
       sourceRef: room.sourceRef,
+      workspaceMode: room.workspaceMode,
+      workspaceVolumeRevision: room.workspaceVolumeRevision,
       startCommand: room.startCommand,
       env: osEnv,
       depsVolumeOverride: gen > 0 ? depsVolumeForGen(room.id, room.runtime.version, gen) : undefined,
@@ -600,14 +1212,25 @@ export class RoomOrchestrator {
     return raw ? Number.parseInt(raw, 10) : 0
   }
 
+  private markWorkspaceModified(roomId: string): void {
+    const room = this.mustGet(roomId)
+    if (room.workspaceMode !== 'hotel') return
+    this.rooms.update(roomId, {
+      stateRevision: room.stateRevision + 1,
+      syncStatus: 'modified'
+    })
+  }
+
   private async syncRouteFor(roomId: string): Promise<void> {
     const room = this.mustGet(roomId)
     if (room.hostPort != null) {
+      const relayToken = await this.backend.relayToken(room.id)
       await this.gateway.setRoute({
         domain: room.domain,
         roomId: room.id,
         targetPort: room.hostPort,
-        https: room.https
+        https: room.https,
+        relayToken
       })
     }
   }
@@ -674,16 +1297,21 @@ export class RoomOrchestrator {
     })
   }
 
-  private listBackups(roomId: string): { file: string; service: 'postgres' | 'redis'; size: number; createdAt: string }[] {
+  private listBackups(roomId: string): BackupInfo[] {
     const dir = join(this.userData, 'rooms', roomId, 'backups')
     if (!existsSync(dir)) return []
-    const out: { file: string; service: 'postgres' | 'redis'; size: number; createdAt: string }[] = []
+    const out: BackupInfo[] = []
     for (const name of readdirSync(dir)) {
-      const m = /^(postgres|redis)-/.exec(name)
-      if (!m) continue
-      const full = join(dir, name)
+      const service = serviceForBackupId(name)
+      if (!service) continue
+      let full: string
+      try {
+        full = resolveRoomBackupFile(this.userData, roomId, service, name)
+      } catch {
+        continue
+      }
       const stat = statSync(full)
-      out.push({ file: full, service: m[1] as 'postgres' | 'redis', size: stat.size, createdAt: stat.mtime.toISOString() })
+      out.push({ id: name, service, size: stat.size, createdAt: stat.mtime.toISOString() })
     }
     return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20)
   }
@@ -711,4 +1339,8 @@ function deriveProjectName(sourceType: SourceType, sourceRef: string): string {
     return slugify(sourceRef.replaceAll('\\', '/').split('/').filter(Boolean).pop() ?? 'project') || 'project'
   }
   return 'project'
+}
+
+function asShutdownError(context: string, error: unknown): Error {
+  return new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
 }

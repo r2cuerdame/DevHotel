@@ -10,6 +10,8 @@ asarUnpack:
 extraResources:
   - from: ../../packages/mcp/dist/index.js
     to: mcp/index.js
+  - from: resources/github/gh_2.97.0_windows_amd64.zip
+    to: github/gh_2.97.0_windows_amd64.zip
 win:
   target:
     - target: nsis
