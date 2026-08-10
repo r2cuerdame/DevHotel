@@ -15,6 +15,13 @@ function makeRoom(overrides: Partial<RoomRecord> = {}): RoomRecord {
     provider: 'web',
     sourceType: 'managed-git',
     sourceRef: 'https://github.com/acme/site.git',
+    workspaceMode: 'hotel',
+    stateRevision: 1,
+    workspaceVolumeRevision: 0,
+    syncStatus: 'synced',
+    lastSyncedAt: '2026-08-10T10:00:00.000Z',
+    hostSyncEnabled: false,
+    workspaceFingerprint: 'abc',
     runtime: { kind: 'node', version: '22.12.0' },
     packageManager: { kind: 'pnpm', version: '9.15.0' },
     startCommand: 'pnpm dev',
@@ -45,16 +52,23 @@ describe('generateManifestYaml', () => {
       web: { command: 'pnpm dev', internalPort: 3000 },
       domain: { host: 'acme.dev.localhost', https: true },
       services: {},
+      workingState: {
+        owner: 'room',
+        revision: 1,
+        volumeRevision: 0,
+        syncStatus: 'synced',
+        lastSyncedAt: '2026-08-10T10:00:00.000Z'
+      }
     })
   })
 
   it('uses source.path for linked-folder rooms', () => {
     const parsed = load(
       generateManifestYaml(
-        makeRoom({ sourceType: 'linked-folder', sourceRef: 'C:\\code\\site' }),
+        makeRoom({ sourceType: 'linked-folder', sourceRef: 'C:\\code\\site', hostSyncEnabled: true }),
       ),
     ) as { source: unknown }
-    expect(parsed.source).toEqual({ type: 'linked-folder', path: 'C:\\code\\site' })
+    expect(parsed.source).toEqual({ type: 'linked-folder', hostSync: 'enabled', path: 'C:\\code\\site' })
   })
 
   it('omits repository/path for empty rooms and version when absent', () => {

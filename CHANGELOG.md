@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.4.1 — 2026-08-10
+
+### Dual responsive Web preview
+
+- Web Rooms now show a synchronized 62/38 split preview: a selectable PC/tablet viewport on the left and a tall mobile viewport on the right.
+- Each Room remembers its selected viewport presets. Both panes share the Room browser session while retaining independent render state.
+- F12 remains an explicit toolbar toggle for the left preview; while DevTools is open it temporarily occupies the mobile pane and restores it on close.
+- The single Room hamburger still switches to the full-screen Config surface. Menus, Config and modals hide both native previews without discarding their page/session state.
+- Preview navigation, popup, download and browser permission boundaries are hardened; other Rooms, Host loopback and private-LAN targets are blocked from the preview session.
+
+## 0.4.0 — 2026-08-10
+
+### Agent-first product direction
+
+- Core Philosophy is now **Give AI a room, not your computer**: inside the Room an Agent can work freely; Host, shared resources and other Rooms require explicit permission.
+- The target architecture is a stable local daemon/API with Room check-in, one-writer lease and fencing, durable Jobs, capability grants and GUI/CLI/MCP adapters over the same state.
+- Added managed-runtime and sandbox research ADRs. These are release targets, not claims about this preview: the independent daemon, Room Key/lease, durable Jobs, Full Agent microVM backend and zero-prerequisite installer are not implemented yet.
+- Added a backend-neutral Runtime Provider capability contract and a three-way Windows prototype bake-off: Docker Sandboxes adapter, DevHotel-managed Hyper-V Linux VM, and hardened WSL2/containerd compatibility baseline.
+- Added the Room Working State design: Host source is an ingress/sync endpoint, while immutable `StateRevision` inputs unify Build/Test Jobs, Clone, Undo and Suite execution without locking the evolving Room.
+- Web remains the primary served-site provider. User-approved Desktop creation now also offers an honest Android **build-only** Room: JDK/Android SDK/Gradle run inside the Room without KVM, emulator, preview, Host SDK, or Host `adb`. Agent control and MCP creation remain Web-only until device permissions and durable Jobs exist.
+- The bundled experimental MCP adapter can launch through DevHotel's Electron/Node runtime instead of requiring a separate Host Node installation.
+
+### Room-owned Working State
+
+- New Local Folder Rooms no longer execute through a writable Host bind. DevHotel imports the selected folder read-only into a revisioned Room-owned source volume; Room commands and package installation mutate only that owned state.
+- **Sync from Host** stages a new generation, fingerprints it, publishes only after verification, and refuses to overwrite Room-side drift. Existing direct-bind Rooms are visibly quarantined as `legacy-host-bind` until the user chooses **Move into Hotel**.
+- Clone copies Room-owned source and dependency state without inheriting a Host link. Agent control and diagnostics redact Host source paths.
+- Current sync is an honest full staged copy; incremental/COW sync, Room-to-Host Apply/Export, and durable daemon-owned Jobs remain milestones. Android Clean Build now takes an owned source snapshot, runs with the pinned image and disposable caches, and exports APKs with input/environment/artifact SHA-256 provenance; general Web Build/Test Jobs do not yet share this path.
+
+### Room App Store
+
+- **+ Add app** opens a Room App Store instead of exposing separate PostgreSQL/Redis add buttons. PostgreSQL and Redis are installable Room Services with supported-version validation.
+- npm packages can be discovered by exact name search or browsed through curated Frontend, Backend, Testing, Tooling, and Data shelves with pagination, bounded Registry requests, caching, and lifecycle-script warnings.
+- npm/pnpm installs pin the selected exact version and are allowed only for Hotel-owned project workspaces; Host-bound and Empty Rooms fail closed. Installation forks a workspace generation plus fresh dependency generation, publishes both pointers atomically, cleans failed staging, and provides action-level Undo without risking later Room edits.
+
+### Hotel Services foundation
+
+- Lobby now has a full-screen Hotel Services surface, independent of any Room. Installation/availability, assignment, permission, and use are separate concepts: **Hotel prepares and maintains. The guest decides and uses.**
+- GitHub is the first concrete Hotel Service. Packaged builds include a pinned `gh` 2.97.0 archive verified by exact size and SHA-256, provision it atomically under Hotel-owned storage, and never depend on Host `gh` or Host PATH.
+- GitHub Connect validates an explicitly supplied fine-grained token through the pinned executable and stores only Electron `safeStorage` ciphertext under Hotel-owned data; it does not use `gh auth login`, Windows GitHub CLI keyring state, or Room files.
+- The official MCP Registry can be browsed and searched as discovery-only catalog data. MCP/Skills installation, assignment, and Agent-native injection remain visibly unavailable rather than silently installing runtimes on the Host.
+
+### Browser-first Room UX and Clone
+
+- The running site is again the main Web Room view; the single hamburger opens Quick Change, Room Apps, Changes, Check and Console as a full-window configuration surface instead of a narrow drawer.
+- The old hamburger/ellipsis split is gone. Sleep, Clone, viewport and an explicit F12 DevTools toggle share one Room menu while backend/port noise stays hidden.
+- Clone a Web Room with a new nickname, isolated domain and fresh browser profile; optionally copy the managed workspace, active dependency volume and PostgreSQL/Redis data, or start services empty/excluded.
+- Live Clone quiesces the source through code, dependency and service backups; the target web process starts only after restore completes. PostgreSQL backup/restore streams through atomic files and fails on the first SQL error.
+
+### Compatibility-backend isolation and ownership
+
+- Every Room now owns a labeled bridge network with inter-container communication disabled. Adversarial live smoke coverage verifies that Room web/Redis endpoints cannot be reached directly from another Room while same internal ports still work.
+- Docker 29's cross-network published-port path is closed by a fresh per-Room 256-bit relay capability: only the Host Gateway holds the raw token, anchors receive only its verifier, malformed/partial requests fail closed, and Wake/Clone rotates the capability.
+- Container, volume and network deletion now requires exact ownership labels, recorded Room identity and post-delete verification. Failed cleanup preserves retryable metadata instead of orphaning untracked data.
+- The external Docker context and engine identity are pinned; mutation/destruction is rejected after context drift. Legacy DevHotel volumes are adopted only through a constrained, non-destructive migration check.
+- Docker executable resolution is shared by lifecycle, logs and terminal paths, including Docker Desktop installations whose CLI is absent from `PATH`.
+- Buffered exec, interactive Terminal and live Logs all pin the Docker engine, verify exact Room ownership labels, and operate on the inspected immutable container ID; a same-named foreign container cannot capture a Room command.
+- **Security boundary:** this developer-preview bridge blocks direct Room-to-Room traffic, but not all Host gateway/private-LAN egress. It is not yet the final Full Agent Room boundary for untrusted autonomous Agents.
+
+### Lifecycle and removal safety
+
+- Create, Clone, Change, shutdown, update and complete removal share a mutation gate; shutdown/removal drains admitted work and blocks new mutations.
+- Interrupted preparing/cloned Rooms and pending Changes reopen as Broken/Needs Attention with safety metadata preserved, never as apparently healthy Rooms.
+- Renderer mutations now require the trusted main frame and strict runtime schemas. Local Folder access is an exact, in-memory grant created only by the native folder picker; Agent control/MCP cannot request arbitrary Host bind mounts.
+- Database restore accepts only an opaque backup ID resolved to a verified regular file inside that Room's backup directory, never an Agent-supplied Host path.
+- App updates attempt every Room/gateway cleanup, install only after all graceful sleeps succeed, and abort replacement with a native error if any stop fails; the tray refreshes when an update becomes ready.
+- Complete removal owns a process-wide gate through Room deletion, CA cleanup and helper launch, so Tray Quit or Update cannot terminate or race the sequence; canceling native confirmation also restores the Settings UI.
+- Complete removal requires a trusted main-window native confirmation, exact canonical ownership manifest/path validation and verified Room cleanup. Junction/path swaps or failed runtime cleanup stop deletion and retain recovery metadata.
+
+### Current preview requirement
+
+- The installer still uses an external Docker-compatible runtime. It is an honest transition build for testing the Web Room model, not the completed **One Installer. Zero Prerequisites.** product.
+- Container writable-layer tool installs are not yet a durable/cloneable Room component, and compatibility images are not yet pinned to recorded immutable digests. The Full persistent Agent Room guarantee remains a managed-runtime milestone.
+- New Local Folder Rooms import through a short-lived read-only Host mount into a revisioned Room-owned source volume. Host sync stages a complete replacement generation and publishes it only after import/fingerprint success; Room-to-Host writes are not implicit.
+- Existing Local Folder Rooms remain explicit `legacy-host-bind` compatibility records: Agent mutations and accidental Clone sharing are blocked until the user chooses **Move into Hotel**. Sync rejects Room tree drift instead of merging or overwriting it.
+- Host import currently performs a full staged copy (dependency/build caches excluded), not incremental journal/COW sync. `.git` and project environment files remain part of the imported working state. Android Clean Build consumes an immutable source snapshot, but it is still an in-process Change rather than a durable Job: new REST/MCP Room mutations wait for the operation lock, and Web Build/Test still lacks the shared immutable Job primitive.
+
 ## 0.2.2 — 2026-08-10
 
 - **Installed programs** in Stack: every room lists its programs with live in-room versions; switch Node/npm↔pnpm/PostgreSQL/Redis versions in place, undo per component. Service version switches back up the data, recreate the service, and restore it.

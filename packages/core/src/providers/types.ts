@@ -10,6 +10,9 @@ export interface RoomProviderInfo {
   label: string
   available: boolean
   unavailableReason?: string
+  execution: 'served' | 'build-only'
+  preview: 'browser' | 'none'
+  requiresKvm: boolean
 }
 
 /**

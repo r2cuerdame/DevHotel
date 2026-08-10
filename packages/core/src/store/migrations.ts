@@ -70,6 +70,83 @@ export const migrations: Migration[] = [
       CREATE INDEX idx_checks_room_ran ON checks(room_id, ran_at DESC);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE rooms ADD COLUMN workspace_mode TEXT;
+      ALTER TABLE rooms ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE rooms ADD COLUMN workspace_volume_revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE rooms ADD COLUMN sync_status TEXT;
+      ALTER TABLE rooms ADD COLUMN last_synced_at TEXT;
+      ALTER TABLE rooms ADD COLUMN host_sync_enabled INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE rooms ADD COLUMN workspace_fingerprint TEXT;
+
+      UPDATE rooms
+      SET workspace_mode = CASE
+            WHEN source_type = 'linked-folder' THEN 'legacy-host-bind'
+            WHEN source_type = 'empty' THEN 'empty'
+            ELSE 'hotel'
+          END,
+          sync_status = CASE
+            WHEN source_type = 'linked-folder' THEN 'legacy'
+            WHEN source_type = 'empty' THEN 'empty'
+            ELSE 'synced'
+          END,
+          host_sync_enabled = CASE WHEN source_type = 'linked-folder' THEN 1 ELSE 0 END;
+    `
+  },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE hotel_services (
+        id TEXT PRIMARY KEY,
+        manifest_json TEXT NOT NULL,
+        availability TEXT NOT NULL CHECK (availability IN ('available', 'unavailable')),
+        registration_state TEXT NOT NULL CHECK (registration_state IN ('registered', 'unregistered')),
+        provision_state TEXT NOT NULL CHECK (provision_state IN ('not-provisioned', 'provisioning', 'provisioned', 'repair-needed', 'failed')),
+        connection_state TEXT NOT NULL CHECK (connection_state IN ('not-applicable', 'disconnected', 'connected', 'unavailable', 'invalid', 'temporarily-unavailable')),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        status_detail TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE hotel_service_assignments (
+        id TEXT PRIMARY KEY,
+        service_id TEXT NOT NULL REFERENCES hotel_services(id) ON DELETE CASCADE,
+        scope_kind TEXT NOT NULL CHECK (scope_kind IN ('hotel', 'host-project', 'room')),
+        scope_ref TEXT,
+        room_id TEXT REFERENCES rooms(id) ON DELETE CASCADE,
+        agent_adapter_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (scope_kind = 'hotel' AND scope_ref IS NULL AND room_id IS NULL) OR
+          (scope_kind = 'host-project' AND scope_ref IS NOT NULL AND room_id IS NULL) OR
+          (scope_kind = 'room' AND scope_ref IS NOT NULL AND room_id = scope_ref)
+        )
+      );
+      CREATE TABLE hotel_service_injections (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL UNIQUE REFERENCES hotel_service_assignments(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL,
+        managed_key TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_hotel_assignments_scope
+        ON hotel_service_assignments(service_id, scope_kind, IFNULL(scope_ref, ''), agent_adapter_id);
+      CREATE INDEX idx_hotel_assignments_room ON hotel_service_assignments(room_id, agent_adapter_id);
+    `
+  },
+  {
+    // Tombstone for a pre-release table-rebuild draft. Keep the version so
+    // developer databases that already recorded v4 never drift ahead of the
+    // source migration sequence. The final v3 schema above is authoritative.
+    version: 4,
+    sql: 'SELECT 1;'
+  }
 ]
 
 export function applyMigrations(sqlite: DatabaseSync): void {

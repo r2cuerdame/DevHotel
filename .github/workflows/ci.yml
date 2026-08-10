@@ -16,12 +16,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter devhotel prepare:github
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm --filter devhotel-mcp build
       - name: Package (no publish)
-        run: pnpm --filter @devhotel/desktop build && pnpm --filter @devhotel/desktop exec electron-builder --win nsis --publish never
+        run: pnpm --filter devhotel build && pnpm --filter devhotel exec electron-builder --win nsis --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: devhotel-installer

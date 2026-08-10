@@ -1,8 +1,8 @@
 import { EventEmitter } from 'node:events'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { spawn, type ChildProcess } from 'node:child_process'
-import { webName } from './backend/naming'
+import type { ChildProcess } from 'node:child_process'
+import type { IsolationBackend } from './backend/types'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 
@@ -20,8 +20,9 @@ export interface LogLineEvent {
  */
 export class LogHub extends EventEmitter {
   private pumps = new Map<string, ChildProcess>()
+  private desired = new Set<string>()
 
-  constructor(private readonly userData: string) {
+  constructor(private readonly userData: string, private readonly backend: IsolationBackend) {
     super()
   }
 
@@ -34,28 +35,46 @@ export class LogHub extends EventEmitter {
   }
 
   attach(roomId: string): void {
-    if (this.pumps.has(roomId)) return
+    if (this.pumps.has(roomId) || this.desired.has(roomId)) return
+    this.desired.add(roomId)
     mkdirSync(this.logDir(roomId), { recursive: true })
-    const child = spawn('docker', ['logs', '-f', '--tail', '50', webName(roomId)], { windowsHide: true })
-    const onChunk = (chunk: Buffer): void => {
-      for (const raw of chunk.toString('utf8').split(/\r?\n/)) {
-        const line = raw.trimEnd()
-        if (!line) continue
-        this.write(roomId, 'web', line)
-      }
-    }
-    child.stdout?.on('data', onChunk)
-    child.stderr?.on('data', onChunk)
-    child.on('close', () => {
-      this.pumps.delete(roomId)
-    })
-    child.on('error', () => {
-      this.pumps.delete(roomId)
-    })
-    this.pumps.set(roomId, child)
+    void this.backend
+      .followRoomLogs(roomId, 50)
+      .then((child) => {
+        if (!this.desired.has(roomId)) {
+          child.kill()
+          return
+        }
+        this.pumps.set(roomId, child)
+        const onChunk = (chunk: Buffer): void => {
+          for (const raw of chunk.toString('utf8').split(/\r?\n/)) {
+            const line = raw.trimEnd()
+            if (!line) continue
+            this.write(roomId, 'web', line)
+          }
+        }
+        child.stdout?.on('data', onChunk)
+        child.stderr?.on('data', onChunk)
+        child.on('close', () => {
+          if (this.pumps.get(roomId) === child) {
+            this.pumps.delete(roomId)
+            this.desired.delete(roomId)
+          }
+        })
+        child.on('error', () => {
+          if (this.pumps.get(roomId) === child) {
+            this.pumps.delete(roomId)
+            this.desired.delete(roomId)
+          }
+        })
+      })
+      .catch(() => {
+        this.desired.delete(roomId)
+      })
   }
 
   detach(roomId: string): void {
+    this.desired.delete(roomId)
     const pump = this.pumps.get(roomId)
     if (pump) {
       pump.kill()
@@ -90,6 +109,7 @@ export class LogHub extends EventEmitter {
   }
 
   dispose(): void {
+    this.desired.clear()
     for (const [, pump] of this.pumps) pump.kill()
     this.pumps.clear()
   }

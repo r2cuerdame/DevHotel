@@ -14,12 +14,13 @@ export class ChangeEngine {
     const def = this.defs.get(kind)
     if (!def) throw new Error(`Unknown change kind: ${kind}`)
 
+    const operation = { id: randomUUID(), createdAt: new Date().toISOString() }
     const planned = def.plan(ctx, params)
     await def.preflight?.(ctx, params)
-    const captured = def.capture ? await def.capture(ctx, params) : null
+    const captured = def.capture ? await def.capture(ctx, params, operation) : null
 
     const entry = ctx.changes.append({
-      id: randomUUID(),
+      id: operation.id,
       roomId: ctx.roomId,
       kind,
       title: planned.title,
@@ -34,7 +35,7 @@ export class ChangeEngine {
       undoStrategy: planned.undoStrategy,
       status: 'pending',
       rawLogPath: null,
-      createdAt: new Date().toISOString(),
+      createdAt: operation.createdAt,
       undoneAt: null
     })
     ctx.log(`change ${entry.seq} [${kind}] ${planned.title} (${actor})`)
@@ -45,14 +46,18 @@ export class ChangeEngine {
       push: (s: string) => {
         steps.push(s)
         ctx.log(`  · ${s}`)
+        // Persist progress while the entry is still pending. A process crash
+        // must not sever an already-created safety backup from its operation.
+        ctx.changes.setStatus(entry.id, 'pending', { steps: [...steps] })
       },
       setCaptured: (blob: unknown) => {
         capturedOverride = { blob }
+        ctx.changes.setStatus(entry.id, 'pending', { captured: blob, steps: [...steps] })
       }
     }
 
     try {
-      await def.apply(ctx, params, stepSink)
+      await def.apply(ctx, params, stepSink, operation)
       ctx.changes.setStatus(entry.id, 'applied', {
         steps,
         ...(capturedOverride ? { captured: (capturedOverride as { blob: unknown }).blob } : {})
@@ -61,19 +66,24 @@ export class ChangeEngine {
       const detail = err instanceof Error ? err.message : String(err)
       ctx.log(`  apply failed: ${detail}`)
       ctx.changes.setStatus(entry.id, 'failed', { steps, verify: { ok: false, detail: `apply failed: ${detail}` } })
-      if (planned.undoable && def.undo) {
+      const failureCapture = capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured
+      const canRollback = def.canRollbackApplyFailure?.(ctx, params, failureCapture) ?? true
+      if (planned.undoable && def.undo && canRollback) {
         try {
-          await def.undo(ctx, { ...entry, captured: capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured, steps })
+          await def.undo(ctx, { ...entry, captured: failureCapture, steps })
           ctx.changes.setStatus(entry.id, 'rolled-back')
           ctx.log('  rolled back')
         } catch (undoErr) {
           ctx.log(`  rollback also failed: ${String(undoErr)}`)
         }
+      } else if (planned.undoable && def.undo && !canRollback) {
+        ctx.log('  rollback skipped: required safety capture was not completed')
       }
       return ctx.changes.get(entry.id)!
     }
 
-    const verify = await def.verify(ctx, params)
+    const effectiveCaptured = capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured
+    const verify = await def.verify(ctx, params, effectiveCaptured, operation)
     if (verify.ok) {
       ctx.changes.setStatus(entry.id, 'verified', { verify })
       ctx.log(`  verified: ${verify.detail}`)

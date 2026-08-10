@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { connect, type ControlClient } from './client'
 import { makeTools } from './tools'
+import { MCP_METADATA } from './metadata'
 
 let cached: ControlClient | null = null
 async function getClient(): Promise<ControlClient> {
@@ -11,7 +12,7 @@ async function getClient(): Promise<ControlClient> {
 }
 
 async function main(): Promise<void> {
-  const server = new McpServer({ name: 'devhotel', version: '0.1.0' })
+  const server = new McpServer(MCP_METADATA)
   for (const tool of makeTools(getClient)) {
     server.tool(tool.name, tool.description, tool.schema, tool.handler)
   }

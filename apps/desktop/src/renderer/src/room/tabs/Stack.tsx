@@ -2,15 +2,11 @@ import { useEffect, useState } from 'react'
 import type { ComponentInfo, RoomRecord } from '@devhotel/shared'
 import { api } from '../../api'
 import { useStore, useT } from '../../state/store'
-
-const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
-const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
+import { PackageStoreModal } from '../PackageStoreModal'
 
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
-  const [device, setDevice] = useState(room.android?.device ?? 'Samsung Galaxy S10')
-  const [osVersion, setOsVersion] = useState(room.android?.version ?? '14.0')
   const [command, setCommand] = useState(room.startCommand)
   const [domain, setDomain] = useState(room.domain)
   const [port, setPort] = useState(room.internalPort)
@@ -30,49 +26,31 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
       <>
         <InstalledPrograms room={room} pending={pending} run={run} />
         <div className="panel-section">
-          <h3>{t('android.emulator')}</h3>
-          <div className="row wrap">
-            <select value={device} onChange={(e) => setDevice(e.target.value)} style={{ width: 190 }}>
-              {ANDROID_DEVICES.map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))}
-            </select>
-            <select value={osVersion} onChange={(e) => setOsVersion(e.target.value)} style={{ width: 140 }}>
-              {ANDROID_VERSIONS.map((v) => (
-                <option key={v} value={v}>
-                  Android {v}
-                </option>
-              ))}
-            </select>
+          <h3>{t('android.buildCommand')}</h3>
+          <div className="row">
+            <input className="mono" value={command} onChange={(e) => setCommand(e.target.value)} style={{ flex: 1 }} />
             <button
               className="btn"
-              disabled={pending !== null || (device === (room.android?.device ?? 'Samsung Galaxy S10') && osVersion === (room.android?.version ?? '14.0'))}
-              onClick={() => void run('emu', () => applyChange(room.id, { kind: 'emulator-config', device, version: osVersion }))}
+              disabled={command === room.startCommand || !command || pending !== null}
+              onClick={() => void run('cmd', () => applyChange(room.id, { kind: 'start-command', command }))}
             >
-              {pending === 'emu' ? t('common.applying') : t('common.apply')}
+              {pending === 'cmd' ? t('common.applying') : t('common.apply')}
             </button>
           </div>
           <p className="small muted" style={{ marginTop: 6 }}>
-            {t('android.emulatorConfigHint')}
+            {t('android.apkHint')}
           </p>
         </div>
         <div className="panel-section">
-        <h3>{t('android.buildCommand')}</h3>
-        <div className="row">
-          <input className="mono" value={command} onChange={(e) => setCommand(e.target.value)} style={{ flex: 1 }} />
-          <button
-            className="btn"
-            disabled={command === room.startCommand || !command || pending !== null}
-            onClick={() => void run('cmd', () => applyChange(room.id, { kind: 'start-command', command }))}
-          >
-            {pending === 'cmd' ? t('common.applying') : t('common.apply')}
-          </button>
-        </div>
-        <p className="small muted" style={{ marginTop: 6 }}>
-          {t('android.apkHint')}
-        </p>
+          <h3>{t('android.deviceService')}</h3>
+          <div className="change-item coming-next-card">
+            <span className="status-dot" data-status="sleeping" />
+            <span className="title">
+              {t('android.deviceService')}
+              <div className="small muted">{t('android.deviceServiceComingNext')}</div>
+            </span>
+            <span className="status-chip">{t('android.comingNext')}</span>
+          </div>
         </div>
       </>
     )
@@ -163,9 +141,9 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   )
 }
 
-const DB_SERVICES: { id: 'postgres' | 'redis'; label: string; addVersion: string; options: string[] }[] = [
-  { id: 'postgres', label: 'PostgreSQL', addVersion: '17', options: ['15', '16', '17'] },
-  { id: 'redis', label: 'Redis', addVersion: '8', options: ['7', '8'] }
+const DB_SERVICES: { id: 'postgres' | 'redis'; label: string; options: string[] }[] = [
+  { id: 'postgres', label: 'PostgreSQL', options: ['15', '16', '17'] },
+  { id: 'redis', label: 'Redis', options: ['7', '8'] }
 ]
 
 /** Full database lifecycle: add, version switch (backup→recreate→restore), backup, restart, remove, restore. */
@@ -177,12 +155,16 @@ function DatabasesSection({
   room: RoomRecord
   pending: string | null
   run: (kind: string, fn: () => Promise<unknown>) => Promise<void>
-}): React.JSX.Element {
+}): React.JSX.Element | null {
   const applyChange = useStore((s) => s.applyChange)
   const inspection = useStore((s) => s.inspections[room.id])
   const t = useT()
   const [versions, setVersions] = useState<Record<string, string>>({})
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+  const hasInstalledService = DB_SERVICES.some(({ id }) => Boolean(room.services[id]))
+  const hasBackups = Boolean(inspection?.backups.length)
+
+  if (!hasInstalledService && !hasBackups) return null
 
   return (
     <div className="panel-section">
@@ -239,28 +221,14 @@ function DatabasesSection({
           </div>
         )
       })}
-      {DB_SERVICES.some(({ id }) => !room.services[id]) && (
-        <div className="row wrap" style={{ marginBottom: 8 }}>
-          {DB_SERVICES.filter(({ id }) => !room.services[id]).map(({ id, label, addVersion }) => (
-            <button
-              key={id}
-              className="btn"
-              disabled={pending !== null}
-              onClick={() => void run(`${id}-add`, () => applyChange(room.id, { kind: 'service-add', service: id, version: addVersion }))}
-            >
-              {pending === `${id}-add` ? t('common.applying') : `+ ${label} ${addVersion}`}
-            </button>
-          ))}
-        </div>
-      )}
-      <p className="small muted">{t('services.servicesHint')}</p>
+      {hasInstalledService && <p className="small muted">{t('services.servicesHint')}</p>}
       {inspection && inspection.backups.length > 0 && (
         <>
           <h3 style={{ marginTop: 14 }}>{t('services.backupsTitle')}</h3>
           {inspection.backups.map((b) => (
-            <div key={b.file} className="change-item">
+            <div key={b.id} className="change-item">
               <span className="title">
-                <span className="mono small">{b.file.split('\\').pop()}</span>
+                <span className="mono small">{b.id}</span>
                 <div className="small muted">{new Date(b.createdAt).toLocaleString()}</div>
               </span>
               <button
@@ -268,11 +236,13 @@ function DatabasesSection({
                 disabled={pending !== null || !running || !room.services[b.service]}
                 onClick={() => {
                   if (window.confirm(t('services.restoreConfirm'))) {
-                    void run(`restore-${b.file}`, () => applyChange(room.id, { kind: 'db-restore', service: b.service, file: b.file }))
+                    void run(`restore-${b.id}`, () =>
+                      applyChange(room.id, { kind: 'db-restore', service: b.service, backupId: b.id })
+                    )
                   }
                 }}
               >
-                {pending === `restore-${b.file}` ? t('common.applying') : t('services.restore')}
+                {pending === `restore-${b.id}` ? t('common.applying') : t('services.restore')}
               </button>
             </div>
           ))}
@@ -298,6 +268,7 @@ function InstalledPrograms({
   const t = useT()
   const [components, setComponents] = useState<ComponentInfo[]>([])
   const [selections, setSelections] = useState<Record<string, string>>({})
+  const [storeOpen, setStoreOpen] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -324,7 +295,14 @@ function InstalledPrograms({
 
   return (
     <div className="panel-section">
-      <h3>{t('stack.installed')}</h3>
+      <div className="section-heading-row">
+        <h3>{t('stack.installed')}</h3>
+        {room.provider === 'web' && (
+          <button className="btn" onClick={() => setStoreOpen(true)}>
+            {t('packageStore.add')}
+          </button>
+        )}
+      </div>
       {components.map((c) => {
         const current =
           c.id === 'pm' ? c.label : ((c.options ?? []).find((o) => c.version.startsWith(o)) ?? c.version.split('.')[0] ?? c.version)
@@ -367,6 +345,7 @@ function InstalledPrograms({
           </div>
         )
       })}
+      {storeOpen && <PackageStoreModal room={room} onClose={() => setStoreOpen(false)} />}
     </div>
   )
 }

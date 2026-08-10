@@ -12,7 +12,10 @@ export class WindowsRoomProvider implements RoomProvider {
     kind: 'windows',
     label: 'Windows Room',
     available: false,
-    unavailableReason: 'Arrives after Web and Android rooms are daily-usable'
+    unavailableReason: 'Arrives after Web and Android rooms are daily-usable',
+    execution: 'build-only',
+    preview: 'none',
+    requiresKvm: false
   }
 
   async detect(): Promise<RoomPlan> {

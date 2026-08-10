@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { zPmKind, zProviderKind, zQuickChange, zSourceType } from '@devhotel/shared'
+import { zChangeId, zPmKind, zQuickChange, zRoomId } from '@devhotel/shared'
 import type { ControlClient } from './client'
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
@@ -40,13 +40,13 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'create_room',
       description:
-        'Create a new isolated room for a project (git URL, local folder, or empty). DevHotel auto-detects runtime, package manager, start command and port; pass overrides only when needed. Returns the created room.',
+        'Create a new isolated room from a git URL or as an empty Room. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the created room.',
       schema: {
-        sourceType: zSourceType,
-        sourceRef: z.string().describe('git URL for managed-git, absolute folder path for linked-folder, empty string for empty'),
+        sourceType: z.enum(['managed-git', 'empty']),
+        sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
         project: z.string().describe('project name, e.g. the repo name'),
         nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
-        provider: zProviderKind.optional().describe("'web' (default) or 'android' for a Gradle build room"),
+        provider: z.literal('web').optional().describe("'web' (the only provider available in this release)"),
         runtimeVersion: z.string().regex(/^\d+$/).optional().describe('Node major version override, e.g. "22"'),
         pmKind: zPmKind.optional(),
         startCommand: z.string().optional(),
@@ -73,7 +73,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'start_room',
       description: 'Start (wake) a room: its web server and services run again with preserved state.',
-      schema: { roomId: z.string() },
+      schema: { roomId: zRoomId },
       handler: wrap(async (a) => {
         await (await getClient()).startRoom(a.roomId)
         return `Room ${a.roomId} started.`
@@ -82,7 +82,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'sleep_room',
       description: 'Sleep a room: stops its whole process tree and frees CPU/RAM while keeping all data.',
-      schema: { roomId: z.string() },
+      schema: { roomId: zRoomId },
       handler: wrap(async (a) => {
         await (await getClient()).sleepRoom(a.roomId)
         return `Room ${a.roomId} is sleeping.`
@@ -91,7 +91,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'inspect_room',
       description: 'Inspect a room: status, URL, stack, latest health check, recent changes and undoable change.',
-      schema: { roomId: z.string() },
+      schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).inspectRoom(a.roomId))
     },
     {
@@ -99,7 +99,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       description:
         'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr.',
       schema: {
-        roomId: z.string(),
+        roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
         timeoutMs: z.number().int().positive().optional()
       },
@@ -109,27 +109,27 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       name: 'check_room',
       description:
         'Run DevHotel health checks on a room (runtime, deps, process, port, gateway, HTTPS, HTTP) and return the report with suggested fixes.',
-      schema: { roomId: z.string() },
+      schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).runChecks(a.roomId))
     },
     {
       name: 'apply_quick_change',
       description:
         'Apply a quick change to a room as a verified, undoable transaction: node-version, start-command, domain, https, internal-port, or deps-install.',
-      schema: { roomId: z.string(), change: zQuickChange },
+      schema: { roomId: zRoomId, change: zQuickChange },
       handler: wrap(async (a) => (await getClient()).applyChange(a.roomId, a.change))
     },
     {
       name: 'undo_change',
       description: 'Undo a previously applied change by id (see inspect_room / apply_quick_change results).',
-      schema: { roomId: z.string(), changeId: z.string() },
+      schema: { roomId: zRoomId, changeId: zChangeId },
       handler: wrap(async (a) => (await getClient()).undoChange(a.roomId, a.changeId))
     },
     {
       name: 'copy_diagnostic',
       description:
         'Get the secret-redacted diagnostic bundle for a room — paste it into an LLM or issue to debug startup failures.',
-      schema: { roomId: z.string() },
+      schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await (await getClient()).diagnostic(a.roomId)).text)
     }
   ]

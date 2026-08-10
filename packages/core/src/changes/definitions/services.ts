@@ -1,11 +1,22 @@
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import type { ServiceKind } from '@devhotel/shared'
+import { randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { zBackupId, type ServiceKind } from '@devhotel/shared'
 import { SERVICE_DB_NAME, SERVICE_DB_USER, SERVICE_DEFAULT_VERSIONS } from '../../backend/naming'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
 const SERVICE_LABEL: Record<ServiceKind, string> = { postgres: 'PostgreSQL', redis: 'Redis' }
+const SERVICE_ALLOWED_VERSIONS: Record<ServiceKind, readonly string[]> = {
+  postgres: ['15', '16', '17'],
+  redis: ['7', '8']
+}
+
+function assertAllowedServiceVersion(service: ServiceKind, version: string): void {
+  if (!SERVICE_ALLOWED_VERSIONS[service].includes(version)) {
+    throw new Error(`Unsupported ${SERVICE_LABEL[service]} version: ${version}`)
+  }
+}
 
 function backupsDir(ctx: ChangeCtx): string {
   const dir = join(ctx.userData, 'rooms', ctx.roomId, 'backups')
@@ -13,7 +24,59 @@ function backupsDir(ctx: ChangeCtx): string {
   return dir
 }
 
-async function pingService(ctx: ChangeCtx, svc: ServiceKind, timeoutMs = 60_000): Promise<{ ok: boolean; detail: string }> {
+function comparable(path: string): string {
+  const normalized = resolve(path)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+export function serviceForBackupId(id: string): ServiceKind | null {
+  if (!zBackupId.safeParse(id).success) return null
+  if (id.startsWith('postgres-') && id.endsWith('.sql')) return 'postgres'
+  if (id.startsWith('redis-') && id.endsWith('.rdb')) return 'redis'
+  return null
+}
+
+/** Resolve a public opaque backup ID only inside its owning Room's plain backups directory. */
+export function resolveRoomBackupFile(
+  userData: string,
+  roomId: string,
+  service: ServiceKind,
+  backupId: string
+): string {
+  if (basename(backupId) !== backupId || serviceForBackupId(backupId) !== service) {
+    throw new Error(`Invalid ${SERVICE_LABEL[service]} backup ID`)
+  }
+  const root = resolve(userData)
+  const roomDir = resolve(root, 'rooms', roomId)
+  const dir = resolve(roomDir, 'backups')
+  const file = resolve(dir, backupId)
+  const rel = relative(dir, file)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel) || comparable(dirname(file)) !== comparable(dir)) {
+    throw new Error('Backup ID escapes the Room backups directory')
+  }
+  if (!existsSync(file)) throw new Error(`Backup not found in this Room: ${backupId}`)
+
+  for (const item of [root, resolve(root, 'rooms'), roomDir, dir, file]) {
+    if (!existsSync(item)) throw new Error(`Backup path is incomplete: ${backupId}`)
+    if (lstatSync(item).isSymbolicLink()) {
+      throw new Error(`Backup path contains a symbolic link or junction: ${backupId}`)
+    }
+  }
+  const canonicalDir = realpathSync.native(dir)
+  const canonicalFile = realpathSync.native(file)
+  if (comparable(dirname(canonicalFile)) !== comparable(canonicalDir)) {
+    throw new Error('Backup resolved outside the Room backups directory')
+  }
+  const stat = statSync(canonicalFile)
+  if (!stat.isFile() || stat.size === 0) throw new Error(`Backup is not a non-empty regular file: ${backupId}`)
+  return canonicalFile
+}
+
+export async function pingService(
+  ctx: ChangeCtx,
+  svc: ServiceKind,
+  timeoutMs = 60_000
+): Promise<{ ok: boolean; detail: string }> {
   const deadline = Date.now() + timeoutMs
   let last = ''
   while (Date.now() < deadline) {
@@ -34,29 +97,96 @@ async function pingService(ctx: ChangeCtx, svc: ServiceKind, timeoutMs = 60_000)
   return { ok: false, detail: `${SERVICE_LABEL[svc]} not answering${last ? `: ${last}` : ''}` }
 }
 
-export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Promise<string> {
-  const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19)
-  if (svc === 'postgres') {
-    const file = join(backupsDir(ctx), `postgres-${stamp}.sql`)
-    const res = await ctx.backend.execInService(ctx.roomId, 'postgres', ['pg_dump', '-U', SERVICE_DB_USER, '-d', SERVICE_DB_NAME], {
-      timeoutMs: 600_000
-    })
-    if (res.code !== 0) throw new Error(`pg_dump failed: ${res.stderr.slice(-300)}`)
-    writeFileSync(file, res.stdout, 'utf8')
-    return file
+/**
+ * Awake clones use a portable logical dump of DevHotel's managed database.
+ * Reject whole-instance state which that format cannot faithfully represent;
+ * sleeping clones use a stopped full-volume copy and therefore need no check.
+ */
+export async function validatePostgresLogicalClone(ctx: ChangeCtx): Promise<void> {
+  const databases = await ctx.backend.execInService(
+    ctx.roomId,
+    'postgres',
+    [
+      'psql',
+      '-At',
+      '-U',
+      SERVICE_DB_USER,
+      '-d',
+      'postgres',
+      '-c',
+      `SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('postgres', '${SERVICE_DB_NAME}') ORDER BY 1;`
+    ],
+    { timeoutMs: 30_000 }
+  )
+  if (databases.code !== 0) throw new Error(`PostgreSQL clone validation failed: ${databases.stderr.slice(-300)}`)
+  const extraDatabases = databases.stdout.trim()
+  if (extraDatabases) {
+    throw new Error(`PostgreSQL has unmanaged databases that an awake logical clone cannot copy: ${extraDatabases.replaceAll('\n', ', ')}`)
   }
-  const file = join(backupsDir(ctx), `redis-${stamp}.rdb`)
-  const save = await ctx.backend.execInService(ctx.roomId, 'redis', ['redis-cli', 'save'], { timeoutMs: 300_000 })
-  if (save.code !== 0) throw new Error(`redis SAVE failed: ${save.stderr.slice(-300)}`)
-  await ctx.backend.copyFromService(ctx.roomId, 'redis', '/data/dump.rdb', file)
-  return file
+
+  const roles = await ctx.backend.execInService(
+    ctx.roomId,
+    'postgres',
+    [
+      'psql',
+      '-At',
+      '-U',
+      SERVICE_DB_USER,
+      '-d',
+      'postgres',
+      '-c',
+      `SELECT rolname FROM pg_roles WHERE rolname <> '${SERVICE_DB_USER}' AND rolname !~ '^pg_' ORDER BY 1;`
+    ],
+    { timeoutMs: 30_000 }
+  )
+  if (roles.code !== 0) throw new Error(`PostgreSQL clone validation failed: ${roles.stderr.slice(-300)}`)
+  const extraRoles = roles.stdout.trim()
+  if (extraRoles) {
+    throw new Error(`PostgreSQL has unmanaged roles that an awake logical clone cannot copy: ${extraRoles.replaceAll('\n', ', ')}`)
+  }
 }
 
-async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: string): Promise<void> {
+export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Promise<string> {
+  const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19)
+  const unique = randomUUID().slice(0, 8)
+  if (svc === 'postgres') {
+    const file = join(backupsDir(ctx), `postgres-${stamp}-${unique}.sql`)
+    const partial = `${file}.${randomUUID()}.partial`
+    try {
+      const res = await ctx.backend.execInServiceToFile(
+        ctx.roomId,
+        'postgres',
+        ['pg_dump', '-U', SERVICE_DB_USER, '-d', SERVICE_DB_NAME],
+        partial,
+        { timeoutMs: 600_000 }
+      )
+      if (res.code !== 0) throw new Error(`pg_dump failed: ${res.stderr.slice(-300)}`)
+      if (statSync(partial).size === 0) throw new Error('pg_dump produced an empty backup')
+      // A completed dump becomes visible atomically; crashes and disk errors
+      // leave at most a uniquely named .partial file which finally removes.
+      renameSync(partial, file)
+      return file
+    } finally {
+      rmSync(partial, { force: true })
+    }
+  }
+  const file = join(backupsDir(ctx), `redis-${stamp}-${unique}.rdb`)
+  const partial = `${file}.${randomUUID()}.partial`
+  try {
+    const save = await ctx.backend.execInService(ctx.roomId, 'redis', ['redis-cli', 'save'], { timeoutMs: 300_000 })
+    if (save.code !== 0) throw new Error(`redis SAVE failed: ${save.stderr.slice(-300)}`)
+    await ctx.backend.copyFromService(ctx.roomId, 'redis', '/data/dump.rdb', partial)
+    if (statSync(partial).size === 0) throw new Error('Redis SAVE produced an empty backup')
+    renameSync(partial, file)
+    return file
+  } finally {
+    rmSync(partial, { force: true })
+  }
+}
+
+export async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: string): Promise<void> {
   if (!existsSync(file)) throw new Error(`Backup file not found: ${file}`)
   if (svc === 'postgres') {
-    const { readFileSync } = await import('node:fs')
-    const sql = readFileSync(file, 'utf8')
     // separate -c invocations: DROP DATABASE refuses to run inside the implicit
     // transaction psql wraps around a single multi-statement -c
     const drop = await ctx.backend.execInService(
@@ -73,10 +203,13 @@ async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: st
       { timeoutMs: 120_000 }
     )
     if (create.code !== 0) throw new Error(`database reset failed: ${create.stderr.slice(-300)}`)
-    const res = await ctx.backend.execInService(ctx.roomId, 'postgres', ['psql', '-U', SERVICE_DB_USER, '-d', SERVICE_DB_NAME], {
-      timeoutMs: 600_000,
-      input: sql
-    })
+    const res = await ctx.backend.execInServiceFromFile(
+      ctx.roomId,
+      'postgres',
+      ['psql', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-U', SERVICE_DB_USER, '-d', SERVICE_DB_NAME],
+      file,
+      { timeoutMs: 600_000 }
+    )
     if (res.code !== 0) throw new Error(`psql restore failed: ${res.stderr.slice(-300)}`)
     return
   }
@@ -106,6 +239,7 @@ export const serviceAddChange: ChangeDefinition<{ service: ServiceKind; version?
   },
   async preflight(ctx, p) {
     const room = ctx.room()
+    assertAllowedServiceVersion(p.service, p.version ?? SERVICE_DEFAULT_VERSIONS[p.service])
     if (room.provider !== 'web') throw new Error('Services are available in Web rooms')
     if (room.services[p.service]) throw new Error(`${SERVICE_LABEL[p.service]} already exists in this room`)
   },
@@ -208,6 +342,7 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
   },
   async preflight(ctx, p) {
     const current = ctx.room().services[p.service]
+    assertAllowedServiceVersion(p.service, p.version)
     if (!current) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
     if (current.version === p.version) throw new Error(`${SERVICE_LABEL[p.service]} is already on ${p.version}`)
     if (!ctx.isAwake()) throw new Error('Wake the room first — the data is backed up before switching')
@@ -225,6 +360,10 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
     if (!ping.ok) throw new Error(ping.detail)
     steps.push('Restore the data into the new version')
     await restoreServiceFromFile(ctx, p.service, backupFile)
+  },
+  canRollbackApplyFailure(_ctx, _p, captured) {
+    const backup = captured as { prevVersion?: unknown; backupFile?: unknown } | null
+    return typeof backup?.prevVersion === 'string' && typeof backup.backupFile === 'string'
   },
   async verify(ctx, p) {
     return pingService(ctx, p.service)
@@ -308,14 +447,14 @@ export const dbBackupChange: ChangeDefinition<{ service: ServiceKind }> = {
   }
 }
 
-export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; file: string }> = {
+export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; backupId: string }> = {
   kind: 'db-restore',
   plan(ctx, p) {
     return {
       title: `${SERVICE_LABEL[p.service]} data restored`,
       component: SERVICE_LABEL[p.service],
       before: null,
-      after: { file: p.file },
+      after: { backupId: p.backupId },
       undoable: true,
       undoStrategy: 'safety-backup-restore',
       autoRollback: false
@@ -324,7 +463,7 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; file: str
   async preflight(ctx, p) {
     if (!ctx.room().services[p.service]) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
     if (!ctx.isAwake()) throw new Error('Wake the room first')
-    if (!existsSync(p.file)) throw new Error(`Backup file not found: ${p.file}`)
+    resolveRoomBackupFile(ctx.userData, ctx.roomId, p.service, p.backupId)
   },
   async capture(ctx, p) {
     const backupFile = await backupServiceToFile(ctx, p.service)
@@ -332,8 +471,9 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; file: str
     return { backupFile }
   },
   async apply(ctx, p, steps) {
-    steps.push(`Restore ${SERVICE_LABEL[p.service]} from ${p.file}`)
-    await restoreServiceFromFile(ctx, p.service, p.file)
+    const file = resolveRoomBackupFile(ctx.userData, ctx.roomId, p.service, p.backupId)
+    steps.push(`Restore ${SERVICE_LABEL[p.service]} from ${p.backupId}`)
+    await restoreServiceFromFile(ctx, p.service, file)
   },
   verify(ctx, p) {
     return pingService(ctx, p.service)

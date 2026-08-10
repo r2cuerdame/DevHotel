@@ -4,12 +4,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from 'node:path'
 import {
   zApplyChangeBody,
-  zCreateRoomInput,
+  zAgentCreateRoomInput,
   zExecBody,
+  zRoomId,
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
 import type { RoomOrchestrator } from '@devhotel/core'
+import type { RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /**
  * Loopback control API for the MCP server (and other local agents).
@@ -47,54 +49,56 @@ export async function startControlApi(
 
     if (parts[1] === 'rooms') {
       const roomId = parts[2]
+      const safeRoomId = roomId ? zRoomId.parse(roomId) : undefined
       const op = parts[3]
 
       if (!roomId && req.method === 'GET') {
-        sendJson(res, 200, orch.listRooms())
+        sendJson(res, 200, orch.listRooms().map(roomForAgent))
         return
       }
       if (!roomId && req.method === 'POST') {
-        const body = zCreateRoomInput.omit({ actor: true }).parse(await readBody(req))
+        const body = zAgentCreateRoomInput.parse(await readBody(req))
         const room = await orch.createRoom({ ...body, actor: 'agent' })
         sendJson(res, 200, room)
         return
       }
-      if (roomId && !op && req.method === 'GET') {
-        sendJson(res, 200, orch.inspectRoom(roomId))
+      if (safeRoomId && !op && req.method === 'GET') {
+        const inspection = orch.inspectRoom(safeRoomId)
+        sendJson(res, 200, { ...inspection, room: roomForAgent(inspection.room), dataDir: '[Hotel data hidden]' } satisfies RoomInspection)
         return
       }
-      if (roomId && op && req.method === 'POST') {
+      if (safeRoomId && op && req.method === 'POST') {
         switch (op) {
           case 'start':
-            await orch.startRoom(roomId, 'agent')
+            await orch.startRoom(safeRoomId, 'agent')
             res.writeHead(204).end()
             return
           case 'sleep':
-            await orch.sleepRoom(roomId, 'agent')
+            await orch.sleepRoom(safeRoomId, 'agent')
             res.writeHead(204).end()
             return
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.execInRoom(roomId, body.cmd, { timeoutMs: body.timeoutMs }))
+            sendJson(res, 200, await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs }, 'agent'))
             return
           }
           case 'checks':
-            sendJson(res, 200, await orch.runChecks(roomId))
+            sendJson(res, 200, await orch.runChecks(safeRoomId))
             return
           case 'changes': {
             const body = zApplyChangeBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.applyChange(roomId, body.change, 'agent'))
+            sendJson(res, 200, await orch.applyChange(safeRoomId, body.change, 'agent'))
             return
           }
           case 'undo': {
             const body = zUndoChangeBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.undoChange(roomId, body.changeId, 'agent'))
+            sendJson(res, 200, await orch.undoChange(safeRoomId, body.changeId, 'agent'))
             return
           }
         }
       }
-      if (roomId && op === 'diagnostic' && req.method === 'GET') {
-        sendJson(res, 200, { text: await orch.getDiagnostic(roomId) })
+      if (safeRoomId && op === 'diagnostic' && req.method === 'GET') {
+        sendJson(res, 200, { text: await orch.getDiagnostic(safeRoomId) })
         return
       }
     }
@@ -119,6 +123,10 @@ export async function startControlApi(
       server.close()
     }
   }
+}
+
+function roomForAgent(room: RoomRecord): RoomRecord {
+  return room.sourceType === 'linked-folder' ? { ...room, sourceRef: '[Host folder hidden]' } : room
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

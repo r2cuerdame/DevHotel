@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
-import type { ChangeCtx } from '../changes/types'
+import { packageInstallCommand } from '../changes/definitions/packageInstall'
+import type { ChangeCtx, ChangeDefinition } from '../changes/types'
 import { changesRepo, type ChangesRepo } from '../store/changesRepo'
 import { roomsRepo, type RoomsRepo } from '../store/roomsRepo'
 import { settingsRepo, type SettingsRepo } from '../store/settingsRepo'
@@ -35,6 +36,8 @@ function ctx(roomId = 'room1abc'): ChangeCtx {
         nodeMajor: r.runtime.version,
         sourceType: r.sourceType,
         sourceRef: r.sourceRef,
+        workspaceMode: r.workspaceMode,
+        workspaceVolumeRevision: r.workspaceVolumeRevision,
         startCommand: r.startCommand,
         env: {},
         depsVolumeOverride: gen > 0 ? `dh-${roomId}-deps-node${r.runtime.version}-g${gen}` : undefined,
@@ -110,6 +113,76 @@ describe('node-version change', () => {
   })
 })
 
+describe('Android build-only boundaries', () => {
+  it('rejects run and emulator changes before any emulator backend operation', async () => {
+    rooms.update('room1abc', {
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      hostPort: null
+    })
+    backend.emulatorState = async () => {
+      throw new Error('must not inspect emulator state')
+    }
+    backend.createEmulator = async () => {
+      throw new Error('NO_KVM')
+    }
+    backend.removeEmulator = async () => {
+      throw new Error('must not remove retained emulator data')
+    }
+
+    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(/build-only/)
+    await expect(
+      engine.execute(ctx(), 'emulator-config', { device: 'Samsung Galaxy S10', version: '14.0' }, 'user')
+    ).rejects.toThrow(/unavailable in build-only/)
+    expect(backend.calls).not.toContain(expect.stringContaining('Emulator'))
+  })
+})
+
+describe('change crash durability', () => {
+  it('persists steps and captured safety data before apply completes', async () => {
+    let entered!: () => void
+    let release!: () => void
+    const enteredApply = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const holdApply = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    engine.register({
+      kind: 'durable-capture-test',
+      plan: () => ({
+        title: 'Durable capture',
+        component: 'Test',
+        before: null,
+        after: null,
+        undoable: true,
+        undoStrategy: 'restore-file',
+        autoRollback: false
+      }),
+      async apply(_changeCtx, _params, steps) {
+        steps.push('Safety backup written')
+        steps.setCaptured({ backupFile: 'room-backup.sql' })
+        entered()
+        await holdApply
+      },
+      async verify() {
+        return { ok: true, detail: 'done' }
+      }
+    } satisfies ChangeDefinition<Record<string, never>>)
+
+    const task = engine.execute(ctx(), 'durable-capture-test', {}, 'user')
+    await enteredApply
+    const pending = changes.list('room1abc')[0]!
+    expect(pending.status).toBe('pending')
+    expect(pending.steps).toEqual(['Safety backup written'])
+    expect(pending.captured).toEqual({ backupFile: 'room-backup.sql' })
+
+    release()
+    await expect(task).resolves.toMatchObject({ status: 'verified' })
+  })
+})
+
 describe('domain change', () => {
   it('applies, routes, verifies against the gateway table', async () => {
     const entry = await engine.execute(ctx(), 'domain', { domain: 'renamed.localhost' }, 'user')
@@ -179,6 +252,14 @@ describe('sleeping rooms', () => {
 })
 
 describe('services', () => {
+  it('rejects service versions outside the supported catalog before changing Room state', async () => {
+    await expect(
+      engine.execute(ctx(), 'service-add', { service: 'postgres', version: 'latest' }, 'user')
+    ).rejects.toThrow(/Unsupported PostgreSQL version/)
+    expect(rooms.get('room1abc')!.services.postgres).toBeUndefined()
+    expect(changes.list('room1abc')).toHaveLength(0)
+  })
+
   it('adds postgres, verifies it answers, and undo removes it with its volume', async () => {
     const entry = await engine.execute(ctx(), 'service-add', { service: 'postgres' }, 'user')
     expect(entry.status).toBe('verified')
@@ -211,6 +292,55 @@ describe('services', () => {
     expect(entry.status).toBe('verified')
     expect(entry.verify?.detail).toMatch(/postgres-.*\.sql/)
   })
+
+  it('does not touch the intact service or volume when a version-change backup fails before capture', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+    backend.execInServiceToFile = async (_roomId, svc, cmd) => {
+      backend.calls.push(`execInServiceToFile:${svc}:${cmd[0]}`)
+      return { code: 1, stdout: '', stderr: 'disk full before a backup existed' }
+    }
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toMatch(/pg_dump failed.*disk full/)
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(backend.serviceStates.get('postgres')).toBe('running')
+    expect(backend.calls.some((call) => call.startsWith('removeService:postgres'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('createService:postgres'))).toBe(false)
+  })
+
+  it('rejects unsupported service upgrades before backup or recreation', async () => {
+    rooms.update('room1abc', { services: { redis: { version: '7' } } })
+    backend.serviceStates.set('redis', 'running')
+    await expect(
+      engine.execute(ctx(), 'service-version', { service: 'redis', version: 'latest' }, 'user')
+    ).rejects.toThrow(/Unsupported Redis version/)
+    expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '7' })
+    expect(backend.calls.some((call) => call.startsWith('removeService:redis'))).toBe(false)
+  })
+
+  it('still restores the captured backup when a version change fails after destructive work begins', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+    const createService = backend.createService.bind(backend)
+    backend.createService = async (roomId, svc, version) => {
+      if (version === '17') {
+        backend.calls.push(`createService:${svc}:${version}`)
+        throw new Error('new image failed to start')
+      }
+      await createService(roomId, svc, version)
+    }
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('rolled-back')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(backend.calls).toContain('createService:postgres:16')
+    expect(backend.calls).toContain('execInServiceFromFile:postgres:psql')
+    expect(entry.captured).toMatchObject({ prevVersion: '16', backupFile: expect.stringMatching(/postgres-.*\.sql$/) })
+  })
 })
 
 describe('engine safety', () => {
@@ -222,5 +352,216 @@ describe('engine safety', () => {
     const entry = await engine.execute(ctx(), 'start-command', { command: 'pnpm start' }, 'user')
     await engine.undo(ctx(), entry.id, 'user')
     await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/already undone/)
+  })
+})
+
+describe('Android immutable build', () => {
+  beforeEach(() => {
+    rooms.update('room1abc', {
+      provider: 'android',
+      workspaceMode: 'hotel',
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/android.git',
+      stateRevision: 17,
+      workspaceVolumeRevision: 3,
+      syncStatus: 'modified',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: './gradlew assembleDebug --no-daemon',
+      hostPort: null
+    })
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+  })
+
+  it('builds only a frozen Room revision, exports provenance, and cleans the snapshot', async () => {
+    const before = rooms.get('room1abc')!
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toContain(`artifacts/${entry.id}/`)
+    const snapshot = `dh-room1abc-src-build-${entry.id.replaceAll('-', '')}`
+    const pauseAt = backend.calls.indexOf('pauseWeb:room1abc')
+    const copyAt = backend.calls.indexOf(`copyVolume:dh-room1abc-src-r3:${snapshot}`)
+    const unpauseAt = backend.calls.indexOf('unpauseWeb:room1abc')
+    const buildAt = backend.calls.findIndex((call) => call.startsWith(`runOneShot:${snapshot}:`))
+    const exportAt = backend.calls.findIndex((call) => call.startsWith(`exportAndroidArtifacts:${snapshot}:`))
+    const cleanupAt = backend.calls.indexOf(`removeWorkspaceSnapshot:${entry.id}`)
+    expect([pauseAt, copyAt, unpauseAt, buildAt, exportAt, cleanupAt]).toEqual(
+      [...[pauseAt, copyAt, unpauseAt, buildAt, exportAt, cleanupAt]].sort((a, b) => a - b)
+    )
+    expect(pauseAt).toBeGreaterThanOrEqual(0)
+    expect(backend.lastWebSpec?.workspaceVolumeOverride).toBe(snapshot)
+    expect(backend.lastWebSpec).toMatchObject({ noCacheVolume: true, extraVolumes: [] })
+
+    const provenance = entry.captured as {
+      jobId: string
+      changeId: string
+      roomId: string
+      executionLifecycle: string
+      cleanExecution: boolean
+      input: { stateRevision: number; workspaceVolumeRevision: number; buildInputSha256: string; environmentRevision: string }
+      artifacts: { sha256: string }[]
+      provenanceSha256: string
+    }
+    expect(provenance).toMatchObject({
+      jobId: entry.id,
+      changeId: entry.id,
+      roomId: 'room1abc',
+      executionLifecycle: 'in-process-only',
+      cleanExecution: true,
+      input: { stateRevision: 17, workspaceVolumeRevision: 3, buildInputSha256: 'b'.repeat(64) }
+    })
+    expect(provenance.input.environmentRevision).toMatch(/^[a-f0-9]{64}$/)
+    expect(provenance.artifacts[0]?.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(provenance.provenanceSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(rooms.get('room1abc')).toMatchObject({
+      stateRevision: before.stateRevision,
+      workspaceVolumeRevision: before.workspaceVolumeRevision,
+      syncStatus: before.syncStatus
+    })
+  })
+
+  it('unpauses the live Room and removes its snapshot when the isolated build fails', async () => {
+    backend.oneShotResult = { code: 1, stdout: '', stderr: 'Gradle failed' }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'agent')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('Gradle failed')
+    expect(backend.calls).toContain('unpauseWeb:room1abc')
+    expect(backend.calls).toContain(`removeWorkspaceSnapshot:${entry.id}`)
+    expect(backend.calls.some((call) => call.startsWith('exportAndroidArtifacts:'))).toBe(false)
+    expect(rooms.get('room1abc')).toMatchObject({ stateRevision: 17, workspaceVolumeRevision: 3 })
+  })
+
+  it('recreates the live Android runtime if unpause fails and still cleans the build snapshot', async () => {
+    backend.unpauseWeb = async (roomId) => {
+      backend.calls.push(`unpauseWeb:${roomId}`)
+      throw new Error('engine refused unpause')
+    }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('engine refused unpause')
+    expect(backend.calls).toContain('recreateWeb:room1abc:node17:default')
+    expect(backend.lastWebSpec?.workspaceVolumeOverride).toBeUndefined()
+    expect(backend.calls).toContain(`removeWorkspaceSnapshot:${entry.id}`)
+    expect(backend.calls.some((call) => call.startsWith('runOneShot:'))).toBe(false)
+  })
+
+  it('fails verification when an exported APK does not match its recorded hash', async () => {
+    backend.exportAndroidArtifacts = async (_roomId, workspaceVolume, artifactsRoot, operationId) => {
+      backend.calls.push(`exportAndroidArtifacts:${workspaceVolume}`)
+      const { mkdirSync, writeFileSync } = await import('node:fs')
+      const { dirname, join } = await import('node:path')
+      const relativePath = 'app/build/outputs/apk/debug/app-debug.apk'
+      const path = join(artifactsRoot, operationId, relativePath)
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, 'tampered')
+      return [{ relativePath, size: 8, sha256: 'c'.repeat(64) }]
+    }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+
+    expect(entry.status).toBe('applied')
+    expect(entry.verify).toEqual({ ok: false, detail: expect.stringMatching(/checksum does not match/) })
+    expect(backend.calls).toContain(`removeWorkspaceSnapshot:${entry.id}`)
+  })
+
+  it.each(['missing', 'corrupt', 'tampered'] as const)(
+    'fails closed and removes artifacts when the on-disk provenance manifest is %s',
+    async (mode) => {
+      const changeCtx = ctx()
+      backend.removeWorkspaceSnapshot = async (_roomId, operationId) => {
+        backend.calls.push(`removeWorkspaceSnapshot:${operationId}`)
+        const { createHash } = await import('node:crypto')
+        const { readFileSync, rmSync, writeFileSync } = await import('node:fs')
+        const { join } = await import('node:path')
+        const manifest = join(changeCtx.userData, 'rooms', 'room1abc', 'artifacts', operationId, 'provenance.json')
+        if (mode === 'missing') rmSync(manifest)
+        else if (mode === 'corrupt') writeFileSync(manifest, '{broken-json', 'utf8')
+        else {
+          const parsed = JSON.parse(readFileSync(manifest, 'utf8')) as Record<string, unknown>
+          parsed.command = 'tampered command'
+          const { provenanceSha256: _old, ...unsigned } = parsed
+          parsed.provenanceSha256 = createHash('sha256').update(JSON.stringify(unsigned)).digest('hex')
+          writeFileSync(manifest, JSON.stringify(parsed), 'utf8')
+        }
+      }
+
+      const entry = await engine.execute(changeCtx, 'android-build', {}, 'user')
+
+      expect(entry.status).toBe('applied')
+      expect(entry.verify?.detail).toMatch(/manifest/)
+      const { existsSync } = await import('node:fs')
+      const { join } = await import('node:path')
+      expect(existsSync(join(changeCtx.userData, 'rooms', 'room1abc', 'artifacts', entry.id))).toBe(false)
+    }
+  )
+
+  it('rejects Android builds without a Room-owned workspace before pausing', async () => {
+    rooms.update('room1abc', { workspaceMode: 'legacy-host-bind' })
+    await expect(engine.execute(ctx(), 'android-build', {}, 'user')).rejects.toThrow(/Room-owned Hotel workspace/)
+    expect(backend.calls).not.toContain('pauseWeb:room1abc')
+  })
+})
+
+describe('package install change', () => {
+  it('runs the selected Room package manager inside a Hotel workspace', async () => {
+    rooms.update('room1abc', {
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/demo.git',
+      workspaceMode: 'hotel'
+    })
+    const entry = await engine.execute(
+      ctx(),
+      'package-install',
+      { name: '@vitejs/plugin-react', version: '5.0.1', dev: true },
+      'user'
+    )
+    expect(entry.status).toBe('verified')
+    expect(entry.undoable).toBe(true)
+    expect(backend.calls).toContain('runOneShot:dh-room1abc-deps-node22-g1:pnpm add --save-exact --save-dev @vitejs/plugin-react@5.0.1')
+    expect(backend.calls).toContain('recreateWeb:room1abc:node22:dh-room1abc-deps-node22-g1')
+    expect(rooms.get('room1abc')).toMatchObject({ workspaceVolumeRevision: 1, stateRevision: 1, syncStatus: 'modified' })
+  })
+
+  it('refuses linked Host folders before executing any install command', async () => {
+    await expect(
+      engine.execute(ctx(), 'package-install', { name: 'zod', version: '4.0.0', dev: false }, 'user')
+    ).rejects.toThrow(/protect Host files/)
+    expect(backend.calls.some((call) => call.startsWith('runOneShot'))).toBe(false)
+    expect(changes.list('room1abc')).toHaveLength(0)
+  })
+
+  it('allows an imported Local Folder after it becomes Hotel-owned working state', async () => {
+    rooms.update('room1abc', {
+      sourceType: 'linked-folder',
+      sourceRef: 'D:\\Projects\\demo',
+      workspaceMode: 'hotel'
+    })
+    const entry = await engine.execute(
+      ctx(),
+      'package-install',
+      { name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+    expect(entry.status).toBe('verified')
+    expect(backend.calls).toContain('runOneShot:dh-room1abc-deps-node22-g1:pnpm add --save-exact zod@4.0.0')
+  })
+
+  it('explains that Empty Rooms do not have a persistent project state yet', async () => {
+    rooms.update('room1abc', { sourceType: 'empty', sourceRef: '', workspaceMode: 'empty' })
+    await expect(
+      engine.execute(ctx(), 'package-install', { name: 'zod', version: '4.0.0', dev: false }, 'user')
+    ).rejects.toThrow(/no persistent project working state/)
+    expect(backend.calls.some((call) => call.startsWith('runOneShot'))).toBe(false)
+  })
+
+  it('pins exact versions for npm and pnpm installs', () => {
+    expect(packageInstallCommand('npm', { name: 'zod', version: '4.0.0', dev: false })).toBe(
+      'npm install --save-exact --save zod@4.0.0'
+    )
+    expect(packageInstallCommand('pnpm', { name: 'zod', version: '4.0.0', dev: true })).toBe(
+      'pnpm add --save-exact --save-dev zod@4.0.0'
+    )
   })
 })

@@ -1,12 +1,15 @@
 import type { ChangeEntry, QuickChange } from './changes'
 import type { CheckReport } from './checks'
-import type { Actor, CreateRoomInput, RoomInspection, RoomPlan, RoomRecord, SourceType } from './rooms'
+import type { RendererCreateRoomInput, RendererPlanRoomInput } from './control'
+import type { CloneRoomInput, RoomInspection, RoomPlan, RoomRecord } from './rooms'
+import type { GitHubServiceStatus, McpRegistryPage } from './hotelServices'
 
 /** IPC channel names. Events (`ev*`) flow main → renderer; the rest are invoke/handle. */
 export const IPC = {
   roomsList: 'rooms:list',
   roomsPlan: 'rooms:plan',
   roomsCreate: 'rooms:create',
+  roomsClone: 'rooms:clone',
   roomsStart: 'rooms:start',
   roomsSleep: 'rooms:sleep',
   roomsDelete: 'rooms:delete',
@@ -14,6 +17,14 @@ export const IPC = {
   roomsInspect: 'rooms:inspect',
   roomsRename: 'rooms:rename',
   roomsComponents: 'rooms:components',
+  roomsSyncFromHost: 'rooms:syncFromHost',
+  roomsMoveIntoHotel: 'rooms:moveIntoHotel',
+  packagesSearch: 'packages:search',
+  hotelGithubStatus: 'hotel:github:status',
+  hotelGithubInstall: 'hotel:github:install',
+  hotelGithubConnect: 'hotel:github:connect',
+  hotelGithubDisconnect: 'hotel:github:disconnect',
+  hotelMcpBrowse: 'hotel:mcp:browse',
   changesList: 'changes:list',
   changesApply: 'changes:apply',
   changesUndo: 'changes:undo',
@@ -40,16 +51,19 @@ export const IPC = {
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
   previewSetBounds: 'preview:setBounds',
+  previewSetVisible: 'preview:setVisible',
   previewDetach: 'preview:detach',
   previewNav: 'preview:nav',
   previewDevTools: 'preview:devtools',
   previewViewport: 'preview:viewport',
+  previewLayout: 'preview:layout',
   evRoomsChanged: 'ev:roomsChanged',
   evRoomEvent: 'ev:roomEvent',
   evLogLine: 'ev:logLine',
   evTermData: 'ev:termData',
   evTermExit: 'ev:termExit',
   evPreviewState: 'ev:previewState',
+  evPreviewDevTools: 'ev:previewDevTools',
   evUpdate: 'ev:update'
 } as const
 
@@ -67,6 +81,14 @@ export interface ComponentInfo {
   options?: string[]
 }
 
+export interface RegistryPackageInfo {
+  name: string
+  version: string
+  description: string
+  publisher: string
+  updatedAt: string
+}
+
 export interface GatewayStatusInfo {
   running: boolean
   httpPort: number | null
@@ -75,6 +97,19 @@ export interface GatewayStatusInfo {
 }
 
 export type PreviewNavAction = 'back' | 'forward' | 'reload' | 'home'
+export type PreviewTarget = 'left' | 'right' | 'both'
+
+export interface PreviewViewport {
+  width: number
+  height: number
+}
+
+export interface PreviewLayout {
+  mode: 'single' | 'split'
+  /** null means fill the left pane instead of emulating a fixed desktop viewport */
+  leftViewport: PreviewViewport | null
+  rightViewport: PreviewViewport
+}
 
 export interface PreviewState {
   roomId: string
@@ -113,14 +148,12 @@ export interface UpdateStatusInfo {
 export interface IpcApi {
   rooms: {
     list(): Promise<RoomRecord[]>
-    plan(input: {
-      sourceType: SourceType
-      sourceRef: string
-      nickname: string
-      project?: string
-      provider?: import('./rooms').ProviderKind
-    }): Promise<RoomPlan>
-    create(input: CreateRoomInput): Promise<RoomRecord>
+    plan(input: RendererPlanRoomInput): Promise<RoomPlan>
+    create(input: RendererCreateRoomInput): Promise<RoomRecord>
+    clone(
+      sourceRoomId: string,
+      options: Omit<CloneRoomInput, 'sourceRoomId' | 'actor'>
+    ): Promise<RoomRecord>
     start(roomId: string): Promise<void>
     sleep(roomId: string): Promise<void>
     delete(roomId: string): Promise<{ reclaimedBytes: number }>
@@ -128,10 +161,22 @@ export interface IpcApi {
     inspect(roomId: string): Promise<RoomInspection>
     rename(roomId: string, nickname: string): Promise<void>
     components(roomId: string): Promise<import('./ipc').ComponentInfo[]>
+    syncFromHost(roomId: string, approvedHostPath: string): Promise<RoomRecord>
+    moveIntoHotel(roomId: string, approvedHostPath: string): Promise<RoomRecord>
+  }
+  packages: {
+    search(query: string, offset?: number): Promise<RegistryPackageInfo[]>
+  }
+  hotel: {
+    githubStatus(): Promise<GitHubServiceStatus>
+    githubInstall(): Promise<GitHubServiceStatus>
+    githubConnect(token: string): Promise<GitHubServiceStatus>
+    githubDisconnect(): Promise<GitHubServiceStatus>
+    mcpBrowse(search?: string, cursor?: string): Promise<McpRegistryPage>
   }
   changes: {
     list(roomId: string): Promise<ChangeEntry[]>
-    apply(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry>
+    apply(roomId: string, change: QuickChange): Promise<ChangeEntry>
     undo(roomId: string, changeId: string): Promise<ChangeEntry>
   }
   checks: { run(roomId: string): Promise<CheckReport> }
@@ -165,16 +210,22 @@ export interface IpcApi {
     footprint(): Promise<{ dataDir: string; installDir: string; autostart: boolean }>
     setAutostart(enabled: boolean): Promise<void>
     /** deletes every room, removes CA trust and autostart, erases app data, launches the uninstaller */
-    cleanUninstall(): Promise<void>
+    /** true once cleanup/uninstaller helpers are scheduled; false when native confirmation is cancelled */
+    cleanUninstall(): Promise<boolean>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>
+    /** hide or reveal the native preview without destroying its browsing state */
+    setVisible(roomId: string, visible: boolean): Promise<void>
     detach(): Promise<void>
-    nav(roomId: string, action: PreviewNavAction): Promise<void>
+    /** navigate both responsive panes by default */
+    nav(roomId: string, action: PreviewNavAction, target?: PreviewTarget): Promise<void>
     /** toggle a docked Chrome DevTools panel; resolves to the new open state */
     devtools(roomId: string): Promise<boolean>
     /** emulate a viewport size (null = fill the area) */
     viewport(roomId: string, size: { width: number; height: number } | null): Promise<void>
+    /** select one or two independent responsive previews sharing the Room browser session */
+    layout(roomId: string, layout: PreviewLayout): Promise<void>
   }
   on(channel: IpcChannel, listener: (...args: any[]) => void): () => void
 }

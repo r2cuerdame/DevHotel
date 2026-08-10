@@ -1,7 +1,7 @@
 import http from 'node:http'
-import net from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { RouteTable } from './routes'
+import { connectRelay, createHttpRelayConnection } from '../relayProtocol'
 
 export interface ProxyRequestOpts {
   tls: boolean
@@ -62,7 +62,8 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
           method: req.method,
           path: req.url,
           headers,
-          agent: false
+          createConnection: (_options, oncreate) =>
+            createHttpRelayConnection(route.targetPort, route.relayToken, oncreate)
         },
         (targetRes) => {
           res.writeHead(targetRes.statusCode ?? 502, copyHeaders(targetRes.headers))
@@ -89,7 +90,8 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
         socket.destroy()
         return
       }
-      const target = net.connect(route.targetPort, '127.0.0.1', () => {
+      const target = connectRelay(route.targetPort, route.relayToken)
+      target.once('connect', () => {
         const lines = [`${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/1.1`]
         for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
           const name = req.rawHeaders[i]

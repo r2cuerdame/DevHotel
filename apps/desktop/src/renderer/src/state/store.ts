@@ -2,13 +2,15 @@ import { create } from 'zustand'
 import type {
   ChangeEntry,
   CheckReport,
-  CreateRoomInput,
+  CloneServiceMode,
   GatewayStatusInfo,
   PreviewState,
   QuickChange,
   RoomInspection,
   RoomPlan,
   RoomRecord,
+  RendererCreateRoomInput,
+  RendererPlanRoomInput,
   UpdateStatusInfo
 } from '@devhotel/shared'
 import { IPC } from '@devhotel/shared'
@@ -48,14 +50,12 @@ interface DhState {
   refreshRooms(): Promise<void>
   refreshInspection(roomId: string): Promise<void>
   refreshGateway(): Promise<void>
-  planRoom(input: {
-    sourceType: CreateRoomInput['sourceType']
-    sourceRef: string
-    nickname: string
-    project?: string
-    provider?: CreateRoomInput['provider']
-  }): Promise<RoomPlan>
-  createRoom(input: CreateRoomInput): Promise<RoomRecord | null>
+  planRoom(input: RendererPlanRoomInput): Promise<RoomPlan>
+  createRoom(input: RendererCreateRoomInput): Promise<RoomRecord | null>
+  cloneRoom(
+    roomId: string,
+    options: { nickname: string; copyDependencies: boolean; services: CloneServiceMode }
+  ): Promise<RoomRecord | null>
   roomAction(roomId: string, action: 'start' | 'sleep' | 'restart' | 'delete'): Promise<void>
   applyChange(roomId: string, change: QuickChange): Promise<ChangeEntry | null>
   undoChange(roomId: string, changeId: string): Promise<void>
@@ -176,6 +176,26 @@ export const useStore = create<DhState>((set, get) => ({
     }
   },
 
+  async cloneRoom(roomId, options) {
+    set((s) => ({ busy: { ...s.busy, [roomId]: translate(get().lang, 'busy.cloning') } }))
+    try {
+      const room = await api.rooms.clone(roomId, options)
+      await get().refreshRooms()
+      get().toast('success', translate(get().lang, 'toast.roomCloned', { nickname: room.nickname }))
+      get().openRoom(room.id)
+      return room
+    } catch (err) {
+      get().toast('error', err instanceof Error ? err.message : String(err))
+      return null
+    } finally {
+      set((s) => {
+        const busy = { ...s.busy }
+        delete busy[roomId]
+        return { busy }
+      })
+    }
+  },
+
   async roomAction(roomId, action) {
     const labels: Record<typeof action, keyof Translation> = {
       start: 'busy.waking',
@@ -208,7 +228,7 @@ export const useStore = create<DhState>((set, get) => ({
 
   async applyChange(roomId, change) {
     try {
-      const entry = await api.changes.apply(roomId, change, 'user')
+      const entry = await api.changes.apply(roomId, change)
       get().toast(
         entry.verify?.ok ? 'success' : 'error',
         entry.verify?.ok

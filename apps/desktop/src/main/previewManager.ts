@@ -1,21 +1,44 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { session, WebContentsView, type BrowserWindow } from 'electron'
+import { session, WebContentsView, type BrowserWindow, type WebContents } from 'electron'
 import forge from 'node-forge'
-import { readFileSync, existsSync } from 'node:fs'
-import { IPC, type PreviewNavAction, type PreviewState } from '@devhotel/shared'
+import {
+  IPC,
+  type PreviewLayout,
+  type PreviewNavAction,
+  type PreviewState,
+  type PreviewTarget,
+  type PreviewViewport
+} from '@devhotel/shared'
 import type { RoomOrchestrator } from '@devhotel/core'
+import { calculatePreviewBounds, previewScale } from './previewLayout'
+import {
+  isAllowedRoomNavigation,
+  isAllowedPreviewRequest,
+  isPreviewableRoom,
+  mobilePreviewUserAgent,
+  roomPreviewPartition
+} from './previewSecurity'
+import { PreviewSyncGuard } from './previewSync'
 
 const THUMB_INTERVAL_MS = 30_000
+const DEFAULT_LAYOUT: PreviewLayout = {
+  mode: 'split',
+  leftViewport: null,
+  rightViewport: { width: 390, height: 844 }
+}
 
 export class PreviewManager {
   private view: WebContentsView | null = null
+  private rightView: WebContentsView | null = null
   private devtools: WebContentsView | null = null
   private roomId: string | null = null
   private thumbTimer: NodeJS.Timeout | null = null
-  private verifiedPartitions = new Set<string>()
+  private configuredPartitions = new Set<string>()
   private lastBounds: { x: number; y: number; width: number; height: number } | null = null
-  private viewportSize: { width: number; height: number } | null = null
+  private previewLayout: PreviewLayout = { ...DEFAULT_LAYOUT, rightViewport: { ...DEFAULT_LAYOUT.rightViewport } }
+  private pendingRightLoads = new PreviewSyncGuard()
+  private visible = true
 
   constructor(
     private readonly win: BrowserWindow,
@@ -24,29 +47,32 @@ export class PreviewManager {
   ) {
     orch.onEvent((e) => {
       if (e.kind === 'deleted') {
-        void this.clearRoomData(e.roomId)
         if (this.roomId === e.roomId) this.detach()
+        void this.clearRoomData(e.roomId)
       }
       if (e.kind === 'status' && this.roomId === e.roomId) {
         const room = orch.rooms.get(e.roomId)
-        if (room && (room.status === 'sleeping' || room.status === 'broken')) this.detach()
+        if (!isPreviewableRoom(room)) this.detach()
       }
     })
   }
 
   attach(roomId: string, bounds: { x: number; y: number; width: number; height: number }): void {
     const room = this.orch.rooms.get(roomId)
-    if (!room) return
+    if (!isPreviewableRoom(room)) {
+      // A forged/stale renderer attach must never leave another Room visible.
+      if (this.roomId) this.detach()
+      return
+    }
     if (this.roomId !== roomId) {
       this.detach()
-      const partition = `persist:room-${roomId}`
-      this.trustRoomCertificates(partition)
-      const view = new WebContentsView({
-        webPreferences: { partition, sandbox: true, nodeIntegration: false, contextIsolation: true }
-      })
+      const partition = roomPreviewPartition(roomId)
+      this.configurePartition(partition, roomId)
+      const view = this.createPreviewView(roomId, partition, 'left')
       this.view = view
       this.roomId = roomId
       this.win.contentView.addChildView(view)
+      view.setVisible(this.visible)
       const wc = view.webContents
       const pushState = (): void => {
         if (this.win.isDestroyed() || wc.isDestroyed()) return
@@ -59,92 +85,112 @@ export class PreviewManager {
         }
         this.win.webContents.send(IPC.evPreviewState, state)
       }
-      wc.on('did-navigate', pushState)
-      wc.on('did-navigate-in-page', pushState)
+      const leftNavigated = (_event: Electron.Event, url: string): void => {
+        pushState()
+        this.syncRightFromLeft(url)
+      }
+      wc.on('did-navigate', leftNavigated)
+      wc.on('did-navigate-in-page', leftNavigated)
       wc.on('did-start-loading', pushState)
       wc.on('did-stop-loading', pushState)
-      wc.on('before-input-event', (_e, input) => {
-        if (input.type === 'keyDown' && input.key === 'F12') this.toggleDevTools(roomId)
-      })
-      const url = this.homeUrl(roomId)
+      const url = this.safeHomeUrl(roomId)
       if (url) void wc.loadURL(url).catch(() => undefined)
+      if (this.previewLayout.mode === 'split') this.ensureRightView()
       this.thumbTimer = setInterval(() => void this.capture(), THUMB_INTERVAL_MS)
     }
     this.lastBounds = bounds
     this.layout()
   }
 
-  /** Splits the preview area between the site and a docked DevTools panel, and applies viewport emulation. */
+  /** Lays out two responsive panes; docked DevTools temporarily takes the mobile pane's place. */
   private layout(): void {
     if (!this.view || !this.lastBounds) return
-    const area = this.lastBounds
-    if (this.devtools) {
-      const siteWidth = Math.round(area.width * 0.6)
-      this.view.setBounds({ x: area.x, y: area.y, width: siteWidth, height: area.height })
-      this.devtools.setBounds({
-        x: area.x + siteWidth,
-        y: area.y,
-        width: area.width - siteWidth,
-        height: area.height
-      })
-    } else {
-      this.view.setBounds(area)
-    }
-    this.applyViewport()
+    const effectiveMode = this.devtools ? 'single' : this.previewLayout.mode
+    const bounds = calculatePreviewBounds(this.lastBounds, effectiveMode, this.devtools !== null)
+    this.view.setBounds(bounds.left)
+    if (bounds.right && this.rightView) this.rightView.setBounds(bounds.right)
+    if (bounds.devtools && this.devtools) this.devtools.setBounds(bounds.devtools)
+    this.updateVisibility()
+    this.applyViewport(this.view, this.previewLayout.leftViewport, 'desktop')
+    if (this.rightView) this.applyViewport(this.rightView, this.previewLayout.rightViewport, 'mobile')
   }
 
-  private applyViewport(): void {
-    const wc = this.view?.webContents
-    if (!wc || wc.isDestroyed()) return
-    if (!this.viewportSize) {
+  private applyViewport(view: WebContentsView, size: PreviewViewport | null, kind: 'desktop' | 'mobile'): void {
+    const wc = view.webContents
+    if (wc.isDestroyed()) return
+    if (!size) {
       wc.disableDeviceEmulation()
       return
     }
-    const siteBounds = this.view!.getBounds()
-    const scale = Math.min(1, siteBounds.width / this.viewportSize.width, siteBounds.height / this.viewportSize.height)
+    const siteBounds = view.getBounds()
     wc.enableDeviceEmulation({
-      screenPosition: this.viewportSize.width < 600 ? 'mobile' : 'desktop',
-      screenSize: this.viewportSize,
+      screenPosition: kind,
+      screenSize: size,
       viewPosition: { x: 0, y: 0 },
-      viewSize: this.viewportSize,
-      deviceScaleFactor: 0,
-      scale
+      viewSize: size,
+      deviceScaleFactor: kind === 'mobile' ? 2 : 1,
+      scale: previewScale(siteBounds, size)
     })
   }
 
   setViewport(roomId: string, size: { width: number; height: number } | null): void {
     if (this.roomId !== roomId) return
-    this.viewportSize = size
-    this.applyViewport()
+    this.previewLayout = { ...this.previewLayout, leftViewport: size }
+    this.layout()
+  }
+
+  setLayout(roomId: string, nextLayout: PreviewLayout): void {
+    if (this.roomId !== roomId) return
+    const wasSingle = this.previewLayout.mode === 'single'
+    this.previewLayout = {
+      mode: nextLayout.mode,
+      leftViewport: nextLayout.leftViewport ? { ...nextLayout.leftViewport } : null,
+      rightViewport: { ...nextLayout.rightViewport }
+    }
+    if (nextLayout.mode === 'split') {
+      this.ensureRightView()
+      if (wasSingle) this.syncRightToLeft()
+    }
+    this.layout()
+  }
+
+  /** Keeps the Room's browser alive while another renderer surface covers it. */
+  setVisible(roomId: string, visible: boolean): void {
+    if (this.roomId !== roomId || !this.view) return
+    this.visible = visible
+    this.updateVisibility()
+    if (visible) this.layout()
   }
 
   toggleDevTools(roomId: string): boolean {
     if (this.roomId !== roomId || !this.view) return false
     const wc = this.view.webContents
     if (this.devtools) {
-      wc.closeDevTools()
-      this.win.contentView.removeChildView(this.devtools)
-      this.devtools.webContents.close()
-      this.devtools = null
+      this.closeDevTools(roomId, true)
+      return false
     } else {
-      this.devtools = new WebContentsView({ webPreferences: { sandbox: true } })
-      this.win.contentView.addChildView(this.devtools)
-      wc.setDevToolsWebContents(this.devtools.webContents)
+      const tools = new WebContentsView({ webPreferences: { sandbox: true } })
+      this.devtools = tools
+      this.win.contentView.addChildView(tools)
+      tools.setVisible(this.visible)
+      tools.webContents.once('render-process-gone', () => this.handleDevToolsGone(tools, roomId))
+      tools.webContents.once('destroyed', () => this.handleDevToolsGone(tools, roomId))
+      wc.setDevToolsWebContents(tools.webContents)
       wc.openDevTools({ mode: 'detach' })
     }
     this.layout()
-    return this.devtools !== null
+    if (!this.win.isDestroyed()) this.win.webContents.send(IPC.evPreviewDevTools, roomId, true)
+    return true
   }
 
   detach(): void {
+    const detachedRoomId = this.roomId
     if (this.thumbTimer) {
       clearInterval(this.thumbTimer)
       this.thumbTimer = null
     }
     if (this.devtools) {
-      this.win.contentView.removeChildView(this.devtools)
-      this.devtools.webContents.close()
-      this.devtools = null
+      this.closeDevTools(null, false)
     }
     if (this.view) {
       void this.capture()
@@ -152,27 +198,176 @@ export class PreviewManager {
       this.view.webContents.close()
       this.view = null
     }
+    if (this.rightView) {
+      this.win.contentView.removeChildView(this.rightView)
+      this.rightView.webContents.close()
+      this.rightView = null
+    }
     this.roomId = null
-    this.viewportSize = null
+    this.pendingRightLoads.clear()
+    this.previewLayout = { ...DEFAULT_LAYOUT, rightViewport: { ...DEFAULT_LAYOUT.rightViewport } }
     this.lastBounds = null
+    this.visible = true
+    if (detachedRoomId && !this.win.isDestroyed()) {
+      this.win.webContents.send(IPC.evPreviewDevTools, detachedRoomId, false)
+    }
   }
 
-  nav(roomId: string, action: PreviewNavAction): void {
+  nav(roomId: string, action: PreviewNavAction, target: PreviewTarget = 'both'): void {
     if (this.roomId !== roomId || !this.view) return
-    const wc = this.view.webContents
+    // The left pane owns toolbar history. Its resulting URL is mirrored into
+    // the mobile pane, avoiding two racing history stacks.
+    if (target === 'right' && this.previewLayout.mode === 'split' && this.rightView) {
+      this.navigateWebContents(this.rightView.webContents, roomId, action)
+      return
+    }
+    this.navigateWebContents(this.view.webContents, roomId, action)
+    if (action === 'reload' && target === 'both' && this.previewLayout.mode === 'split' && this.rightView) {
+      this.rightView.webContents.reload()
+    }
+  }
+
+  private navigateWebContents(wc: WebContents, roomId: string, action: PreviewNavAction): void {
     if (action === 'back' && wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack()
     else if (action === 'forward' && wc.navigationHistory.canGoForward()) wc.navigationHistory.goForward()
     else if (action === 'reload') wc.reload()
     else if (action === 'home') {
-      const url = this.homeUrl(roomId)
+      const url = this.safeHomeUrl(roomId)
       if (url) void wc.loadURL(url).catch(() => undefined)
     }
+  }
+
+  private createPreviewView(roomId: string, partition: string, side: 'left' | 'right'): WebContentsView {
+    const view = new WebContentsView({
+      webPreferences: { partition, sandbox: true, nodeIntegration: false, contextIsolation: true }
+    })
+    const wc = view.webContents
+    if (side === 'right') wc.setUserAgent(mobilePreviewUserAgent(process.versions.chrome))
+    wc.setWindowOpenHandler(() => ({ action: 'deny' }))
+    wc.on('will-attach-webview', (event) => event.preventDefault())
+    const denyOutsideRoom = (event: Electron.Event, url: string): void => {
+      const home = this.safeHomeUrl(roomId)
+      if (!home || !isAllowedRoomNavigation(url, home)) {
+        event.preventDefault()
+        return
+      }
+      if (side === 'right') {
+        // Mobile is a responsive projection of the authoritative left route.
+        event.preventDefault()
+        this.loadLeftFromRight(url)
+      }
+    }
+    wc.on('will-navigate', denyOutsideRoom)
+    wc.on('will-redirect', denyOutsideRoom)
+    if (side === 'left') {
+      wc.on('devtools-closed', () => {
+        if (this.devtools) this.handleDevToolsGone(this.devtools, roomId)
+      })
+    }
+    wc.on('before-input-event', (event, input) => {
+      if (input.type === 'keyDown' && input.key === 'F12') {
+        event.preventDefault()
+        this.toggleDevTools(roomId)
+      }
+    })
+    return view
+  }
+
+  private ensureRightView(): void {
+    if (this.rightView || !this.roomId || !this.view) return
+    const partition = roomPreviewPartition(this.roomId)
+    const right = this.createPreviewView(this.roomId, partition, 'right')
+    this.rightView = right
+    this.win.contentView.addChildView(right)
+    right.setVisible(false)
+    right.webContents.setAudioMuted(true)
+    const rightNavigated = (_event: Electron.Event, url: string): void => {
+      if (this.pendingRightLoads.consume(url)) return
+      // A redirect from a guarded mirror load, an explicit target:right call,
+      // or a mobile SPA transition is promoted to the authoritative pane.
+      this.pendingRightLoads.clear()
+      this.loadLeftFromRight(url)
+    }
+    right.webContents.on('did-navigate', rightNavigated)
+    right.webContents.on('did-navigate-in-page', rightNavigated)
+    right.webContents.on('did-fail-load', (_event, _code, _description, url) => {
+      this.pendingRightLoads.fail(url)
+    })
+    const url = this.view.webContents.getURL() || this.safeHomeUrl(this.roomId)
+    if (url) this.syncRightFromLeft(url)
+  }
+
+  private syncRightToLeft(): void {
+    if (!this.view || !this.rightView) return
+    const url = this.view.webContents.getURL()
+    if (url) this.syncRightFromLeft(url)
+  }
+
+  private syncRightFromLeft(url: string): void {
+    if (!this.rightView || !this.roomId || this.previewLayout.mode !== 'split') return
+    const home = this.safeHomeUrl(this.roomId)
+    if (!home || !isAllowedRoomNavigation(url, home) || url === this.rightView.webContents.getURL()) return
+    this.pendingRightLoads.mark(url)
+    void this.rightView.webContents.loadURL(url).catch(() => this.pendingRightLoads.fail(url))
+  }
+
+  private loadLeftFromRight(url: string): void {
+    if (!this.view || !this.roomId) return
+    const home = this.safeHomeUrl(this.roomId)
+    if (!home || !isAllowedRoomNavigation(url, home) || url === this.view.webContents.getURL()) return
+    void this.view.webContents.loadURL(url).catch(() => undefined)
+  }
+
+  private updateVisibility(): void {
+    this.view?.setVisible(this.visible)
+    if (this.view && !this.view.webContents.isDestroyed()) this.view.webContents.setAudioMuted(!this.visible)
+    const rightVisible = this.visible && this.previewLayout.mode === 'split' && !this.devtools
+    this.rightView?.setVisible(rightVisible)
+    // Mobile is a visual comparison pane; only the authoritative left pane may play audio.
+    if (this.rightView && !this.rightView.webContents.isDestroyed()) this.rightView.webContents.setAudioMuted(true)
+    this.devtools?.setVisible(this.visible)
+  }
+
+  private closeDevTools(roomId: string | null, relayout: boolean): void {
+    const tools = this.devtools
+    if (!tools) return
+    this.devtools = null
+    if (this.view && !this.view.webContents.isDestroyed()) this.view.webContents.closeDevTools()
+    try {
+      this.win.contentView.removeChildView(tools)
+    } catch {
+      // The native child may already have been removed after a renderer crash.
+    }
+    if (!tools.webContents.isDestroyed()) tools.webContents.close()
+    if (relayout) this.layout()
+    if (roomId && !this.win.isDestroyed()) this.win.webContents.send(IPC.evPreviewDevTools, roomId, false)
+  }
+
+  private handleDevToolsGone(tools: WebContentsView, roomId: string): void {
+    if (this.devtools !== tools) return
+    this.devtools = null
+    try {
+      this.win.contentView.removeChildView(tools)
+    } catch {
+      // best effort after render-process-gone/destroyed
+    }
+    if (!tools.webContents.isDestroyed()) tools.webContents.close()
+    this.layout()
+    if (!this.win.isDestroyed()) this.win.webContents.send(IPC.evPreviewDevTools, roomId, false)
   }
 
   private homeUrl(roomId: string): string | null {
     const room = this.orch.rooms.get(roomId)
     if (!room) return null
     return this.orch.inspectRoom(roomId).urls.app
+  }
+
+  private safeHomeUrl(roomId: string): string | null {
+    try {
+      return this.homeUrl(roomId)
+    } catch {
+      return null
+    }
   }
 
   private async capture(): Promise<void> {
@@ -191,13 +386,28 @@ export class PreviewManager {
     }
   }
 
-  /** Trust leaf certificates signed by the DevHotel Local CA inside room previews only. */
-  private trustRoomCertificates(partition: string): void {
-    if (this.verifiedPartitions.has(partition)) return
-    this.verifiedPartitions.add(partition)
+  /** Configure one persistent Room session exactly once, with fail-closed Host capabilities. */
+  private configurePartition(partition: string, roomId: string): void {
+    if (this.configuredPartitions.has(partition)) return
+    this.configuredPartitions.add(partition)
     const caPath = join(this.userData, 'ca', 'rootCA.pem')
-    session.fromPartition(partition).setCertificateVerifyProc((request, callback) => {
-      if (!request.hostname.endsWith('.localhost') || !existsSync(caPath)) {
+    const roomSession = session.fromPartition(partition)
+    roomSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
+    roomSession.setPermissionCheckHandler(() => false)
+    roomSession.setDevicePermissionHandler(() => false)
+    roomSession.on('will-download', (event) => event.preventDefault())
+    roomSession.webRequest.onBeforeRequest((details, callback) => {
+      const home = this.safeHomeUrl(roomId)
+      callback({
+        cancel:
+          !home ||
+          !isAllowedPreviewRequest(details.url, home, details.resourceType === 'mainFrame')
+      })
+    })
+    roomSession.setCertificateVerifyProc((request, callback) => {
+      const home = this.safeHomeUrl(roomId)
+      const roomHostname = home ? new URL(home).hostname : null
+      if (request.hostname !== roomHostname || !existsSync(caPath)) {
         callback(-3) // fall back to Chromium's verdict
         return
       }
@@ -214,7 +424,7 @@ export class PreviewManager {
 
   private async clearRoomData(roomId: string): Promise<void> {
     try {
-      await session.fromPartition(`persist:room-${roomId}`).clearStorageData()
+      await session.fromPartition(roomPreviewPartition(roomId)).clearStorageData()
     } catch {
       // best effort
     }

@@ -2,6 +2,8 @@ import { createServer, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ControlClient, DevHotelNotRunningError, loadControlInfo } from '../client'
 import { makeTools } from '../tools'
+import { z } from 'zod'
+import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
 let server: Server
@@ -18,7 +20,7 @@ beforeAll(async () => {
     req.on('data', (c) => (raw += c))
     req.on('end', () => {
       seen.push({ method: req.method!, url: req.url!, body: raw ? JSON.parse(raw) : null })
-      if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.1.0' }))
+      if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.4.1' }))
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
       }
@@ -39,7 +41,7 @@ beforeAll(async () => {
 afterAll(() => server.close())
 
 function client(): ControlClient {
-  return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.1.0' })
+  return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.4.1' })
 }
 
 describe('ControlClient', () => {
@@ -53,7 +55,7 @@ describe('ControlClient', () => {
   })
 
   it('sends bearer token (401 without)', async () => {
-    const bad = new ControlClient({ port, token: 'wrong', pid: 0, version: '0.1.0' })
+    const bad = new ControlClient({ port, token: 'wrong', pid: 0, version: '0.4.1' })
     await expect(bad.listRooms()).rejects.toThrow(/401/)
   })
 
@@ -91,6 +93,10 @@ describe('makeTools', () => {
     )
   })
 
+  it('reports the package release metadata', () => {
+    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.4.1' })
+  })
+
   it('list_rooms returns JSON content', async () => {
     const res = await byName.list_rooms!.handler({})
     expect(res.isError).toBeUndefined()
@@ -107,6 +113,14 @@ describe('makeTools', () => {
   it('copy_diagnostic returns plain text', async () => {
     const res = await byName.copy_diagnostic!.handler({ roomId: 'abc12345' })
     expect(res.content[0]!.text).toMatch(/^DevHotel Diagnostic Bundle/)
+  })
+
+  it('publishes a Web-only create contract', () => {
+    const schema = z.object(byName.create_room!.schema)
+    const base = { sourceType: 'empty', sourceRef: '', project: 'demo', nickname: 'dev' }
+    expect(schema.safeParse({ ...base, provider: 'web' }).success).toBe(true)
+    expect(schema.safeParse({ ...base, provider: 'android' }).success).toBe(false)
+    expect(schema.safeParse({ ...base, provider: 'windows' }).success).toBe(false)
   })
 
   it('errors surface as isError content, not throws', async () => {

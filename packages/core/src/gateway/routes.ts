@@ -3,6 +3,8 @@ export interface Route {
   roomId: string
   targetPort: number
   https: boolean
+  /** Omitted only by tests/non-container targets; real Room relays fail closed without it. */
+  relayToken?: string
 }
 
 export class RouteTable {

@@ -7,13 +7,14 @@ export type QuickChange =
   | { kind: 'https'; enabled: boolean }
   | { kind: 'internal-port'; port: number }
   | { kind: 'deps-install'; clean: boolean }
+  | { kind: 'package-install'; name: string; version: string; dev: boolean }
   | { kind: 'android-build' }
   | { kind: 'android-run' }
   | { kind: 'service-add'; service: 'postgres' | 'redis'; version?: string }
   | { kind: 'service-remove'; service: 'postgres' | 'redis' }
   | { kind: 'service-restart'; service: 'postgres' | 'redis' }
   | { kind: 'db-backup'; service: 'postgres' | 'redis' }
-  | { kind: 'db-restore'; service: 'postgres' | 'redis'; file: string }
+  | { kind: 'db-restore'; service: 'postgres' | 'redis'; backupId: string }
   | { kind: 'os-settings'; os: import('./rooms').RoomOsSettings }
   | { kind: 'package-manager'; pm: 'npm' | 'pnpm'; version?: string }
   | { kind: 'emulator-config'; device: string; version: string }

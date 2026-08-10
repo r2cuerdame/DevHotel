@@ -32,7 +32,18 @@ export function buildDiagnostic(input: DiagnosticInput): string {
   push(`- Node: ${room.runtime.version}`)
   push(`- Package Manager: ${room.packageManager.kind}${room.packageManager.version ? ` ${room.packageManager.version}` : ''}`)
   push(`- Start Command: ${room.startCommand}`)
-  push(`- Source: ${room.sourceType}${room.sourceType !== 'empty' ? ` (${room.sourceRef})` : ''}`)
+  push(
+    `- Source: ${room.sourceType}${
+      room.sourceType === 'managed-git'
+        ? ` (${room.sourceRef})`
+        : room.workspaceMode === 'legacy-host-bind'
+          ? ' (legacy Host-bound compatibility mode)'
+          : room.sourceType === 'linked-folder'
+            ? ` (Room-owned; Host sync ${room.hostSyncEnabled ? 'enabled' : 'detached'})`
+            : ''
+    }`
+  )
+  push(`- Working state: ${room.workspaceMode} · r${room.stateRevision} · ${room.syncStatus}`)
   push()
   push('Routing')
   push(`- Internal: ${room.internalPort}`)
