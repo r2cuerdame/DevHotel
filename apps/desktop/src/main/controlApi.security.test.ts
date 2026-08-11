@@ -117,6 +117,39 @@ describe('agent control API host boundary', () => {
     }
   })
 
+  it('gates agent Host sync behind explicit human approval and runs it as user', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-sync-'))
+    roots.push(userData)
+    const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\code\\demo' }
+    const syncFromHost = vi.fn(async () => ({ ...room, syncStatus: 'synced' }))
+    let allow = false
+    const approvals = { requestHostSync: vi.fn(async () => allow) }
+    const control = await startControlApi(
+      { rooms: { get: () => room }, syncFromHost } as unknown as RoomOrchestrator,
+      userData,
+      'test',
+      { github: null },
+      approvals
+    )
+    try {
+      const headers = { authorization: `Bearer ${control.info.token}` }
+      const url = `http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/sync-from-host`
+
+      const denied = await fetch(url, { method: 'POST', headers })
+      expect(denied.status).toBe(403)
+      expect(syncFromHost).not.toHaveBeenCalled()
+
+      allow = true
+      const approved = await fetch(url, { method: 'POST', headers })
+      expect(approved.status).toBe(200)
+      expect(syncFromHost).toHaveBeenCalledWith('room1abc', 'user')
+      const body = (await approved.json()) as { sourceRef: string }
+      expect(body.sourceRef).toBe('[Host folder hidden]')
+    } finally {
+      control.stop()
+    }
+  })
+
   it('refuses agent deletion of Host-linked rooms but allows Hotel-owned ones', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-delete-'))
     roots.push(userData)

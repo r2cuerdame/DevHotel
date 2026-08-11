@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Agent-requested, human-approved Host sync
+
+- New MCP tool `sync_from_host`: an agent may *request* an inbound sync of a room's linked Host folder; DevHotel focuses its window and shows an approval dialog. Only after the human clicks **Allow** does the sync run — as actor `user`, on the room's own linked path (agents can never supply a path). Declining returns a clear error to the agent. This is the first concrete goal.md §5.11 grant flow: the agent asks, the person decides.
+
 ## 0.4.2 — 2026-08-11
 
 ### Android emulator preview restored

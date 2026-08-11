@@ -22,6 +22,14 @@ export interface HotelServicesRef {
 }
 
 /**
+ * Human-approval bridge for agent requests that touch Host resources
+ * (goal.md §5.11): the agent asks, the person decides in the app window.
+ */
+export interface AgentApprovalsRef {
+  requestHostSync: ((room: RoomRecord) => Promise<boolean>) | null
+}
+
+/**
  * Loopback control API for the MCP server (and other local agents).
  * Bearer-token authenticated; every mutation is attributed to actor 'agent'.
  */
@@ -29,7 +37,8 @@ export async function startControlApi(
   orch: RoomOrchestrator,
   userData: string,
   version: string,
-  hotel: HotelServicesRef = { github: null }
+  hotel: HotelServicesRef = { github: null },
+  approvals: AgentApprovalsRef = { requestHostSync: null }
 ): Promise<{ server: Server; info: ControlInfo; stop: () => void }> {
   const token = randomBytes(24).toString('hex')
 
@@ -125,6 +134,31 @@ export async function startControlApi(
             const body = zAgentRenameBody.parse(await readBody(req))
             await orch.renameRoom(safeRoomId, body.nickname)
             res.writeHead(204).end()
+            return
+          }
+          case 'sync-from-host': {
+            // The agent may only ask; the sync itself runs as 'user' because a
+            // human explicitly approved it in the DevHotel window. The path is
+            // always the Room's own linked folder — never agent-supplied.
+            if (!approvals.requestHostSync) {
+              sendJson(res, 503, { error: 'The DevHotel window is not available to approve Host access' })
+              return
+            }
+            const room = orch.rooms.get(safeRoomId)
+            if (!room) {
+              sendJson(res, 404, { error: 'room not found' })
+              return
+            }
+            if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
+              sendJson(res, 409, { error: 'This Room has no linked Host folder to sync from' })
+              return
+            }
+            const approved = await approvals.requestHostSync(room)
+            if (!approved) {
+              sendJson(res, 403, { error: 'The user declined the Host sync request' })
+              return
+            }
+            sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'user')))
             return
           }
           case 'exec': {

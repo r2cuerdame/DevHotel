@@ -121,12 +121,33 @@ async function bootstrap(): Promise<void> {
   }
 
   const hotelForAgents: import('./controlApi').HotelServicesRef = { github: null }
-  const control = await startControlApi(orch, userData, app.getVersion(), hotelForAgents).catch((err) => {
+  const approvalsForAgents: import('./controlApi').AgentApprovalsRef = { requestHostSync: null }
+  const control = await startControlApi(orch, userData, app.getVersion(), hotelForAgents, approvalsForAgents).catch((err) => {
     console.error('control api failed to start:', err)
     return null
   })
 
   mainWindow = createWindow()
+  approvalsForAgents.requestHostSync = async (room) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'question',
+      title: 'Agent requests Host sync',
+      message: `An agent asks to sync ${room.project} / ${room.nickname} from its linked Host folder.`,
+      detail:
+        `${room.sourceRef}\n\n` +
+        'The Room-owned working state will be replaced by the current Host files. ' +
+        'Room-side edits that were never exported to the Host are overwritten.',
+      buttons: ['Allow this sync', 'Deny'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true
+    })
+    return response === 0
+  }
   const previews = new PreviewManager(mainWindow, orch, userData)
   const terms = new TermManager(orch)
   const cleanRemoval = new CleanRemovalGate()

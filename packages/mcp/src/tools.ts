@@ -194,6 +194,13 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: wrap(async (a) => (await (await getClient()).diagnostic(a.roomId)).text)
     },
     {
+      name: 'sync_from_host',
+      description:
+        "Request an inbound sync of the room's linked Host folder into the Room-owned working state. DevHotel shows an approval dialog to the human — this call blocks until they Allow or Deny, and fails if declined, if the room has no Host link, or if it is asleep. The synced path is always the room's own linked folder; agents cannot choose paths.",
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
+    },
+    {
       name: 'hotel_github_status',
       description:
         'Status of the Hotel-owned GitHub Service: pinned gh provisioning state and credential connection state. Connecting a token stays a human action in the DevHotel app.',

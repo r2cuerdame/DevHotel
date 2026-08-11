@@ -124,6 +124,9 @@ export class ControlClient {
   diagnostic(roomId: string) {
     return this.req<{ text: string }>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/diagnostic`)
   }
+  syncFromHost(roomId: string) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sync-from-host`)
+  }
   hotelGithubStatus() {
     return this.req<unknown>('GET', '/v1/hotel/github')
   }

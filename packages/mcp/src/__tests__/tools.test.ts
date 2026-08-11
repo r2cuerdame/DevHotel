@@ -97,6 +97,7 @@ describe('makeTools', () => {
         'run_in_room',
         'sleep_room',
         'start_room',
+        'sync_from_host',
         'undo_change'
       ].sort()
     )
