@@ -21,8 +21,9 @@ import {
   splitLeftWidth
 } from './previewLayout'
 
-/** The emulator screen is portrait 540×1140 — the preview pins to that aspect. */
-const EMULATOR_ASPECT = { width: 540, height: 1140 }
+/** The emulator screen is 540×1140 (or rotated) — the preview pins to that aspect. */
+const EMULATOR_PORTRAIT = { width: 540, height: 1140 }
+const EMULATOR_LANDSCAPE = { width: 1140, height: 540 }
 
 export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
@@ -48,6 +49,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
 
   const android = room?.provider === 'android'
+  const emulatorLandscape = room?.android?.orientation === 'landscape'
   const previewLayout: PreviewLayout = android
     ? { mode: 'single', leftViewport: null, rightViewport: { width: 390, height: 844 } }
     : createPreviewLayout(leftPreset, rightPreset, splitEnabled, splitRatio)
@@ -71,10 +73,17 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       setHostWidth(Math.round(r.width))
       let bounds = { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }
       if (android) {
-        // pin the phone screen to its aspect, full height and centered,
-        // so the device fills its frame edge to edge
-        const width = Math.min(bounds.width, Math.round((bounds.height * EMULATOR_ASPECT.width) / EMULATOR_ASPECT.height))
-        bounds = { x: bounds.x + Math.round((bounds.width - width) / 2), y: bounds.y, width, height: bounds.height }
+        // pin the phone screen to its aspect (portrait or landscape) and
+        // center it, so the device fills its frame edge to edge
+        const aspect = emulatorLandscape ? EMULATOR_LANDSCAPE : EMULATOR_PORTRAIT
+        const width = Math.min(bounds.width, Math.round((bounds.height * aspect.width) / aspect.height))
+        const height = Math.min(bounds.height, Math.round((width * aspect.height) / aspect.width))
+        bounds = {
+          x: bounds.x + Math.round((bounds.width - width) / 2),
+          y: bounds.y + Math.round((bounds.height - height) / 2),
+          width,
+          height
+        }
       }
       void api.preview
         .setBounds(roomId, bounds)
@@ -90,7 +99,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       window.removeEventListener('resize', report)
       void api.preview.detach().catch(() => undefined)
     }
-  }, [roomId, showSite, android])
+  }, [roomId, showSite, android, emulatorLandscape])
 
   useEffect(() => {
     if (!showSite || dragging) return
@@ -141,6 +150,19 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
       />
       <div className="room-body">
         <div className={`preview-workbench${detailsOpen ? ' preview-host-hidden' : ''}`}>
+          {showSite && android && (
+            <div className="preview-device-strip android-nav-strip" aria-label={t('android.navKeys')}>
+              <button className="btn" onClick={() => void api.android.key(roomId, 'back').catch(() => undefined)}>
+                <span aria-hidden>◁</span> {t('android.navBack')}
+              </button>
+              <button className="btn" onClick={() => void api.android.key(roomId, 'home').catch(() => undefined)}>
+                <span aria-hidden>○</span> {t('android.navHome')}
+              </button>
+              <button className="btn" onClick={() => void api.android.key(roomId, 'recents').catch(() => undefined)}>
+                <span aria-hidden>▢</span> {t('android.navRecents')}
+              </button>
+            </div>
+          )}
           {showSite && !android && (
             <div className="preview-device-strip" aria-label={t('preview.responsiveViews')}>
               <PreviewSelector

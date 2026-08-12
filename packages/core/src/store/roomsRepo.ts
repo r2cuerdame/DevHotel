@@ -45,7 +45,12 @@ interface RoomRow {
 interface ExtraJson {
   services?: RoomServices
   os?: RoomOsSettings
-  android?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }
+  android?: {
+    device: string
+    version: string
+    resolution?: 'native' | 'balanced' | 'fast'
+    orientation?: 'portrait' | 'landscape'
+  }
 }
 
 function parseExtra(extra: string): ExtraJson {

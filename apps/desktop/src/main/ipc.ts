@@ -7,6 +7,7 @@ import {
   zAutostartEnabled,
   zChangeId,
   zExternalHttpUrl,
+  zAndroidNavKey,
   zGitHubToken,
   zHostPath,
   zLogKind,
@@ -316,6 +317,18 @@ export function registerIpc(opts: {
   })
 
   /* preview */
+  /* android phone navigation keys — pressed from the preview strip */
+  handle(IPC.androidKey, (_event, roomId, key) => {
+    const safeRoomId = zRoomId.parse(roomId)
+    const keycode = { back: 4, home: 3, recents: 187 }[zAndroidNavKey.parse(key)]
+    return orch.execInRoom(
+      safeRoomId,
+      ['sh', '-lc', `adb connect localhost:5555 >/dev/null 2>&1; adb -s localhost:5555 shell input keyevent ${keycode}`],
+      { timeoutMs: 20_000 },
+      'user'
+    )
+  })
+
   handle(IPC.previewSetBounds, (_event, roomId, bounds) =>
     previews.attach(zRoomId.parse(roomId), zPreviewBounds.parse(bounds))
   )

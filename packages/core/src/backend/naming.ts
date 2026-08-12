@@ -79,11 +79,20 @@ export function emulatorName(roomId: string): string {
 }
 
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
+export type EmulatorOrientation = 'portrait' | 'landscape'
 
 export interface EmulatorOpts {
   device: string
   version: string
   resolution?: EmulatorResolution
+  orientation?: EmulatorOrientation
+}
+
+/** X screen dimensions for the emulator container, per orientation. */
+export function emulatorScreen(orientation: EmulatorOrientation = 'portrait'): { width: number; height: number } {
+  return orientation === 'landscape'
+    ? { width: EMULATOR_SCREEN_HEIGHT, height: EMULATOR_SCREEN_WIDTH }
+    : { width: EMULATOR_SCREEN_WIDTH, height: EMULATOR_SCREEN_HEIGHT }
 }
 
 /** Native panel pixels and density of the AVD profiles offered in the Stack tab. */
@@ -106,24 +115,33 @@ const EMULATOR_RESOLUTION_SCALE: Record<EmulatorResolution, number> = {
  * (swiftshader renders in software), so shrinking the guest LCD is the single
  * biggest speed lever; 'balanced' is the default for a usable phone.
  */
-export function emulatorAvdOverride(device?: string, resolution: EmulatorResolution = 'balanced'): string {
+export function emulatorAvdOverride(
+  device?: string,
+  resolution: EmulatorResolution = 'balanced',
+  orientation: EmulatorOrientation = 'portrait'
+): string {
   const lcd = EMULATOR_DEVICE_LCD[device ?? EMULATOR_DEFAULT_DEVICE] ?? EMULATOR_DEVICE_LCD[EMULATOR_DEFAULT_DEVICE]!
   const scale = EMULATOR_RESOLUTION_SCALE[resolution]
-  if (scale === 1) return '# DevHotel: native device resolution\n'
-  const even = (value: number): number => 2 * Math.round((value * scale) / 2)
-  return [
-    '# DevHotel: reduced guest LCD for software rendering speed',
-    `hw.lcd.width=${even(lcd.width)}`,
-    `hw.lcd.height=${even(lcd.height)}`,
-    `hw.lcd.density=${even(lcd.density)}`,
-    ''
-  ].join('\n')
+  const lines = ['# DevHotel AVD overrides']
+  if (scale !== 1) {
+    const even = (value: number): number => 2 * Math.round((value * scale) / 2)
+    lines.push(
+      // reduced guest LCD: the single biggest speed lever under software rendering
+      `hw.lcd.width=${even(lcd.width)}`,
+      `hw.lcd.height=${even(lcd.height)}`,
+      `hw.lcd.density=${even(lcd.density)}`
+    )
+  }
+  if (orientation === 'landscape') lines.push('hw.initialOrientation=landscape')
+  lines.push('')
+  return lines.join('\n')
 }
 
 /** `docker create` args — the container is started only after the openbox rules are staged inside. */
 export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
+  const screen = emulatorScreen(opts?.orientation)
   return [
     'create',
     '--name',
@@ -153,9 +171,9 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     '-e',
     'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim',
     '-e',
-    `SCREEN_WIDTH=${EMULATOR_SCREEN_WIDTH}`,
+    `SCREEN_WIDTH=${screen.width}`,
     '-e',
-    `SCREEN_HEIGHT=${EMULATOR_SCREEN_HEIGHT}`,
+    `SCREEN_HEIGHT=${screen.height}`,
     '-e',
     'SCREEN_DEPTH=24',
     emulatorImage(version)

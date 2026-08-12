@@ -258,7 +258,10 @@ export class FakeBackend implements IsolationBackend {
     writeFileSync(hostPath, 'fake-room-file')
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
-  async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }) {
+  async createEmulator(
+    roomId: string,
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+  ) {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)
     this.emulatorStateValue = 'running'
   }

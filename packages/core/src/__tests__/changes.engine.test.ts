@@ -136,9 +136,19 @@ describe('Android emulator changes', () => {
       android: { device: 'Samsung Galaxy S10', version: '14.0' }
     })
 
-    const entry = await engine.execute(ctx(), 'emulator-config', { device: 'Pixel 6', version: '15.0', resolution: 'fast' }, 'user')
+    const entry = await engine.execute(
+      ctx(),
+      'emulator-config',
+      { device: 'Pixel 6', version: '15.0', resolution: 'fast', orientation: 'landscape' },
+      'user'
+    )
     expect(entry.status).toBe('verified')
-    expect(rooms.get('room1abc')!.android).toEqual({ device: 'Pixel 6', version: '15.0', resolution: 'fast' })
+    expect(rooms.get('room1abc')!.android).toEqual({
+      device: 'Pixel 6',
+      version: '15.0',
+      resolution: 'fast',
+      orientation: 'landscape'
+    })
     expect(backend.calls).toContain('removeEmulator:room1abc')
     expect(backend.calls).toContain('createEmulator:room1abc:Pixel 6:15.0')
 

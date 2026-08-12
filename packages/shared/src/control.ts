@@ -74,7 +74,8 @@ export const zQuickChange = z.discriminatedUnion('kind', [
     kind: z.literal('emulator-config'),
     device: z.string().regex(/^[A-Za-z0-9 ().-]{2,40}$/),
     version: z.enum(['14.0', '13.0', '12.0', '11.0']),
-    resolution: z.enum(['native', 'balanced', 'fast']).optional()
+    resolution: z.enum(['native', 'balanced', 'fast']).optional(),
+    orientation: z.enum(['portrait', 'landscape']).optional()
   }).strict(),
   z.object({ kind: z.literal('service-version'), service: zServiceKind, version: z.string().regex(/^\d+$/) }).strict(),
   z.object({ kind: z.literal('service-add'), service: zServiceKind, version: z.string().regex(/^\d+$/).optional() }).strict(),
@@ -147,6 +148,10 @@ export const zAgentCloneBody = z.object({
   services: z.enum(['copy', 'empty', 'exclude'])
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
+
+/** Physical navigation keys the Android preview strip can send to the emulator. */
+export const zAndroidNavKey = z.enum(['back', 'home', 'recents'])
+export type AndroidNavKey = z.infer<typeof zAndroidNavKey>
 
 export const zRendererCreateRoomInput = zCreateRoomInput.omit({ actor: true }).strict()
 export type RendererCreateRoomInput = z.infer<typeof zRendererCreateRoomInput>

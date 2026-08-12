@@ -50,6 +50,7 @@ export const IPC = {
   footprint: 'app:footprint',
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
+  androidKey: 'android:key',
   previewSetBounds: 'preview:setBounds',
   previewSetVisible: 'preview:setVisible',
   previewDetach: 'preview:detach',
@@ -214,6 +215,10 @@ export interface IpcApi {
     /** deletes every room, removes CA trust and autostart, erases app data, launches the uninstaller */
     /** true once cleanup/uninstaller helpers are scheduled; false when native confirmation is cancelled */
     cleanUninstall(): Promise<boolean>
+  }
+  android: {
+    /** press a phone navigation key on the room's emulator */
+    key(roomId: string, key: import('./control').AndroidNavKey): Promise<void>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

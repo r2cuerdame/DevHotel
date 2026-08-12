@@ -7,8 +7,6 @@ import {
   ANCHOR_IMAGE,
   EMULATOR_AVD_OVERRIDE_PATH,
   EMULATOR_IMAGE,
-  EMULATOR_SCREEN_HEIGHT,
-  EMULATOR_SCREEN_WIDTH,
   RELAY_PORT,
   anchorName,
   buildAnchorArgs,
@@ -22,6 +20,7 @@ import {
   emulatorAvdOverride,
   emulatorImage,
   emulatorName,
+  emulatorScreen,
   effectiveDepsVolume,
   imageFor,
   isJobName,
@@ -48,22 +47,24 @@ const LONG_TIMEOUT_MS = 600_000
  * itself), so FIT_EMULATOR_PY below enforces the full-screen size and the
  * force-center rule snaps the frame back to 0,0 on that resize.
  */
-const OPENBOX_FRAMELESS_RC = `<?xml version="1.0" encoding="UTF-8"?>
+function openboxFramelessRc(width: number, height: number): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <applications>
     <application class="Emulator" type="normal">
       <decor>no</decor>
       <position force="yes"><x>center</x><y>center</y></position>
-      <size><width>${EMULATOR_SCREEN_WIDTH}</width><height>${EMULATOR_SCREEN_HEIGHT}</height></size>
+      <size><width>${width}</width><height>${height}</height></size>
     </application>
     <application class="Emulator" type="utility">
       <decor>no</decor>
       <layer>below</layer>
-      <position force="yes"><x>${EMULATOR_SCREEN_WIDTH + 20}</x><y>0</y></position>
+      <position force="yes"><x>${width + 20}</x><y>0</y></position>
     </application>
   </applications>
 </openbox_config>
 `
+}
 
 /**
  * Replaces the image's wallpaper-only autostart: the noVNC backdrop stays
@@ -79,10 +80,11 @@ python3 "$HOME/.config/openbox/fit-emulator.py" >/dev/null 2>&1 &
  * and libX11 ship in the image) forces the "Android Emulator*" window to the
  * full X screen; Qt then rescales the device content edge to edge.
  */
-const FIT_EMULATOR_PY = `import ctypes
+function fitEmulatorPy(width: number, height: number): string {
+  return `import ctypes
 import time
 
-W, H = ${EMULATOR_SCREEN_WIDTH}, ${EMULATOR_SCREEN_HEIGHT}
+W, H = ${width}, ${height}
 
 x11 = ctypes.CDLL("libX11.so.6")
 x11.XOpenDisplay.restype = ctypes.c_void_p
@@ -195,6 +197,7 @@ def main():
 if __name__ == "__main__":
     main()
 `
+}
 
 function must(result: ExecResult, what: string): ExecResult {
   if (result.code !== 0) {
@@ -1031,21 +1034,28 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), 'copy from room')
   }
 
-  async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }): Promise<void> {
+  async createEmulator(
+    roomId: string,
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+  ): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
     // frameless fullscreen phone: rules, autostart, the fit daemon and the AVD
     // resolution override are copied into the *created* (not yet started)
     // container, so openbox can never win a race and map the emulator
-    // decorated, and the AVD is born at the requested LCD size.
+    // decorated, and the AVD is born at the requested LCD size/orientation.
     must(await runDocker(buildEmulatorArgs(roomId, opts)), 'create emulator container')
+    const screen = emulatorScreen(opts?.orientation)
     const staging = mkdtempSync(join(tmpdir(), 'dh-openbox-'))
     try {
       mkdirSync(join(staging, 'openbox'))
-      writeFileSync(join(staging, 'openbox', 'rc.xml'), OPENBOX_FRAMELESS_RC)
+      writeFileSync(join(staging, 'openbox', 'rc.xml'), openboxFramelessRc(screen.width, screen.height))
       writeFileSync(join(staging, 'openbox', 'autostart'), OPENBOX_AUTOSTART)
-      writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), FIT_EMULATOR_PY)
-      writeFileSync(join(staging, 'avd-override.ini'), emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced'))
+      writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), fitEmulatorPy(screen.width, screen.height))
+      writeFileSync(
+        join(staging, 'avd-override.ini'),
+        emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced', opts?.orientation ?? 'portrait')
+      )
       must(
         await runDocker(['cp', join(staging, 'openbox'), `${emulatorName(roomId)}:/home/androidusr/.config/`]),
         'install emulator window rules'

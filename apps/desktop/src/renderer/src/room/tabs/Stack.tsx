@@ -7,6 +7,7 @@ import { PackageStoreModal } from '../PackageStoreModal'
 const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
 const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
 type AndroidResolution = 'balanced' | 'fast' | 'native'
+type AndroidOrientation = 'portrait' | 'landscape'
 
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
@@ -17,6 +18,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const [device, setDevice] = useState(room.android?.device ?? ANDROID_DEVICES[0]!)
   const [osVersion, setOsVersion] = useState(room.android?.version ?? ANDROID_VERSIONS[0]!)
   const [resolution, setResolution] = useState<AndroidResolution>(room.android?.resolution ?? 'balanced')
+  const [orientation, setOrientation] = useState<AndroidOrientation>(room.android?.orientation ?? 'portrait')
   const [pending, setPending] = useState<string | null>(null)
 
   async function run(kind: string, fn: () => Promise<unknown>): Promise<void> {
@@ -75,16 +77,28 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
               <option value="fast">{t('android.resFast')}</option>
               <option value="native">{t('android.resNative')}</option>
             </select>
+            <select
+              value={orientation}
+              onChange={(e) => setOrientation(e.target.value as AndroidOrientation)}
+              style={{ width: 110 }}
+              aria-label={t('android.orientation')}
+            >
+              <option value="portrait">{t('android.portrait')}</option>
+              <option value="landscape">{t('android.landscape')}</option>
+            </select>
             <button
               className="btn"
               disabled={
                 pending !== null ||
                 (device === (room.android?.device ?? ANDROID_DEVICES[0]) &&
                   osVersion === (room.android?.version ?? ANDROID_VERSIONS[0]) &&
-                  resolution === (room.android?.resolution ?? 'balanced'))
+                  resolution === (room.android?.resolution ?? 'balanced') &&
+                  orientation === (room.android?.orientation ?? 'portrait'))
               }
               onClick={() =>
-                void run('emu', () => applyChange(room.id, { kind: 'emulator-config', device, version: osVersion, resolution }))
+                void run('emu', () =>
+                  applyChange(room.id, { kind: 'emulator-config', device, version: osVersion, resolution, orientation })
+                )
               }
             >
               {pending === 'emu' ? t('common.applying') : t('common.apply')}

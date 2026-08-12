@@ -1,20 +1,37 @@
-import { EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, type EmulatorResolution } from '../../backend/naming'
+import {
+  EMULATOR_DEFAULT_DEVICE,
+  EMULATOR_DEFAULT_VERSION,
+  type EmulatorOrientation,
+  type EmulatorResolution
+} from '../../backend/naming'
 import type { ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
-type EmulatorSelection = { device: string; version: string; resolution?: EmulatorResolution }
+type EmulatorSelection = {
+  device: string
+  version: string
+  resolution?: EmulatorResolution
+  orientation?: EmulatorOrientation
+}
 
 const DEFAULT_SELECTION: EmulatorSelection = {
   device: EMULATOR_DEFAULT_DEVICE,
   version: EMULATOR_DEFAULT_VERSION,
-  resolution: 'balanced'
+  resolution: 'balanced',
+  orientation: 'portrait'
 }
 
 function label(selection: EmulatorSelection): string {
-  return `${selection.device} (Android ${selection.version}, ${selection.resolution ?? 'balanced'})`
+  const orientation = selection.orientation === 'landscape' ? ', landscape' : ''
+  return `${selection.device} (Android ${selection.version}, ${selection.resolution ?? 'balanced'}${orientation})`
 }
 
-export const emulatorConfigChange: ChangeDefinition<{ device: string; version: string; resolution?: EmulatorResolution }> = {
+export const emulatorConfigChange: ChangeDefinition<{
+  device: string
+  version: string
+  resolution?: EmulatorResolution
+  orientation?: EmulatorOrientation
+}> = {
   kind: 'emulator-config',
   plan(ctx, p) {
     const prev = ctx.room().android ?? DEFAULT_SELECTION
@@ -22,7 +39,12 @@ export const emulatorConfigChange: ChangeDefinition<{ device: string; version: s
       title: `Emulator ${label(prev)} → ${label(p)}`,
       component: 'Emulator',
       before: prev,
-      after: { device: p.device, version: p.version, resolution: p.resolution ?? 'balanced' },
+      after: {
+        device: p.device,
+        version: p.version,
+        resolution: p.resolution ?? 'balanced',
+        orientation: p.orientation ?? 'portrait'
+      },
       undoable: true,
       undoStrategy: 'inverse-apply',
       autoRollback: false
@@ -36,7 +58,8 @@ export const emulatorConfigChange: ChangeDefinition<{ device: string; version: s
       prev &&
       prev.device === p.device &&
       prev.version === p.version &&
-      (prev.resolution ?? 'balanced') === (p.resolution ?? 'balanced')
+      (prev.resolution ?? 'balanced') === (p.resolution ?? 'balanced') &&
+      (prev.orientation ?? 'portrait') === (p.orientation ?? 'portrait')
     ) {
       throw new Error('Emulator settings are unchanged')
     }
@@ -45,7 +68,12 @@ export const emulatorConfigChange: ChangeDefinition<{ device: string; version: s
     return { prev: ctx.room().android ?? DEFAULT_SELECTION }
   },
   async apply(ctx, p, steps) {
-    const next: EmulatorSelection = { device: p.device, version: p.version, resolution: p.resolution ?? 'balanced' }
+    const next: EmulatorSelection = {
+      device: p.device,
+      version: p.version,
+      resolution: p.resolution ?? 'balanced',
+      orientation: p.orientation ?? 'portrait'
+    }
     ctx.rooms.update(ctx.roomId, { android: next })
     if (ctx.isAwake()) {
       steps.push(`Start ${label(next)} (a new OS version downloads its image first)`)

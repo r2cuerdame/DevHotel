@@ -158,7 +158,10 @@ export interface IsolationBackend {
   /** copy a file out of the room's web/build container to the host */
   copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
   /* --- android emulator sidecar (KVM) --- */
-  createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }): Promise<void>
+  createEmulator(
+    roomId: string,
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+  ): Promise<void>
   removeEmulator(roomId: string): Promise<void>
   emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'>
 }

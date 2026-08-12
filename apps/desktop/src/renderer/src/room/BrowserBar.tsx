@@ -85,22 +85,26 @@ export function BrowserBar({
 
       {served && (
         <div className="browser-nav" aria-label={t('tabs.site')}>
-          <button
-            className="icon-btn"
-            title={t('common.back')}
-            disabled={!siteControlsEnabled || !preview?.canGoBack}
-            onClick={() => void api.preview.nav(room.id, 'back')}
-          >
-            ←
-          </button>
-          <button
-            className="icon-btn"
-            title={t('bar.forward')}
-            disabled={!siteControlsEnabled || !preview?.canGoForward}
-            onClick={() => void api.preview.nav(room.id, 'forward')}
-          >
-            →
-          </button>
+          {web && (
+            <>
+              <button
+                className="icon-btn"
+                title={t('common.back')}
+                disabled={!siteControlsEnabled || !preview?.canGoBack}
+                onClick={() => void api.preview.nav(room.id, 'back')}
+              >
+                ←
+              </button>
+              <button
+                className="icon-btn"
+                title={t('bar.forward')}
+                disabled={!siteControlsEnabled || !preview?.canGoForward}
+                onClick={() => void api.preview.nav(room.id, 'forward')}
+              >
+                →
+              </button>
+            </>
+          )}
           <button
             className="icon-btn"
             title={t('bar.reload')}
@@ -112,9 +116,15 @@ export function BrowserBar({
         </div>
       )}
 
-      <div className={`domain-pill${served ? '' : ' build-room-pill'}`} title={served ? url : t('android.buildOnlyHint')}>
+      <div className={`domain-pill${served ? '' : ' build-room-pill'}`} title={web ? url : t('android.buildOnlyHint')}>
         {web && room.https && <span title="HTTPS">🔒</span>}
-        <span className="url">{served ? url : t('android.buildRoom')}</span>
+        <span className="url">
+          {web
+            ? url
+            : room.provider === 'android'
+              ? `📱 ${room.android?.device ?? 'Samsung Galaxy S10'} · Android ${room.android?.version ?? '14.0'} · AOSP`
+              : t('android.buildRoom')}
+        </span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} />
           {busy ?? statusLabel(t, room.status)}

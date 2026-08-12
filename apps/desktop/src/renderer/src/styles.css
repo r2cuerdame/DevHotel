@@ -738,6 +738,16 @@ code,
   font-size: 11px;
 }
 
+/* Phone navigation keys under the browser bar for Android rooms. */
+.android-nav-strip {
+  justify-content: center;
+}
+
+.android-nav-strip .btn {
+  min-width: 96px;
+  font-size: 11px;
+}
+
 .split-toggle[data-active] {
   color: var(--brass);
   border-color: var(--brass);

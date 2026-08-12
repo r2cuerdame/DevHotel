@@ -64,6 +64,9 @@ const api: IpcApi = {
     setAutostart: (enabled) => ipcRenderer.invoke(IPC.autostartSet, enabled),
     cleanUninstall: () => ipcRenderer.invoke(IPC.cleanUninstall)
   },
+  android: {
+    key: (roomId, key) => ipcRenderer.invoke(IPC.androidKey, roomId, key)
+  },
   preview: {
     setBounds: (roomId, bounds) => ipcRenderer.invoke(IPC.previewSetBounds, roomId, bounds),
     setVisible: (roomId, visible) => ipcRenderer.invoke(IPC.previewSetVisible, roomId, visible),

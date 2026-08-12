@@ -175,6 +175,16 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim')
   })
 
+  it('rotates the X screen and AVD orientation for landscape emulators', () => {
+    const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0', orientation: 'landscape' })
+    expect(args).toContain('SCREEN_WIDTH=1140')
+    expect(args).toContain('SCREEN_HEIGHT=540')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'landscape')).toContain('hw.initialOrientation=landscape')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).not.toContain('hw.initialOrientation')
+    // portrait stays the default
+    expect(buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })).toContain('SCREEN_WIDTH=540')
+  })
+
   it('scales the guest LCD per resolution preset for software rendering speed', () => {
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=1080')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=2280')
