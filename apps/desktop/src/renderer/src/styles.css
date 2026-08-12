@@ -405,6 +405,7 @@ code,
   max-width: calc(100vw - 48px);
   max-height: calc(100vh - 64px);
   overflow-y: auto;
+  overflow-x: hidden;
   background: var(--walnut);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1408,6 +1409,33 @@ code,
   border-radius: 10px;
   padding: 14px;
   margin-bottom: 12px;
+}
+
+/* Long unbreakable paths (MCP command/config) must wrap instead of widening the modal. */
+.settings-card pre {
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  background: var(--walnut);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-card .row {
+  min-width: 0;
+}
+
+.settings-card .row > input {
+  min-width: 0;
+}
+
+.settings-card .row > .btn {
+  align-self: flex-start;
+  flex-shrink: 0;
 }
 
 /* ---------- toasts ---------- */
