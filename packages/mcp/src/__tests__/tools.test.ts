@@ -79,6 +79,8 @@ describe('makeTools', () => {
   it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
+        'android_run',
+        'android_screenshot',
         'apply_quick_change',
         'check_room',
         'clone_room',
@@ -87,6 +89,7 @@ describe('makeTools', () => {
         'delete_room',
         'hotel_github_install',
         'hotel_github_status',
+        'hotel_status',
         'inspect_room',
         'list_changes',
         'list_rooms',
@@ -94,6 +97,8 @@ describe('makeTools', () => {
         'restart_web',
         'room_components',
         'room_logs',
+        'room_pull_file',
+        'room_push_file',
         'run_in_room',
         'sleep_room',
         'start_room',
@@ -107,22 +112,28 @@ describe('makeTools', () => {
     expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.4.2' })
   })
 
+  function firstText(res: { content: ({ type: string } & Record<string, unknown>)[] }): string {
+    const first = res.content[0]
+    if (!first || first.type !== 'text') throw new Error('expected text content')
+    return first.text as string
+  }
+
   it('list_rooms returns JSON content', async () => {
     const res = await byName.list_rooms!.handler({})
     expect(res.isError).toBeUndefined()
-    expect(res.content[0]!.text).toContain('abc12345')
+    expect(firstText(res)).toContain('abc12345')
   })
 
   it('run_in_room forwards argv and returns exec result', async () => {
     const res = await byName.run_in_room!.handler({ roomId: 'abc12345', cmd: ['pnpm', 'install'] })
-    expect(res.content[0]!.text).toContain('"code": 0')
+    expect(firstText(res)).toContain('"code": 0')
     const req = seen.find((s) => s.url === '/v1/rooms/abc12345/exec')
     expect(req?.body.cmd).toEqual(['pnpm', 'install'])
   })
 
   it('copy_diagnostic returns plain text', async () => {
     const res = await byName.copy_diagnostic!.handler({ roomId: 'abc12345' })
-    expect(res.content[0]!.text).toMatch(/^DevHotel Diagnostic Bundle/)
+    expect(firstText(res)).toMatch(/^DevHotel Diagnostic Bundle/)
   })
 
   it('publishes a Web + Android create contract', () => {

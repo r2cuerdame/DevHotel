@@ -61,7 +61,10 @@ export const zQuickChange = z.discriminatedUnion('kind', [
     })
     .strict(),
   z.object({ kind: z.literal('android-build') }).strict(),
-  z.object({ kind: z.literal('android-run') }).strict(),
+  z.object({
+    kind: z.literal('android-run'),
+    applicationId: z.string().regex(/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/).optional()
+  }).strict(),
   z.object({
     kind: z.literal('package-manager'),
     pm: z.enum(['npm', 'pnpm']),

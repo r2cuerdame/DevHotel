@@ -1019,6 +1019,18 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), `copy into ${svc}`)
   }
 
+  async copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
+    must(await runDocker(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), 'copy into room')
+  }
+
+  async copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
+    must(await runDocker(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), 'copy from room')
+  }
+
   async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)

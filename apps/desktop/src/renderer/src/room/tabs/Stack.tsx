@@ -6,7 +6,7 @@ import { PackageStoreModal } from '../PackageStoreModal'
 
 const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
 const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
-const ANDROID_RESOLUTIONS = ['balanced', 'fast', 'native'] as const
+type AndroidResolution = 'balanced' | 'fast' | 'native'
 
 export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
@@ -16,7 +16,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const [port, setPort] = useState(room.internalPort)
   const [device, setDevice] = useState(room.android?.device ?? ANDROID_DEVICES[0]!)
   const [osVersion, setOsVersion] = useState(room.android?.version ?? ANDROID_VERSIONS[0]!)
-  const [resolution, setResolution] = useState<(typeof ANDROID_RESOLUTIONS)[number]>(room.android?.resolution ?? 'balanced')
+  const [resolution, setResolution] = useState<AndroidResolution>(room.android?.resolution ?? 'balanced')
   const [pending, setPending] = useState<string | null>(null)
 
   async function run(kind: string, fn: () => Promise<unknown>): Promise<void> {
@@ -67,7 +67,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
             </select>
             <select
               value={resolution}
-              onChange={(e) => setResolution(e.target.value as (typeof ANDROID_RESOLUTIONS)[number])}
+              onChange={(e) => setResolution(e.target.value as AndroidResolution)}
               style={{ width: 150 }}
               aria-label={t('android.resolution')}
             >

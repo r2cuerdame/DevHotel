@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
@@ -806,6 +806,96 @@ export class RoomOrchestrator {
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
     return { reclaimedBytes }
+  }
+
+  private static readonly ROOM_FILE_CAP = 16 * 1024 * 1024
+
+  private validateRoomFilePath(path: string): string {
+    if (!/^\/workspace\/[^\0]*$/.test(path) || path.split('/').includes('..')) {
+      throw new Error('Room file paths must be absolute paths under /workspace')
+    }
+    return path
+  }
+
+  /** Official file egress: read one workspace file (base64), capped at 16MB. */
+  async pullRoomFile(roomId: string, path: string): Promise<{ path: string; size: number; contentBase64: string }> {
+    this.mustGet(roomId)
+    const safePath = this.validateRoomFilePath(path)
+    const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
+    mkdirSync(tmp, { recursive: true })
+    const hostFile = join(tmp, 'file.bin')
+    try {
+      await this.backend.copyFromRoom(roomId, safePath, hostFile)
+      const stats = statSync(hostFile)
+      if (stats.size > RoomOrchestrator.ROOM_FILE_CAP) {
+        throw new Error(`file is ${stats.size} bytes — larger than the 16MB pull cap`)
+      }
+      return { path: safePath, size: stats.size, contentBase64: readFileSync(hostFile).toString('base64') }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+
+  /** Official file ingress: write one workspace file from base64, capped at 16MB. */
+  async pushRoomFile(roomId: string, path: string, contentBase64: string): Promise<{ path: string; size: number }> {
+    this.mustGet(roomId)
+    const safePath = this.validateRoomFilePath(path)
+    const content = Buffer.from(contentBase64, 'base64')
+    if (content.byteLength > RoomOrchestrator.ROOM_FILE_CAP) {
+      throw new Error(`content is ${content.byteLength} bytes — larger than the 16MB push cap`)
+    }
+    const dir = safePath.slice(0, safePath.lastIndexOf('/')) || '/workspace'
+    const mkdir = await this.backend.execInRoom(roomId, ['sh', '-lc', `mkdir -p '${dir}'`], { timeoutMs: 30_000 })
+    if (mkdir.code !== 0) throw new Error(`could not create ${dir}: ${mkdir.stderr.slice(-200)}`)
+    const tmp = join(this.userData, 'tmp', `push-${newRoomId()}`)
+    mkdirSync(tmp, { recursive: true })
+    const hostFile = join(tmp, 'file.bin')
+    try {
+      writeFileSync(hostFile, content)
+      await this.backend.copyIntoRoom(roomId, hostFile, safePath)
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+    this.markWorkspaceModified(roomId)
+    return { path: safePath, size: content.byteLength }
+  }
+
+  /** One-call answer to "is DevHotel ready and what is running" for agents. */
+  async hotelStatus(): Promise<{
+    backend: { ok: boolean; detail: string }
+    gateway: ReturnType<Gateway['status']>
+    rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
+  }> {
+    const backend = await this.backend.health()
+    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
+    for (const room of this.rooms.list()) {
+      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      let emulator: 'running' | 'exited' | 'missing' | null = null
+      if (room.provider === 'android' && awake && backend.ok) {
+        try {
+          emulator = await this.backend.emulatorState(room.id)
+        } catch {
+          emulator = null
+        }
+      }
+      let url: string | null = null
+      try {
+        url = awake ? this.inspectRoom(room.id).urls.app : null
+      } catch {
+        url = null
+      }
+      rooms.push({
+        id: room.id,
+        project: room.project,
+        nickname: room.nickname,
+        provider: room.provider,
+        status: room.status,
+        domain: room.domain,
+        url,
+        emulator
+      })
+    }
+    return { backend, gateway: this.gateway.status(), rooms }
   }
 
   inspectRoom(roomId: string): RoomInspection {

@@ -153,6 +153,10 @@ export interface IsolationBackend {
   copyFromService(roomId: string, svc: 'postgres' | 'redis', containerPath: string, hostPath: string): Promise<void>
   /** copy a host file into the service container */
   copyToService(roomId: string, svc: 'postgres' | 'redis', hostPath: string, containerPath: string): Promise<void>
+  /** copy a host file into the room's web/build container */
+  copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void>
+  /** copy a file out of the room's web/build container to the host */
+  copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
   /* --- android emulator sidecar (KVM) --- */
   createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }): Promise<void>
   removeEmulator(roomId: string): Promise<void>

@@ -290,7 +290,7 @@ export const ja: Translation = {
   'android.resBalanced': 'バランス (75%、推奨)',
   'android.resFast': '高速 (50%)',
   'android.resNative': 'ネイティブ (低速)',
-  'android.resolutionHint': 'GPU パススルーがないため、解像度を下げるほどエミュレーターは高速になります。',
+  'android.resolutionHint': 'GPU パススルーがないため、解像度を下げるほどエミュレーターは高速になります。 デバイスプロファイルは画面サイズと形状のみを再現します。ランタイムは AOSP エミュレーターであり、Samsung One UI や実機ではありません。',
   'stack.installed': 'インストール済みプログラム',
   'packageStore.add': '+ アプリを追加',
   'packageStore.title': 'Room アプリストア',

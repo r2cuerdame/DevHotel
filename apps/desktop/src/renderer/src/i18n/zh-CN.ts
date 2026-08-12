@@ -286,7 +286,7 @@ export const zhCN: Translation = {
   'android.resBalanced': '均衡 (75%，推荐)',
   'android.resFast': '快速 (50%)',
   'android.resNative': '原生 (慢)',
-  'android.resolutionHint': '没有 GPU 直通，分辨率越低模拟器渲染越快。',
+  'android.resolutionHint': '没有 GPU 直通，分辨率越低模拟器渲染越快。 设备配置仅模拟屏幕尺寸和形状 — 运行时是 AOSP 模拟器，并非三星 One UI 或真机。',
   'stack.installed': '已安装程序',
   'packageStore.add': '+ 添加应用',
   'packageStore.title': 'Room 应用商店',

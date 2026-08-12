@@ -292,7 +292,7 @@ export const es: Translation = {
   'android.resBalanced': 'Equilibrada (75 %, recomendada)',
   'android.resFast': 'Rápida (50 %)',
   'android.resNative': 'Nativa (lenta)',
-  'android.resolutionHint': 'Sin passthrough de GPU, una resolución menor renderiza mucho más rápido.',
+  'android.resolutionHint': 'Sin passthrough de GPU, una resolución menor renderiza mucho más rápido. Los perfiles de dispositivo solo imitan el tamaño y la forma de la pantalla: el runtime es un emulador AOSP, no Samsung One UI ni un dispositivo físico.',
   'stack.installed': 'Programas instalados',
   'packageStore.add': '+ Añadir app',
   'packageStore.title': 'Tienda de apps del Room',

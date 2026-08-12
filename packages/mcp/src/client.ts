@@ -127,6 +127,21 @@ export class ControlClient {
   syncFromHost(roomId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sync-from-host`)
   }
+  hotelStatus() {
+    return this.req<unknown>('GET', '/v1/status')
+  }
+  pullFile(roomId: string, path: string) {
+    return this.req<{ path: string; size: number; contentBase64: string }>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/file?path=${encodeURIComponent(path)}`
+    )
+  }
+  pushFile(roomId: string, path: string, contentBase64: string) {
+    return this.req<{ path: string; size: number }>('PUT', `/v1/rooms/${encodeURIComponent(roomId)}/file`, {
+      path,
+      contentBase64
+    })
+  }
   hotelGithubStatus() {
     return this.req<unknown>('GET', '/v1/hotel/github')
   }

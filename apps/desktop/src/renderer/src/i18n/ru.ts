@@ -291,7 +291,7 @@ export const ru: Translation = {
   'android.resBalanced': 'Сбалансированное (75%, рекомендуется)',
   'android.resFast': 'Быстрое (50%)',
   'android.resNative': 'Родное (медленно)',
-  'android.resolutionHint': 'Без GPU-passthrough меньшее разрешение отрисовывается заметно быстрее.',
+  'android.resolutionHint': 'Без GPU-passthrough меньшее разрешение отрисовывается заметно быстрее. Профили устройств имитируют только размер и форму экрана — рантайм это эмулятор AOSP, а не Samsung One UI и не физическое устройство.',
   'stack.installed': 'Установленные программы',
   'packageStore.add': '+ Добавить приложение',
   'packageStore.title': 'Room App Store',

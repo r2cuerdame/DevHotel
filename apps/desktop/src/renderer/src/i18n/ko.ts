@@ -289,7 +289,7 @@ export const ko: Translation = {
   'android.resBalanced': '균형 (75%, 권장)',
   'android.resFast': '빠름 (50%)',
   'android.resNative': '원본 (느림)',
-  'android.resolutionHint': 'GPU 패스스루가 없어 해상도를 낮출수록 에뮬레이터가 훨씬 빨라집니다.',
+  'android.resolutionHint': 'GPU 패스스루가 없어 해상도를 낮출수록 에뮬레이터가 훨씬 빨라집니다. 기기 프로필은 화면 크기·형태만 모방합니다 — 런타임은 AOSP 에뮬레이터이며 Samsung One UI나 실기기가 아닙니다.',
   'stack.installed': '설치된 프로그램',
   'packageStore.add': '+ 앱 추가',
   'packageStore.title': 'Room 앱 스토어',

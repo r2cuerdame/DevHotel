@@ -292,7 +292,7 @@ export const fr: Translation = {
   'android.resBalanced': 'Équilibrée (75 %, recommandée)',
   'android.resFast': 'Rapide (50 %)',
   'android.resNative': 'Native (lente)',
-  'android.resolutionHint': 'Sans passthrough GPU, une résolution plus basse est bien plus rapide.',
+  'android.resolutionHint': 'Sans passthrough GPU, une résolution plus basse est bien plus rapide. Les profils d’appareil n’imitent que la taille et la forme de l’écran — le runtime est un émulateur AOSP, pas Samsung One UI ni un appareil physique.',
   'stack.installed': 'Programmes installés',
   'packageStore.add': '+ Ajouter une app',
   'packageStore.title': 'Room App Store',

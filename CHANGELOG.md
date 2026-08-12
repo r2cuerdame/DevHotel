@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Agent field-report fixes (docs/feedback/2026-08-12-agent-field-reports.md)
+
+- **`hotel_status`** MCP tool + `GET /v1/status`: one call for app version, backend health, gateway ports/routes, and every room with provider/status/domain/URL and live emulator state.
+- **`android_screenshot`**: the phone screen returned directly as an MCP image — captured with in-room `adb screencap`, so no host SDK, no noVNC letterboxing, no upload round-trips.
+- **`android_run`**: one-shot build → install **all** built module APKs → launch a chosen `applicationId` → screenshot of the running app. The `android-run` quick change itself now installs every module (multi-APK apps like app+crash-lab no longer need manual adb) and accepts `applicationId`.
+- **`room_pull_file` / `room_push_file`**: official file egress/ingress for room workspaces (base64, 16MB cap, `/workspace`-only paths, docker-cp transport — no more temp-HTTP/wget workarounds). Pushing marks the working state modified.
+- Device selector honesty: hints now state profiles mimic screen size/shape only — the runtime is an AOSP emulator, not Samsung One UI or a physical device.
+- The full five-agent feedback triage (exclusive lease, snapshot reset, streamed exec output, failure bundles, artifact receipts, android clone, Gradle queue, newer images…) is recorded as the working backlog.
+
 ### Agent-requested, human-approved Host sync
 
 - New MCP tool `sync_from_host`: an agent may *request* an inbound sync of a room's linked Host folder; DevHotel focuses its window and shows an approval dialog. Only after the human clicks **Allow** does the sync run — as actor `user`, on the room's own linked path (agents can never supply a path). Declining returns a clear error to the agent. This is the first concrete goal.md §5.11 grant flow: the agent asks, the person decides.

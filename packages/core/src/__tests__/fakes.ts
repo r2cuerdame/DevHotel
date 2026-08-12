@@ -249,6 +249,14 @@ export class FakeBackend implements IsolationBackend {
   async copyToService(_roomId: string, svc: 'postgres' | 'redis', _hostPath: string, containerPath: string) {
     this.calls.push(`copyToService:${svc}:${containerPath}`)
   }
+  async copyIntoRoom(_roomId: string, _hostPath: string, containerPath: string) {
+    this.calls.push(`copyIntoRoom:${containerPath}`)
+  }
+  async copyFromRoom(_roomId: string, containerPath: string, hostPath: string) {
+    this.calls.push(`copyFromRoom:${containerPath}`)
+    const { writeFileSync } = await import('node:fs')
+    writeFileSync(hostPath, 'fake-room-file')
+  }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   async createEmulator(roomId: string, opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast' }) {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)

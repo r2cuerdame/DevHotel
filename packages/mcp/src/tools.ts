@@ -2,7 +2,30 @@ import { z } from 'zod'
 import { zChangeId, zPmKind, zQuickChange, zRoomId } from '@devhotel/shared'
 import type { ControlClient } from './client'
 
-type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
+type ToolContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
+type ToolResult = { content: ToolContent[]; isError?: boolean }
+
+/** The phone screen as raw pixels via in-room adb — no host SDK, no noVNC letterboxing. */
+const SCREENCAP_CMD =
+  "adb connect localhost:5555 >/dev/null 2>&1; adb -s localhost:5555 exec-out screencap -p | base64 | tr -d '\\n'"
+
+async function screenshotContent(client: import('./client').ControlClient, roomId: string): Promise<ToolContent> {
+  const result = (await client.execInRoom(roomId, ['sh', '-lc', SCREENCAP_CMD], 60_000)) as {
+    code: number
+    stdout: string
+    stderr: string
+  }
+  const data = result.stdout.trim()
+  if (result.code !== 0 || data.length < 100) {
+    throw new Error(
+      `screen capture failed (exit ${result.code}): ${result.stderr.slice(-200) || 'empty image'} — ` +
+        'the room must be an awake Android room with its emulator running; apps using FLAG_SECURE block capture'
+    )
+  }
+  return { type: 'image', data, mimeType: 'image/png' }
+}
 
 export interface ToolDef {
   name: string
@@ -192,6 +215,74 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         'Get the secret-redacted diagnostic bundle for a room — paste it into an LLM or issue to debug startup failures.',
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await (await getClient()).diagnostic(a.roomId)).text)
+    },
+    {
+      name: 'hotel_status',
+      description:
+        'One call answering "is DevHotel ready and what is running": app version, isolation backend health, gateway ports/routes, and every room with provider, status, domain, URL, and (for awake Android rooms) emulator state.',
+      schema: {},
+      handler: wrap(async () => (await getClient()).hotelStatus())
+    },
+    {
+      name: 'android_screenshot',
+      description:
+        "Capture the Android room's phone screen and return it as an image — clean device pixels via in-room adb, no host SDK and no noVNC letterboxing. The room must be awake with its emulator running.",
+      schema: { roomId: zRoomId },
+      handler: async (a: { roomId: string }): Promise<ToolResult> => {
+        try {
+          return { content: [await screenshotContent(await getClient(), a.roomId)] }
+        } catch (err) {
+          return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+        }
+      }
+    },
+    {
+      name: 'android_run',
+      description:
+        'One-shot Android dev loop: build the room workspace, install EVERY built module APK, launch the chosen applicationId (default: first module) on the emulator, then return the change result plus a screenshot of the running app. Long call — the Gradle build alone can take minutes.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: z.string().optional().describe('which built module to launch, e.g. "com.example.app"; defaults to the first')
+      },
+      handler: async (a: { roomId: string; applicationId?: string }): Promise<ToolResult> => {
+        try {
+          const client = await getClient()
+          const entry = await client.applyChange(a.roomId, {
+            kind: 'android-run',
+            ...(a.applicationId ? { applicationId: a.applicationId } : {})
+          })
+          const content: ToolContent[] = [{ type: 'text', text: JSON.stringify(entry, null, 2) }]
+          try {
+            content.push(await screenshotContent(client, a.roomId))
+          } catch (err) {
+            content.push({ type: 'text', text: `screenshot skipped: ${err instanceof Error ? err.message : String(err)}` })
+          }
+          return { content }
+        } catch (err) {
+          return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+        }
+      }
+    },
+    {
+      name: 'room_pull_file',
+      description:
+        "Download a file from the room's workspace (an APK, test report, screenshot…) as base64. Absolute in-room path under /workspace; 16MB cap.",
+      schema: {
+        roomId: zRoomId,
+        path: z.string().describe('absolute in-room path under /workspace')
+      },
+      handler: wrap(async (a) => (await getClient()).pullFile(a.roomId, a.path))
+    },
+    {
+      name: 'room_push_file',
+      description:
+        "Upload a file into the room's workspace from base64 content. Absolute in-room path under /workspace; parent directories are created; 16MB cap. Marks the working state as modified.",
+      schema: {
+        roomId: zRoomId,
+        path: z.string().describe('absolute in-room destination under /workspace'),
+        contentBase64: z.string().describe('file content, base64-encoded')
+      },
+      handler: wrap(async (a) => (await getClient()).pushFile(a.roomId, a.path, a.contentBase64))
     },
     {
       name: 'sync_from_host',

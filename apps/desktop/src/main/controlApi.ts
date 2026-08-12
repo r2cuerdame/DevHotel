@@ -65,6 +65,12 @@ export async function startControlApi(
       return
     }
 
+    if (parts[1] === 'status' && req.method === 'GET') {
+      const status = await orch.hotelStatus()
+      sendJson(res, 200, { version, ...status })
+      return
+    }
+
     if (parts[1] === 'hotel' && parts[2] === 'github') {
       if (!hotel.github) {
         sendJson(res, 503, { error: 'Hotel services are still starting' })
@@ -180,6 +186,20 @@ export async function startControlApi(
             return
           }
         }
+      }
+      if (safeRoomId && op === 'file' && req.method === 'GET') {
+        const path = url.searchParams.get('path') ?? ''
+        sendJson(res, 200, await orch.pullRoomFile(safeRoomId, path))
+        return
+      }
+      if (safeRoomId && op === 'file' && req.method === 'PUT') {
+        const body = (await readBody(req)) as { path?: unknown; contentBase64?: unknown }
+        if (typeof body.path !== 'string' || typeof body.contentBase64 !== 'string') {
+          sendJson(res, 400, { error: 'expected { path, contentBase64 }' })
+          return
+        }
+        sendJson(res, 200, await orch.pushRoomFile(safeRoomId, body.path, body.contentBase64))
+        return
       }
       if (safeRoomId && req.method === 'GET') {
         switch (op) {

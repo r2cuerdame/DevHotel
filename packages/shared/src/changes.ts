@@ -9,7 +9,7 @@ export type QuickChange =
   | { kind: 'deps-install'; clean: boolean }
   | { kind: 'package-install'; name: string; version: string; dev: boolean }
   | { kind: 'android-build' }
-  | { kind: 'android-run' }
+  | { kind: 'android-run'; applicationId?: string }
   | { kind: 'service-add'; service: 'postgres' | 'redis'; version?: string }
   | { kind: 'service-remove'; service: 'postgres' | 'redis' }
   | { kind: 'service-restart'; service: 'postgres' | 'redis' }
