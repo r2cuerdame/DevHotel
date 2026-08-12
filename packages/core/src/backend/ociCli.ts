@@ -1070,6 +1070,21 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['start', emulatorName(roomId)]), 'start emulator container')
   }
 
+  async captureEmulatorScreen(roomId: string): Promise<string> {
+    await this.assertPinnedEngineIdentity()
+    const result = await runDocker([
+      'exec',
+      emulatorName(roomId),
+      'sh',
+      '-c',
+      "ffmpeg -y -loglevel error -f x11grab -i :0 -frames:v 1 -f image2pipe -vcodec png - | base64 | tr -d '\\n'"
+    ])
+    must(result, 'capture emulator screen')
+    const png = result.stdout.trim()
+    if (png.length < 100) throw new Error('emulator screen capture returned no image')
+    return png
+  }
+
   async removeEmulator(roomId: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.removeRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')

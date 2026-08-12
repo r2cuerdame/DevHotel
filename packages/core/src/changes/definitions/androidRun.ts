@@ -1,9 +1,9 @@
-import { EMULATOR_ADB_ADDR } from '../../backend/naming'
+import { EMULATOR_ADB_SERIAL } from '../../backend/naming'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
 const BUILD_TIMEOUT_MS = 15 * 60_000
-const ADB = `adb -s ${EMULATOR_ADB_ADDR}`
+const ADB = `adb -s ${EMULATOR_ADB_SERIAL}`
 
 interface BuiltApp {
   appId: string
@@ -83,7 +83,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     while (Date.now() < bootDeadline) {
       const probe = await ctx.backend.execInRoom(
         room.id,
-        ['sh', '-lc', `adb connect ${EMULATOR_ADB_ADDR} >/dev/null 2>&1; ${ADB} shell getprop sys.boot_completed 2>/dev/null`],
+        ['sh', '-lc', `${ADB} shell getprop sys.boot_completed 2>/dev/null`],
         { timeoutMs: 20_000 }
       )
       if (probe.stdout.trim() === '1') {

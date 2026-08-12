@@ -265,6 +265,10 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)
     this.emulatorStateValue = 'running'
   }
+  async captureEmulatorScreen(roomId: string) {
+    this.calls.push(`captureEmulatorScreen:${roomId}`)
+    return 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+  }
   async removeEmulator(roomId: string) {
     this.calls.push(`removeEmulator:${roomId}`)
     this.emulatorStateValue = 'missing'

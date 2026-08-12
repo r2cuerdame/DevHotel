@@ -217,6 +217,11 @@ export async function startControlApi(
             sendJson(res, 200, { lines: orch.logs.tail(safeRoomId, kind) })
             return
           }
+          case 'screenshot': {
+            const mode = url.searchParams.get('mode') === 'screen' ? 'screen' : 'auto'
+            sendJson(res, 200, await orch.androidScreenshot(safeRoomId, mode))
+            return
+          }
         }
       }
     }

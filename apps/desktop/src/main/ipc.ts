@@ -323,7 +323,7 @@ export function registerIpc(opts: {
     const keycode = { back: 4, home: 3, recents: 187 }[zAndroidNavKey.parse(key)]
     return orch.execInRoom(
       safeRoomId,
-      ['sh', '-lc', `adb connect localhost:5555 >/dev/null 2>&1; adb -s localhost:5555 shell input keyevent ${keycode}`],
+      ['sh', '-lc', `adb -s emulator-5554 shell input keyevent ${keycode}`],
       { timeoutMs: 20_000 },
       'user'
     )

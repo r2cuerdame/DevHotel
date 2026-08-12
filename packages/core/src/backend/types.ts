@@ -162,6 +162,8 @@ export interface IsolationBackend {
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
   ): Promise<void>
+  /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
+  captureEmulatorScreen(roomId: string): Promise<string>
   removeEmulator(roomId: string): Promise<void>
   emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'>
 }

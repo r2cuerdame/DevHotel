@@ -7,24 +7,13 @@ type ToolContent =
   | { type: 'image'; data: string; mimeType: string }
 type ToolResult = { content: ToolContent[]; isError?: boolean }
 
-/** The phone screen as raw pixels via in-room adb — no host SDK, no noVNC letterboxing. */
-const SCREENCAP_CMD =
-  "adb connect localhost:5555 >/dev/null 2>&1; adb -s localhost:5555 exec-out screencap -p | base64 | tr -d '\\n'"
-
-async function screenshotContent(client: import('./client').ControlClient, roomId: string): Promise<ToolContent> {
-  const result = (await client.execInRoom(roomId, ['sh', '-lc', SCREENCAP_CMD], 60_000)) as {
-    code: number
-    stdout: string
-    stderr: string
-  }
-  const data = result.stdout.trim()
-  if (result.code !== 0 || data.length < 100) {
-    throw new Error(
-      `screen capture failed (exit ${result.code}): ${result.stderr.slice(-200) || 'empty image'} — ` +
-        'the room must be an awake Android room with its emulator running; apps using FLAG_SECURE block capture'
-    )
-  }
-  return { type: 'image', data, mimeType: 'image/png' }
+async function screenshotContent(
+  client: import('./client').ControlClient,
+  roomId: string,
+  mode: 'auto' | 'screen' = 'auto'
+): Promise<ToolContent> {
+  const shot = await client.screenshot(roomId, mode)
+  return { type: 'image', data: shot.png, mimeType: 'image/png' }
 }
 
 export interface ToolDef {
@@ -123,7 +112,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr.',
+        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
@@ -226,11 +215,14 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_screenshot',
       description:
-        "Capture the Android room's phone screen and return it as an image — clean device pixels via in-room adb, no host SDK and no noVNC letterboxing. The room must be awake with its emulator running.",
-      schema: { roomId: zRoomId },
-      handler: async (a: { roomId: string }): Promise<ToolResult> => {
+        "Capture the Android room's phone screen and return it as an image. Default 'auto' uses sharp guest-side screencap; pass mode 'screen' to grab the emulator display instead — that also captures apps that set FLAG_SECURE. The room must be awake.",
+      schema: {
+        roomId: zRoomId,
+        mode: z.enum(['auto', 'screen']).optional().describe("'screen' captures the display output, including FLAG_SECURE apps")
+      },
+      handler: async (a: { roomId: string; mode?: 'auto' | 'screen' }): Promise<ToolResult> => {
         try {
-          return { content: [await screenshotContent(await getClient(), a.roomId)] }
+          return { content: [await screenshotContent(await getClient(), a.roomId, a.mode ?? 'auto')] }
         } catch (err) {
           return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
         }

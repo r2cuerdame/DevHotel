@@ -130,6 +130,12 @@ export class ControlClient {
   hotelStatus() {
     return this.req<unknown>('GET', '/v1/status')
   }
+  screenshot(roomId: string, mode: 'auto' | 'screen' = 'auto') {
+    return this.req<{ png: string; source: 'adb' | 'screen' }>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/screenshot?mode=${mode}`
+    )
+  }
   pullFile(roomId: string, path: string) {
     return this.req<{ path: string; size: number; contentBase64: string }>(
       'GET',

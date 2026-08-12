@@ -18,7 +18,7 @@ import type {
 } from '@devhotel/shared'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
-import { EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
+import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -858,6 +858,28 @@ export class RoomOrchestrator {
     }
     this.markWorkspaceModified(roomId)
     return { path: safePath, size: content.byteLength }
+  }
+
+  /**
+   * Phone screen as base64 PNG. 'auto' prefers the sharp guest-side screencap;
+   * 'screen' grabs the X display instead, which also shows FLAG_SECURE apps
+   * (exactly what the preview shows).
+   */
+  async androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
+    const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+    if (!awake) throw new Error('Wake the room before taking a screenshot')
+    if (mode !== 'screen') {
+      const result = await this.backend.execInRoom(
+        roomId,
+        ['sh', '-lc', `adb -s ${EMULATOR_ADB_SERIAL} exec-out screencap -p | base64 | tr -d '\\n'`],
+        { timeoutMs: 60_000 }
+      )
+      const png = result.stdout.trim()
+      if (result.code === 0 && png.length > 100) return { png, source: 'adb' }
+    }
+    return { png: await this.backend.captureEmulatorScreen(roomId), source: 'screen' }
   }
 
   /** One-call answer to "is DevHotel ready and what is running" for agents. */

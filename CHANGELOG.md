@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Phone-first Android rooms
+
+- The Android room bar shows the device (profile · Android version · AOSP) instead of a meaningless vnc URL; browser back/forward hide, reload stays.
+- Phone navigation strip above the screen: Back / Home / Recents, sent as in-room adb key events.
+- Screen orientation (portrait/landscape) joins device/OS/resolution in Stack — landscape rotates the whole pipeline (X screen 1140×540, `hw.initialOrientation`, fit daemon, preview aspect), undoable, and settable over MCP.
+- One emulator no longer appears as two adb serials: DevHotel targets the auto-detected `emulator-5554` and never `adb connect`s, so Gradle instrumentation runs once.
+- `android_screenshot` gained mode `'screen'`: an X-display grab that also captures FLAG_SECURE apps; `'auto'` prefers the sharper guest-side screencap. Both are served by `GET /v1/rooms/:id/screenshot`.
+
 ### Agent field-report fixes (docs/feedback/2026-08-12-agent-field-reports.md)
 
 - **`hotel_status`** MCP tool + `GET /v1/status`: one call for app version, backend health, gateway ports/routes, and every room with provider/status/domain/URL and live emulator state.

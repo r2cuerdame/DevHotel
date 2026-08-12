@@ -64,7 +64,12 @@ export const EMULATOR_DEFAULT_DEVICE = 'Samsung Galaxy S10'
 export const EMULATOR_DEFAULT_VERSION = '14.0'
 export const EMULATOR_IMAGE = emulatorImage(EMULATOR_DEFAULT_VERSION)
 export const EMULATOR_SCREEN_PORT = 6080
-export const EMULATOR_ADB_ADDR = 'localhost:5555'
+/**
+ * adb auto-detects the shared-netns emulator by its console port as
+ * emulator-5554. Never `adb connect localhost:5555` — that registers the SAME
+ * device under a second serial and Gradle instrumentation runs twice.
+ */
+export const EMULATOR_ADB_SERIAL = 'emulator-5554'
 export const EMULATOR_SCREEN_WIDTH = 540
 export const EMULATOR_SCREEN_HEIGHT = 1140
 /** Where createEmulator stages the AVD override; docker-android appends it to config.ini at AVD creation. */
