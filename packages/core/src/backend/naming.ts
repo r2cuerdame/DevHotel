@@ -127,17 +127,24 @@ export function emulatorAvdOverride(
 ): string {
   const lcd = EMULATOR_DEVICE_LCD[device ?? EMULATOR_DEFAULT_DEVICE] ?? EMULATOR_DEVICE_LCD[EMULATOR_DEFAULT_DEVICE]!
   const scale = EMULATOR_RESOLUTION_SCALE[resolution]
+  const landscape = orientation === 'landscape'
   const lines = ['# DevHotel AVD overrides']
-  if (scale !== 1) {
+  if (scale !== 1 || landscape) {
     const even = (value: number): number => 2 * Math.round((value * scale) / 2)
+    const width = even(lcd.width)
+    const height = even(lcd.height)
     lines.push(
-      // reduced guest LCD: the single biggest speed lever under software rendering
-      `hw.lcd.width=${even(lcd.width)}`,
-      `hw.lcd.height=${even(lcd.height)}`,
+      // A landscape Room needs a landscape-shaped panel. Android takes its
+      // orientation from the panel and qemu keeps the panel's aspect ratio, so
+      // hw.initialOrientation on a portrait panel leaves a portrait device
+      // stranded in a wide screen — swapping the axes is what actually rotates.
+      // Reduced pixels remain the biggest speed lever under software rendering.
+      `hw.lcd.width=${landscape ? height : width}`,
+      `hw.lcd.height=${landscape ? width : height}`,
       `hw.lcd.density=${even(lcd.density)}`
     )
   }
-  if (orientation === 'landscape') lines.push('hw.initialOrientation=landscape')
+  if (landscape) lines.push('hw.initialOrientation=landscape')
   lines.push('')
   return lines.join('\n')
 }

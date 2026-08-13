@@ -179,8 +179,16 @@ describe('buildWebCreateArgs', () => {
     const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0', orientation: 'landscape' })
     expect(args).toContain('SCREEN_WIDTH=1140')
     expect(args).toContain('SCREEN_HEIGHT=540')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'landscape')).toContain('hw.initialOrientation=landscape')
+    // the panel itself must be landscape-shaped: Android reads its orientation
+    // from the panel, and qemu keeps the panel aspect no matter the X screen
+    const land = emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'landscape')
+    expect(land).toContain('hw.lcd.width=2280')
+    expect(land).toContain('hw.lcd.height=1080')
+    expect(land).toContain('hw.initialOrientation=landscape')
+    // native resolution still has to swap the axes, or landscape does nothing
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'native', 'landscape')).toContain('hw.lcd.width=3040')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).not.toContain('hw.initialOrientation')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).toContain('hw.lcd.width=1080')
     // portrait stays the default
     expect(buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })).toContain('SCREEN_WIDTH=540')
   })

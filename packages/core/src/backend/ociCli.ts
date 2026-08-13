@@ -67,10 +67,11 @@ function openboxFramelessRc(width: number, height: number): string {
 }
 
 /**
- * Replaces the image's wallpaper-only autostart: the noVNC backdrop stays
- * black and the fit daemon keeps the phone edge to edge for the room's life.
+ * Runs in addition to the image's own autostart (openbox executes the system
+ * one too, which paints the docker-android wallpaper) — so the fit daemon also
+ * paints the root window black rather than relying on this file to replace it.
  */
-const OPENBOX_AUTOSTART = `# DevHotel: black backdrop; keep the emulator phone window filling the screen
+const OPENBOX_AUTOSTART = `# DevHotel: keep the emulator phone window filling the screen on a black desk
 python3 "$HOME/.config/openbox/fit-emulator.py" >/dev/null 2>&1 &
 `
 
@@ -101,6 +102,8 @@ x11.XFree.argtypes = [ctypes.c_void_p]
 x11.XMoveResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_int] * 2 + [ctypes.c_uint] * 2
 x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 x11.XUnmapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XSetWindowBackground.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+x11.XClearWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 
@@ -172,6 +175,10 @@ def main():
     root = x11.XDefaultRootWindow(dpy)
     while True:
         try:
+            # the image paints a wallpaper on the root window; any letterboxing
+            # around the phone should read as black, not as a docker logo
+            x11.XSetWindowBackground(dpy, root, 0)
+            x11.XClearWindow(dpy, root)
             phone, strays = scan_windows(dpy, root)
             if phone:
                 attrs = XWindowAttributes()

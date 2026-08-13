@@ -16,6 +16,8 @@ Existing rooms carry fingerprints computed the old way, so their first sync afte
 
 - noVNC's own chrome — the pull-out control bar, its handle and status toasts — is hidden in the Room preview. The Room shows a phone screen; DevHotel's strip drives it.
 - **Rotate** joins Back / Home / Recents in the phone strip, stepping the device through its four orientations over adb. The emulator screen keeps the size the Room was created with, so a rotated device is letterboxed inside it — Quick change › Orientation resizes the screen itself for a full-size landscape Room.
+- **Landscape Rooms are actually landscape.** Setting Orientation rotated the X screen but left the guest portrait: `hw.initialOrientation` alone does not turn the device, because Android reads its orientation from the panel and qemu keeps the panel's aspect ratio. The AVD panel axes are now swapped for landscape Rooms (at every resolution preset, native included), so the device boots landscape and fills the screen instead of standing narrow in a wide frame with the emulator toolbar and the docker-android wallpaper showing beside it.
+- The letterbox around the phone is black in every case: openbox runs the image's wallpaper autostart alongside ours, so the fit daemon now paints the root window itself rather than assuming our autostart replaced it.
 
 - The Android room bar shows the device (profile · Android version · AOSP) instead of a meaningless vnc URL; browser back/forward hide, reload stays.
 - Phone navigation strip above the screen: Back / Home / Recents, sent as in-room adb key events.
