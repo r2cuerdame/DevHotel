@@ -74,6 +74,16 @@ describe('resilientClient', () => {
     expect(connects).toBe(2)
   })
 
+  it('is not thenable, so async plumbing cannot call a non-existent .then', async () => {
+    const wrapped = resilientClient(async () => client())
+    expect((wrapped as unknown as { then?: unknown }).then).toBeUndefined()
+    // returning it from an async function must yield the client itself,
+    // not attempt to resolve it as a promise (this crashed the stdio server)
+    const returned = await (async () => wrapped)()
+    expect(returned).toBe(wrapped)
+    await expect(returned.ping()).resolves.toEqual({ version: '0.4.1' })
+  })
+
   it('does not mask real API errors with a reconnect', async () => {
     let connects = 0
     const wrapped = resilientClient(async () => {

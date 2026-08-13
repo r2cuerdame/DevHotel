@@ -170,16 +170,26 @@ function isStaleConnection(err: unknown): boolean {
   return err instanceof Error && /control API 401/.test(err.message)
 }
 
+/** Real ControlClient methods; anything else must not be forwarded (see below). */
+const CLIENT_METHODS = new Set(
+  Object.getOwnPropertyNames(ControlClient.prototype).filter((name) => name !== 'constructor')
+)
+
 /**
  * A ControlClient that survives DevHotel app restarts: on a stale-connection
  * failure it re-reads control.json (fresh port/token) and retries once, so a
  * long-lived MCP session never needs a manual reconnect.
+ *
+ * Only real methods are forwarded. A proxy that answers *every* property with a
+ * function is thenable, so `return client` from an async function makes the
+ * runtime invoke `client.then(...)` — which ControlClient does not have, and the
+ * resulting unhandled rejection killed the stdio server on its first tool call.
  */
 export function resilientClient(connector: () => Promise<ControlClient> = connect): ControlClient {
   let inner: ControlClient | null = null
   return new Proxy({} as ControlClient, {
     get(_target, prop: string | symbol) {
-      if (typeof prop !== 'string') return undefined
+      if (typeof prop !== 'string' || !CLIENT_METHODS.has(prop)) return undefined
       return async (...args: unknown[]) => {
         inner ??= await connector()
         const call = async (client: ControlClient): Promise<unknown> =>
@@ -193,6 +203,9 @@ export function resilientClient(connector: () => Promise<ControlClient> = connec
           return await call(inner)
         }
       }
+    },
+    has(_target, prop) {
+      return typeof prop === 'string' && CLIENT_METHODS.has(prop)
     }
   })
 }
