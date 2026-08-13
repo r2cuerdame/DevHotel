@@ -1,4 +1,9 @@
 /** Monotonic high-water mark for Room-owned workspace volume generations. */
+/** Settings key holding the one previous workspace generation kept for recovery. */
+export function retainedWorkspaceGenKey(roomId: string): string {
+  return `retainedWorkspaceGen:${roomId}`
+}
+
 export function workspaceGenMaxKey(roomId: string): string {
   return `workspaceGenMax:${roomId}`
 }

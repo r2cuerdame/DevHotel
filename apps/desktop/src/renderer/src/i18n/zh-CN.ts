@@ -89,6 +89,8 @@ export const zhCN: Translation = {
   'working.resetBaseline': '重置基准',
   'working.baselineHint': '将当前房间文件设为比较基准，从而再次允许与主机同步。不会复制任何文件。',
   'working.baselineReset': '已将当前房间文件设为同步基准',
+  'working.agentSync': '允许代理从主机同步',
+  'working.agentSyncHint': '仅重新读取此房间已关联的文件夹，不读取其他路径，也从不写入主机。取消勾选即可撤销。',
 
   'settings.title': '设置',
   'settings.language': '语言',

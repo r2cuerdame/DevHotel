@@ -45,6 +45,7 @@ interface RoomRow {
 interface ExtraJson {
   services?: RoomServices
   os?: RoomOsSettings
+  agentHostSync?: boolean
   android?: {
     device: string
     version: string
@@ -89,6 +90,9 @@ function rowToRoom(row: RoomRow): RoomRecord {
     status: row.status as RoomStatus,
     services: parseExtra(row.extra).services ?? {},
     os: parseExtra(row.extra).os ?? { env: {} },
+    ...(parseExtra(row.extra).agentHostSync !== undefined
+      ? { agentHostSync: parseExtra(row.extra).agentHostSync }
+      : {}),
     ...(parseExtra(row.extra).android ? { android: parseExtra(row.extra).android } : {}),
     hostPort: row.host_port,
     createdAt: row.created_at,
@@ -199,7 +203,12 @@ export function roomsRepo(db: Db): RoomsRepo {
           r.createdAt,
           r.lastUsedAt,
           r.thumbPath,
-          JSON.stringify({ services: r.services ?? {}, os: r.os ?? { env: {} }, ...(r.android ? { android: r.android } : {}) }),
+          JSON.stringify({
+            services: r.services ?? {},
+            os: r.os ?? { env: {} },
+            ...(r.agentHostSync !== undefined ? { agentHostSync: r.agentHostSync } : {}),
+            ...(r.android ? { android: r.android } : {})
+          }),
         )
     },
     get(id) {
@@ -214,12 +223,18 @@ export function roomsRepo(db: Db): RoomsRepo {
     },
     update(id, patch) {
       const cols = patchToColumns(patch)
-      if (patch.services !== undefined || patch.os !== undefined || patch.android !== undefined) {
+      if (
+        patch.services !== undefined ||
+        patch.os !== undefined ||
+        patch.android !== undefined ||
+        patch.agentHostSync !== undefined
+      ) {
         const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
         const extra = parseExtra(row?.extra ?? '{}')
         if (patch.services !== undefined) extra.services = patch.services
         if (patch.os !== undefined) extra.os = patch.os
         if (patch.android !== undefined) extra.android = patch.android
+        if (patch.agentHostSync !== undefined) extra.agentHostSync = patch.agentHostSync
         cols['extra'] = JSON.stringify(extra)
       }
       const names = Object.keys(cols)

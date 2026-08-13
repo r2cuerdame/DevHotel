@@ -16,7 +16,8 @@ const api: IpcApi = {
     components: (roomId) => ipcRenderer.invoke(IPC.roomsComponents, roomId),
     syncFromHost: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsSyncFromHost, roomId, approvedHostPath),
     moveIntoHotel: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsMoveIntoHotel, roomId, approvedHostPath),
-    resetSyncBaseline: (roomId) => ipcRenderer.invoke(IPC.roomsResetSyncBaseline, roomId)
+    resetSyncBaseline: (roomId) => ipcRenderer.invoke(IPC.roomsResetSyncBaseline, roomId),
+    setAgentHostSync: (roomId, allowed) => ipcRenderer.invoke(IPC.roomsSetAgentHostSync, roomId, allowed)
   },
   packages: {
     search: (query, offset) => ipcRenderer.invoke(IPC.packagesSearch, query, offset)

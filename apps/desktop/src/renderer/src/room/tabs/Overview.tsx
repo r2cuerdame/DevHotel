@@ -187,6 +187,27 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
                 {t('working.moveIntoHotel')}
               </button>
             )}
+            {room.hostSyncEnabled && (
+              <label className="row small" style={{ gap: 6 }} title={t('working.agentSyncHint')}>
+                <input
+                  type="checkbox"
+                  checked={room.agentHostSync !== false}
+                  disabled={pending !== null}
+                  onChange={(event) => {
+                    const allowed = event.target.checked
+                    void run('grant', async () => {
+                      try {
+                        await api.rooms.setAgentHostSync(room.id, allowed)
+                        await Promise.all([refreshInspection(room.id), refreshRooms()])
+                      } catch (err) {
+                        toast('error', err instanceof Error ? err.message : String(err))
+                      }
+                    })
+                  }}
+                />
+                {t('working.agentSync')}
+              </label>
+            )}
             {room.workspaceMode === 'hotel' && room.hostSyncEnabled && room.syncStatus === 'modified' && (
               <button className="btn" disabled={pending !== null} title={t('working.baselineHint')} onClick={() => void resetBaseline()}>
                 {pending === 'baseline' ? t('common.applying') : t('working.resetBaseline')}

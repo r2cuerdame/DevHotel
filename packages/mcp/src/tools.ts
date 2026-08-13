@@ -286,7 +286,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'sync_from_host',
       description:
-        "Request an inbound sync of the room's linked Host folder into the Room-owned working state. DevHotel shows an approval dialog to the human — this call blocks until they Allow or Deny, and fails if declined, if the room has no Host link, or if it is asleep. The synced path is always the room's own linked folder; agents cannot choose paths.",
+        "Re-read the room's linked Host folder into the Room-owned working state. Runs under the room's inbound-sync grant (the human linked that folder when creating the room and can revoke agent sync per room), is journaled as the agent, and reads no other path — agents cannot choose paths. Fails if the grant is revoked, if the room has no Host link, if it is asleep, or if Room files drifted (see reset_sync_baseline). The generation it replaces is retained for recovery.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
     },

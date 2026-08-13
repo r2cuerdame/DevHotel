@@ -163,6 +163,9 @@ export function registerIpc(opts: {
     orch.moveIntoHotel(reauthorizeRoomSource(roomId, selectedPath), 'user')
   )
   handle(IPC.roomsResetSyncBaseline, (_event, roomId) => orch.resetSyncBaseline(zRoomId.parse(roomId), 'user'))
+  handle(IPC.roomsSetAgentHostSync, (_event, roomId, allowed) =>
+    orch.setAgentHostSync(zRoomId.parse(roomId), allowed === true, 'user')
+  )
   handle(IPC.packagesSearch, (_event, query, offset) =>
     searchNpmRegistry(zPackageSearchQuery.parse(query), fetch, zPackageSearchOffset.parse(offset ?? 0))
   )

@@ -46,7 +46,7 @@ import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
 import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
-import { nextWorkspaceVolumeRevision, workspaceGenMaxKey } from './workingState'
+import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey } from './workingState'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
@@ -945,6 +945,30 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
   }
 
+  /** Revoke or restore this Room's inbound Host-sync grant for agents. */
+  setAgentHostSync(roomId: string, allowed: boolean, actor: Actor): RoomRecord {
+    const room = this.mustGet(roomId)
+    if (room.sourceType !== 'linked-folder') throw new Error('Only Rooms linked to a Host folder have a sync grant')
+    this.rooms.update(roomId, { agentHostSync: allowed })
+    this.appendJournal(
+      roomId,
+      'agent-host-sync-grant',
+      allowed ? 'Agents may sync this Room from its Host folder' : 'Agent Host sync revoked for this Room',
+      actor,
+      'Working State',
+      { agentHostSync: room.agentHostSync ?? true },
+      { agentHostSync: allowed }
+    )
+    this.emit(roomId, 'status')
+    return this.mustGet(roomId)
+  }
+
+  /** True when an agent may run inbound sync without a fresh human action. */
+  agentHostSyncAllowed(roomId: string): boolean {
+    const room = this.mustGet(roomId)
+    return room.sourceType === 'linked-folder' && room.hostSyncEnabled && room.agentHostSync !== false
+  }
+
   moveIntoHotel(roomId: string, actor: Actor): Promise<RoomRecord> {
     return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, true))
   }
@@ -987,8 +1011,17 @@ export class RoomOrchestrator {
   }
 
   private async replaceWorkspaceFromHostLocked(roomId: string, actor: Actor, migrateLegacy: boolean): Promise<RoomRecord> {
-    if (actor !== 'user') throw new Error('Importing Host files requires an explicit user action')
     const room = this.mustGet(roomId)
+    // Moving a legacy Room into the Hotel rewires where it executes: always a
+    // human decision. Inbound sync re-reads the folder the human already linked
+    // to this Room, so agents may run it under the Room's revocable grant.
+    if (actor !== 'user' && (migrateLegacy || !this.agentHostSyncAllowed(roomId))) {
+      throw new Error(
+        migrateLegacy
+          ? 'Moving a Room into the Hotel requires an explicit user action'
+          : 'Agent Host sync is revoked for this Room. Re-enable it in the Room, or run the sync yourself.'
+      )
+    }
     if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
       throw new Error('This Room is detached from its original Host folder')
     }
@@ -1088,11 +1121,22 @@ export class RoomOrchestrator {
     this.emit(roomId, 'change')
     this.emit(roomId, 'status')
 
+    // Keep the generation this sync replaced: it holds the Room's own edits and
+    // its .git, so a sync that turns out to be wrong stays recoverable from the
+    // retained volume. Only the generation kept by the *previous* sync is
+    // dropped, so at most one spare generation ever accumulates.
     if (room.workspaceMode === 'hotel') {
-      try {
-        await this.backend.removeWorkspaceVolume(roomId, room.workspaceVolumeRevision)
-      } catch (err) {
-        this.olog(roomId, `old workspace generation retained for cleanup: ${err instanceof Error ? err.message : String(err)}`)
+      const retainedKey = retainedWorkspaceGenKey(roomId)
+      const previouslyRetained = this.settings.get(retainedKey)
+      this.settings.set(retainedKey, String(room.workspaceVolumeRevision))
+      this.olog(roomId, `previous workspace generation r${room.workspaceVolumeRevision} retained for recovery`)
+      const stale = previouslyRetained === null ? null : Number.parseInt(previouslyRetained, 10)
+      if (stale !== null && Number.isSafeInteger(stale) && stale !== room.workspaceVolumeRevision) {
+        try {
+          await this.backend.removeWorkspaceVolume(roomId, stale)
+        } catch (err) {
+          this.olog(roomId, `stale workspace generation r${stale} retained for cleanup: ${err instanceof Error ? err.message : String(err)}`)
+        }
       }
     }
     return updated

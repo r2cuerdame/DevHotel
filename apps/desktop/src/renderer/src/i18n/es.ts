@@ -89,6 +89,8 @@ export const es: Translation = {
   'working.resetBaseline': 'Restablecer base',
   'working.baselineHint': 'Acepta los archivos actuales de la habitación como punto de comparación para permitir de nuevo la sincronización con el Host. No se copia nada.',
   'working.baselineReset': 'Archivos de la habitación aceptados como base de sincronización',
+  'working.agentSync': 'Los agentes pueden sincronizar desde el Host',
+  'working.agentSyncHint': 'Vuelve a leer solo la carpeta vinculada a esta habitación. No lee ninguna otra ruta ni escribe nunca en el Host. Desmarca para revocar.',
 
   'settings.title': 'Ajustes',
   'settings.language': 'Idioma',

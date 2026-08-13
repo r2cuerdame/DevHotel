@@ -89,6 +89,8 @@ export const de: Translation = {
   'working.resetBaseline': 'Basis zurücksetzen',
   'working.baselineHint': 'Akzeptiert die aktuellen Room-Dateien als Vergleichspunkt, damit die Host-Synchronisierung wieder erlaubt ist. Es wird nichts kopiert.',
   'working.baselineReset': 'Room-Dateien als Synchronisierungsbasis übernommen',
+  'working.agentSync': 'Agenten dürfen vom Host synchronisieren',
+  'working.agentSyncHint': 'Liest nur den mit diesem Room verknüpften Ordner erneut. Kein anderer Pfad wird gelesen, und auf den Host wird nie geschrieben. Zum Widerrufen abwählen.',
 
   'settings.title': 'Einstellungen',
   'settings.language': 'Sprache',

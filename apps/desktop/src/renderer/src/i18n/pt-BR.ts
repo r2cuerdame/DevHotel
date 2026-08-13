@@ -89,6 +89,8 @@ export const ptBR: Translation = {
   'working.resetBaseline': 'Redefinir base',
   'working.baselineHint': 'Aceita os arquivos atuais do quarto como ponto de comparação para permitir a sincronização com o Host novamente. Nada é copiado.',
   'working.baselineReset': 'Arquivos do quarto aceitos como base de sincronização',
+  'working.agentSync': 'Agentes podem sincronizar do Host',
+  'working.agentSyncHint': 'Relê apenas a pasta vinculada a este quarto. Nenhum outro caminho é lido e nada é gravado no Host. Desmarque para revogar.',
 
   'settings.title': 'Configurações',
   'settings.language': 'Idioma',

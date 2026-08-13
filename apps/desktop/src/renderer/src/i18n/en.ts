@@ -93,6 +93,8 @@ export const en = {
   'working.resetBaseline': 'Reset baseline',
   'working.baselineHint': 'Accept the current Room files as the comparison point so Host sync is allowed again. Nothing is copied.',
   'working.baselineReset': 'Room files accepted as the sync baseline',
+  'working.agentSync': 'Agents may sync from Host',
+  'working.agentSyncHint': 'Lets agents re-read this Room\u2019s own linked folder without asking each time. It reads no other path and never writes to the Host. Uncheck to revoke.',
 
   // Settings
   'settings.title': 'Settings',

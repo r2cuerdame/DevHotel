@@ -29,8 +29,13 @@ room's Changes list. Host boundaries hold:
   or delete Host-linked ones.
 - Agent mutations on `legacy-host-bind` rooms are refused until the user moves
   the room into the Hotel.
-- `sync-from-host` only *requests*: DevHotel raises an approval dialog and the
-  call blocks until the human allows (runs as `user`) or denies (`403`).
+- `sync-from-host` runs under the Room's **inbound-sync grant**: the human
+  linked that folder when creating the Room and can revoke agent sync per Room
+  ("Agents may sync from Host" in the Working state card) — revoked returns
+  `403`. It re-reads only `room.sourceRef`, never a path from the request, is
+  journaled as `agent`, and retains the replaced workspace generation so a
+  wrong sync stays recoverable. Moving a legacy Room into the Hotel remains
+  user-only.
 
 ## Endpoints
 

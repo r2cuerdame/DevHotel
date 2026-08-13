@@ -89,6 +89,8 @@ export const fr: Translation = {
   'working.resetBaseline': 'Réinitialiser la référence',
   'working.baselineHint': 'Accepte les fichiers actuels de la chambre comme point de comparaison afin d’autoriser à nouveau la synchronisation depuis le Host. Rien n’est copié.',
   'working.baselineReset': 'Fichiers de la chambre acceptés comme référence de synchronisation',
+  'working.agentSync': 'Les agents peuvent synchroniser depuis le Host',
+  'working.agentSyncHint': 'Relit uniquement le dossier lié à cette chambre. Aucun autre chemin n\u2019est lu et rien n\u2019est écrit sur le Host. Décochez pour révoquer.',
 
   'settings.title': 'Réglages',
   'settings.language': 'Langue',

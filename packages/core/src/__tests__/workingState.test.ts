@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { srcVolume } from '../backend/naming'
 import { depsGenKey, depsGenMaxKey, depsVolumeForGen } from '../changes/definitions/deps'
 import { RoomOrchestrator } from '../orchestrator'
+import { retainedWorkspaceGenKey } from '../workingState'
 import { buildDiagnostic } from '../diagnostics/bundle'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
@@ -118,6 +119,47 @@ describe('Room-owned working state', () => {
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
   })
 
+  it('lets agents sync under the Room grant, refuses once revoked, and never lets them migrate', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'same-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'same-fingerprint'
+
+    expect(orch.agentHostSyncAllowed(room.id)).toBe(true)
+    const synced = await orch.syncFromHost(room.id, 'agent')
+    expect(synced.syncStatus).toBe('synced')
+    // journaled honestly as the agent, not laundered as the user
+    expect(orch.listChanges(room.id)[0]).toMatchObject({ kind: 'sync-from-host', actor: 'agent' })
+
+    orch.setAgentHostSync(room.id, false, 'user')
+    expect(orch.agentHostSyncAllowed(room.id)).toBe(false)
+    orch.rooms.update(room.id, { workspaceFingerprint: 'same-fingerprint' })
+    await expect(orch.syncFromHost(room.id, 'agent')).rejects.toThrow(/revoked/)
+    // the human can still sync the same Room themselves
+    await expect(orch.syncFromHost(room.id, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+  })
+
+  it('never lets an agent move a legacy Host-bound Room into the Hotel', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'legacy-host-bind',
+      syncStatus: 'legacy',
+      hostSyncEnabled: true
+    })
+    orch.rooms.create(room)
+    await expect(orch.moveIntoHotel(room.id, 'agent')).rejects.toThrow(/explicit user action/)
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
   it('reset baseline accepts the current Room files and unblocks the refused sync', async () => {
     const room = makeRoom({
       sourceType: 'linked-folder',
@@ -180,7 +222,18 @@ describe('Room-owned working state', () => {
     expect(synced.syncStatus).toBe('synced')
     expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r2`)
     expect(backend.lastWebSpec?.workspaceVolumeRevision).toBe(2)
+    // the replaced generation survives this sync so a wrong sync is recoverable
+    expect(backend.calls).not.toContain('removeWorkspaceVolume:r1')
+    expect(orch.settings.get(retainedWorkspaceGenKey(room.id))).toBe('1')
+
+    // ...and the next sync drops it, so only one spare generation is kept
+    backend.workspaceFingerprintValue = 'same-fingerprint'
+    orch.rooms.update(room.id, { workspaceFingerprint: 'same-fingerprint' })
+    const again = await orch.syncFromHost(room.id, 'user')
+    expect(again.workspaceVolumeRevision).toBe(3)
     expect(backend.calls).toContain('removeWorkspaceVolume:r1')
+    expect(backend.calls).not.toContain('removeWorkspaceVolume:r2')
+    expect(orch.settings.get(retainedWorkspaceGenKey(room.id))).toBe('2')
   })
 
   it('never reuses a failed Host-sync workspace generation', async () => {

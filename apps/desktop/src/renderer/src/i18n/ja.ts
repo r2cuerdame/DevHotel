@@ -89,6 +89,8 @@ export const ja: Translation = {
   'working.resetBaseline': '基準をリセット',
   'working.baselineHint': '現在のルームのファイルを比較基準として認め、Host 同期を再び許可します。コピーは行われません。',
   'working.baselineReset': '現在のルームのファイルを同期の基準に設定しました',
+  'working.agentSync': 'エージェントの Host 同期を許可',
+  'working.agentSyncHint': 'このルームに紐づくフォルダのみを再読み込みします。他のパスは読まず、Host への書き込みもしません。解除すると即座に禁止されます。',
 
   'settings.title': '設定',
   'settings.language': '言語',

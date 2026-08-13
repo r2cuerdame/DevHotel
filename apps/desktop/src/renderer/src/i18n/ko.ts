@@ -87,6 +87,8 @@ export const ko: Translation = {
   'working.resetBaseline': '기준 재설정',
   'working.baselineHint': '현재 Room 파일을 비교 기준으로 인정해 Host 동기화를 다시 허용합니다. 복사는 일어나지 않습니다.',
   'working.baselineReset': '현재 Room 파일을 동기화 기준으로 설정했습니다',
+  'working.agentSync': '에이전트의 Host 동기화 허용',
+  'working.agentSyncHint': '이 Room에 연결된 폴더만 다시 읽습니다. 다른 경로는 읽지 않고 Host에 쓰지도 않습니다. 해제하면 즉시 차단됩니다.',
 
   'settings.title': '설정',
   'settings.language': '언어',

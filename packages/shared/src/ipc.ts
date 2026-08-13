@@ -20,6 +20,7 @@ export const IPC = {
   roomsSyncFromHost: 'rooms:syncFromHost',
   roomsMoveIntoHotel: 'rooms:moveIntoHotel',
   roomsResetSyncBaseline: 'rooms:resetSyncBaseline',
+  roomsSetAgentHostSync: 'rooms:setAgentHostSync',
   packagesSearch: 'packages:search',
   hotelGithubStatus: 'hotel:github:status',
   hotelGithubInstall: 'hotel:github:install',
@@ -169,6 +170,8 @@ export interface IpcApi {
     moveIntoHotel(roomId: string, approvedHostPath: string): Promise<RoomRecord>
     /** accept the Room's current files as the Host sync baseline */
     resetSyncBaseline(roomId: string): Promise<RoomRecord>
+    /** allow or revoke agent-initiated inbound Host sync for this Room */
+    setAgentHostSync(roomId: string, allowed: boolean): Promise<RoomRecord>
   }
   packages: {
     search(query: string, offset?: number): Promise<RegistryPackageInfo[]>

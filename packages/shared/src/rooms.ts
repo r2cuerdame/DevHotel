@@ -59,6 +59,13 @@ export interface RoomRecord {
   status: RoomStatus
   services: RoomServices
   os: RoomOsSettings
+  /**
+   * Inbound Host-sync grant for agents (goal.md §5.11): scoped to this Room and
+   * to reading its own linked folder, revocable at any time from the Room.
+   * Defaults to allowed — the human already chose this folder when creating the
+   * Room, and sync never reads any other path.
+   */
+  agentHostSync?: boolean
   /** android rooms: emulator device/OS/resolution/orientation selection */
   android?: { device: string; version: string; resolution?: EmulatorResolution; orientation?: EmulatorOrientation }
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */

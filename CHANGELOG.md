@@ -41,9 +41,15 @@ Existing rooms carry fingerprints computed the old way, so their first sync afte
 - Device selector honesty: hints now state profiles mimic screen size/shape only — the runtime is an AOSP emulator, not Samsung One UI or a physical device.
 - The full five-agent feedback triage (exclusive lease, snapshot reset, streamed exec output, failure bundles, artifact receipts, android clone, Gradle queue, newer images…) is recorded as the working backlog.
 
-### Agent-requested, human-approved Host sync
+### Host sync is a standing Room grant, not a popup
 
-- New MCP tool `sync_from_host`: an agent may *request* an inbound sync of a room's linked Host folder; DevHotel focuses its window and shows an approval dialog. Only after the human clicks **Allow** does the sync run — as actor `user`, on the room's own linked path (agents can never supply a path). Declining returns a clear error to the agent. This is the first concrete goal.md §5.11 grant flow: the agent asks, the person decides.
+The modal that interrupted every agent sync is gone. Its job is done by a persisted, revocable grant instead — closer to goal.md §5.11, which describes grants with scope, actor and revocation rather than per-call prompts.
+
+- **No dialog.** `sync_from_host` runs under the Room's inbound-sync grant. The human already chose that folder when creating the Room, sync re-reads only `room.sourceRef` (agents can neither supply a path nor create linked-folder Rooms), and it never writes to the Host.
+- **Revocable per Room**: "Agents may sync from Host" in the Working state card. Revoked ⇒ `403` for agents, while the user's own sync button keeps working. The toggle is journaled.
+- **Honest audit**: agent syncs are recorded as actor `agent`. They were previously journaled as `user` because the dialog had approved them — the trail said a person acted when an agent did.
+- **Recoverable**: a successful sync used to delete the workspace generation it replaced, taking Room-side edits and `.git` with it. The replaced generation is now retained until the following sync, so exactly one spare stays available for recovery.
+- Moving a legacy Host-bound Room into the Hotel stays user-only — it rewires where the Room executes.
 
 ## 0.4.2 — 2026-08-11
 
