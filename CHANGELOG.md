@@ -14,6 +14,9 @@ Existing rooms carry fingerprints computed the old way, so their first sync afte
 
 ### Phone-first Android rooms
 
+- noVNC's own chrome — the pull-out control bar, its handle and status toasts — is hidden in the Room preview. The Room shows a phone screen; DevHotel's strip drives it.
+- **Rotate** joins Back / Home / Recents in the phone strip, stepping the device through its four orientations over adb. The emulator screen keeps the size the Room was created with, so a rotated device is letterboxed inside it — Quick change › Orientation resizes the screen itself for a full-size landscape Room.
+
 - The Android room bar shows the device (profile · Android version · AOSP) instead of a meaningless vnc URL; browser back/forward hide, reload stays.
 - Phone navigation strip above the screen: Back / Home / Recents, sent as in-room adb key events.
 - Screen orientation (portrait/landscape) joins device/OS/resolution in Stack — landscape rotates the whole pipeline (X screen 1140×540, `hw.initialOrientation`, fit daemon, preview aspect), undoable, and settable over MCP.

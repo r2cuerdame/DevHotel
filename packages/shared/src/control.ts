@@ -149,9 +149,9 @@ export const zAgentCloneBody = z.object({
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 
-/** Physical navigation keys the Android preview strip can send to the emulator. */
-export const zAndroidNavKey = z.enum(['back', 'home', 'recents'])
-export type AndroidNavKey = z.infer<typeof zAndroidNavKey>
+/** Phone controls the Android preview strip can drive on the emulator. */
+export const zAndroidAction = z.enum(['back', 'home', 'recents', 'rotate'])
+export type AndroidAction = z.infer<typeof zAndroidAction>
 
 export const zRendererCreateRoomInput = zCreateRoomInput.omit({ actor: true }).strict()
 export type RendererCreateRoomInput = z.infer<typeof zRendererCreateRoomInput>

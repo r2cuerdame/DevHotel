@@ -7,7 +7,7 @@ import {
   zAutostartEnabled,
   zChangeId,
   zExternalHttpUrl,
-  zAndroidNavKey,
+  zAndroidAction,
   zGitHubToken,
   zHostPath,
   zLogKind,
@@ -321,16 +321,20 @@ export function registerIpc(opts: {
   })
 
   /* preview */
-  /* android phone navigation keys — pressed from the preview strip */
-  handle(IPC.androidKey, (_event, roomId, key) => {
+  /* android phone controls — pressed from the preview strip */
+  handle(IPC.androidAction, (_event, roomId, action) => {
     const safeRoomId = zRoomId.parse(roomId)
-    const keycode = { back: 4, home: 3, recents: 187 }[zAndroidNavKey.parse(key)]
-    return orch.execInRoom(
-      safeRoomId,
-      ['sh', '-lc', `adb -s emulator-5554 shell input keyevent ${keycode}`],
-      { timeoutMs: 20_000 },
-      'user'
-    )
+    const safeAction = zAndroidAction.parse(action)
+    const keycodes = { back: 4, home: 3, recents: 187 } as const
+    // Rotation steps the guest through its four orientations. The emulator
+    // screen keeps the size the Room was created with, so a rotated device is
+    // letterboxed inside it — Stack's orientation setting resizes the screen
+    // itself for a full-size landscape Room.
+    const command =
+      safeAction === 'rotate'
+        ? "adb -s emulator-5554 shell 'settings put system accelerometer_rotation 0; r=$(settings get system user_rotation); case \"$r\" in 0|1|2|3) ;; *) r=0 ;; esac; settings put system user_rotation $(((r + 1) % 4))'"
+        : `adb -s emulator-5554 shell input keyevent ${keycodes[safeAction]}`
+    return orch.execInRoom(safeRoomId, ['sh', '-lc', command], { timeoutMs: 20_000 }, 'user')
   })
 
   handle(IPC.previewSetBounds, (_event, roomId, bounds) =>

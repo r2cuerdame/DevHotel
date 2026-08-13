@@ -22,6 +22,20 @@ import {
 import { PreviewSyncGuard } from './previewSync'
 
 const THUMB_INTERVAL_MS = 30_000
+
+/**
+ * The Android preview is a phone screen, not a VNC client: noVNC's own control
+ * bar, its pull-out handle and its status toasts are chrome the Room never
+ * needs — DevHotel's own strip drives the device. Injected per load because
+ * Chromium drops inserted CSS on navigation.
+ */
+const NOVNC_CHROME_CSS = `
+  #noVNC_control_bar_anchor,
+  #noVNC_hint_anchor,
+  #noVNC_control_bar_hint,
+  #noVNC_status { display: none !important; }
+  html, body, #noVNC_container { background: #000 !important; }
+`
 // The split is manual (renderer button); until the renderer sends its stored
 // layout the preview stays a single full pane.
 const DEFAULT_LAYOUT: PreviewLayout = {
@@ -269,6 +283,11 @@ export class PreviewManager {
     }
     wc.on('will-navigate', denyOutsideRoom)
     wc.on('will-redirect', denyOutsideRoom)
+    if (this.orch.rooms.get(roomId)?.provider === 'android') {
+      wc.on('dom-ready', () => {
+        void wc.insertCSS(NOVNC_CHROME_CSS).catch(() => undefined)
+      })
+    }
     if (side === 'left') {
       wc.on('devtools-closed', () => {
         if (this.devtools) this.handleDevToolsGone(this.devtools, roomId)

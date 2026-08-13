@@ -318,6 +318,8 @@ export const en = {
   'android.navBack': 'Back',
   'android.navHome': 'Home',
   'android.navRecents': 'Recents',
+  'android.navRotate': 'Rotate',
+  'android.navRotateHint': 'Turn the device 90\u00b0. The emulator screen keeps its size, so a rotated device is letterboxed \u2014 set Orientation in Quick change for a full-size landscape Room.',
   'android.orientation': 'Orientation',
   'android.portrait': 'Portrait',
   'android.landscape': 'Landscape',

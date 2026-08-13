@@ -301,6 +301,8 @@ export const ptBR: Translation = {
   'android.navBack': 'Voltar',
   'android.navHome': 'Início',
   'android.navRecents': 'Recentes',
+  'android.navRotate': 'Girar',
+  'android.navRotateHint': 'Gira o dispositivo 90\u00b0. A tela do emulador mantém o tamanho, então um dispositivo girado fica com bordas \u2014 use Orientação em Mudança rápida para um quarto em paisagem em tela cheia.',
   'android.orientation': 'Orientação',
   'android.portrait': 'Retrato',
   'android.landscape': 'Paisagem',

@@ -296,6 +296,8 @@ export const zhCN: Translation = {
   'android.navBack': '返回',
   'android.navHome': '主屏',
   'android.navRecents': '最近任务',
+  'android.navRotate': '旋转',
+  'android.navRotateHint': '将设备旋转 90 度。模拟器屏幕尺寸不变，因此旋转后会出现黑边 \u2014 如需全屏横屏房间，请在快速更改中设置屏幕方向。',
   'android.orientation': '屏幕方向',
   'android.portrait': '竖屏',
   'android.landscape': '横屏',

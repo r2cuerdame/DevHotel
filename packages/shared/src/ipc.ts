@@ -52,7 +52,7 @@ export const IPC = {
   footprint: 'app:footprint',
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
-  androidKey: 'android:key',
+  androidAction: 'android:action',
   previewSetBounds: 'preview:setBounds',
   previewSetVisible: 'preview:setVisible',
   previewDetach: 'preview:detach',
@@ -223,8 +223,8 @@ export interface IpcApi {
     cleanUninstall(): Promise<boolean>
   }
   android: {
-    /** press a phone navigation key on the room's emulator */
-    key(roomId: string, key: import('./control').AndroidNavKey): Promise<void>
+    /** drive a phone control (navigation key or screen rotation) on the room's emulator */
+    action(roomId: string, action: import('./control').AndroidAction): Promise<void>
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

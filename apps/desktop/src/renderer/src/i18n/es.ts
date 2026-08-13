@@ -302,6 +302,8 @@ export const es: Translation = {
   'android.navBack': 'Atrás',
   'android.navHome': 'Inicio',
   'android.navRecents': 'Recientes',
+  'android.navRotate': 'Rotar',
+  'android.navRotateHint': 'Gira el dispositivo 90\u00b0. La pantalla del emulador mantiene su tamaño, así que un dispositivo rotado queda con bordes: cambia la Orientación en Cambio rápido para una habitación horizontal a pantalla completa.',
   'android.orientation': 'Orientación',
   'android.portrait': 'Vertical',
   'android.landscape': 'Horizontal',

@@ -301,6 +301,8 @@ export const ru: Translation = {
   'android.navBack': 'Назад',
   'android.navHome': 'Домой',
   'android.navRecents': 'Недавние',
+  'android.navRotate': 'Повернуть',
+  'android.navRotateHint': 'Поворачивает устройство на 90\u00b0. Размер экрана эмулятора не меняется, поэтому повёрнутое устройство отображается с полями \u2014 для полноэкранной альбомной комнаты измените ориентацию в быстрых изменениях.',
   'android.orientation': 'Ориентация',
   'android.portrait': 'Портретная',
   'android.landscape': 'Альбомная',

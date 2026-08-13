@@ -302,6 +302,8 @@ export const fr: Translation = {
   'android.navBack': 'Retour',
   'android.navHome': 'Accueil',
   'android.navRecents': 'Applications récentes',
+  'android.navRotate': 'Pivoter',
+  'android.navRotateHint': 'Fait pivoter l\u2019appareil de 90\u00b0. L\u2019écran de l\u2019émulateur garde sa taille, un appareil pivoté apparaît donc avec des bandes \u2014 réglez l\u2019Orientation dans Modification rapide pour une chambre paysage plein écran.',
   'android.orientation': 'Orientation',
   'android.portrait': 'Portrait',
   'android.landscape': 'Paysage',

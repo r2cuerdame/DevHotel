@@ -299,6 +299,8 @@ export const ko: Translation = {
   'android.navBack': '뒤로',
   'android.navHome': '홈',
   'android.navRecents': '최근 앱',
+  'android.navRotate': '회전',
+  'android.navRotateHint': '기기를 90도 돌립니다. 에뮬레이터 화면 크기는 그대로라 회전하면 여백이 생깁니다 \u2014 가로 화면을 꽉 채우려면 빠른 변경의 화면 방향을 바꾸세요.',
   'android.orientation': '화면 방향',
   'android.portrait': '세로',
   'android.landscape': '가로',

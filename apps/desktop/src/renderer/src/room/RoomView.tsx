@@ -152,14 +152,21 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
         <div className={`preview-workbench${detailsOpen ? ' preview-host-hidden' : ''}`}>
           {showSite && android && (
             <div className="preview-device-strip android-nav-strip" aria-label={t('android.navKeys')}>
-              <button className="btn" onClick={() => void api.android.key(roomId, 'back').catch(() => undefined)}>
+              <button className="btn" onClick={() => void api.android.action(roomId, 'back').catch(() => undefined)}>
                 <span aria-hidden>◁</span> {t('android.navBack')}
               </button>
-              <button className="btn" onClick={() => void api.android.key(roomId, 'home').catch(() => undefined)}>
+              <button className="btn" onClick={() => void api.android.action(roomId, 'home').catch(() => undefined)}>
                 <span aria-hidden>○</span> {t('android.navHome')}
               </button>
-              <button className="btn" onClick={() => void api.android.key(roomId, 'recents').catch(() => undefined)}>
+              <button className="btn" onClick={() => void api.android.action(roomId, 'recents').catch(() => undefined)}>
                 <span aria-hidden>▢</span> {t('android.navRecents')}
+              </button>
+              <button
+                className="btn"
+                title={t('android.navRotateHint')}
+                onClick={() => void api.android.action(roomId, 'rotate').catch(() => undefined)}
+              >
+                <span aria-hidden>⟳</span> {t('android.navRotate')}
               </button>
             </div>
           )}

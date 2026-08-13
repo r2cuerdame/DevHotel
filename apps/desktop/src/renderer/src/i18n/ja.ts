@@ -300,6 +300,8 @@ export const ja: Translation = {
   'android.navBack': '戻る',
   'android.navHome': 'ホーム',
   'android.navRecents': '最近のアプリ',
+  'android.navRotate': '回転',
+  'android.navRotateHint': '端末を 90 度回転します。エミュレーターの画面サイズは変わらないため余白が出ます \u2014 横向きで画面いっぱいにするにはクイック変更の画面の向きを変更してください。',
   'android.orientation': '画面の向き',
   'android.portrait': '縦向き',
   'android.landscape': '横向き',

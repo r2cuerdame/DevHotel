@@ -301,6 +301,8 @@ export const de: Translation = {
   'android.navBack': 'Zurück',
   'android.navHome': 'Startseite',
   'android.navRecents': 'Letzte Apps',
+  'android.navRotate': 'Drehen',
+  'android.navRotateHint': 'Dreht das Gerät um 90\u00b0. Der Emulatorbildschirm behält seine Größe, ein gedrehtes Gerät wird daher mit Rändern dargestellt \u2014 für einen formatfüllenden Querformat-Room die Ausrichtung in Schnelländerung setzen.',
   'android.orientation': 'Ausrichtung',
   'android.portrait': 'Hochformat',
   'android.landscape': 'Querformat',
