@@ -60,6 +60,7 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
 | `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined |
+| `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |
 | `GET /v1/rooms/:id/logs` | `?kind=web\|orchestrator` | `{ lines[] }` tail |

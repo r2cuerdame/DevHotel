@@ -277,6 +277,13 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: wrap(async (a) => (await getClient()).pushFile(a.roomId, a.path, a.contentBase64))
     },
     {
+      name: 'reset_sync_baseline',
+      description:
+        "Accept the room's current files as the Host-sync baseline. Use when sync_from_host reports that Room files changed — e.g. after a build wrote into the workspace — and you want later syncs allowed again. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).resetSyncBaseline(a.roomId))
+    },
+    {
       name: 'sync_from_host',
       description:
         "Request an inbound sync of the room's linked Host folder into the Room-owned working state. DevHotel shows an approval dialog to the human — this call blocks until they Allow or Deny, and fails if declined, if the room has no Host link, or if it is asleep. The synced path is always the room's own linked folder; agents cannot choose paths.",

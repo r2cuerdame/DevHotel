@@ -86,6 +86,9 @@ export const fr: Translation = {
   'working.synced': 'Synchronisé',
   'working.modified': 'Modifié',
   'working.modifiedHint': 'Exportez ou validez les changements de la Room avant la synchronisation Host.',
+  'working.resetBaseline': 'Réinitialiser la référence',
+  'working.baselineHint': 'Accepte les fichiers actuels de la chambre comme point de comparaison afin d’autoriser à nouveau la synchronisation depuis le Host. Rien n’est copié.',
+  'working.baselineReset': 'Fichiers de la chambre acceptés comme référence de synchronisation',
 
   'settings.title': 'Réglages',
   'settings.language': 'Langue',

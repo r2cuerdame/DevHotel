@@ -86,6 +86,9 @@ export const ptBR: Translation = {
   'working.synced': 'Sincronizado',
   'working.modified': 'Modificado',
   'working.modifiedHint': 'Exporte ou confirme as alterações da Room antes de sincronizar do Host.',
+  'working.resetBaseline': 'Redefinir base',
+  'working.baselineHint': 'Aceita os arquivos atuais do quarto como ponto de comparação para permitir a sincronização com o Host novamente. Nada é copiado.',
+  'working.baselineReset': 'Arquivos do quarto aceitos como base de sincronização',
 
   'settings.title': 'Configurações',
   'settings.language': 'Idioma',

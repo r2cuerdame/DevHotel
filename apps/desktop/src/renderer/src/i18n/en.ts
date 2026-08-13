@@ -90,6 +90,9 @@ export const en = {
   'working.synced': 'Synced',
   'working.modified': 'Modified',
   'working.modifiedHint': 'Room changes must be exported or committed before Host sync.',
+  'working.resetBaseline': 'Reset baseline',
+  'working.baselineHint': 'Accept the current Room files as the comparison point so Host sync is allowed again. Nothing is copied.',
+  'working.baselineReset': 'Room files accepted as the sync baseline',
 
   // Settings
   'settings.title': 'Settings',

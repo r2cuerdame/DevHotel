@@ -86,6 +86,9 @@ export const ru: Translation = {
   'working.synced': 'Синхронизировано',
   'working.modified': 'Изменено',
   'working.modifiedHint': 'Перед синхронизацией экспортируйте или зафиксируйте изменения Room.',
+  'working.resetBaseline': 'Сбросить эталон',
+  'working.baselineHint': 'Принять текущие файлы номера как точку сравнения, чтобы снова разрешить синхронизацию с хостом. Ничего не копируется.',
+  'working.baselineReset': 'Файлы номера приняты как эталон синхронизации',
 
   'settings.title': 'Настройки',
   'settings.language': 'Язык',

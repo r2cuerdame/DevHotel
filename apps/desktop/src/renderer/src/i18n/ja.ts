@@ -86,6 +86,9 @@ export const ja: Translation = {
   'working.synced': '同期済み',
   'working.modified': '変更あり',
   'working.modifiedHint': 'Host 同期の前に Room の変更をエクスポートまたはコミットしてください。',
+  'working.resetBaseline': '基準をリセット',
+  'working.baselineHint': '現在のルームのファイルを比較基準として認め、Host 同期を再び許可します。コピーは行われません。',
+  'working.baselineReset': '現在のルームのファイルを同期の基準に設定しました',
 
   'settings.title': '設定',
   'settings.language': '言語',

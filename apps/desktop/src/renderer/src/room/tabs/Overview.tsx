@@ -63,6 +63,18 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
     })
   }
 
+  async function resetBaseline(): Promise<void> {
+    await run('baseline', async () => {
+      try {
+        await api.rooms.resetSyncBaseline(room.id)
+        await Promise.all([refreshInspection(room.id), refreshRooms()])
+        toast('success', t('working.baselineReset'))
+      } catch (err) {
+        toast('error', err instanceof Error ? err.message : String(err))
+      }
+    })
+  }
+
   return (
     <>
       <div className="panel-hero">
@@ -173,6 +185,11 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             {room.workspaceMode === 'legacy-host-bind' && room.hostSyncEnabled && (
               <button className="btn primary" disabled={pending !== null} onClick={() => void workingStateAction('migrate')}>
                 {t('working.moveIntoHotel')}
+              </button>
+            )}
+            {room.workspaceMode === 'hotel' && room.hostSyncEnabled && room.syncStatus === 'modified' && (
+              <button className="btn" disabled={pending !== null} title={t('working.baselineHint')} onClick={() => void resetBaseline()}>
+                {pending === 'baseline' ? t('common.applying') : t('working.resetBaseline')}
               </button>
             )}
             {room.workspaceMode === 'hotel' && room.hostSyncEnabled && (

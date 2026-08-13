@@ -949,6 +949,43 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, true))
   }
 
+  /**
+   * Accept the Room's current files as the Host-sync baseline (goal.md §8.4).
+   * Nothing is copied and no Host file is read — it only records "this is the
+   * state I compare against next time", which is the one way out when a Room
+   * has legitimately diverged (a build ran, a script wrote a file) and every
+   * later sync would otherwise be refused forever. The destructive step, the
+   * sync itself, still needs its own explicit user action.
+   */
+  resetSyncBaseline(roomId: string, actor: Actor): Promise<RoomRecord> {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (room.workspaceMode !== 'hotel') {
+        throw new Error('Only Hotel-owned workspaces have a Host sync baseline')
+      }
+      if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
+        throw new Error('This Room is detached from its original Host folder')
+      }
+      const fingerprint = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
+      const before = { syncStatus: room.syncStatus, workspaceFingerprint: room.workspaceFingerprint }
+      this.rooms.update(roomId, { workspaceFingerprint: fingerprint, syncStatus: 'synced' })
+      this.appendJournal(
+        roomId,
+        'reset-sync-baseline',
+        'Room files accepted as the Host sync baseline',
+        actor,
+        'Room',
+        before,
+        { syncStatus: 'synced', workspaceFingerprint: fingerprint }
+      )
+      this.olog(roomId, `sync baseline reset at r${room.stateRevision}`)
+      const updated = this.mustGet(roomId)
+      await writeManifest(this.userData, updated)
+      this.emit(roomId, 'status')
+      return updated
+    })
+  }
+
   private async replaceWorkspaceFromHostLocked(roomId: string, actor: Actor, migrateLegacy: boolean): Promise<RoomRecord> {
     if (actor !== 'user') throw new Error('Importing Host files requires an explicit user action')
     const room = this.mustGet(roomId)
@@ -971,7 +1008,10 @@ export class RoomOrchestrator {
       const currentFingerprint = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
       if (!room.workspaceFingerprint || currentFingerprint !== room.workspaceFingerprint) {
         this.rooms.update(roomId, { syncStatus: 'modified' })
-        throw new Error('Room files changed since the last Host sync. Export or commit them before replacing Room state.')
+        throw new Error(
+          'Room files changed since the last Host sync. Export or commit them first, ' +
+            'or accept the current Room files as the new baseline (Reset baseline) and sync again.'
+        )
       }
     }
 

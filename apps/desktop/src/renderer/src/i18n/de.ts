@@ -86,6 +86,9 @@ export const de: Translation = {
   'working.synced': 'Synchronisiert',
   'working.modified': 'Geändert',
   'working.modifiedHint': 'Room-Änderungen vor der Host-Synchronisierung exportieren oder committen.',
+  'working.resetBaseline': 'Basis zurücksetzen',
+  'working.baselineHint': 'Akzeptiert die aktuellen Room-Dateien als Vergleichspunkt, damit die Host-Synchronisierung wieder erlaubt ist. Es wird nichts kopiert.',
+  'working.baselineReset': 'Room-Dateien als Synchronisierungsbasis übernommen',
 
   'settings.title': 'Einstellungen',
   'settings.language': 'Sprache',

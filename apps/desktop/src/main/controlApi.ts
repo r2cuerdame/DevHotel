@@ -167,6 +167,13 @@ export async function startControlApi(
             sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'user')))
             return
           }
+          case 'sync-baseline': {
+            // Records a new comparison point only; no Host file is read and no
+            // Room file changes, so this needs no human approval. The sync it
+            // unblocks still does.
+            sendJson(res, 200, roomForAgent(await orch.resetSyncBaseline(safeRoomId, 'agent')))
+            return
+          }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
             sendJson(res, 200, await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs }, 'agent'))

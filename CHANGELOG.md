@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Host sync no longer dead-ends after a build
+
+Reported by an agent whose Android Room could never sync again: the room went `modified` at its first `android-run` and refused every later sync, with no way back from any surface.
+
+- **The workspace fingerprint is content identity, not a filesystem snapshot.** Generated trees (`build`, `dist`, `node_modules`, `.next`, `coverage`, `.gradle`, `.git/objects`) are now pruned *including their own directory entry* — previously the excluded directory's entry still counted, so a first build permanently looked like Room-side drift — and mtime no longer participates, so touching a file without changing it is not an edit. Deleting build output now genuinely restores the fingerprint.
+- **Reset baseline**: accept the Room's current files as the comparison point when they *have* legitimately changed. Nothing is copied and no Host file is read; the change is journaled with its actor. Available in the room's Working state card, as `POST /v1/rooms/:id/sync-baseline`, and as the `reset_sync_baseline` MCP tool. The sync it unblocks still needs its own explicit user action (and, for agents, the approval dialog).
+- The refusal message now names the way out instead of only stating the problem.
+
+Existing rooms carry fingerprints computed the old way, so their first sync after updating still reports drift once — Reset baseline (or any successful sync) re-anchors them.
+
 ### Phone-first Android rooms
 
 - The Android room bar shows the device (profile · Android version · AOSP) instead of a meaningless vnc URL; browser back/forward hide, reload stays.

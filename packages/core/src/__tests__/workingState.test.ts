@@ -118,6 +118,46 @@ describe('Room-owned working state', () => {
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
   })
 
+  it('reset baseline accepts the current Room files and unblocks the refused sync', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'stale-baseline-from-before-the-build'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'current-fingerprint'
+
+    await expect(orch.syncFromHost(room.id, 'user')).rejects.toThrow(/Room files changed/)
+
+    const reset = await orch.resetSyncBaseline(room.id, 'agent')
+    expect(reset).toMatchObject({ syncStatus: 'synced', workspaceFingerprint: 'current-fingerprint' })
+    // recorded for the human, and it never touches Host files
+    expect(orch.listChanges(room.id)[0]).toMatchObject({ kind: 'reset-sync-baseline', actor: 'agent' })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+
+    // the previously refused sync now proceeds
+    await expect(orch.syncFromHost(room.id, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(true)
+  })
+
+  it('refuses a baseline reset for rooms with no Host link', async () => {
+    const room = makeRoom({
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/repo.git',
+      workspaceMode: 'hotel',
+      hostSyncEnabled: false,
+      syncStatus: 'modified'
+    })
+    orch.rooms.create(room)
+    await expect(orch.resetSyncBaseline(room.id, 'agent')).rejects.toThrow(/detached/)
+  })
+
   it('publishes a successfully staged Host import as a new source generation', async () => {
     const room = makeRoom({
       sourceType: 'linked-folder',

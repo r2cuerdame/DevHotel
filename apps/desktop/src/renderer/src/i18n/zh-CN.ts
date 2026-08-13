@@ -86,6 +86,9 @@ export const zhCN: Translation = {
   'working.synced': '已同步',
   'working.modified': '已修改',
   'working.modifiedHint': '从 Host 同步前，请先导出或提交 Room 更改。',
+  'working.resetBaseline': '重置基准',
+  'working.baselineHint': '将当前房间文件设为比较基准，从而再次允许与主机同步。不会复制任何文件。',
+  'working.baselineReset': '已将当前房间文件设为同步基准',
 
   'settings.title': '设置',
   'settings.language': '语言',

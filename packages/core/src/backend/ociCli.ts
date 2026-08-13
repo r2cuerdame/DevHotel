@@ -797,7 +797,12 @@ export class OciCliBackend implements IsolationBackend {
         DU_IMAGE,
         'sh',
         '-lc',
-        "set -eu; sync_paths=$(mktemp); sync_sorted=$(mktemp); sync_records=$(mktemp); cd /workspace; find . -mindepth 1 ! -path './node_modules/*' ! -path '*/node_modules/*' ! -path './.git/objects/*' ! -path '*/.git/objects/*' ! -path './.next/*' ! -path '*/.next/*' ! -path './dist/*' ! -path '*/dist/*' ! -path './build/*' ! -path '*/build/*' ! -path './coverage/*' ! -path '*/coverage/*' ! -path './.gradle/*' -print0 > \"$sync_paths\"; sort -z \"$sync_paths\" > \"$sync_sorted\"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' \"$path\" | sha256sum); path_hash=${path_hash%% *}; metadata=$(stat -c '%f:%u:%g:%Y' \"$path\"); if [ -L \"$path\" ]; then kind=L; content_hash=$(readlink -n \"$path\" | sha256sum); content_hash=${content_hash%% *}; elif [ -f \"$path\" ]; then kind=F; content_hash=$(sha256sum \"$path\"); content_hash=${content_hash%% *}; elif [ -d \"$path\" ]; then kind=D; content_hash=-; else echo \"unsupported workspace object: $path\" >&2; exit 2; fi; printf '%s %s %s %s\\n' \"$kind\" \"$metadata\" \"$path_hash\" \"$content_hash\" >> \"$sync_records\"; done < \"$sync_sorted\"; sha256sum \"$sync_records\""
+        // Content identity of the Room's *source*, deliberately not a
+        // filesystem snapshot: generated trees are pruned entirely (their own
+        // directory entry included, or a first build would permanently look
+        // like drift) and mtime is excluded (touching a file without changing
+        // it is not a Room-side edit). Mode/uid/gid and content still count.
+        "set -eu; sync_paths=$(mktemp); sync_sorted=$(mktemp); sync_records=$(mktemp); cd /workspace; find . -mindepth 1 \\( -type d \\( -name node_modules -o -name .next -o -name dist -o -name build -o -name coverage -o -name .gradle -o -path '*/.git/objects' \\) \\) -prune -o -print0 > \"$sync_paths\"; sort -z \"$sync_paths\" > \"$sync_sorted\"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' \"$path\" | sha256sum); path_hash=${path_hash%% *}; metadata=$(stat -c '%f:%u:%g' \"$path\"); if [ -L \"$path\" ]; then kind=L; content_hash=$(readlink -n \"$path\" | sha256sum); content_hash=${content_hash%% *}; elif [ -f \"$path\" ]; then kind=F; content_hash=$(sha256sum \"$path\"); content_hash=${content_hash%% *}; elif [ -d \"$path\" ]; then kind=D; content_hash=-; else echo \"unsupported workspace object: $path\" >&2; exit 2; fi; printf '%s %s %s %s\\n' \"$kind\" \"$metadata\" \"$path_hash\" \"$content_hash\" >> \"$sync_records\"; done < \"$sync_sorted\"; sha256sum \"$sync_records\""
       ]),
       'fingerprint Room workspace'
     )

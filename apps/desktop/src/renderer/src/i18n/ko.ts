@@ -84,6 +84,9 @@ export const ko: Translation = {
   'working.synced': '동기화됨',
   'working.modified': 'Room에서 변경됨',
   'working.modifiedHint': 'Host 동기화 전에 Room 변경사항을 내보내거나 커밋해야 합니다.',
+  'working.resetBaseline': '기준 재설정',
+  'working.baselineHint': '현재 Room 파일을 비교 기준으로 인정해 Host 동기화를 다시 허용합니다. 복사는 일어나지 않습니다.',
+  'working.baselineReset': '현재 Room 파일을 동기화 기준으로 설정했습니다',
 
   'settings.title': '설정',
   'settings.language': '언어',
