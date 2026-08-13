@@ -118,6 +118,8 @@ This describes the current external-Docker developer preview. The target release
 
 See [Managed Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-managed-runtime-design.md) for the zero-prerequisite installation, ownership, update, recovery, and cleanup boundary.
 
+Agents (or any local tool) can drive DevHotel without MCP through the stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), auth, and the full endpoint contract.
+
 ## License
 
 [MIT](./LICENSE)

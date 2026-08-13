@@ -1,6 +1,6 @@
 # Agent field reports — 2026-08-12 (+13)
 
-Six agents used DevHotel Android/Web rooms for real work (app testing, WebView
+Seven agents used DevHotel Android/Web rooms for real work (app testing, WebView
 audits, parallel code analysis, billing/preview verification). Their verbatim
 pain points, deduplicated and triaged. Items marked **[shipped]** were fixed the
 same day; the rest are the working backlog, roughly in leverage order.
@@ -20,6 +20,12 @@ same day; the rest are the working backlog, roughly in leverage order.
 - FLAG_SECURE apps blocked screenshots → `android_screenshot` mode `'screen'` grabs the emulator display (exactly what the preview shows), which Android's secure-surface enforcement cannot black out; `'auto'` still prefers the sharper guest-side screencap.
 - Long `run_in_room` output truncated by message limits → tool guidance: redirect to a file and fetch with `room_pull_file` (real streaming remains backlog item 3).
 - Android rooms got a phone-first UI: no address bar (device pill instead), Back/Home/Recents nav strip, and a portrait/landscape orientation setting that rotates the whole pipeline.
+- The control API contract is now public documentation (`docs/control-api.md`) — the seventh agent used it successfully without MCP by reading `control.json`, and asked for exactly this. Their MCP absolute-path advice was already our practice (Settings registers the full exe + script paths).
+
+## New from the seventh report (Go project, could not use DevHotel at all)
+
+- **Runtime kinds beyond node/jdk** (Go first, then Rust/Python). This is the goal.md §18.2 runtime-adapter seam: detection (`go.mod`, `Cargo.toml`, `pyproject.toml`), pinned images, deps/cache volume semantics, and Quick Change version switching per toolchain. Promoted to backlog rank ~2: it gates entire project classes, not just ergonomics.
+- **Room-owned Container Service** (Docker/Podman *inside* the room, nested containers) so Compose-based e2e (DB + server) and container-isolated sample execution can run where the build runs. Correctly a Room Service, not a Hotel Service — the room already owns a network namespace. Needs a design pass: rootless podman vs DinD, storage quotas, image cache ownership, and how nested containers appear in checks/cleanup. Without it, "build & test in the Room" excludes every containerized project.
 
 ## Backlog (leverage order)
 

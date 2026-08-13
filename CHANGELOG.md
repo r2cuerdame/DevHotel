@@ -10,6 +10,10 @@
 - One emulator no longer appears as two adb serials: DevHotel targets the auto-detected `emulator-5554` and never `adb connect`s, so Gradle instrumentation runs once.
 - `android_screenshot` gained mode `'screen'`: an X-display grab that also captures FLAG_SECURE apps; `'auto'` prefers the sharper guest-side screencap. Both are served by `GET /v1/rooms/:id/screenshot`.
 
+### Documented control API
+
+- `docs/control-api.md` publishes the loopback REST contract (discovery via `control.json`, bearer auth, all `/v1` endpoints with agent semantics) so external agents can collaborate without an MCP session. Runtime kinds beyond node/jdk (Go/Rust/Python) and a Room-owned Container Service (Docker-in-Room for Compose e2e) join the backlog from the seventh field report.
+
 ### Agent field-report fixes (docs/feedback/2026-08-12-agent-field-reports.md)
 
 - **`hotel_status`** MCP tool + `GET /v1/status`: one call for app version, backend health, gateway ports/routes, and every room with provider/status/domain/URL and live emulator state.
