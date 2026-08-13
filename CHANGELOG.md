@@ -10,6 +10,10 @@
 - One emulator no longer appears as two adb serials: DevHotel targets the auto-detected `emulator-5554` and never `adb connect`s, so Gradle instrumentation runs once.
 - `android_screenshot` gained mode `'screen'`: an X-display grab that also captures FLAG_SECURE apps; `'auto'` prefers the sharper guest-side screencap. Both are served by `GET /v1/rooms/:id/screenshot`.
 
+### The MCP setup command actually works
+
+- The one-line Claude Code command in Settings was rejected by the CLI: `--env` is variadic, so `--env ELECTRON_RUN_AS_NODE=1 devhotel` made it read the server name as another environment variable and abort. The command is now `claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "<exe>" "<script>"` — name first, user scope so every project sees the Hotel, still absolute paths.
+
 ### MCP survives app restarts
 
 - The bundled MCP server cached its first control-API connection forever, so restarting the DevHotel app (which rotates the loopback port and token) made every tool fail until the whole MCP session was restarted. The client now detects the stale connection, re-reads `control.json`, and retries once — long-lived agent sessions keep working across app restarts and updates.

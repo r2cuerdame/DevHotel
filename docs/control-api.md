@@ -74,3 +74,13 @@ Register the bundled MCP server by **absolute executable path** (the Settings
 card and this repo's docs already do): agents launched before a PATH change
 never see bare-name commands, so `devhotel-mcp` by name fails for them while
 `"C:\…\DevHotel.exe" "C:\…\resources\mcp\index.js"` always resolves.
+
+For Claude Code the server **name must come before the options**, because
+`-e/--env` is variadic and otherwise consumes the name:
+
+```
+claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "C:\…\DevHotel.exe" "C:\…\resources\mcp\index.js"
+```
+
+`-s user` registers it once for every project. Registration only takes effect
+for agent sessions started afterwards — a running session must reconnect.
