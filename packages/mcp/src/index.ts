@@ -1,14 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { connect, type ControlClient } from './client'
+import { resilientClient, type ControlClient } from './client'
 import { makeTools } from './tools'
 import { MCP_METADATA } from './metadata'
 
-let cached: ControlClient | null = null
+// Survives DevHotel app restarts (new control port/token) without an MCP restart.
+const client = resilientClient()
 async function getClient(): Promise<ControlClient> {
-  if (cached) return cached
-  cached = await connect()
-  return cached
+  return client
 }
 
 async function main(): Promise<void> {

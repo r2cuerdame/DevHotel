@@ -162,3 +162,37 @@ export async function connect(): Promise<ControlClient> {
   await client.ping()
   return client
 }
+
+function isStaleConnection(err: unknown): boolean {
+  // DevHotel restarts change the control port and token: the old socket
+  // refuses (NotRunning) or a lucky port reuse answers 401.
+  if (err instanceof DevHotelNotRunningError) return true
+  return err instanceof Error && /control API 401/.test(err.message)
+}
+
+/**
+ * A ControlClient that survives DevHotel app restarts: on a stale-connection
+ * failure it re-reads control.json (fresh port/token) and retries once, so a
+ * long-lived MCP session never needs a manual reconnect.
+ */
+export function resilientClient(connector: () => Promise<ControlClient> = connect): ControlClient {
+  let inner: ControlClient | null = null
+  return new Proxy({} as ControlClient, {
+    get(_target, prop: string | symbol) {
+      if (typeof prop !== 'string') return undefined
+      return async (...args: unknown[]) => {
+        inner ??= await connector()
+        const call = async (client: ControlClient): Promise<unknown> =>
+          (client[prop as keyof ControlClient] as (...a: unknown[]) => Promise<unknown>)(...args)
+        try {
+          return await call(inner)
+        } catch (err) {
+          if (!isStaleConnection(err)) throw err
+          inner = null
+          inner = await connector()
+          return await call(inner)
+        }
+      }
+    }
+  })
+}

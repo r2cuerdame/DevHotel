@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { ControlClient, DevHotelNotRunningError, loadControlInfo } from '../client'
+import { ControlClient, DevHotelNotRunningError, loadControlInfo, resilientClient } from '../client'
 import { makeTools } from '../tools'
 import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
@@ -61,6 +61,27 @@ describe('ControlClient', () => {
 
   it('maps 204 to undefined', async () => {
     await expect(client().startRoom('abc12345')).resolves.toBeUndefined()
+  })
+})
+
+describe('resilientClient', () => {
+  it('re-reads control info and retries once when DevHotel restarted', async () => {
+    let connects = 0
+    const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, version: 'x' })
+    const wrapped = resilientClient(async () => (connects++ === 0 ? stale : client()))
+    const rooms = await wrapped.listRooms()
+    expect(rooms).toHaveLength(1)
+    expect(connects).toBe(2)
+  })
+
+  it('does not mask real API errors with a reconnect', async () => {
+    let connects = 0
+    const wrapped = resilientClient(async () => {
+      connects++
+      return client()
+    })
+    await expect(wrapped.inspectRoom('missing')).rejects.toThrow(/404/)
+    expect(connects).toBe(1)
   })
 })
 
