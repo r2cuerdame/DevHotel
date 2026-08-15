@@ -10,6 +10,13 @@ export type QuickChange =
   | { kind: 'package-install'; name: string; version: string; dev: boolean }
   | { kind: 'android-build' }
   | { kind: 'android-run'; applicationId?: string }
+  | {
+      kind: 'room-reset'
+      reinstallDependencies: boolean
+      clearCaches: boolean
+      services: import('./rooms').ResetServiceMode
+      clearBrowserData: boolean
+    }
   | { kind: 'service-add'; service: 'postgres' | 'redis'; version?: string }
   | { kind: 'service-remove'; service: 'postgres' | 'redis' }
   | { kind: 'service-restart'; service: 'postgres' | 'redis' }

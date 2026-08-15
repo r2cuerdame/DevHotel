@@ -277,6 +277,27 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: wrap(async (a) => (await getClient()).pushFile(a.roomId, a.path, a.contentBase64))
     },
     {
+      name: 'reset_room',
+      description:
+        "Reset a room in place: it keeps its number, nickname, domain, plan, source code and change history, and gives back what it can rebuild — dependencies (reinstalled into a fresh layer), download/SDK caches, Room App data, and the browser profile. A safety backup of every Room App is taken before data is cleared. Not undoable; source code is never touched (use sync_from_host for that).",
+      schema: {
+        roomId: zRoomId,
+        reinstallDependencies: z.boolean().optional().describe('default false'),
+        clearCaches: z.boolean().optional().describe('default false'),
+        services: z.enum(['keep', 'empty', 'remove']).optional().describe("default 'keep'; empty/remove need an awake room"),
+        clearBrowserData: z.boolean().optional().describe('default false')
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).applyChange(a.roomId, {
+          kind: 'room-reset',
+          reinstallDependencies: a.reinstallDependencies ?? false,
+          clearCaches: a.clearCaches ?? false,
+          services: a.services ?? 'keep',
+          clearBrowserData: a.clearBrowserData ?? false
+        })
+      )
+    },
+    {
       name: 'reset_sync_baseline',
       description:
         "Accept the room's current files as the Host-sync baseline. Use when sync_from_host reports that Room files changed — e.g. after a build wrote into the workspace — and you want later syncs allowed again. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",

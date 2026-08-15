@@ -62,6 +62,13 @@ export const zQuickChange = z.discriminatedUnion('kind', [
     .strict(),
   z.object({ kind: z.literal('android-build') }).strict(),
   z.object({
+    kind: z.literal('room-reset'),
+    reinstallDependencies: z.boolean(),
+    clearCaches: z.boolean(),
+    services: z.enum(['keep', 'empty', 'remove']),
+    clearBrowserData: z.boolean()
+  }).strict(),
+  z.object({
     kind: z.literal('android-run'),
     applicationId: z.string().regex(/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/).optional()
   }).strict(),

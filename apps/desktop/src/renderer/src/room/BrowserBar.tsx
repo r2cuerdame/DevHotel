@@ -3,6 +3,7 @@ import { IPC, type RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { statusLabel, useStore, useT } from '../state/store'
 import { CloneRoomModal } from './CloneRoomModal'
+import { ResetRoomModal } from './ResetRoomModal'
 
 export function BrowserBar({
   room,
@@ -24,6 +25,7 @@ export function BrowserBar({
   const [menuOpen, setMenuOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [cloneOpen, setCloneOpen] = useState(false)
+  const [resetOpen, setResetOpen] = useState(false)
   const [nickname, setNickname] = useState(room.nickname)
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -52,9 +54,9 @@ export function BrowserBar({
   useEffect(() => {
     // WebContentsView is a native child above renderer DOM. Hide it while any
     // toolbar overlay is open so the menu/modal can actually be seen.
-    onModalChange(menuOpen || renameOpen || cloneOpen)
+    onModalChange(menuOpen || renameOpen || cloneOpen || resetOpen)
     return () => onModalChange(false)
-  }, [cloneOpen, menuOpen, onModalChange, renameOpen])
+  }, [cloneOpen, menuOpen, onModalChange, renameOpen, resetOpen])
 
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
   const web = room.provider === 'web'
@@ -226,6 +228,13 @@ export function BrowserBar({
               />
             )}
             <MenuItem
+              label={t('reset.menu')}
+              onClick={() => {
+                setResetOpen(true)
+                setMenuOpen(false)
+              }}
+            />
+            <MenuItem
               label={t('diag.copyDiagnostic')}
               onClick={() => {
                 void useStore.getState().copyDiagnostic(room.id)
@@ -282,6 +291,7 @@ export function BrowserBar({
       )}
 
       {cloneOpen && <CloneRoomModal room={room} onClose={() => setCloneOpen(false)} />}
+      {resetOpen && <ResetRoomModal room={room} onClose={() => setResetOpen(false)} />}
     </div>
   )
 }

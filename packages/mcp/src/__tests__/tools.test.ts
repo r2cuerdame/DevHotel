@@ -125,6 +125,7 @@ describe('makeTools', () => {
         'list_changes',
         'list_rooms',
         'rename_room',
+        'reset_room',
         'reset_sync_baseline',
         'restart_web',
         'room_components',

@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { app, BrowserWindow, dialog, net, protocol, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell } from 'electron'
 import { Gateway, OciCliBackend, hotelServicesRepo, openDb, RoomOrchestrator, roomsRepo } from '@devhotel/core'
 import { registerIpc } from './ipc'
 import { PreviewManager } from './previewManager'
@@ -13,6 +13,7 @@ import { ensureDataOwnership } from './cleanRemoval'
 import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGate'
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
 import { GITHUB_SERVICE_DEFAULT_ENABLED, GITHUB_SERVICE_MANIFEST, GitHubService, PINNED_GH } from './githubService'
+import { roomPreviewPartition } from './previewSecurity'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
@@ -103,7 +104,18 @@ async function bootstrap(): Promise<void> {
     canAdoptLegacyVolume: (roomId) =>
       ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml'))
   })
-  const orch = new RoomOrchestrator({ userData, backend, gateway, db, appVersion: app.getVersion() })
+  const orch = new RoomOrchestrator({
+    userData,
+    backend,
+    gateway,
+    db,
+    appVersion: app.getVersion(),
+    // The Room's browser profile is an Electron session partition, so only the
+    // desktop app can clear it; core asks through this hook.
+    clearBrowserData: async (roomId) => {
+      await session.fromPartition(roomPreviewPartition(roomId)).clearStorageData()
+    }
+  })
 
   protocol.handle('devhotel-thumb', (request) => {
     const url = new URL(request.url)

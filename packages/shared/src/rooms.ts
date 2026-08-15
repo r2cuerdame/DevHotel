@@ -17,6 +17,8 @@ export interface ProviderInfo {
 /** Guest LCD scaling: swiftshader renders in software, so fewer pixels = a much faster phone. */
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 export type EmulatorOrientation = 'portrait' | 'landscape'
+/** Room Apps and their data when a Room is reset: keep them, start them empty, or take the apps out. */
+export type ResetServiceMode = 'keep' | 'empty' | 'remove'
 /** Where `/workspace` actually lives. Legacy host binds are compatibility-only. */
 export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'

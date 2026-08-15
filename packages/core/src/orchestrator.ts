@@ -56,7 +56,8 @@ const ANDROID_CHANGE_KINDS = new Set([
   'emulator-config',
   'start-command',
   'restart-web',
-  'os-settings'
+  'os-settings',
+  'room-reset'
 ])
 
 const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'android-run'])
@@ -73,6 +74,8 @@ export interface OrchestratorOptions {
   gateway: Gateway
   db: Db
   appVersion: string
+  /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
+  clearBrowserData?: (roomId: string) => Promise<void>
 }
 
 const EMPTY_READER: SourceReader = {
@@ -97,12 +100,14 @@ export class RoomOrchestrator {
   private readonly backend: IsolationBackend
   private readonly gateway: Gateway
   private readonly appVersion: string
+  private readonly clearBrowserData?: (roomId: string) => Promise<void>
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
     this.backend = opts.backend
     this.gateway = opts.gateway
     this.appVersion = opts.appVersion
+    this.clearBrowserData = opts.clearBrowserData
     this.rooms = roomsRepo(opts.db)
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
@@ -1395,7 +1400,8 @@ export class RoomOrchestrator {
         const s = this.mustGet(roomId).status
         return s === 'running' || s === 'ready' || s === 'attention'
       },
-      syncRoute: () => this.syncRouteFor(roomId)
+      syncRoute: () => this.syncRouteFor(roomId),
+      clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined
     }
   }
 

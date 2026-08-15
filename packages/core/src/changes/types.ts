@@ -23,6 +23,12 @@ export interface ChangeCtx {
   isAwake(): boolean
   /** re-route the gateway to the room's current domain/hostPort/https */
   syncRoute(): Promise<void>
+  /**
+   * Clear the Room's browser profile (cookies, localStorage, IndexedDB, cache).
+   * Owned by the desktop app because the profile is an Electron session
+   * partition; absent in headless contexts, where there is no profile to clear.
+   */
+  clearBrowserData?: () => Promise<void>
 }
 
 export interface ChangePlanned {

@@ -20,6 +20,7 @@ import { osSettingsChange } from './osSettings'
 import { packageManagerChange } from './packageManager'
 import { emulatorConfigChange } from './emulatorConfig'
 import { packageInstallChange } from './packageInstall'
+import { roomResetChange } from './roomReset'
 
 export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(nodeVersionChange)
@@ -41,6 +42,7 @@ export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(packageManagerChange)
   engine.register(emulatorConfigChange)
   engine.register(packageInstallChange)
+  engine.register(roomResetChange)
 }
 
 export { pmInstallCommand, currentDepsGen, depsVolumeForGen, depsGenKey, depsGenMaxKey } from './deps'
