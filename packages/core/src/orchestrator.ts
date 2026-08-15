@@ -815,9 +815,14 @@ export class RoomOrchestrator {
 
   private static readonly ROOM_FILE_CAP = 16 * 1024 * 1024
 
-  private validateRoomFilePath(path: string): string {
+  private validateRoomFilePath(roomId: string, path: string): string {
     if (!/^\/workspace\/[^\0]*$/.test(path) || path.split('/').includes('..')) {
       throw new Error('Room file paths must be absolute paths under /workspace')
+    }
+    // In a legacy Host-bound Room /workspace IS the user's real folder, so file
+    // transfer there would read and write Host files directly (goal.md §5.11).
+    if (this.mustGet(roomId).workspaceMode === 'legacy-host-bind') {
+      throw new Error('Move this legacy Host-bound Room into the Hotel before transferring files')
     }
     return path
   }
@@ -825,7 +830,7 @@ export class RoomOrchestrator {
   /** Official file egress: read one workspace file (base64), capped at 16MB. */
   async pullRoomFile(roomId: string, path: string): Promise<{ path: string; size: number; contentBase64: string }> {
     this.mustGet(roomId)
-    const safePath = this.validateRoomFilePath(path)
+    const safePath = this.validateRoomFilePath(roomId, path)
     const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
     const hostFile = join(tmp, 'file.bin')
@@ -844,7 +849,7 @@ export class RoomOrchestrator {
   /** Official file ingress: write one workspace file from base64, capped at 16MB. */
   async pushRoomFile(roomId: string, path: string, contentBase64: string): Promise<{ path: string; size: number }> {
     this.mustGet(roomId)
-    const safePath = this.validateRoomFilePath(path)
+    const safePath = this.validateRoomFilePath(roomId, path)
     const content = Buffer.from(contentBase64, 'base64')
     if (content.byteLength > RoomOrchestrator.ROOM_FILE_CAP) {
       throw new Error(`content is ${content.byteLength} bytes — larger than the 16MB push cap`)

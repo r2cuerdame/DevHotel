@@ -17,8 +17,6 @@ export interface RoomResetInput {
 interface Captured {
   /** safety dumps taken before any service data is destroyed, by service */
   backups: Partial<Record<ServiceKind, string>>
-  /** services that had to be backed up — used to tell "nothing to do" from "backup failed" */
-  expected: ServiceKind[]
 }
 
 function serviceEntries(ctx: ChangeCtx): [ServiceKind, { version: string }][] {
@@ -53,7 +51,9 @@ export const roomResetChange: ChangeDefinition<RoomResetInput> = {
       after: { reset: parts },
       // Browser data and cleared caches have no inverse, so the whole reset
       // cannot honestly claim one (§13.4). Service data is recoverable from the
-      // safety backup this change records, through Restore in Room Apps.
+      // safety backup taken in capture(), through Restore in Room Apps — and
+      // because capture runs before the change is admitted, a failed dump stops
+      // the reset before anything is destroyed.
       undoable: false,
       undoStrategy: 'none',
       autoRollback: false
@@ -65,35 +65,45 @@ export const roomResetChange: ChangeDefinition<RoomResetInput> = {
     if (room.workspaceMode === 'legacy-host-bind') {
       throw new Error('Move this legacy Host-bound Room into the Hotel before resetting it')
     }
-    if (p.reinstallDependencies && room.sourceType === 'empty') {
-      throw new Error('An empty room has no dependencies to reinstall')
+    if (p.reinstallDependencies) {
+      if (room.sourceType === 'empty') throw new Error('An empty room has no dependencies to reinstall')
+      if (room.provider === 'android') {
+        // Android Rooms mount no dependency volume, so an install here would
+        // write straight into the Room's source tree instead of a fresh layer.
+        throw new Error('Android Rooms have no dependency layer — clear the SDK and Gradle caches instead')
+      }
     }
-    if (p.services !== 'keep' && serviceEntries(ctx).length > 0 && !ctx.isAwake()) {
-      // the safety dump is taken by talking to the running service
-      throw new Error('Wake the room before resetting Room App data')
+    if (p.services !== 'keep') {
+      for (const [svc] of serviceEntries(ctx)) {
+        // the safety dump is taken by talking to the running service, so refuse
+        // early and say why rather than failing later on a raw pg_dump error
+        if (!ctx.isAwake() || (await ctx.backend.serviceState(ctx.roomId, svc)) !== 'running') {
+          throw new Error(`Start the room and its ${svc} app before resetting Room App data — the safety backup needs it running`)
+        }
+      }
     }
   },
+  /**
+   * The interlock: every Room App is dumped here, and capture runs before the
+   * change is admitted, so a failed dump aborts the reset with nothing yet
+   * destroyed. Nothing below this point may delete data a dump does not cover.
+   */
   async capture(ctx, p): Promise<Captured> {
-    if (p.services === 'keep') return { backups: {}, expected: [] }
+    if (p.services === 'keep') return { backups: {} }
     const backups: Partial<Record<ServiceKind, string>> = {}
-    const expected = serviceEntries(ctx).map(([svc]) => svc)
-    for (const svc of expected) {
+    for (const [svc] of serviceEntries(ctx)) {
       const file = await backupServiceToFile(ctx, svc)
       ctx.log(`safety backup before reset: ${file}`)
       backups[svc] = file
     }
-    return { backups, expected }
-  },
-  /** Never destroy service data on a failed run until its dump is on disk. */
-  canRollbackApplyFailure(_ctx, _p, captured) {
-    const state = captured as Captured | null
-    if (!state) return false
-    return state.expected.every((svc) => Boolean(state.backups[svc]))
+    return { backups }
   },
   async apply(ctx, p, steps) {
     const room = ctx.room()
 
     if (p.services !== 'keep') {
+      // one service at a time, each finished before the next begins, so a
+      // failure leaves the Room record agreeing with what actually exists
       for (const [svc, cfg] of serviceEntries(ctx)) {
         steps.push(p.services === 'empty' ? `Start ${svc} with empty data` : `Remove ${svc}`)
         await ctx.backend.removeService(ctx.roomId, svc, { volume: true })
@@ -101,17 +111,22 @@ export const roomResetChange: ChangeDefinition<RoomResetInput> = {
           await ctx.backend.createService(ctx.roomId, svc, cfg.version)
           const ready = await pingService(ctx, svc)
           if (!ready.ok) throw new Error(`${svc} did not come back after reset: ${ready.detail}`)
+        } else {
+          const remaining = { ...ctx.room().services }
+          delete remaining[svc]
+          ctx.rooms.update(ctx.roomId, { services: remaining })
         }
       }
-      if (p.services === 'remove') ctx.rooms.update(ctx.roomId, { services: {} })
     }
 
     if (p.clearCaches) {
+      // emptied in place: these volumes stay mounted by the Room's containers,
+      // so removing them would be refused while they exist
       steps.push('Clear download caches')
-      await ctx.backend.resetVolume(ctx.roomId, cacheVolume(ctx.roomId))
+      await ctx.backend.clearVolumeContents(ctx.roomId, cacheVolume(ctx.roomId))
       if (room.provider === 'android') {
         steps.push('Clear the Android SDK and Gradle cache')
-        await ctx.backend.resetVolume(ctx.roomId, `dh-${ctx.roomId}-sdk`)
+        await ctx.backend.clearVolumeContents(ctx.roomId, `dh-${ctx.roomId}-sdk`)
       }
     }
 

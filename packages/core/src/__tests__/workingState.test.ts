@@ -188,6 +188,20 @@ describe('Room-owned working state', () => {
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(true)
   })
 
+  it('refuses agent file transfer for legacy Host-bound rooms, whose workspace is the Host folder', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'legacy-host-bind',
+      syncStatus: 'legacy',
+      hostSyncEnabled: true
+    })
+    orch.rooms.create(room)
+    await expect(orch.pullRoomFile(room.id, '/workspace/.env')).rejects.toThrow(/legacy Host-bound/)
+    await expect(orch.pushRoomFile(room.id, '/workspace/evil.sh', 'ZXZpbA==')).rejects.toThrow(/legacy Host-bound/)
+    expect(backend.calls.some((call) => call.startsWith('copyFromRoom:') || call.startsWith('copyIntoRoom:'))).toBe(false)
+  })
+
   it('refuses a baseline reset for rooms with no Host link', async () => {
     const room = makeRoom({
       sourceType: 'managed-git',

@@ -195,6 +195,9 @@ export class FakeBackend implements IsolationBackend {
   async resetVolume(_roomId: string, name: string) {
     this.calls.push(`resetVolume:${name}`)
   }
+  async clearVolumeContents(_roomId: string, name: string) {
+    this.calls.push(`clearVolumeContents:${name}`)
+  }
   serviceStates = new Map<string, 'running' | 'exited' | 'missing'>()
   svcExecResult: ExecResult = ok
   async createService(roomId: string, svc: 'postgres' | 'redis', version: string) {

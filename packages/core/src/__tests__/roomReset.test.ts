@@ -53,6 +53,9 @@ describe('Room reset', () => {
       ...overrides
     })
     orch.rooms.create(record)
+    // an awake Room with its apps up: the safety dump needs them running
+    backend.serviceStates.set('postgres', 'running')
+    backend.serviceStates.set('redis', 'running')
     return record
   }
 
@@ -72,7 +75,10 @@ describe('Room reset', () => {
     const removeAt = backend.calls.indexOf('removeService:postgres:with-volume')
     expect(backupAt).toBeLessThan(removeAt)
     expect(backend.calls).toContain('createService:postgres:17')
-    expect(backend.calls).toContain('resetVolume:dh-room1abc-cache')
+    // the cache volume stays mounted by the web container, so it is emptied in
+    // place — removing it would be refused and abort the reset half-done
+    expect(backend.calls).toContain('clearVolumeContents:dh-room1abc-cache')
+    expect(backend.calls).not.toContain('resetVolume:dh-room1abc-cache')
     // dependencies come back as a NEW generation; the live volume is never wiped
     expect(orch.settings.get(depsGenKey(before.id, '22'))).toBe('1')
     expect(backend.calls.some((c) => c.startsWith('runOneShot:dh-room1abc-deps-node22-g1:'))).toBe(true)
@@ -122,9 +128,20 @@ describe('Room reset', () => {
         { kind: 'room-reset', reinstallDependencies: false, clearCaches: false, services: 'empty', clearBrowserData: false },
         'user'
       )
-    ).rejects.toThrow(/Wake the room/)
+    ).rejects.toThrow(/Start the room and its postgres app/)
 
-    orch.rooms.update(record.id, { status: 'ready', hostPort: 45000, workspaceMode: 'legacy-host-bind' })
+    // Android Rooms mount no dependency layer: an install would land in the
+    // user's source tree, so it is refused rather than silently misdirected
+    orch.rooms.update(record.id, { status: 'ready', hostPort: webPort.port, provider: 'android' })
+    await expect(
+      orch.applyChange(
+        record.id,
+        { kind: 'room-reset', reinstallDependencies: true, clearCaches: false, services: 'keep', clearBrowserData: false },
+        'user'
+      )
+    ).rejects.toThrow(/no dependency layer/)
+
+    orch.rooms.update(record.id, { provider: 'web', workspaceMode: 'legacy-host-bind' })
     await expect(
       orch.applyChange(
         record.id,

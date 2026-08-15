@@ -10,7 +10,8 @@ A Room can now be handed back clean while staying the same Room. **Reset clears 
 - **Reset**, each an option: dependencies (reinstalled into a *fresh* generation — the live layer is never wiped), download caches (SDK/Gradle caches on Android Rooms), Room App data (`Keep data` / `Fresh data` / `Remove apps`), and the Room browser profile. The stale thumbnail always goes, so the Lobby card cannot show a picture of the Room before the reset.
 - **Safety**: every Room App is dumped to a backup before its data is destroyed, and the change refuses to roll back destructively until that dump exists — the same interlock the service-version change uses. Resetting app data therefore needs an awake Room.
 - Honest about undo: a reset is **not** undoable (cleared caches and browser data have no inverse), so it never offers one. Room App data is recoverable from the safety backup through Restore in Room Apps.
-- Legacy Host-bound Rooms are refused — their workspace is a bind mount to your real folder.
+- Legacy Host-bound Rooms are refused — their workspace is a bind mount to your real folder. The same rule now guards `room_pull_file` / `room_push_file`, which could otherwise have read and written a legacy Room's real Host folder.
+- Caches are emptied in place rather than by deleting their volume: the Room's containers mount those volumes for the Room's whole life, so a delete would be refused mid-reset. Android Rooms have no dependency layer, so reinstalling dependencies there is refused instead of writing into the source tree.
 - Surfaces: the Room's ☰ menu (`Reset Room…`, confirmation by typing the nickname), and the `reset_room` MCP tool. Source code is deliberately out of scope, per goal.md §13.3; restoring code stays Sync from Host / Git.
 
 ### Unservable providers fail loudly instead of impersonating a Web Room

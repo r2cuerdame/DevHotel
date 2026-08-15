@@ -153,6 +153,8 @@ export interface IsolationBackend {
   copyFromService(roomId: string, svc: 'postgres' | 'redis', containerPath: string, hostPath: string): Promise<void>
   /** copy a host file into the service container */
   copyToService(roomId: string, svc: 'postgres' | 'redis', hostPath: string, containerPath: string): Promise<void>
+  /** empty a volume that containers still mount — deleting it would be refused while in use */
+  clearVolumeContents(roomId: string, name: string): Promise<void>
   /** copy a host file into the room's web/build container */
   copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void>
   /** copy a file out of the room's web/build container to the host */

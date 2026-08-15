@@ -924,6 +924,41 @@ export class OciCliBackend implements IsolationBackend {
     return sizes
   }
 
+  /**
+   * Empty a volume in place. `resetVolume` removes and recreates, which Docker
+   * refuses for a volume any container still references — and the Room's cache
+   * and SDK volumes are mounted by its web container for the Room's whole life,
+   * stopped or not. Mounting the same volume into a throwaway helper and
+   * clearing it there works regardless.
+   */
+  async clearVolumeContents(roomId: string, name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    assertExpectedRoomVolumeName(roomId, name)
+    const volume = await this.inspectVolume(name)
+    if (!volume) return
+    await this.assertRoomVolumeOwnership(volume, roomId, name)
+    await this.ensureImage(DU_IMAGE)
+    must(
+      await runDocker([
+        'run',
+        '--rm',
+        '--network',
+        'none',
+        '--cap-drop',
+        'ALL',
+        '--security-opt',
+        'no-new-privileges',
+        '-v',
+        `${name}:/target`,
+        DU_IMAGE,
+        'sh',
+        '-lc',
+        'find /target -mindepth 1 -maxdepth 1 -exec rm -rf {} +'
+      ]),
+      `clear volume ${name}`
+    )
+  }
+
   async resetVolume(roomId: string, name: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     assertExpectedRoomVolumeName(roomId, name)
