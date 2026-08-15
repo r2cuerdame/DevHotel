@@ -79,6 +79,17 @@ function makeChange(overrides: Partial<Omit<ChangeEntry, 'seq'>> = {}): Omit<Cha
 }
 
 describe('roomsRepo', () => {
+  it('refuses to hydrate a room whose stored provider this build does not know', () => {
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom())
+    // a row written by a newer build, or edited by hand: it must not be cast
+    // through and quietly served as a Web Room
+    db.sqlite.prepare("UPDATE rooms SET provider = 'plan9' WHERE id = ?").run('room-1')
+
+    expect(() => rooms.get('room-1')).toThrow(/provider 'plan9'/)
+    expect(() => rooms.list()).toThrow(/does not know/)
+  })
+
   it('round-trips a room preserving nested objects', () => {
     const rooms = roomsRepo(db)
     const room = makeRoom()

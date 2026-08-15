@@ -1410,6 +1410,16 @@ export class RoomOrchestrator {
       const base = getProvider('android').buildSpec(room, osOverlay)
       return { ...base, env: { ...base.env, ...osEnv }, ...overrides }
     }
+    // Every container this Room ever materializes comes through here, so this
+    // is where a provider the build cannot serve has to stop. Falling through
+    // would hand it the Web runtime — a Linux Node image, Web checks and Web
+    // change kinds — under another provider's name.
+    if (room.provider !== 'web') {
+      const provider = getProvider(room.provider)
+      throw new Error(
+        `${provider.info.label} cannot run in this DevHotel build: ${provider.info.unavailableReason ?? 'provider unavailable'}`
+      )
+    }
     const gen = this.depsGen(room.id)
     return {
       roomId: room.id,

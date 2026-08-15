@@ -3,6 +3,17 @@ export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
 export type PmKind = 'npm' | 'pnpm' | 'gradle'
 export type ProviderKind = 'web' | 'android' | 'windows'
+
+/** What a Room provider can do in this build — the registry's own answer, so the UI never invents availability. */
+export interface ProviderInfo {
+  kind: ProviderKind
+  label: string
+  available: boolean
+  unavailableReason?: string
+  execution: 'served' | 'build-only'
+  preview: 'browser' | 'none'
+  requiresKvm: boolean
+}
 /** Guest LCD scaling: swiftshader renders in software, so fewer pixels = a much faster phone. */
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 export type EmulatorOrientation = 'portrait' | 'landscape'

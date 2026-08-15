@@ -1,19 +1,12 @@
-import type { RoomPlan, RoomRecord } from '@devhotel/shared'
+import type { ProviderInfo, ProviderKind, RoomPlan, RoomRecord } from '@devhotel/shared'
 import type { WebSpec } from '../backend/types'
 import type { DetectOptions } from '../detect/detector'
 import type { SourceReader } from '../detect/sourceReader'
 
-export type RoomProviderKind = 'web' | 'android' | 'windows'
+export type RoomProviderKind = ProviderKind
 
-export interface RoomProviderInfo {
-  kind: RoomProviderKind
-  label: string
-  available: boolean
-  unavailableReason?: string
-  execution: 'served' | 'build-only'
-  preview: 'browser' | 'none'
-  requiresKvm: boolean
-}
+/** Shared with the renderer so the New Room wizard renders real availability. */
+export type RoomProviderInfo = ProviderInfo
 
 /**
  * Provider seam per goal.md §18.1 — a provider owns what is genuinely

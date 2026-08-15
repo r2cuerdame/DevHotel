@@ -21,6 +21,28 @@ describe('provider registry', () => {
     expect(windows.unavailableReason).toBeTruthy()
   })
 
+  it('refuses to build a container spec for a provider this build cannot serve', async () => {
+    const { RoomOrchestrator } = await import('../orchestrator')
+    const { FakeBackend, FakeGateway, makeRoom: makeRoomRecord, tempDir, testDb } = await import('./fakes')
+    const db = testDb()
+    try {
+      const orch = new RoomOrchestrator({
+        userData: tempDir(),
+        backend: new FakeBackend(),
+        gateway: new FakeGateway().asGateway(),
+        db,
+        appVersion: 'test'
+      })
+      // a windows row can only arrive out-of-band; it must never fall through
+      // to the Web runtime just because it is not android
+      orch.rooms.create(makeRoomRecord({ provider: 'windows', status: 'sleeping', hostPort: null }))
+      await expect(orch.startRoom('room1abc', 'user')).resolves.toBeUndefined()
+      expect(orch.rooms.get('room1abc')?.status).toBe('broken')
+    } finally {
+      db.close()
+    }
+  })
+
   it('returns the provider matching its kind', () => {
     expect(getProvider('web').info.kind).toBe('web')
     expect(getProvider('android').info.kind).toBe('android')

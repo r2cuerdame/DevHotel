@@ -231,6 +231,7 @@ export const ptBR: Translation = {
   'rename.title': 'Renomear quarto',
   'rename.save': 'Salvar',
   'wizard.roomType': 'Tipo de quarto',
+  'wizard.providerLater': 'No roadmap — ainda não disponível',
   'wizard.webRoom': 'Quarto Web',
   'wizard.webRoomHint': 'Desenvolvimento Web com Node.js e prévia local',
   'wizard.sourceAndroid': 'App Android',

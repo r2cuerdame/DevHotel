@@ -230,6 +230,7 @@ export const ja: Translation = {
   'rename.title': 'ルーム名を変更',
   'rename.save': '保存',
   'wizard.roomType': 'ルームの種類',
+  'wizard.providerLater': 'ロードマップ掲載 — まだ利用できません',
   'wizard.webRoom': 'Web ルーム',
   'wizard.webRoomHint': 'Node.js Web 開発とローカルブラウザプレビュー',
   'wizard.sourceAndroid': 'Android アプリ',

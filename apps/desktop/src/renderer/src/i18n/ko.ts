@@ -228,6 +228,7 @@ export const ko: Translation = {
   'rename.title': 'Room 이름 바꾸기',
   'rename.save': '저장',
   'wizard.roomType': 'Room 종류',
+  'wizard.providerLater': '로드맵에 있음 — 아직 제공되지 않음',
   'wizard.webRoom': 'Web Room',
   'wizard.webRoomHint': 'Node.js 웹 개발과 로컬 브라우저 미리보기',
   'wizard.sourceAndroid': 'Android 앱',

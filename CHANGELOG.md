@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Unservable providers fail loudly instead of impersonating a Web Room
+
+A feasibility review of adding a Windows provider found the placeholder was riskier than the missing feature.
+
+- A stored `provider` value was cast through unvalidated, and every runtime branch reads "android, else web" — so a Room row naming a provider this build cannot serve would have booted as a Node/Debian Web Room, with Web checks and Web change kinds. Hydration now rejects an unknown provider, and `webSpecFor` — the one path every Room container is built through — refuses a known-but-unavailable provider with the registry's own reason.
+- The New Room wizard renders roadmap providers from the registry, so the disabled "Windows Room" tile states its real availability and disappears by itself once the provider reports available. `windowsProvider.ts` claimed to be "visible on the roadmap, never faked in the UI" while nothing rendered it at all.
+- Windows Rooms themselves remain unbuilt, and the creation contracts (`zProviderKind`) stay `web | android`.
+
 ### Host sync no longer dead-ends after a build
 
 Reported by an agent whose Android Room could never sync again: the room went `modified` at its first `android-run` and refused every later sync, with no way back from any surface.

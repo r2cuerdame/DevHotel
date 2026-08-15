@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
+import { useEffect, useState } from 'react'
+import type { ProviderInfo, ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import type { Translation } from '../i18n'
@@ -23,6 +23,20 @@ export function NewRoomWizard(): React.JSX.Element {
   const [nickname, setNickname] = useState('dev')
   const [plan, setPlan] = useState<RoomPlan | null>(null)
   const [loading, setLoading] = useState(false)
+  const [roadmap, setRoadmap] = useState<ProviderInfo[]>([])
+
+  useEffect(() => {
+    let active = true
+    void api.rooms
+      .providers()
+      .then((list) => {
+        if (active) setRoadmap(list.filter((info) => !info.available))
+      })
+      .catch(() => undefined)
+    return () => {
+      active = false
+    }
+  }, [])
 
   // editable plan fields
   const [runtimeVersion, setRuntimeVersion] = useState('22')
@@ -112,6 +126,15 @@ export function NewRoomWizard(): React.JSX.Element {
                   <b>{t('android.buildRoom')}</b>
                   <small>{t('wizard.sourceAndroidHint')}</small>
                 </button>
+                {/* Roadmap providers come from the registry, so the tile is
+                    never a hand-written promise: it disappears the day the
+                    provider reports itself available. */}
+                {roadmap.map((info) => (
+                  <button key={info.kind} className="source-choice" disabled title={info.unavailableReason}>
+                    <b>{info.label}</b>
+                    <small>{t('wizard.providerLater')}</small>
+                  </button>
+                ))}
               </div>
             </div>
             <div className="source-choices">

@@ -231,6 +231,7 @@ export const ru: Translation = {
   'rename.title': 'Переименовать номер',
   'rename.save': 'Сохранить',
   'wizard.roomType': 'Тип номера',
+  'wizard.providerLater': 'В планах — пока недоступно',
   'wizard.webRoom': 'Web-номер',
   'wizard.webRoomHint': 'Веб-разработка на Node.js с локальным предпросмотром',
   'wizard.sourceAndroid': 'Android-приложение',

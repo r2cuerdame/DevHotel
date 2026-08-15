@@ -34,7 +34,7 @@ import {
   zTermResize,
   type McpSetupInfo
 } from '@devhotel/shared'
-import { caTrustStatus, ensureCa, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
+import { caTrustStatus, ensureCa, providers, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
 import type { PreviewManager } from './previewManager'
 import type { TermManager } from './termManager'
 import {
@@ -162,6 +162,7 @@ export function registerIpc(opts: {
   handle(IPC.roomsMoveIntoHotel, (_event, roomId, selectedPath) =>
     orch.moveIntoHotel(reauthorizeRoomSource(roomId, selectedPath), 'user')
   )
+  handle(IPC.roomsProviders, () => providers())
   handle(IPC.roomsResetSyncBaseline, (_event, roomId) => orch.resetSyncBaseline(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsSetAgentHostSync, (_event, roomId, allowed) =>
     orch.setAgentHostSync(zRoomId.parse(roomId), allowed === true, 'user')

@@ -231,6 +231,7 @@ export const es: Translation = {
   'rename.title': 'Renombrar habitación',
   'rename.save': 'Guardar',
   'wizard.roomType': 'Tipo de habitación',
+  'wizard.providerLater': 'En la hoja de ruta: aún no disponible',
   'wizard.webRoom': 'Habitación web',
   'wizard.webRoomHint': 'Desarrollo web con Node.js y vista previa local',
   'wizard.sourceAndroid': 'App Android',

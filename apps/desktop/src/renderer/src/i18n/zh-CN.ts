@@ -228,6 +228,7 @@ export const zhCN: Translation = {
   'rename.title': '重命名房间',
   'rename.save': '保存',
   'wizard.roomType': '房间类型',
+  'wizard.providerLater': '在路线图中 — 尚未提供',
   'wizard.webRoom': 'Web 房间',
   'wizard.webRoomHint': 'Node.js Web 开发与本地浏览器预览',
   'wizard.sourceAndroid': 'Android 应用',

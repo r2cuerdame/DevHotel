@@ -68,7 +68,7 @@ function rowToRoom(row: RoomRow): RoomRecord {
     project: row.project,
     nickname: row.nickname,
     roomNumber: row.room_number,
-    provider: row.provider as ProviderKind,
+    provider: parseProvider(row.provider, row.id),
     sourceType: row.source_type as SourceType,
     sourceRef: row.source_ref,
     workspaceMode: (row.workspace_mode ?? legacyWorkspaceMode(row.source_type)) as WorkspaceMode,
@@ -102,6 +102,23 @@ function rowToRoom(row: RoomRow): RoomRecord {
 }
 
 type ColumnValue = string | number | null
+
+const KNOWN_PROVIDERS: readonly ProviderKind[] = ['web', 'android', 'windows']
+
+/**
+ * A stored provider must be one this build knows. An unknown value used to be
+ * cast straight through, and since every runtime branch reads "android or else
+ * web", such a Room would quietly boot as a Node/Debian Web Room with Web
+ * checks and Web change kinds. Corruption fails loudly here instead; a known
+ * but unservable provider is caught where the Room is actually run.
+ */
+function parseProvider(value: string, roomId: string): ProviderKind {
+  if ((KNOWN_PROVIDERS as readonly string[]).includes(value)) return value as ProviderKind
+  throw new Error(
+    `Room ${roomId} records provider '${value}', which this DevHotel build does not know. ` +
+      'The Room database was written by a newer version or edited by hand.'
+  )
+}
 
 function patchToColumns(patch: Partial<RoomRecord>): Record<string, ColumnValue> {
   const cols: Record<string, ColumnValue> = {}

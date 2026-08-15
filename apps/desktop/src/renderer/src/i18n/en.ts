@@ -247,6 +247,7 @@ export const en = {
   'rename.title': 'Rename room',
   'rename.save': 'Save',
   'wizard.roomType': 'Room type',
+  'wizard.providerLater': 'On the roadmap — not available yet',
   'wizard.webRoom': 'Web Room',
   'wizard.webRoomHint': 'Node.js web development with a local browser preview',
   'wizard.sourceAndroid': 'Android app',

@@ -231,6 +231,7 @@ export const de: Translation = {
   'rename.title': 'Zimmer umbenennen',
   'rename.save': 'Speichern',
   'wizard.roomType': 'Room-Typ',
+  'wizard.providerLater': 'Auf der Roadmap — noch nicht verfügbar',
   'wizard.webRoom': 'Web Room',
   'wizard.webRoomHint': 'Node.js-Webentwicklung mit lokaler Browser-Vorschau',
   'wizard.sourceAndroid': 'Android-App',
