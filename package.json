@@ -1,7 +1,7 @@
 {
   "name": "devhotel-workspace",
   "private": true,
-  "version": "0.4.2",
+  "version": "0.4.3",
   "type": "module",
   "description": "Give AI a room, not your computer — a local runtime for isolated development agents.",
   "license": "MIT",
