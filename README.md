@@ -1,5 +1,11 @@
 # DevHotel
 
+[![Download](https://img.shields.io/github/v/release/r2cuerdame/DevHotel?sort=semver&label=download&color=2ea44f)](https://github.com/r2cuerdame/DevHotel/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/r2cuerdame/DevHotel/total?label=downloads)](https://github.com/r2cuerdame/DevHotel/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)](#download)
+[![License](https://img.shields.io/github/license/r2cuerdame/DevHotel)](./LICENSE)
+[![Release build](https://github.com/r2cuerdame/DevHotel/actions/workflows/release.yml/badge.svg)](https://github.com/r2cuerdame/DevHotel/actions/workflows/release.yml)
+
 > **Give AI a room, not your computer.**
 >
 > **Inside the Room, AI is free to act. Outside the Room, permission is required.**
@@ -22,7 +28,8 @@ Quick Start · Quick Change
 - A working Web Room can be cloned into `stage` or `node24-test`, optionally including dependencies and service data; the clone receives a fresh isolated browser profile.
 - Quick Changes run as verified transactions with **action-level Undo**: `↶ Undo: Node 22 → 24`.
 - When something breaks, a 14-step check pipeline tells you *which* layer failed, and **Copy Diagnostic** produces a secret-redacted bundle you can paste into an issue or an LLM.
-- Web is the primary served-site provider. The Desktop client also exposes an Android Room that builds APKs without any Host SDK or `adb` and shows a Room-owned KVM-backed emulator screen as its site; shared physical devices remain a later Hotel Device Service.
+- **Reset Room** hands a Room back clean without checking out: it keeps the room number, nickname, domain, plan, source code and history, and rebuilds only what it can — dependencies, caches, Room App data, browser profile. Room App data is dumped to a safety backup first.
+- Three Room kinds today. **Web** is the primary served-site provider. **Android** builds APKs with no Host SDK or `adb` and shows a Room-owned KVM-backed emulator screen — portrait or landscape, with Back/Home/Recents/Rotate — as its site. **Windows (VMware)** clones a Workstation template snapshot into a Room-owned VM; guest exec and file ingress are deliberately later capabilities, and shared physical devices remain a later Hotel Device Service.
 
 See [goal.md](./goal.md) for the full product definition (Korean).
 
@@ -60,12 +67,17 @@ Current preview requirements:
 
 - Windows 11 (first supported OS)
 - Docker Engine — Docker Desktop with the WSL2 backend, or any engine exposing the `docker` CLI
+- Android Rooms additionally need KVM through that engine; Windows Rooms need VMware Workstation Pro on the host
 
-## Install
+## Download
 
-Download the developer-preview installer from [GitHub Releases](../../releases) and run it. The current installer still expects the external Docker requirement above; it must not be presented as the final zero-prerequisite install experience.
+**[⬇ Download the latest installer](https://github.com/r2cuerdame/DevHotel/releases/latest)** — `DevHotel-Setup-<version>.exe`, Windows 11 x64.
 
-DevHotel auto-updates from Releases. App updates must never silently change a room's Node, PostgreSQL, Redis, or package-manager selection.
+Run the installer and DevHotel starts in the tray. It keeps itself up to date from Releases; app updates never silently change a Room's Node, PostgreSQL, Redis, or package-manager selection — Room stacks change only when you change them.
+
+This is a developer preview: it still expects the external Docker requirement above, so it is not yet the zero-prerequisite install described in the previous section. Windows Rooms additionally need VMware Workstation Pro on the host.
+
+Every release ships `DevHotel-Setup-<version>.exe`, its `.blockmap`, and `latest.yml`; the `latest.yml` checksum must match the installer or auto-update refuses the download. Releases are cut locally rather than by CI — see [Releasing](./docs/releasing.md).
 
 ## Hotel Services — shared infrastructure, scoped access
 
@@ -118,9 +130,17 @@ This describes the current external-Docker developer preview. The target release
 
 See [Managed Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-managed-runtime-design.md) for the zero-prerequisite installation, ownership, update, recovery, and cleanup boundary.
 
-Agents (or any local tool) can drive DevHotel without MCP through the stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), auth, and the full endpoint contract.
-
 Releases are cut locally, not by CI — see [Releasing](./docs/releasing.md).
+
+## For agents
+
+Settings → **MCP** gives you a one-line registration command for Claude Code and an `mcpServers` snippet for any other client. Register it by absolute path; the bundled server reconnects by itself when the DevHotel app restarts.
+
+The MCP server exposes 27 tools over the same contract the app uses: create/start/sleep/clone/rename/delete a Room, run commands in it, apply and undo Quick Changes, read logs, components and diagnostics, push and pull workspace files, reset a Room, request a Host sync under the Room's revocable grant, and — for Android Rooms — build, install and launch an APK and take a screenshot of the phone.
+
+Agents (or any local tool) can drive DevHotel **without MCP** through the same stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), bearer auth, agent semantics, and every endpoint.
+
+Everything an agent changes lands in the Room's Changes list, attributed to `agent` and undoable where an inverse honestly exists. Host resources stay outside that boundary: agents cannot create Host-linked Rooms, choose Host paths, or transfer files in a legacy Host-bound Room.
 
 ## License
 
