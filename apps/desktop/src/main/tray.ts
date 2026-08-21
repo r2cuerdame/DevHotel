@@ -1,5 +1,7 @@
 import { app, Menu, nativeImage, Tray, type BrowserWindow } from 'electron'
 import type { RoomOrchestrator } from '@devhotel/core'
+import type { UpdateStatusInfo } from '@devhotel/shared'
+import { updateTrayMenuItem } from './updateTrayMenu'
 
 /** 16×16 brass key-plate tray icon, generated in code (no asset pipeline needed). */
 function trayIcon(): Electron.NativeImage {
@@ -27,8 +29,9 @@ export function createTray(opts: {
   win: BrowserWindow
   orch: RoomOrchestrator
   onQuit: () => void
-  updateReady: () => string | null
-  onUpdateReady: (listener: () => void) => () => void
+  updateStatus: () => UpdateStatusInfo
+  onUpdateStatusChange: (listener: () => void) => () => void
+  checkForUpdates: () => void
   installUpdate: () => void
 }): Tray {
   const { win, orch, onQuit } = opts
@@ -45,7 +48,6 @@ export function createTray(opts: {
     const rooms = orch.listRooms()
     const running = rooms.filter((r) => r.status === 'running' || r.status === 'ready' || r.status === 'attention')
     const health = await orch.backendHealth().catch(() => ({ ok: false, detail: 'unreachable' }))
-    const updateVersion = opts.updateReady()
 
     const menu = Menu.buildFromTemplate([
       { label: 'Open DevHotel', click: show },
@@ -73,9 +75,7 @@ export function createTray(opts: {
           app.setLoginItemSettings({ openAtLogin: item.checked, args: ['--hidden'] })
         }
       },
-      ...(updateVersion
-        ? [{ label: `Restart to update to ${updateVersion}`, click: opts.installUpdate }]
-        : []),
+      updateTrayMenuItem(opts.updateStatus(), opts.checkForUpdates, opts.installUpdate),
       { type: 'separator' },
       { label: 'Quit DevHotel', click: onQuit }
     ])
@@ -84,7 +84,7 @@ export function createTray(opts: {
 
   void rebuild()
   orch.onEvent(() => void rebuild())
-  opts.onUpdateReady(() => void rebuild())
+  opts.onUpdateStatusChange(() => void rebuild())
   tray.on('click', show)
   return tray
 }

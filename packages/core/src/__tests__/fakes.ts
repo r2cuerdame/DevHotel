@@ -7,6 +7,7 @@ import type { RoomRecord } from '@devhotel/shared'
 import type { ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
+import type { WindowsVmLifecycle } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
 
 export function tempDir(): string {
@@ -278,6 +279,68 @@ export class FakeBackend implements IsolationBackend {
   }
   async emulatorState() {
     return this.emulatorStateValue
+  }
+}
+
+export class FakeWindowsVm implements WindowsVmLifecycle {
+  calls: string[] = []
+  stateValue: 'running' | 'stopped' | 'missing' = 'stopped'
+  healthValue = { ok: true, detail: 'fake vmrun' }
+  baselineValue = { ok: true, detail: 'fake clean baseline' }
+  failCreate = false
+  readonly templateId = 'd'.repeat(64)
+
+  async health() {
+    this.calls.push('health')
+    return this.healthValue
+  }
+
+  async inspectTemplate(input: { templateVmxPath: string; snapshot: string }) {
+    this.calls.push(`inspectTemplate:${input.snapshot}`)
+    return { templateId: this.templateId, snapshot: input.snapshot }
+  }
+
+  async create(input: { roomId: string; templateVmxPath: string; snapshot: string }) {
+    this.calls.push(`create:${input.roomId}:${input.snapshot}`)
+    if (this.failCreate) throw new Error('fake create failed before ownership marker')
+    this.stateValue = 'stopped'
+    return { roomId: input.roomId, templateId: this.templateId, snapshot: input.snapshot }
+  }
+
+  async start(roomId: string) {
+    this.calls.push(`start:${roomId}`)
+    this.stateValue = 'running'
+  }
+
+  async state(roomId: string) {
+    this.calls.push(`state:${roomId}`)
+    return this.stateValue
+  }
+
+  async sleep(roomId: string) {
+    this.calls.push(`sleep:${roomId}`)
+    if (this.stateValue !== 'missing') this.stateValue = 'stopped'
+  }
+
+  async delete(roomId: string) {
+    this.calls.push(`delete:${roomId}`)
+    this.stateValue = 'missing'
+    return { reclaimedBytes: 2048 }
+  }
+
+  async reset(roomId: string) {
+    this.calls.push(`reset:${roomId}`)
+    this.stateValue = 'stopped'
+    return { roomId, templateId: this.templateId, snapshot: 'devhotel-clean' }
+  }
+
+  async validateBaseline(roomId: string) {
+    this.calls.push(`validateBaseline:${roomId}`)
+    return this.baselineValue
+  }
+
+  async openConsole(roomId: string) {
+    this.calls.push(`openConsole:${roomId}`)
   }
 }
 

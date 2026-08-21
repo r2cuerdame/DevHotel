@@ -20,6 +20,8 @@ const TABS: { id: ConfigTab; icon: string; key: keyof Translation }[] = [
   { id: 'console', icon: '❯', key: 'tabs.console' }
 ]
 
+const WINDOWS_HIDDEN_TABS = new Set<ConfigTab>(['stack', 'system', 'console'])
+
 export function RoomConfig({
   room,
   tab,
@@ -40,6 +42,14 @@ export function RoomConfig({
     void refreshInspection(room.id)
   }, [room.id, refreshInspection])
 
+  const windows = room.provider === 'windows'
+  const visibleTabs = windows ? TABS.filter(({ id }) => !WINDOWS_HIDDEN_TABS.has(id)) : TABS
+  const activeTab = windows && WINDOWS_HIDDEN_TABS.has(tab) ? 'overview' : tab
+
+  useEffect(() => {
+    if (activeTab !== tab) onTabChange(activeTab)
+  }, [activeTab, onTabChange, tab])
+
   return (
     <section className="room-config" aria-label={t('bar.roomDetails')}>
       <header className="room-config-head">
@@ -54,11 +64,11 @@ export function RoomConfig({
         )}
       </header>
       <nav className="panel-tabs" aria-label={t('bar.roomDetails')}>
-        {TABS.map(({ id, icon, key }) => (
+        {visibleTabs.map(({ id, icon, key }) => (
           <button
             key={id}
             className="panel-tab"
-            data-active={tab === id}
+            data-active={activeTab === id}
             title={t(key)}
             onClick={() => onTabChange(id)}
           >
@@ -70,12 +80,12 @@ export function RoomConfig({
         ))}
       </nav>
       <div className="panel-content">
-        {tab === 'overview' && <OverviewTab room={room} onShowHealth={() => onTabChange('health')} />}
-        {tab === 'stack' && <StackTab room={room} />}
-        {tab === 'system' && <SystemTab room={room} />}
-        {tab === 'activity' && <ActivityTab room={room} />}
-        {tab === 'health' && <DiagnosticsTab room={room} />}
-        {tab === 'console' && <ConsoleTab room={room} />}
+        {activeTab === 'overview' && <OverviewTab room={room} onShowHealth={() => onTabChange('health')} />}
+        {activeTab === 'stack' && <StackTab room={room} />}
+        {activeTab === 'system' && <SystemTab room={room} />}
+        {activeTab === 'activity' && <ActivityTab room={room} />}
+        {activeTab === 'health' && <DiagnosticsTab room={room} />}
+        {activeTab === 'console' && <ConsoleTab room={room} />}
       </div>
     </section>
   )

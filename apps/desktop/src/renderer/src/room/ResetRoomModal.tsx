@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { ResetServiceMode, RoomRecord } from '@devhotel/shared'
+import { api } from '../api'
 import { useStore, useT } from '../state/store'
 
 /**
@@ -8,6 +9,81 @@ import { useStore, useT } from '../state/store'
  * restoring code stays Sync from Host / Git (goal.md §13.3).
  */
 export function ResetRoomModal({ room, onClose }: { room: RoomRecord; onClose: () => void }): React.JSX.Element {
+  if (room.provider === 'windows') return <WindowsResetRoomModal room={room} onClose={onClose} />
+  return <RebuildableRoomResetModal room={room} onClose={onClose} />
+}
+
+function WindowsResetRoomModal({ room, onClose }: { room: RoomRecord; onClose: () => void }): React.JSX.Element {
+  const refreshRooms = useStore((s) => s.refreshRooms)
+  const refreshInspection = useStore((s) => s.refreshInspection)
+  const toast = useStore((s) => s.toast)
+  const t = useT()
+  const [confirmation, setConfirmation] = useState('')
+  const [resetting, setResetting] = useState(false)
+  const confirmed = confirmation.trim().toLocaleLowerCase() === room.nickname.toLocaleLowerCase()
+
+  async function submit(): Promise<void> {
+    if (!confirmed || resetting) return
+    setResetting(true)
+    try {
+      await api.rooms.resetWindows(room.id)
+      await Promise.all([refreshRooms(), refreshInspection(room.id)])
+      toast('success', t('windows.resetDone'))
+      onClose()
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : String(err))
+      setResetting(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={() => !resetting && onClose()}>
+      <form
+        className="modal clone-modal"
+        onClick={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          event.preventDefault()
+          void submit()
+        }}
+      >
+        <h2>{t('windows.resetTitle')}</h2>
+        <p className="small muted" style={{ marginTop: 0 }}>
+          {t('windows.resetRule')}
+        </p>
+        <div className="panel-section">
+          <h3>{t('windows.cleanBaseline')}</h3>
+          <div className="change-item">
+            <span className="status-dot" data-status="ready" />
+            <span className="title">
+              {t('windows.linkedCloneRecreate')}
+              {room.windows?.snapshot && <div className="mono small">{room.windows.snapshot}</div>}
+            </span>
+          </div>
+        </div>
+        <div className="field">
+          <label htmlFor="reset-confirm">{t('reset.confirmLabel', { nickname: room.nickname })}</label>
+          <input
+            id="reset-confirm"
+            value={confirmation}
+            autoFocus
+            autoComplete="off"
+            onChange={(event) => setConfirmation(event.target.value)}
+          />
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="btn" disabled={resetting} onClick={onClose}>
+            {t('common.cancel')}
+          </button>
+          <button type="submit" className="btn danger" disabled={!confirmed || resetting}>
+            {resetting ? t('windows.resetting') : t('windows.resetSubmit')}
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function RebuildableRoomResetModal({ room, onClose }: { room: RoomRecord; onClose: () => void }): React.JSX.Element {
   const applyChange = useStore((s) => s.applyChange)
   const t = useT()
   const android = room.provider === 'android'

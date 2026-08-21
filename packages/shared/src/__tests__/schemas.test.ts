@@ -155,7 +155,7 @@ describe('zCreateRoomInput', () => {
     expect(zAgentCreateRoomInput.safeParse({ ...linked, sourceType: 'managed-git', sourceRef: 'https://example.test/repo.git' }).success).toBe(true)
   })
 
-  it('allows Web and Android Rooms for users and agents, never windows', () => {
+  it('allows desktop-only Windows creation with an opaque VMware picker grant', () => {
     const create = {
       sourceType: 'empty' as const,
       sourceRef: '',
@@ -167,9 +167,41 @@ describe('zCreateRoomInput', () => {
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'web' }).success).toBe(true)
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'android' }).success).toBe(true)
     expect(zRendererCreateRoomInput.safeParse({ ...create, provider: 'windows' }).success).toBe(false)
+    expect(
+      zRendererCreateRoomInput.safeParse({
+        ...create,
+        provider: 'windows',
+        windows: { templateGrantId: '11111111-2222-4333-8444-555555555555', snapshot: 'devhotel-clean' }
+      }).success
+    ).toBe(true)
+    expect(
+      zRendererCreateRoomInput.safeParse({
+        ...create,
+        provider: 'windows',
+        planOverrides: { internalPort: 3000 },
+        windows: { templateGrantId: '11111111-2222-4333-8444-555555555555', snapshot: 'devhotel-clean' }
+      }).success
+    ).toBe(false)
+    expect(
+      zCreateRoomInput.safeParse({
+        ...create,
+        provider: 'windows',
+        actor: 'user',
+        windows: { baseVmxPath: 'C:\\VMs\\Windows 11.vmx', snapshot: 'devhotel-clean' }
+      }).success
+    ).toBe(true)
     expect(zAgentCreateRoomInput.safeParse({ ...create, provider: 'android' }).success).toBe(true)
     expect(zAgentCreateRoomInput.safeParse({ ...create, provider: 'windows' }).success).toBe(false)
     expect(zRendererPlanRoomInput.safeParse({ ...plan, provider: 'android' }).success).toBe(true)
+    expect(zRendererPlanRoomInput.safeParse({ ...plan, provider: 'windows' }).success).toBe(true)
+    expect(
+      zRendererPlanRoomInput.safeParse({
+        ...plan,
+        provider: 'windows',
+        sourceType: 'managed-git',
+        sourceRef: 'https://example.test/repo.git'
+      }).success
+    ).toBe(false)
   })
 })
 

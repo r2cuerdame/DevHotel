@@ -17,13 +17,13 @@ export async function reconcile(
   rooms: RoomsRepo,
   log: (line: string) => void
 ): Promise<ReconcileResult> {
-  const known = new Set(rooms.list().map((r) => r.id))
+  const knownOciRooms = new Set(rooms.list().filter((room) => room.provider !== 'windows').map((room) => room.id))
   const straysRemoved: string[] = []
   for (const c of await backend.listManagedContainers()) {
     // A one-shot process is owned by the client operation that started it.
     // At process startup no such operation is live, even when its Room still
     // exists, so every surviving job container is stale and must be reaped.
-    if (c.role === 'job' || !c.roomId || !known.has(c.roomId)) {
+    if (c.role === 'job' || !c.roomId || !knownOciRooms.has(c.roomId)) {
       const kind = c.role === 'job' ? 'stale job container' : 'stray container'
       log(`reconcile: removing ${kind} ${c.name} (room ${c.roomId || 'unknown'})`)
       await backend.removeManagedContainer(c.name)
@@ -33,7 +33,7 @@ export async function reconcile(
 
   const networksRemoved: string[] = []
   for (const network of await backend.listManagedNetworks()) {
-    if (!network.roomId || !known.has(network.roomId)) {
+    if (!network.roomId || !knownOciRooms.has(network.roomId)) {
       log(`reconcile: removing stray network ${network.name} (room ${network.roomId || 'unknown'})`)
       await backend.removeManagedNetwork(network.name)
       networksRemoved.push(network.name)
@@ -42,6 +42,9 @@ export async function reconcile(
 
   const roomsSlept: string[] = []
   for (const room of rooms.list()) {
+    // Windows VMs have a separate ownership ledger and lifecycle reconciler.
+    // Never hand one to the OCI backend just because it shares the Room table.
+    if (room.provider === 'windows') continue
     if (room.status === 'sleeping') continue
     if (room.status === 'preparing') {
       // Creation/clone is not resumable: its workspace or data volumes may be

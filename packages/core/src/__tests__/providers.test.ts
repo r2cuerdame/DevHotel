@@ -4,6 +4,7 @@ import { detectProject } from '../detect/detector'
 import { fsSourceReader, type SourceReader } from '../detect/sourceReader'
 import { getProvider, providers } from '../providers/index'
 import { buildWebSpec } from '../providers/webProvider'
+import { WindowsRoomProvider } from '../providers/windowsProvider'
 import { makeRoom } from './fakes'
 
 function fixture(name: string): SourceReader {
@@ -11,33 +12,52 @@ function fixture(name: string): SourceReader {
 }
 
 describe('provider registry', () => {
-  it('lists web and android as available, windows as an honest roadmap stub', () => {
+  it('lists every provider and reports VMware availability without inventing a preview', () => {
     const infos = providers()
     expect(infos.map((i) => i.kind)).toEqual(['web', 'android', 'windows'])
     expect(infos.find((i) => i.kind === 'web')!.available).toBe(true)
     expect(infos.find((i) => i.kind === 'android')!.available).toBe(true)
     const windows = infos.find((i) => i.kind === 'windows')!
-    expect(windows.available).toBe(false)
-    expect(windows.unavailableReason).toBeTruthy()
+    expect(windows).toMatchObject({ execution: 'build-only', preview: 'none', requiresKvm: false })
+    if (!windows.available) {
+      expect(windows.unavailableReason).toMatch(
+        process.platform === 'win32' ? /VMware Workstation/ : /Windows host/
+      )
+    }
   })
 
   it('refuses to build a container spec for a provider this build cannot serve', async () => {
     const { RoomOrchestrator } = await import('../orchestrator')
     const { FakeBackend, FakeGateway, makeRoom: makeRoomRecord, tempDir, testDb } = await import('./fakes')
     const db = testDb()
+    const backend = new FakeBackend()
     try {
       const orch = new RoomOrchestrator({
         userData: tempDir(),
-        backend: new FakeBackend(),
+        backend,
         gateway: new FakeGateway().asGateway(),
         db,
         appVersion: 'test'
       })
       // a windows row can only arrive out-of-band; it must never fall through
       // to the Web runtime just because it is not android
-      orch.rooms.create(makeRoomRecord({ provider: 'windows', status: 'sleeping', hostPort: null }))
-      await expect(orch.startRoom('room1abc', 'user')).resolves.toBeUndefined()
-      expect(orch.rooms.get('room1abc')?.status).toBe('broken')
+      orch.rooms.create(makeRoomRecord({
+        provider: 'windows',
+        sourceType: 'empty',
+        sourceRef: '',
+        workspaceMode: 'empty',
+        syncStatus: 'empty',
+        runtime: { kind: 'windows', version: '11' },
+        packageManager: { kind: 'none' },
+        startCommand: 'VMware guest boot',
+        internalPort: 0,
+        status: 'sleeping',
+        hostPort: null,
+        windows: { backend: 'vmware', templateId: 'a'.repeat(64), snapshot: 'clean' }
+      }))
+      await expect(orch.startRoom('room1abc', 'user')).rejects.toThrow(/VMware Workstation backend is not configured/)
+      expect(orch.rooms.get('room1abc')?.status).toBe('sleeping')
+      expect(backend.calls).toEqual([])
     } finally {
       db.close()
     }
@@ -46,6 +66,28 @@ describe('provider registry', () => {
   it('returns the provider matching its kind', () => {
     expect(getProvider('web').info.kind).toBe('web')
     expect(getProvider('android').info.kind).toBe('android')
+  })
+})
+
+describe('WindowsRoomProvider', () => {
+  it('becomes creatable only when VMware is available and plans no fake Web runtime', async () => {
+    expect(new WindowsRoomProvider(() => false, 'win32').info).toMatchObject({
+      available: false,
+      preview: 'none',
+      unavailableReason: expect.stringMatching(/Install VMware Workstation Pro/)
+    })
+    expect(new WindowsRoomProvider(() => true, 'linux').info).toMatchObject({
+      available: false,
+      unavailableReason: expect.stringMatching(/Windows host/)
+    })
+    const provider = new WindowsRoomProvider(() => true, 'win32')
+    expect(provider.info).toMatchObject({ available: true, label: 'Windows Room (VMware)', preview: 'none' })
+    const plan = await provider.detect(fixture('empty'), { project: 'WinApp', nickname: 'dev' })
+    expect(plan.runtime).toMatchObject({ kind: 'windows', value: '11' })
+    expect(plan.packageManager.value).toBe('none')
+    expect(plan.internalPort.value).toBe(0)
+    expect(plan.warnings.join(' ')).toMatch(/offline/i)
+    expect(() => provider.buildSpec()).toThrow(/not an OCI WebSpec/)
   })
 })
 

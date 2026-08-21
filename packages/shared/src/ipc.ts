@@ -22,6 +22,9 @@ export const IPC = {
   roomsResetSyncBaseline: 'rooms:resetSyncBaseline',
   roomsSetAgentHostSync: 'rooms:setAgentHostSync',
   roomsProviders: 'rooms:providers',
+  roomsPickVmwareTemplate: 'rooms:pickVmwareTemplate',
+  roomsOpenWindows: 'rooms:openWindows',
+  roomsResetWindows: 'rooms:resetWindows',
   packagesSearch: 'packages:search',
   hotelGithubStatus: 'hotel:github:status',
   hotelGithubInstall: 'hotel:github:install',
@@ -46,6 +49,9 @@ export const IPC = {
   caTrust: 'ca:trust',
   caUntrust: 'ca:untrust',
   appVersion: 'app:version',
+  vmwareStatus: 'app:vmwareStatus',
+  openVmwareDownload: 'app:openVmwareDownload',
+  relaunch: 'app:relaunch',
   openExternal: 'app:openExternal',
   openPath: 'app:openPath',
   pickFolder: 'app:pickFolder',
@@ -145,10 +151,55 @@ export interface McpSetupInfo {
 }
 
 export interface UpdateStatusInfo {
-  state: 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'error'
+  state: 'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'ready' | 'error'
   version?: string
   detail?: string
 }
+
+/** One native-picker-approved VMware template. The Host path never crosses into renderer state. */
+export interface VmwareTemplateSelection {
+  grantId: string
+  label: string
+  snapshots: string[]
+}
+
+/** Live VMware setup state. Host executable paths never cross into renderer state. */
+export type VmwareSetupStatusInfo =
+  | {
+      state: 'unsupported'
+      supported: false
+      installed: false
+      ready: false
+      detail: string
+    }
+  | {
+      state: 'missing'
+      supported: true
+      installed: false
+      ready: false
+      detail: string
+    }
+  | {
+      state: 'relaunch-required'
+      supported: true
+      installed: true
+      ready: false
+      detail: string
+    }
+  | {
+      state: 'unavailable'
+      supported: true
+      installed: true
+      ready: false
+      detail: string
+    }
+  | {
+      state: 'ready'
+      supported: true
+      installed: true
+      ready: true
+      detail: string
+    }
 
 /** The API surface exposed to the renderer as `window.devhotel`. */
 export interface IpcApi {
@@ -175,6 +226,12 @@ export interface IpcApi {
     setAgentHostSync(roomId: string, allowed: boolean): Promise<RoomRecord>
     /** every Room provider this build knows, with its real availability */
     providers(): Promise<import('./rooms').ProviderInfo[]>
+    /** inspect a user-selected .vmx and return an opaque, process-local creation grant */
+    pickVmwareTemplate(): Promise<VmwareTemplateSelection | null>
+    /** open an existing Windows Room in VMware Workstation */
+    openWindows(roomId: string): Promise<void>
+    /** discard a Windows clone and recreate it from its clean baseline */
+    resetWindows(roomId: string): Promise<void>
   }
   packages: {
     search(query: string, offset?: number): Promise<RegistryPackageInfo[]>
@@ -215,6 +272,12 @@ export interface IpcApi {
   }
   app: {
     version(): Promise<string>
+    /** re-detect VMware installation and compare it with this process's active vmrun backend */
+    vmwareStatus(): Promise<VmwareSetupStatusInfo>
+    /** open the fixed official Broadcom Workstation download page */
+    openVmwareDownload(): Promise<void>
+    /** relaunch DevHotel through its normal graceful Room shutdown path */
+    relaunch(): Promise<void>
     openExternal(url: string): Promise<void>
     openPath(path: string): Promise<void>
     pickFolder(): Promise<string | null>

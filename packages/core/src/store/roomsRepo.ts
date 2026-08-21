@@ -1,6 +1,7 @@
 import type {
   PmKind,
   ProviderKind,
+  RuntimeKind,
   RoomOsSettings,
   RoomRecord,
   RoomServices,
@@ -52,23 +53,29 @@ interface ExtraJson {
     resolution?: 'native' | 'balanced' | 'fast'
     orientation?: 'portrait' | 'landscape'
   }
+  windows?: unknown
 }
 
-function parseExtra(extra: string): ExtraJson {
+function parseExtra(extra: string): unknown {
   try {
-    return JSON.parse(extra) as ExtraJson
+    return JSON.parse(extra) as unknown
   } catch {
-    return {}
+    return undefined
   }
 }
 
 function rowToRoom(row: RoomRow): RoomRecord {
+  const provider = parseProvider(row.provider, row.id)
+  const parsedExtra = parseExtra(row.extra)
+  const extra = isRecord(parsedExtra) ? parsedExtra as ExtraJson : {}
+  const windows = provider === 'windows' ? parseWindowsMetadata(parsedExtra, row.id) : undefined
+
   return {
     id: row.id,
     project: row.project,
     nickname: row.nickname,
     roomNumber: row.room_number,
-    provider: parseProvider(row.provider, row.id),
+    provider,
     sourceType: row.source_type as SourceType,
     sourceRef: row.source_ref,
     workspaceMode: (row.workspace_mode ?? legacyWorkspaceMode(row.source_type)) as WorkspaceMode,
@@ -78,7 +85,7 @@ function rowToRoom(row: RoomRow): RoomRecord {
     lastSyncedAt: row.last_synced_at,
     hostSyncEnabled: row.host_sync_enabled === 1,
     workspaceFingerprint: row.workspace_fingerprint,
-    runtime: { kind: row.runtime_kind as 'node' | 'jdk', version: row.runtime_version },
+    runtime: { kind: row.runtime_kind as RuntimeKind, version: row.runtime_version },
     packageManager: {
       kind: row.pm_kind as PmKind,
       ...(row.pm_version === null ? {} : { version: row.pm_version }),
@@ -88,17 +95,69 @@ function rowToRoom(row: RoomRow): RoomRecord {
     domain: row.domain,
     https: row.https === 1,
     status: row.status as RoomStatus,
-    services: parseExtra(row.extra).services ?? {},
-    os: parseExtra(row.extra).os ?? { env: {} },
-    ...(parseExtra(row.extra).agentHostSync !== undefined
-      ? { agentHostSync: parseExtra(row.extra).agentHostSync }
+    services: extra.services ?? {},
+    os: extra.os ?? { env: {} },
+    ...(extra.agentHostSync !== undefined
+      ? { agentHostSync: extra.agentHostSync }
       : {}),
-    ...(parseExtra(row.extra).android ? { android: parseExtra(row.extra).android } : {}),
+    ...(extra.android ? { android: extra.android } : {}),
+    ...(windows ? { windows } : {}),
     hostPort: row.host_port,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
     thumbPath: row.thumb_path,
   }
+}
+
+function parseWindowsMetadata(value: unknown, roomId: string): NonNullable<RoomRecord['windows']> {
+  if (!isRecord(value) || !isRecord(value['windows'])) throw invalidWindowsMetadata(roomId)
+
+  const windows = value['windows']
+  if (containsRawVmxPath(windows)) {
+    throw new Error(
+      `Room ${roomId} contains legacy raw-path VMware metadata. Re-create the Windows Room from its template grant.`
+    )
+  }
+
+  const backend = windows['backend']
+  const templateId = windows['templateId']
+  const snapshot = windows['snapshot']
+  if (
+    backend !== 'vmware' ||
+    typeof templateId !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(templateId) ||
+    typeof snapshot !== 'string' ||
+    snapshot.length < 1 ||
+    snapshot.length > 128 ||
+    snapshot !== snapshot.trim() ||
+    !/^[A-Za-z0-9._ -]+$/.test(snapshot)
+  ) {
+    throw invalidWindowsMetadata(roomId)
+  }
+
+  // Never return unknown or provider-owned fields from the persistence boundary.
+  return { backend, templateId, snapshot }
+}
+
+function invalidWindowsMetadata(roomId: string): Error {
+  return new Error(
+    `Room ${roomId} has invalid Windows VMware metadata. Re-create the Windows Room from a clean template snapshot.`
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function containsRawVmxPath(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsRawVmxPath)
+  if (isRecord(value)) {
+    return Object.entries(value).some(([key, nested]) =>
+      /path|vmx/i.test(key) || containsRawVmxPath(nested)
+    )
+  }
+  return typeof value === 'string' &&
+    /^(?:[A-Za-z]:[\\/]|\\\\|\/\/|\/|file:).+\.vmx$/i.test(value)
 }
 
 type ColumnValue = string | number | null
@@ -224,7 +283,8 @@ export function roomsRepo(db: Db): RoomsRepo {
             services: r.services ?? {},
             os: r.os ?? { env: {} },
             ...(r.agentHostSync !== undefined ? { agentHostSync: r.agentHostSync } : {}),
-            ...(r.android ? { android: r.android } : {})
+            ...(r.android ? { android: r.android } : {}),
+            ...(r.windows ? { windows: r.windows } : {})
           }),
         )
     },
@@ -244,14 +304,17 @@ export function roomsRepo(db: Db): RoomsRepo {
         patch.services !== undefined ||
         patch.os !== undefined ||
         patch.android !== undefined ||
-        patch.agentHostSync !== undefined
+        patch.agentHostSync !== undefined ||
+        patch.windows !== undefined
       ) {
         const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
-        const extra = parseExtra(row?.extra ?? '{}')
+        const parsedExtra = parseExtra(row?.extra ?? '{}')
+        const extra = isRecord(parsedExtra) ? parsedExtra as ExtraJson : {}
         if (patch.services !== undefined) extra.services = patch.services
         if (patch.os !== undefined) extra.os = patch.os
         if (patch.android !== undefined) extra.android = patch.android
         if (patch.agentHostSync !== undefined) extra.agentHostSync = patch.agentHostSync
+        if (patch.windows !== undefined) extra.windows = patch.windows
         cols['extra'] = JSON.stringify(extra)
       }
       const names = Object.keys(cols)

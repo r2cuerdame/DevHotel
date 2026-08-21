@@ -29,6 +29,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const room = useStore((s) => s.rooms.find((r) => r.id === roomId))
   const busy = useStore((s) => s.busy[roomId])
   const roomAction = useStore((s) => s.roomAction)
+  const toast = useStore((s) => s.toast)
   const t = useT()
   const running = !!room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
   const [configOpen, setConfigOpen] = useState(false)
@@ -49,6 +50,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
 
   const android = room?.provider === 'android'
+  const windows = room?.provider === 'windows'
   const emulatorLandscape = room?.android?.orientation === 'landscape'
   const previewLayout: PreviewLayout = android
     ? { mode: 'single', leftViewport: null, rightViewport: { width: 390, height: 844 } }
@@ -57,7 +59,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   previewLayoutRef.current = previewLayout
 
   const detailsOpen = configOpen
-  const showSite = running
+  const showSite = running && !windows
   const dragging = dragRatio !== null
   const previewVisible = showSite && !modalOpen && !detailsOpen && !dragging
 
@@ -143,7 +145,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
         room={room}
         configOpen={detailsOpen}
         onToggleConfig={() => {
-          if (!detailsOpen) void api.preview.setVisible(roomId, false).catch(() => undefined)
+          if (!detailsOpen && !windows) void api.preview.setVisible(roomId, false).catch(() => undefined)
           setConfigOpen((open) => !open)
         }}
         onModalChange={setModalOpen}
@@ -239,6 +241,21 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
                 <span className="plate">№ {room.roomNumber}</span>
                 {busy ? (
                   <span>{busy}</span>
+                ) : windows && running ? (
+                  <>
+                    <span>{statusLabel(t, room.status)}</span>
+                    <span>{t('windows.noPreview')}</span>
+                    <button
+                      className="btn primary"
+                      onClick={() => {
+                        void api.rooms
+                          .openWindows(roomId)
+                          .catch((err: unknown) => toast('error', err instanceof Error ? err.message : String(err)))
+                      }}
+                    >
+                      {t('windows.openVmware')}
+                    </button>
+                  </>
                 ) : room.status === 'sleeping' ? (
                   <>
                     <span>{t('room.asleepHint')}</span>

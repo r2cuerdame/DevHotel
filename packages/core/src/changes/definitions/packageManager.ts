@@ -2,7 +2,7 @@ import type { PmKind } from '@devhotel/shared'
 import type { ChangeDefinition } from '../types'
 import { verifyWebUp } from '../types'
 
-export const packageManagerChange: ChangeDefinition<{ pm: Exclude<PmKind, 'gradle'>; version?: string }> = {
+export const packageManagerChange: ChangeDefinition<{ pm: Extract<PmKind, 'npm' | 'pnpm'>; version?: string }> = {
   kind: 'package-manager',
   plan(ctx, p) {
     const prev = ctx.room().packageManager

@@ -1,8 +1,9 @@
 export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken'
 export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
-export type PmKind = 'npm' | 'pnpm' | 'gradle'
+export type PmKind = 'npm' | 'pnpm' | 'gradle' | 'none'
 export type ProviderKind = 'web' | 'android' | 'windows'
+export type RuntimeKind = 'node' | 'jdk' | 'windows'
 
 /** What a Room provider can do in this build — the registry's own answer, so the UI never invents availability. */
 export interface ProviderInfo {
@@ -42,6 +43,15 @@ export interface RoomOsSettings {
   timezone?: string
 }
 
+/** User-owned VMware template used to materialize one Windows Room clone. */
+export interface VmwareRoomConfig {
+  backend: 'vmware'
+  /** Opaque fingerprint of the user-selected template; its Host path stays in the provider ownership ledger. */
+  templateId: string
+  /** Immutable baseline snapshot from which the Room linked clone is created. */
+  snapshot: string
+}
+
 export interface RoomRecord {
   id: string
   project: string
@@ -63,7 +73,7 @@ export interface RoomRecord {
   workspaceFingerprint: string | null
   /** Whether this Room may explicitly import again from sourceRef. Clones detach by default. */
   hostSyncEnabled: boolean
-  runtime: { kind: 'node' | 'jdk'; version: string }
+  runtime: { kind: RuntimeKind; version: string }
   packageManager: { kind: PmKind; version?: string }
   startCommand: string
   internalPort: number
@@ -81,6 +91,8 @@ export interface RoomRecord {
   agentHostSync?: boolean
   /** android rooms: emulator device/OS/resolution/orientation selection */
   android?: { device: string; version: string; resolution?: EmulatorResolution; orientation?: EmulatorOrientation }
+  /** windows rooms: provider-owned VM template and clean baseline. */
+  windows?: VmwareRoomConfig
   /** ephemeral 127.0.0.1 port published by the anchor; null while sleeping */
   hostPort: number | null
   createdAt: string
@@ -97,7 +109,7 @@ export interface Detected<T> {
 export interface RoomPlan {
   project: string
   framework: string | null
-  runtime: Detected<string> & { kind: 'node' | 'jdk' }
+  runtime: Detected<string> & { kind: RuntimeKind }
   packageManager: Detected<PmKind> & { version?: string }
   startCommand: Detected<string>
   internalPort: Detected<number>
@@ -122,6 +134,12 @@ export interface CreateRoomInput {
     domain?: string
     https?: boolean
   }
+  /** Required only for a user-created Windows Room. */
+  windows?: {
+    /** Native-picker-approved path, accepted only on the trusted desktop create boundary. */
+    baseVmxPath: string
+    snapshot: string
+  }
 }
 
 /** Options for making an independent environment from an existing Web room. */
@@ -144,7 +162,8 @@ export interface BackupInfo {
 
 export interface RoomInspection {
   room: RoomRecord
-  urls: { app: string }
+  /** Windows VM Rooms do not expose an embedded browser URL. */
+  urls: { app: string | null }
   /** host folder holding this room's manifest.yaml, logs/, thumbnail */
   dataDir: string
   backups: BackupInfo[]

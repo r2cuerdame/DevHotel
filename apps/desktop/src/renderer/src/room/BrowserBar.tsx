@@ -60,6 +60,7 @@ export function BrowserBar({
 
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
   const web = room.provider === 'web'
+  const windows = room.provider === 'windows'
   // android rooms serve the emulator screen — their bar behaves like a site too
   const served = web || room.provider === 'android'
   const siteControlsEnabled = served && running && !configOpen
@@ -118,14 +119,17 @@ export function BrowserBar({
         </div>
       )}
 
-      <div className={`domain-pill${served ? '' : ' build-room-pill'}`} title={web ? url : t('android.buildOnlyHint')}>
+      <div
+        className={`domain-pill${served ? '' : ' build-room-pill'}`}
+        title={web ? url : windows ? t('windows.noPreview') : t('android.buildOnlyHint')}
+      >
         {web && room.https && <span title="HTTPS">🔒</span>}
         <span className="url">
           {web
             ? url
             : room.provider === 'android'
               ? `📱 ${room.android?.device ?? 'Samsung Galaxy S10'} · Android ${room.android?.version ?? '14.0'} · AOSP`
-              : t('android.buildRoom')}
+              : `⊞ ${t('windows.pill')}${room.windows?.snapshot ? ` · ${room.windows.snapshot}` : ''}`}
         </span>
         <span className="status-label">
           <span className="status-dot" data-status={room.status} />
@@ -133,7 +137,19 @@ export function BrowserBar({
         </span>
       </div>
 
-      {running ? (
+      {windows && running ? (
+        <button
+          className="btn primary"
+          disabled={!!busy}
+          onClick={() => {
+            void api.rooms
+              .openWindows(room.id)
+              .catch((err: unknown) => useStore.getState().toast('error', err instanceof Error ? err.message : String(err)))
+          }}
+        >
+          {t('windows.openVmware')}
+        </button>
+      ) : running ? (
         <button className="btn" disabled={!!busy} onClick={() => void roomAction(room.id, 'restart')}>
           {t('common.restart')}
         </button>
@@ -228,19 +244,21 @@ export function BrowserBar({
               />
             )}
             <MenuItem
-              label={t('reset.menu')}
+              label={windows ? t('windows.resetMenu') : t('reset.menu')}
               onClick={() => {
                 setResetOpen(true)
                 setMenuOpen(false)
               }}
             />
-            <MenuItem
-              label={t('diag.copyDiagnostic')}
-              onClick={() => {
-                void useStore.getState().copyDiagnostic(room.id)
-                setMenuOpen(false)
-              }}
-            />
+            {!windows && (
+              <MenuItem
+                label={t('diag.copyDiagnostic')}
+                onClick={() => {
+                  void useStore.getState().copyDiagnostic(room.id)
+                  setMenuOpen(false)
+                }}
+              />
+            )}
             <div className="bar-menu-sep" />
             <MenuItem
               label={t('bar.deleteRoom')}
