@@ -23,7 +23,10 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm --filter devhotel-mcp build
-      - name: Build and publish to GitHub Releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm --filter devhotel build && pnpm --filter devhotel exec electron-builder --win nsis --publish always
+      # CI verifies the tagged commit and proves the installer builds. It must
+      # NOT publish: `--publish always` created a fresh draft release on every
+      # run, and re-tagging left orphan drafts behind (10 had accumulated by
+      # 0.4.3). The release itself is cut locally, where the ~110MB asset
+      # upload is reliable — see docs/releasing.md.
+      - name: Build the installer (no publish)
+        run: pnpm --filter devhotel build && pnpm --filter devhotel exec electron-builder --win nsis --publish never

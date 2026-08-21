@@ -120,6 +120,8 @@ See [Managed Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-manage
 
 Agents (or any local tool) can drive DevHotel without MCP through the stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), auth, and the full endpoint contract.
 
+Releases are cut locally, not by CI — see [Releasing](./docs/releasing.md).
+
 ## License
 
 [MIT](./LICENSE)
