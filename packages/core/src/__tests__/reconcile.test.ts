@@ -52,6 +52,24 @@ describe('reconcile interrupted preparation', () => {
     expect(logs.some((line) => line.includes('runtime offline'))).toBe(true)
     db.close()
   })
+
+  it('never sends Windows VM rooms through OCI reconciliation', async () => {
+    const windows = makeRoom({
+      id: 'windows1',
+      provider: 'windows',
+      status: 'ready',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      windows: { backend: 'vmware', templateId: 'c'.repeat(64), snapshot: 'clean' }
+    })
+    const rooms = { list: () => [windows], update: () => undefined } as unknown as ReturnType<typeof roomsRepo>
+    const backend = new FakeBackend()
+
+    const result = await reconcile(backend, rooms, () => undefined)
+
+    expect(result.roomsSlept).toEqual([])
+    expect(backend.calls).toEqual([])
+  })
 })
 
 describe('reconcile stale one-shot jobs', () => {

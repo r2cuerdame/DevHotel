@@ -7,6 +7,8 @@ import type {
   BackupInfo,
   ChangeEntry,
   CheckReport,
+  CheckResult,
+  CheckStatus,
   CloneRoomInput,
   CreateRoomInput,
   ProviderKind,
@@ -20,6 +22,7 @@ import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
 import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
+import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
 import {
@@ -68,9 +71,25 @@ export interface OrchestratorEvent {
   detail?: string
 }
 
+export type WindowsVmLifecycle = Pick<
+  WindowsVmBackend,
+  | 'health'
+  | 'inspectTemplate'
+  | 'create'
+  | 'start'
+  | 'state'
+  | 'sleep'
+  | 'delete'
+  | 'reset'
+  | 'validateBaseline'
+  | 'openConsole'
+>
+
 export interface OrchestratorOptions {
   userData: string
   backend: IsolationBackend
+  /** VMware lifecycle stays separate from the OCI backend's container contract. */
+  windowsVm?: WindowsVmLifecycle
   gateway: Gateway
   db: Db
   appVersion: string
@@ -98,6 +117,7 @@ export class RoomOrchestrator {
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
   private readonly userData: string
   private readonly backend: IsolationBackend
+  private readonly windowsVm?: WindowsVmLifecycle
   private readonly gateway: Gateway
   private readonly appVersion: string
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
@@ -105,6 +125,7 @@ export class RoomOrchestrator {
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
     this.backend = opts.backend
+    this.windowsVm = opts.windowsVm
     this.gateway = opts.gateway
     this.appVersion = opts.appVersion
     this.clearBrowserData = opts.clearBrowserData
@@ -123,6 +144,7 @@ export class RoomOrchestrator {
     if (health.ok) {
       reconciled = await reconcile(this.backend, this.rooms, (l) => this.olog('system', l))
     }
+    await this.reconcileWindowsRooms()
     await this.markInterruptedChanges()
     return { backendOk: health.ok, reconciled }
   }
@@ -179,7 +201,8 @@ export class RoomOrchestrator {
       try {
         if (room.status === 'broken') {
           // broken rooms may still own running containers — stop them but keep the status visible
-          await this.backend.stopRoomPod(room.id)
+          if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
+          else await this.backend.stopRoomPod(room.id)
           this.rooms.update(room.id, { hostPort: null })
         } else {
           // The shutdown gate rejects public lifecycle calls. All admitted work
@@ -285,6 +308,12 @@ export class RoomOrchestrator {
     provider?: ProviderKind
   }): Promise<RoomPlan> {
     const project = input.project ?? deriveProjectName(input.sourceType, input.sourceRef)
+    if ((input.provider ?? 'web') === 'windows') {
+      if (input.sourceType !== 'empty' || input.sourceRef !== '') {
+        throw new Error('Windows Rooms currently start empty; planning never imports Host or Git source')
+      }
+      return getProvider('windows').detect(EMPTY_READER, { project, nickname: input.nickname })
+    }
     const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
     try {
       return await getProvider(input.provider ?? 'web').detect(reader, { project, nickname: input.nickname })
@@ -299,6 +328,7 @@ export class RoomOrchestrator {
 
   private async createRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
     const providerKind: ProviderKind = input.provider ?? 'web'
+    if (providerKind === 'windows') return this.createWindowsRoomAdmitted(input)
     const provider = getProvider(providerKind)
     const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
     let plan: RoomPlan
@@ -407,6 +437,102 @@ export class RoomOrchestrator {
     }, true)
 
     const room = this.rooms.get(id)!
+    await writeManifest(this.userData, room)
+    this.emit(id, 'status')
+    return room
+  }
+
+  private async createWindowsRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
+    if (input.actor !== 'user') throw new Error('Windows Rooms require a user-approved VMware template')
+    if (input.sourceType !== 'empty' || input.sourceRef !== '') {
+      throw new Error('Windows Rooms currently start empty; source ingress arrives with the guest agent')
+    }
+    if (input.planOverrides) throw new Error('Web plan overrides do not apply to Windows Rooms')
+    if (!input.windows) throw new Error('Choose a VMware template and clean snapshot')
+
+    const windowsVm = this.mustWindowsVm()
+    const health = await windowsVm.health()
+    if (!health.ok) throw new Error(health.detail)
+    const template = await windowsVm.inspectTemplate({
+      templateVmxPath: input.windows.baseVmxPath,
+      snapshot: input.windows.snapshot
+    })
+    const plan = await getProvider('windows').detect(EMPTY_READER, {
+      project: input.project,
+      nickname: input.nickname
+    })
+
+    const id = newRoomId()
+    const now = new Date().toISOString()
+    const record: RoomRecord = {
+      id,
+      project: input.project,
+      nickname: input.nickname,
+      roomNumber: this.rooms.nextRoomNumber(),
+      provider: 'windows',
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      stateRevision: 0,
+      workspaceVolumeRevision: 0,
+      syncStatus: 'empty',
+      lastSyncedAt: null,
+      hostSyncEnabled: false,
+      workspaceFingerprint: null,
+      runtime: { kind: 'windows', version: plan.runtime.value },
+      packageManager: { kind: 'none' },
+      startCommand: plan.startCommand.value,
+      internalPort: 0,
+      domain: this.uniqueDomain(plan.domain),
+      https: false,
+      status: 'preparing',
+      services: {},
+      os: { env: {} },
+      windows: { backend: 'vmware', templateId: template.templateId, snapshot: template.snapshot },
+      hostPort: null,
+      createdAt: now,
+      lastUsedAt: now,
+      thumbPath: null
+    }
+    this.rooms.create(record)
+    mkdirSync(join(this.userData, 'rooms', id, 'logs'), { recursive: true })
+    this.appendJournal(
+      id,
+      'create-windows-room',
+      `Windows Room created — ${record.project} / ${record.nickname}`,
+      input.actor,
+      'VMware',
+      null,
+      { templateId: template.templateId, snapshot: template.snapshot, clone: 'linked', network: 'offline' }
+    )
+    this.emit(id, 'created')
+    this.olog(id, `create offline VMware linked clone from snapshot ${template.snapshot}`)
+
+    await this.withRoomLock(
+      id,
+      async () => {
+        try {
+          const materialized = await windowsVm.create({
+            roomId: id,
+            templateVmxPath: input.windows!.baseVmxPath,
+            snapshot: template.snapshot
+          })
+          if (materialized.templateId !== template.templateId) {
+            throw new Error('The VMware template identity changed while the Room was being created')
+          }
+          await windowsVm.start(id)
+          if ((await windowsVm.state(id)) !== 'running') throw new Error('VMware did not report the Windows Room as running')
+          this.rooms.update(id, { status: 'ready', lastUsedAt: new Date().toISOString() })
+          this.olog(id, 'Windows Room ready (offline Clean Room policy)')
+        } catch (error) {
+          this.olog(id, `create failed: ${error instanceof Error ? error.message : String(error)}`)
+          this.rooms.update(id, { status: 'broken' })
+        }
+      },
+      true
+    )
+
+    const room = this.mustGet(id)
     await writeManifest(this.userData, room)
     this.emit(id, 'status')
     return room
@@ -680,6 +806,24 @@ export class RoomOrchestrator {
   private async startRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
+    if (room.provider === 'windows') {
+      const windowsVm = this.mustWindowsVm()
+      if (alreadyAwake && (await windowsVm.state(roomId)) === 'running') return
+      this.rooms.update(roomId, { status: 'preparing', hostPort: null })
+      this.emit(roomId, 'status')
+      this.olog(roomId, 'wake Windows VM')
+      try {
+        await windowsVm.start(roomId)
+        if ((await windowsVm.state(roomId)) !== 'running') throw new Error('VMware did not report the Windows Room as running')
+        this.rooms.update(roomId, { status: 'ready', hostPort: null, lastUsedAt: new Date().toISOString() })
+      } catch (error) {
+        this.olog(roomId, `wake failed: ${error instanceof Error ? error.message : String(error)}`)
+        this.rooms.update(roomId, { status: 'broken', hostPort: null })
+      }
+      await writeManifest(this.userData, this.mustGet(roomId))
+      this.emit(roomId, 'status')
+      return
+    }
     if (alreadyAwake && room.hostPort != null) return
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
@@ -738,6 +882,13 @@ export class RoomOrchestrator {
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'sleep room')
+    if (room.provider === 'windows') {
+      await this.mustWindowsVm().sleep(roomId)
+      this.rooms.update(roomId, { status: 'sleeping', hostPort: null, lastUsedAt: new Date().toISOString() })
+      await writeManifest(this.userData, this.mustGet(roomId))
+      this.emit(roomId, 'status')
+      return
+    }
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     await this.backend.stopRoomPod(roomId)
@@ -747,11 +898,61 @@ export class RoomOrchestrator {
   }
 
   restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
+    if (this.mustGet(roomId).provider === 'windows') throw new Error('Windows Rooms do not have a Web process to restart')
     return this.withRoomLock(roomId, async () => {
       const entry = await this.engine.execute(this.ctxFor(roomId), 'restart-web', {}, actor)
       this.reattachLogs(roomId)
       this.emit(roomId, 'change')
       return entry
+    })
+  }
+
+  openWindows(roomId: string): Promise<void> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'windows') throw new Error('Only Windows Rooms open in VMware Workstation')
+    return this.mustWindowsVm().openConsole(roomId)
+  }
+
+  resetWindows(roomId: string, actor: Actor): Promise<void> {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (room.provider !== 'windows') throw new Error('Clean VM reset is available only for Windows Rooms')
+      if (actor !== 'user') throw new Error('Clean VM reset requires an explicit user action')
+      const wasAwake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      const windowsVm = this.mustWindowsVm()
+      this.rooms.update(roomId, { status: 'preparing', hostPort: null })
+      this.emit(roomId, 'status')
+      this.olog(roomId, 'discard Windows clone and recreate from clean snapshot')
+      try {
+        const reset = await windowsVm.reset(roomId)
+        if (reset.templateId !== room.windows?.templateId || reset.snapshot !== room.windows?.snapshot) {
+          throw new Error('VMware reset returned a different template identity')
+        }
+        if (wasAwake) await windowsVm.start(roomId)
+        this.rooms.update(roomId, {
+          status: wasAwake ? 'ready' : 'sleeping',
+          hostPort: null,
+          lastUsedAt: new Date().toISOString()
+        })
+        this.appendJournal(
+          roomId,
+          'reset-windows-room',
+          'Windows Room recreated from its clean snapshot',
+          actor,
+          'VMware',
+          { clone: 'discarded' },
+          { templateId: reset.templateId, snapshot: reset.snapshot, clone: 'linked', network: 'offline' }
+        )
+      } catch (error) {
+        this.rooms.update(roomId, { status: 'broken', hostPort: null })
+        this.olog(roomId, `clean reset failed: ${error instanceof Error ? error.message : String(error)}`)
+        await writeManifest(this.userData, this.mustGet(roomId))
+        this.emit(roomId, 'status')
+        throw error
+      }
+      await writeManifest(this.userData, this.mustGet(roomId))
+      this.emit(roomId, 'change', 'Clean VM reset')
+      this.emit(roomId, 'status')
     })
   }
 
@@ -804,6 +1005,14 @@ export class RoomOrchestrator {
   private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
+    if (room.provider === 'windows') {
+      const windowsVm = this.mustWindowsVm()
+      const { reclaimedBytes } = await windowsVm.delete(roomId)
+      this.rooms.delete(roomId)
+      rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
+      this.emit(roomId, 'deleted')
+      return { reclaimedBytes }
+    }
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
@@ -829,7 +1038,9 @@ export class RoomOrchestrator {
 
   /** Official file egress: read one workspace file (base64), capped at 16MB. */
   async pullRoomFile(roomId: string, path: string): Promise<{ path: string; size: number; contentBase64: string }> {
-    this.mustGet(roomId)
+    if (this.mustGet(roomId).provider === 'windows') {
+      throw new Error('Windows Room file transfer requires the forthcoming guest agent')
+    }
     const safePath = this.validateRoomFilePath(roomId, path)
     const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
@@ -848,7 +1059,9 @@ export class RoomOrchestrator {
 
   /** Official file ingress: write one workspace file from base64, capped at 16MB. */
   async pushRoomFile(roomId: string, path: string, contentBase64: string): Promise<{ path: string; size: number }> {
-    this.mustGet(roomId)
+    if (this.mustGet(roomId).provider === 'windows') {
+      throw new Error('Windows Room file transfer requires the forthcoming guest agent')
+    }
     const safePath = this.validateRoomFilePath(roomId, path)
     const content = Buffer.from(contentBase64, 'base64')
     if (content.byteLength > RoomOrchestrator.ROOM_FILE_CAP) {
@@ -933,15 +1146,17 @@ export class RoomOrchestrator {
   inspectRoom(roomId: string): RoomInspection {
     const room = this.mustGet(roomId)
     const recent = this.changes.list(roomId).slice(0, 15)
-    const baseUrl = this.gateway.urlFor(room.domain, room.https)
+    const baseUrl = room.provider === 'windows' ? null : this.gateway.urlFor(room.domain, room.https)
     return {
       room,
       // android rooms open the emulator screen fullscreen and auto-connected
-      urls: { app: room.provider === 'android' ? `${baseUrl}/vnc.html?autoconnect=true&resize=scale` : baseUrl },
+      urls: { app: room.provider === 'android' ? `${baseUrl!}/vnc.html?autoconnect=true&resize=scale` : baseUrl },
       dataDir: join(this.userData, 'rooms', room.id),
       backups: this.listBackups(room.id),
       stackLine:
-        room.provider === 'android'
+        room.provider === 'windows'
+          ? `Windows ${room.runtime.version} · VMware · offline Clean Room`
+          : room.provider === 'android'
           ? `JDK ${room.runtime.version} · gradle`
           : `Node ${room.runtime.version} · ${room.packageManager.kind}`,
       latestCheck: this.checks.latest(roomId),
@@ -1158,6 +1373,9 @@ export class RoomOrchestrator {
 
   applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
     const room = this.mustGet(roomId)
+    if (room.provider === 'windows') {
+      throw new Error(`'${change.kind}' is not available until the Windows guest agent is installed`)
+    }
     if (room.provider === 'android' && !ANDROID_CHANGE_KINDS.has(change.kind)) {
       throw new Error(`'${change.kind}' is not available for Android rooms`)
     }
@@ -1196,6 +1414,7 @@ export class RoomOrchestrator {
   }
 
   undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
+    if (this.mustGet(roomId).provider === 'windows') throw new Error('Windows VM lifecycle actions are not undoable')
     return this.withRoomLock(roomId, async () => {
       if (actor === 'agent' && this.mustGet(roomId).workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
@@ -1226,7 +1445,7 @@ export class RoomOrchestrator {
   /** The `docker logs -f` pump dies with its container — re-arm it after operations that may have recreated the web container. */
   private reattachLogs(roomId: string): void {
     const room = this.rooms.get(roomId)
-    if (room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')) {
+    if (room && room.provider !== 'windows' && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')) {
       this.logs.detach(roomId)
       this.logs.attach(roomId)
     }
@@ -1238,14 +1457,17 @@ export class RoomOrchestrator {
 
   private async runChecksLocked(roomId: string): Promise<CheckReport> {
     const room = this.mustGet(roomId)
-    const report = await runCheckPipeline({
-      room,
-      backend: this.backend,
-      gateway: this.gateway,
-      userData: this.userData,
-      depsGen: this.depsGen(roomId),
-      syncRoute: () => this.syncRouteFor(roomId)
-    })
+    const report =
+      room.provider === 'windows'
+        ? await this.runWindowsChecks(room)
+        : await runCheckPipeline({
+            room,
+            backend: this.backend,
+            gateway: this.gateway,
+            userData: this.userData,
+            depsGen: this.depsGen(roomId),
+            syncRoute: () => this.syncRouteFor(roomId)
+          })
     this.checks.saveReport(report)
     if (room.status !== 'sleeping' && room.status !== 'preparing') {
       const coreBroken = report.results.some(
@@ -1258,9 +1480,75 @@ export class RoomOrchestrator {
     return report
   }
 
+  private async runWindowsChecks(room: RoomRecord): Promise<CheckReport> {
+    const windowsVm = this.mustWindowsVm()
+    const results: CheckResult[] = []
+    const health = await windowsVm.health()
+    results.push(
+      health.ok
+        ? { step: 'backend', status: 'healthy', summary: health.detail }
+        : { step: 'backend', status: 'broken', summary: 'VMware backend unavailable', detail: health.detail }
+    )
+    const metadataOk =
+      room.runtime.kind === 'windows' &&
+      room.packageManager.kind === 'none' &&
+      room.sourceType === 'empty' &&
+      room.workspaceMode === 'empty' &&
+      room.internalPort === 0 &&
+      room.hostPort === null &&
+      room.windows?.backend === 'vmware' &&
+      /^[a-f0-9]{64}$/.test(room.windows.templateId)
+    results.push(
+      metadataOk
+        ? { step: 'metadata', status: 'healthy', summary: `offline VMware Room ${room.id}` }
+        : { step: 'metadata', status: 'broken', summary: 'Windows Room record is inconsistent' }
+    )
+    const baseline = await windowsVm.validateBaseline(room.id)
+    results.push(
+      baseline.ok
+        ? { step: 'source', status: 'healthy', summary: baseline.detail }
+        : {
+            step: 'source',
+            status: 'warning',
+            summary: 'clean VM baseline cannot be revalidated',
+            detail: baseline.detail
+          }
+    )
+
+    if (!health.ok) {
+      results.push({ step: 'process', status: 'unknown', summary: 'VMware state is unavailable' })
+    } else {
+      const state = await windowsVm.state(room.id)
+      const expectsRunning = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      results.push(
+        state === 'missing'
+          ? { step: 'process', status: 'broken', summary: 'owned VMware clone is missing' }
+          : expectsRunning && state !== 'running'
+            ? { step: 'process', status: 'broken', summary: 'Room record is awake but its VM is stopped' }
+            : !expectsRunning && state === 'running'
+              ? { step: 'process', status: 'warning', summary: 'sleeping Room still has a running VM' }
+              : {
+                  step: 'process',
+                  status: expectsRunning ? 'healthy' : 'unknown',
+                  summary: state === 'running' ? 'Windows VM is running' : 'Windows VM is stopped'
+                }
+      )
+    }
+    const statuses = results.map((result) => result.status)
+    const overall: CheckStatus = statuses.includes('broken')
+      ? 'broken'
+      : statuses.includes('warning')
+        ? 'warning'
+        : statuses.every((status) => status === 'unknown')
+          ? 'unknown'
+          : 'healthy'
+    return { roomId: room.id, ranAt: new Date().toISOString(), results, overall }
+  }
+
   execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }, actor: Actor = 'agent'): Promise<ExecResult> {
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
+      if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
       if (actor === 'agent' && room.workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent commands are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
       }
@@ -1272,6 +1560,7 @@ export class RoomOrchestrator {
   spawnInteractiveExec(roomId: string, cmd: string[]) {
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
+      if (room.provider === 'windows') throw new Error('Windows Room terminals require the forthcoming guest agent')
       if (room.status === 'sleeping' || room.status === 'preparing') {
         throw new Error('The room must be awake for a terminal session')
       }
@@ -1305,6 +1594,18 @@ export class RoomOrchestrator {
     { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
   > {
     const room = this.mustGet(roomId)
+    if (room.provider === 'windows') {
+      return [
+        { id: 'windows', label: 'Windows', version: room.runtime.version, source: 'recorded' },
+        { id: 'vmware', label: 'VMware Workstation', version: 'vmrun', source: 'recorded' },
+        {
+          id: 'snapshot',
+          label: 'Clean snapshot',
+          version: room.windows?.snapshot ?? 'missing',
+          source: 'recorded'
+        }
+      ]
+    }
     const awake =
       (room.status === 'running' || room.status === 'ready' || room.status === 'attention') &&
       (await this.backend.webState(roomId)) === 'running'
@@ -1557,6 +1858,50 @@ export class RoomOrchestrator {
       out.push({ id: name, service, size: stat.size, createdAt: stat.mtime.toISOString() })
     }
     return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20)
+  }
+
+  private async reconcileWindowsRooms(): Promise<void> {
+    const windowsRooms = this.rooms.list().filter((room) => room.provider === 'windows')
+    if (windowsRooms.length === 0) return
+    if (!this.windowsVm) {
+      for (const room of windowsRooms) {
+        if (room.status === 'preparing') this.rooms.update(room.id, { status: 'broken', hostPort: null })
+        else if (room.status !== 'sleeping' && room.status !== 'broken') {
+          this.rooms.update(room.id, { status: 'attention', hostPort: null })
+        }
+      }
+      return
+    }
+    const health = await this.windowsVm.health()
+    if (!health.ok) {
+      for (const room of windowsRooms) {
+        if (room.status === 'preparing') this.rooms.update(room.id, { status: 'broken', hostPort: null })
+        else if (room.status !== 'sleeping' && room.status !== 'broken') {
+          this.rooms.update(room.id, { status: 'attention', hostPort: null })
+        }
+      }
+      return
+    }
+
+    for (const room of windowsRooms) {
+      try {
+        const state = await this.windowsVm.state(room.id)
+        if (state === 'running') await this.windowsVm.sleep(room.id)
+        if (room.status === 'preparing' || state === 'missing') {
+          this.rooms.update(room.id, { status: 'broken', hostPort: null })
+        } else if (room.status !== 'broken') {
+          this.rooms.update(room.id, { status: 'sleeping', hostPort: null })
+        }
+      } catch (error) {
+        this.rooms.update(room.id, { status: 'broken', hostPort: null })
+        this.olog(room.id, `VMware reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
+  private mustWindowsVm(): WindowsVmLifecycle {
+    if (!this.windowsVm) throw new Error('VMware Workstation backend is not configured in this DevHotel build')
+    return this.windowsVm
   }
 
   private mustGet(roomId: string): RoomRecord {

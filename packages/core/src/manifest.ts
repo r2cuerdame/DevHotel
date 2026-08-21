@@ -14,7 +14,7 @@ export function generateManifestYaml(room: RoomRecord): string {
     source['hostSync'] = room.hostSyncEnabled ? 'enabled' : 'detached'
     if (room.hostSyncEnabled) source['path'] = room.sourceRef
   }
-  const doc = {
+  const common = {
     project: room.project,
     nickname: room.nickname,
     provider: room.provider,
@@ -26,6 +26,23 @@ export function generateManifestYaml(room: RoomRecord): string {
       syncStatus: room.syncStatus,
       ...(room.lastSyncedAt ? { lastSyncedAt: room.lastSyncedAt } : {})
     },
+  }
+  if (room.provider === 'windows') {
+    const doc = {
+      ...common,
+      runtime: { windows: room.runtime.version },
+      virtualization: {
+        backend: room.windows?.backend ?? 'vmware',
+        templateId: room.windows?.templateId ?? 'missing',
+        snapshot: room.windows?.snapshot ?? 'missing',
+        clone: 'linked',
+        network: 'offline'
+      }
+    }
+    return dump(doc, { lineWidth: 120 })
+  }
+  const doc = {
+    ...common,
     runtime: room.runtime.kind === 'jdk' ? { jdk: room.runtime.version } : { node: nodeMajor(room.runtime.version) },
     packageManager: {
       type: room.packageManager.kind,

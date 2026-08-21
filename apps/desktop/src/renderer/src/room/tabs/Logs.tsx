@@ -6,13 +6,18 @@ import { useStore, useT } from '../../state/store'
 type LogKind = 'web' | 'orchestrator'
 
 export function LogsTab({ room }: { room: RoomRecord }): React.JSX.Element {
-  const [kind, setKind] = useState<LogKind>('web')
+  const windows = room.provider === 'windows'
+  const [kind, setKind] = useState<LogKind>(windows ? 'orchestrator' : 'web')
   const key = `${room.id}:${kind}`
   const lines = useStore((s) => s.logs[key] ?? [])
   const appendLog = useStore((s) => s.appendLog)
   const clearLog = useStore((s) => s.clearLog)
   const t = useT()
   const boxRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (windows && kind !== 'orchestrator') setKind('orchestrator')
+  }, [kind, windows])
 
   useEffect(() => {
     let active = true
@@ -34,9 +39,11 @@ export function LogsTab({ room }: { room: RoomRecord }): React.JSX.Element {
   return (
     <div className="logs-tab">
       <div className="row">
-        <button className="btn" data-active={kind === 'web'} onClick={() => setKind('web')} style={kind === 'web' ? { borderColor: 'var(--brass)' } : undefined}>
-          {t('logs.web')}
-        </button>
+        {!windows && (
+          <button className="btn" data-active={kind === 'web'} onClick={() => setKind('web')} style={kind === 'web' ? { borderColor: 'var(--brass)' } : undefined}>
+            {t('logs.web')}
+          </button>
+        )}
         <button
           className="btn"
           onClick={() => setKind('orchestrator')}

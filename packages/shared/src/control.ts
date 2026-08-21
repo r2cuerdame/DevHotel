@@ -5,7 +5,7 @@ import { z } from 'zod'
 export const zSourceType = z.enum(['managed-git', 'linked-folder', 'empty'])
 export const zActor = z.enum(['user', 'devhotel', 'agent'])
 export const zPmKind = z.enum(['npm', 'pnpm'])
-export const zProviderKind = z.enum(['web', 'android'])
+export const zProviderKind = z.enum(['web', 'android', 'windows'])
 export const zServiceKind = z.enum(['postgres', 'redis'])
 export const zRoomId = z.string().regex(/^[a-z0-9]{8}$/, 'valid Room ID')
 export const zChangeId = z.string().uuid()
@@ -112,8 +112,16 @@ export const zPlanRoomInput = z.object({
   provider: zProviderKind.optional()
 }).strict()
 
-/** User-approved desktop creation supports Web and build-only Android Rooms. */
-export const zRendererPlanRoomInput = zPlanRoomInput
+/** User-approved desktop planning also exposes VMware-backed Windows Rooms. */
+export const zRendererPlanRoomInput = zPlanRoomInput.superRefine((input, ctx) => {
+  if (input.provider === 'windows' && (input.sourceType !== 'empty' || input.sourceRef !== '')) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['sourceType'],
+      message: 'Windows Rooms currently start empty'
+    })
+  }
+})
 export type RendererPlanRoomInput = z.infer<typeof zRendererPlanRoomInput>
 
 export const zCreateRoomInput = z.object({
@@ -132,11 +140,18 @@ export const zCreateRoomInput = z.object({
       domain: zLocalDomain.optional(),
       https: z.boolean().optional()
     }).strict()
+    .optional(),
+  windows: z
+    .object({
+      baseVmxPath: z.string().trim().min(1).max(4096).regex(/\.vmx$/i, 'VMware .vmx file'),
+      snapshot: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._ -]+$/, 'safe snapshot name')
+    })
+    .strict()
     .optional()
 }).strict()
 
 const zPublicCreateRoomInput = zCreateRoomInput
-  .omit({ actor: true })
+  .omit({ actor: true, windows: true })
   .extend({ provider: z.enum(['web', 'android']).optional() })
   .strict()
 
@@ -160,7 +175,34 @@ export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 export const zAndroidAction = z.enum(['back', 'home', 'recents', 'rotate'])
 export type AndroidAction = z.infer<typeof zAndroidAction>
 
-export const zRendererCreateRoomInput = zCreateRoomInput.omit({ actor: true }).strict()
+const zRendererCreateRoomObject = zCreateRoomInput
+  .omit({ actor: true, windows: true })
+  .extend({
+    windows: z
+      .object({
+        templateGrantId: z.string().uuid(),
+        snapshot: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._ -]+$/, 'safe snapshot name')
+      })
+      .strict()
+      .optional()
+  })
+  .strict()
+
+export const zRendererCreateRoomInput = zRendererCreateRoomObject.superRefine((input, ctx) => {
+  if (input.provider === 'windows') {
+    if (input.sourceType !== 'empty' || input.sourceRef !== '') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['sourceType'], message: 'Windows Rooms currently start empty' })
+    }
+    if (!input.windows) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['windows'], message: 'Choose a VMware template and snapshot' })
+    }
+    if (input.planOverrides) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['planOverrides'], message: 'Web plan overrides do not apply to Windows Rooms' })
+    }
+  } else if (input.windows) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['windows'], message: 'VMware settings require the Windows provider' })
+  }
+})
 export type RendererCreateRoomInput = z.infer<typeof zRendererCreateRoomInput>
 
 export const zCloneRoomInput = z.object({

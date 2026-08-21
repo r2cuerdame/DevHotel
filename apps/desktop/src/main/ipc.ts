@@ -34,7 +34,16 @@ import {
   zTermResize,
   type McpSetupInfo
 } from '@devhotel/shared'
-import { caTrustStatus, ensureCa, providers, trustCaInWindows, untrustCaInWindows, type RoomOrchestrator, type Gateway } from '@devhotel/core'
+import {
+  caTrustStatus,
+  ensureCa,
+  providers,
+  trustCaInWindows,
+  untrustCaInWindows,
+  type Gateway,
+  type RoomOrchestrator,
+  type WindowsVmBackend
+} from '@devhotel/core'
 import type { PreviewManager } from './previewManager'
 import type { TermManager } from './termManager'
 import {
@@ -50,24 +59,45 @@ import { makeMcpSetupInfo } from './mcpSetup'
 import { searchNpmRegistry } from './npmRegistry'
 import type { GitHubService } from './githubService'
 import { browseMcpRegistry } from './mcpRegistry'
+import { VmwareTemplateGrants } from './vmwareTemplateGrants'
+import {
+  detectVmwareSetup,
+  openOfficialVmwareDownload
+} from './vmwareSetup'
 
 export function registerIpc(opts: {
   win: BrowserWindow
   orch: RoomOrchestrator
+  windowsVm: WindowsVmBackend
   gateway: Gateway
   previews: PreviewManager
   terms: TermManager
   userData: string
   dataOwnershipId: string
   github: GitHubService
+  requestRelaunch: () => void
   runCleanRemoval: (operation: CleanRemovalOperation) => Promise<boolean>
   finishCleanRemoval: () => void
 }): void {
-  const { win, orch, gateway, previews, terms, userData, dataOwnershipId, github, runCleanRemoval, finishCleanRemoval } = opts
+  const {
+    win,
+    orch,
+    windowsVm,
+    gateway,
+    previews,
+    terms,
+    userData,
+    dataOwnershipId,
+    github,
+    requestRelaunch,
+    runCleanRemoval,
+    finishCleanRemoval
+  } = opts
   const caDir = join(userData, 'ca')
   const installDir = dirname(process.execPath)
   const packagedRendererUrl = pathToFileURL(join(import.meta.dirname, '../renderer/index.html')).toString()
   const activeTails = new Set<string>()
+  const vmwareGrants = new VmwareTemplateGrants()
   const folderGrants = new LinkedFolderGrants({
     home: app.getPath('home'),
     deniedTrees: [
@@ -129,7 +159,14 @@ export function registerIpc(opts: {
   })
   handle(IPC.roomsCreate, (_event, input) => {
     const parsed = authorizeLinkedFolder(zRendererCreateRoomInput.parse(input))
-    return orch.createRoom({ ...parsed, actor: 'user' })
+    const { windows, ...base } = parsed
+    return orch.createRoom({
+      ...base,
+      actor: 'user',
+      ...(windows
+        ? { windows: { baseVmxPath: vmwareGrants.resolve(windows.templateGrantId), snapshot: windows.snapshot } }
+        : {})
+    })
   })
   handle(IPC.roomsClone, (_event, sourceRoomId, options) => {
     const parsed = zRendererCloneRoomInput.parse({ ...(options as object), sourceRoomId })
@@ -163,6 +200,24 @@ export function registerIpc(opts: {
     orch.moveIntoHotel(reauthorizeRoomSource(roomId, selectedPath), 'user')
   )
   handle(IPC.roomsProviders, () => providers())
+  handle(IPC.roomsPickVmwareTemplate, async () => {
+    const result = await dialog.showOpenDialog(win, {
+      properties: ['openFile'],
+      filters: [{ name: 'VMware virtual machine', extensions: ['vmx'] }]
+    })
+    const selected = result.canceled ? null : (result.filePaths[0] ?? null)
+    if (!selected) return null
+    const grant = vmwareGrants.grant(selected)
+    try {
+      const snapshots = await windowsVm.listSnapshots(grant.vmxPath)
+      return { grantId: grant.grantId, label: grant.label, snapshots }
+    } catch (error) {
+      vmwareGrants.revoke(grant.grantId)
+      throw error
+    }
+  })
+  handle(IPC.roomsOpenWindows, (_event, roomId) => orch.openWindows(zRoomId.parse(roomId)))
+  handle(IPC.roomsResetWindows, (_event, roomId) => orch.resetWindows(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsResetSyncBaseline, (_event, roomId) => orch.resetSyncBaseline(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsSetAgentHostSync, (_event, roomId, allowed) =>
     orch.setAgentHostSync(zRoomId.parse(roomId), allowed === true, 'user')
@@ -232,6 +287,9 @@ export function registerIpc(opts: {
 
   /* app */
   handle(IPC.appVersion, () => app.getVersion())
+  handle(IPC.vmwareStatus, () => detectVmwareSetup({ windowsVm }))
+  handle(IPC.openVmwareDownload, () => openOfficialVmwareDownload((url) => shell.openExternal(url)))
+  handle(IPC.relaunch, () => requestRelaunch())
   handle(IPC.openExternal, (_event, url) => shell.openExternal(zExternalHttpUrl.parse(url)))
   handle(IPC.openPath, async (_event, path) => {
     const allowedRoots = [

@@ -101,7 +101,9 @@ export const packageInstallChange: ChangeDefinition<PackageInstallParams> = {
     if (ctx.room().workspaceMode === 'empty') {
       throw new Error('This Empty Room has no persistent project working state. Add or import a project first.')
     }
-    if (ctx.room().packageManager.kind === 'gradle') throw new Error('npm packages are only available in Web Rooms')
+    if (!['npm', 'pnpm'].includes(ctx.room().packageManager.kind)) {
+      throw new Error('npm packages are only available in Web Rooms')
+    }
   },
   async capture(ctx) {
     const room = ctx.room()
@@ -116,7 +118,9 @@ export const packageInstallChange: ChangeDefinition<PackageInstallParams> = {
   },
   async apply(ctx, p, steps) {
     const room = ctx.room()
-    if (room.packageManager.kind === 'gradle') throw new Error('npm packages are only available in Web Rooms')
+    if (room.packageManager.kind !== 'npm' && room.packageManager.kind !== 'pnpm') {
+      throw new Error('npm packages are only available in Web Rooms')
+    }
     const command = packageInstallCommand(room.packageManager.kind, p)
     const previousDepsGeneration = currentDepsGen(ctx)
     const nextWorkspaceGeneration = nextWorkspaceVolumeRevision(

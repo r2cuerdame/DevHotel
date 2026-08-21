@@ -18,7 +18,10 @@ const api: IpcApi = {
     moveIntoHotel: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsMoveIntoHotel, roomId, approvedHostPath),
     resetSyncBaseline: (roomId) => ipcRenderer.invoke(IPC.roomsResetSyncBaseline, roomId),
     setAgentHostSync: (roomId, allowed) => ipcRenderer.invoke(IPC.roomsSetAgentHostSync, roomId, allowed),
-    providers: () => ipcRenderer.invoke(IPC.roomsProviders)
+    providers: () => ipcRenderer.invoke(IPC.roomsProviders),
+    pickVmwareTemplate: () => ipcRenderer.invoke(IPC.roomsPickVmwareTemplate),
+    openWindows: (roomId) => ipcRenderer.invoke(IPC.roomsOpenWindows, roomId),
+    resetWindows: (roomId) => ipcRenderer.invoke(IPC.roomsResetWindows, roomId)
   },
   packages: {
     search: (query, offset) => ipcRenderer.invoke(IPC.packagesSearch, query, offset)
@@ -59,6 +62,9 @@ const api: IpcApi = {
   },
   app: {
     version: () => ipcRenderer.invoke(IPC.appVersion),
+    vmwareStatus: () => ipcRenderer.invoke(IPC.vmwareStatus),
+    openVmwareDownload: () => ipcRenderer.invoke(IPC.openVmwareDownload),
+    relaunch: () => ipcRenderer.invoke(IPC.relaunch),
     openExternal: (url) => ipcRenderer.invoke(IPC.openExternal, url),
     openPath: (path) => ipcRenderer.invoke(IPC.openPath, path),
     pickFolder: () => ipcRenderer.invoke(IPC.pickFolder),

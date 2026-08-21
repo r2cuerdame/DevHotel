@@ -37,6 +37,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
   const url = inspection?.urls.app
   const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
   const android = room.provider === 'android'
+  const windows = room.provider === 'windows'
   const [pending, setPending] = useState<string | null>(null)
 
   async function run(kind: string, fn: () => Promise<unknown>): Promise<void> {
@@ -85,9 +86,11 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
               {room.project} <span>/ {room.nickname}</span>
             </div>
             <div className="hero-chips">
-              {android
-                ? `JDK ${room.runtime.version} · ${room.packageManager.kind}`
-                : `Node ${room.runtime.version} · ${room.packageManager.kind}${room.https ? ' · HTTPS' : ''}`}
+              {windows
+                ? t('windows.pill')
+                : android
+                  ? `JDK ${room.runtime.version} · ${room.packageManager.kind}`
+                  : `Node ${room.runtime.version} · ${room.packageManager.kind}${room.https ? ' · HTTPS' : ''}`}
             </div>
           </div>
           <span className="status-chip" data-status={room.status}>
@@ -96,7 +99,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
           </span>
         </div>
 
-        {!android && url && (
+        {room.provider === 'web' && url && (
           <button className="url-pill" onClick={() => void api.app.openExternal(url)} title={t('overview.openInBrowser')}>
             {room.https && <span aria-hidden>🔒</span>}
             <span className="url-text">{url}</span>
@@ -107,6 +110,19 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
         )}
 
         <div className="hero-actions">
+          {windows && running && (
+            <button
+              className="btn primary"
+              onClick={() =>
+                void api.rooms
+                  .openWindows(room.id)
+                  .catch((err: unknown) => toast('error', err instanceof Error ? err.message : String(err)))
+              }
+              disabled={!!busy}
+            >
+              {t('windows.openVmware')}
+            </button>
+          )}
           {android && (
             <button
               className={running ? 'btn primary' : 'btn'}
@@ -138,9 +154,11 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
               {room.status === 'sleeping' ? t('bar.wake') : t('bar.start')}
             </button>
           )}
-          <button className="btn" onClick={() => void roomAction(room.id, 'restart')} disabled={!running || !!busy}>
-            {t('common.restart')}
-          </button>
+          {!windows && (
+            <button className="btn" onClick={() => void roomAction(room.id, 'restart')} disabled={!running || !!busy}>
+              {t('common.restart')}
+            </button>
+          )}
         </div>
       </div>
 
@@ -227,7 +245,19 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
         </div>
       )}
 
-      {android ? (
+      {windows ? (
+        <div className="panel-section">
+          <h3>{t('windows.vmwareRoom')}</h3>
+          <div className="change-item">
+            <span className="status-dot" data-status={room.status} />
+            <span className="title">
+              <span>{t('windows.pill')}</span>
+              {room.windows?.snapshot && <div className="mono small">{room.windows.snapshot}</div>}
+              <div className="small muted">{t('windows.noPreview')}</div>
+            </span>
+          </div>
+        </div>
+      ) : android ? (
         <div className="panel-section">
           <h3>{t('android.buildCommand')}</h3>
           <div className="change-item">
@@ -264,7 +294,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
               ? t('working.detached')
               : room.sourceRef}
         </dd>
-        {!android && (
+        {room.provider === 'web' && (
           <>
             <dt>{t('label.domain')}</dt>
             <dd className="mono">{room.domain}</dd>

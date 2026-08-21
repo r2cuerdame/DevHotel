@@ -80,6 +80,32 @@ describe('generateManifestYaml', () => {
     expect(parsed.source).toEqual({ type: 'empty' })
     expect(parsed.packageManager).toEqual({ type: 'npm' })
   })
+
+  it('renders an offline VMware linked clone without Web or Host-path fields', () => {
+    const yaml = generateManifestYaml(
+      makeRoom({
+        provider: 'windows',
+        sourceType: 'empty',
+        sourceRef: '',
+        workspaceMode: 'empty',
+        runtime: { kind: 'windows', version: '11' },
+        packageManager: { kind: 'none' },
+        internalPort: 0,
+        windows: { backend: 'vmware', templateId: 'b'.repeat(64), snapshot: 'devhotel-clean' }
+      })
+    )
+    const parsed = load(yaml) as Record<string, unknown>
+    expect(parsed.runtime).toEqual({ windows: '11' })
+    expect(parsed.virtualization).toEqual({
+      backend: 'vmware',
+      templateId: 'b'.repeat(64),
+      snapshot: 'devhotel-clean',
+      clone: 'linked',
+      network: 'offline'
+    })
+    expect(parsed).not.toHaveProperty('web')
+    expect(yaml).not.toContain('.vmx')
+  })
 })
 
 describe('writeManifest', () => {

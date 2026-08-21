@@ -44,7 +44,7 @@ export function RoomCard({ room }: { room: RoomRecord }): React.JSX.Element {
           <span className="sep" />
           <span>{relTime(t, room.lastUsedAt)}</span>
         </div>
-        <div className="room-meta">{stackLine(room)}</div>
+        <div className="room-meta">{room.provider === 'windows' ? t('windows.pill') : stackLine(room)}</div>
       </div>
     </button>
   )

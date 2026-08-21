@@ -113,6 +113,94 @@ describe('roomsRepo', () => {
     expect(got?.packageManager.version).toBeUndefined()
   })
 
+  it('round-trips opaque VMware metadata without storing the template path', () => {
+    const rooms = roomsRepo(db)
+    const room = makeRoom({
+      id: 'win-room',
+      provider: 'windows',
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      startCommand: 'VMware guest boot',
+      internalPort: 0,
+      windows: { backend: 'vmware', templateId: 'a'.repeat(64), snapshot: 'devhotel-clean' }
+    })
+    rooms.create(room)
+
+    expect(rooms.get(room.id)).toEqual(room)
+    const raw = db.sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(room.id) as { extra: string }
+    expect(raw.extra).not.toContain('.vmx')
+  })
+
+  it('validates and projects only public VMware metadata while hydrating a Windows room', () => {
+    const rooms = roomsRepo(db)
+    const windows = { backend: 'vmware' as const, templateId: 'a'.repeat(64), snapshot: 'devhotel-clean' }
+    rooms.create(makeRoom({
+      id: 'win-projected',
+      provider: 'windows',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      windows
+    }))
+    db.sqlite.prepare('UPDATE rooms SET extra = ? WHERE id = ?').run(
+      JSON.stringify({ windows: { ...windows, harmlessFutureField: 'not-public' } }),
+      'win-projected'
+    )
+
+    const got = rooms.get('win-projected')
+    expect(got?.windows).toStrictEqual(windows)
+    expect(Object.hasOwn(got?.windows ?? {}, 'harmlessFutureField')).toBe(false)
+  })
+
+  it('rejects malformed, legacy, and raw-path-containing VMware metadata', () => {
+    const rooms = roomsRepo(db)
+    const valid = { backend: 'vmware', templateId: 'b'.repeat(64), snapshot: 'clean' }
+    rooms.create(makeRoom({
+      id: 'win-invalid',
+      provider: 'windows',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      windows: valid as RoomRecord['windows']
+    }))
+
+    const invalidExtras = [
+      '{not-json',
+      JSON.stringify({ windows: null }),
+      JSON.stringify({ windows: 'C:\\VMs\\Windows 11.vmx' }),
+      JSON.stringify({ windows: { ...valid, templateId: 'not-a-fingerprint' } }),
+      JSON.stringify({ windows: { ...valid, snapshot: '../clean' } })
+    ]
+    for (const extra of invalidExtras) {
+      db.sqlite.prepare('UPDATE rooms SET extra = ? WHERE id = ?').run(extra, 'win-invalid')
+      expect(() => rooms.get('win-invalid')).toThrow(/invalid Windows VMware metadata/)
+    }
+
+    db.sqlite.prepare('UPDATE rooms SET extra = ? WHERE id = ?').run(
+      JSON.stringify({ windows: { ...valid, ownership: { template: 'C:\\VMs\\Windows 11.vmx' } } }),
+      'win-invalid'
+    )
+    expect(() => rooms.get('win-invalid')).toThrow(/legacy raw-path VMware metadata/)
+  })
+
+  it('never exposes Windows metadata from a non-Windows room row', () => {
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom())
+    db.sqlite.prepare('UPDATE rooms SET extra = ? WHERE id = ?').run(
+      JSON.stringify({
+        services: {},
+        os: { env: {} },
+        windows: { backend: 'vmware', templateId: 'c'.repeat(64), snapshot: 'clean' }
+      }),
+      'room-1'
+    )
+
+    const got = rooms.get('room-1')
+    expect(got?.provider).toBe('web')
+    expect(Object.hasOwn(got ?? {}, 'windows')).toBe(false)
+  })
+
   it('lists rooms ordered by last_used_at DESC', () => {
     const rooms = roomsRepo(db)
     rooms.create(makeRoom({ id: 'a', domain: 'a.local', lastUsedAt: '2026-08-10T09:00:00.000Z' }))

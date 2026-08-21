@@ -1,12 +1,13 @@
-import { useEffect, useState } from 'react'
-import type { ProviderInfo, ProviderKind, RoomPlan, SourceType } from '@devhotel/shared'
+import { useEffect, useRef, useState } from 'react'
+import type { ProviderInfo, ProviderKind, RoomPlan, SourceType, VmwareSetupStatusInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import type { Translation } from '../i18n'
 
 const NODE_MAJORS = ['18', '20', '22', '24']
 type WebPmKind = 'npm' | 'pnpm'
-type CreatableProvider = Extract<ProviderKind, 'web' | 'android'>
+type CreatableProvider = Extract<ProviderKind, 'web' | 'android' | 'windows'>
+type VmwareTemplate = { grantId: string; label: string; snapshots: string[] }
 
 export function NewRoomWizard(): React.JSX.Element {
   const openWizard = useStore((s) => s.openWizard)
@@ -23,14 +24,20 @@ export function NewRoomWizard(): React.JSX.Element {
   const [nickname, setNickname] = useState('dev')
   const [plan, setPlan] = useState<RoomPlan | null>(null)
   const [loading, setLoading] = useState(false)
-  const [roadmap, setRoadmap] = useState<ProviderInfo[]>([])
+  const [providerInfos, setProviderInfos] = useState<ProviderInfo[]>([])
+  const [vmwareTemplate, setVmwareTemplate] = useState<VmwareTemplate | null>(null)
+  const [snapshot, setSnapshot] = useState('')
+  const [vmwareStatus, setVmwareStatus] = useState<VmwareSetupStatusInfo | null>(null)
+  const [vmwareAction, setVmwareAction] = useState<'checking' | 'download' | 'relaunch' | null>(null)
+  const vmwareActionRef = useRef<typeof vmwareAction>(null)
+  const [vmwareDownloadOpened, setVmwareDownloadOpened] = useState(false)
 
   useEffect(() => {
     let active = true
     void api.rooms
       .providers()
       .then((list) => {
-        if (active) setRoadmap(list.filter((info) => !info.available))
+        if (active) setProviderInfos(list)
       })
       .catch(() => undefined)
     return () => {
@@ -46,6 +53,24 @@ export function NewRoomWizard(): React.JSX.Element {
   const [domain, setDomain] = useState('')
   const [https, setHttps] = useState(false)
 
+  const windowsInfo = providerInfos.find((info) => info.kind === 'windows')
+  const vmwareReady = vmwareStatus?.state === 'ready'
+
+  const chooseProvider = (kind: CreatableProvider): void => {
+    const enteringWindows = kind === 'windows' && provider !== 'windows'
+    setProvider(kind)
+    setPlan(null)
+    setStep('source')
+    if (kind === 'windows') {
+      setSourceType('empty')
+      setSourceRef('')
+      if (enteringWindows || vmwareStatus === null) {
+        setVmwareStatus(null)
+        void checkVmwareStatus()
+      }
+    }
+  }
+
   const chooseSource = (type: SourceType): void => {
     setSourceType(type)
   }
@@ -58,26 +83,98 @@ export function NewRoomWizard(): React.JSX.Element {
     }
   }
 
+  async function pickVmwareTemplate(): Promise<void> {
+    setLoading(true)
+    try {
+      const selected = await api.rooms.pickVmwareTemplate()
+      if (!selected) return
+      setVmwareTemplate(selected)
+      setSnapshot(selected.snapshots[0] ?? '')
+      if (!project) setProject(selected.label.replace(/\.vmx$/i, ''))
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function checkVmwareStatus(): Promise<void> {
+    if (vmwareActionRef.current !== null) return
+    vmwareActionRef.current = 'checking'
+    setVmwareAction('checking')
+    try {
+      const status = await api.app.vmwareStatus()
+      setVmwareStatus(status)
+      if (status.ready) {
+        const list = await api.rooms.providers()
+        setProviderInfos(list)
+      }
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      vmwareActionRef.current = null
+      setVmwareAction(null)
+    }
+  }
+
+  async function openVmwareDownload(): Promise<void> {
+    if (vmwareActionRef.current !== null) return
+    vmwareActionRef.current = 'download'
+    setVmwareAction('download')
+    try {
+      await api.app.openVmwareDownload()
+      setVmwareDownloadOpened(true)
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      vmwareActionRef.current = null
+      setVmwareAction(null)
+    }
+  }
+
+  async function relaunchForVmware(): Promise<void> {
+    if (vmwareActionRef.current !== null) return
+    vmwareActionRef.current = 'relaunch'
+    setVmwareAction('relaunch')
+    try {
+      await api.app.relaunch()
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : String(err))
+      vmwareActionRef.current = null
+      setVmwareAction(null)
+    }
+  }
+
   async function analyze(): Promise<void> {
+    const effectiveSourceType: SourceType = provider === 'windows' ? 'empty' : sourceType
+    const effectiveSourceRef = provider === 'windows' ? '' : sourceRef
     const projectName =
       project ||
-      (sourceType === 'managed-git'
-        ? (sourceRef.split('/').pop() ?? '').replace(/\.git$/, '')
-        : sourceRef.replaceAll('\\', '/').split('/').filter(Boolean).pop()) ||
+      (effectiveSourceType === 'managed-git'
+        ? (effectiveSourceRef.split('/').pop() ?? '').replace(/\.git$/, '')
+        : effectiveSourceRef.replaceAll('\\', '/').split('/').filter(Boolean).pop()) ||
       'project'
     setProject(projectName)
     setLoading(true)
     try {
-      const p = await planRoom({ sourceType, sourceRef, nickname, project: projectName, provider })
+      const p = await planRoom({
+        sourceType: effectiveSourceType,
+        sourceRef: effectiveSourceRef,
+        nickname,
+        project: projectName,
+        provider
+      })
       setPlan(p)
-      setRuntimeVersion(p.runtime.value)
-      if (provider === 'web' && (p.packageManager.value === 'npm' || p.packageManager.value === 'pnpm')) {
-        setPmKind(p.packageManager.value)
+      if (provider !== 'windows') {
+        setRuntimeVersion(p.runtime.value)
+        if (provider === 'web' && (p.packageManager.value === 'npm' || p.packageManager.value === 'pnpm')) {
+          setPmKind(p.packageManager.value)
+        }
+        setStartCommand(p.startCommand.value)
+        setInternalPort(p.internalPort.value)
+        setDomain(p.domain)
+        setHttps(p.https)
       }
-      setStartCommand(p.startCommand.value)
-      setInternalPort(p.internalPort.value)
-      setDomain(p.domain)
-      setHttps(p.https)
       setStep('plan')
     } catch (err) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -90,16 +187,21 @@ export function NewRoomWizard(): React.JSX.Element {
     setLoading(true)
     try {
       const planOverrides =
-        provider === 'android'
+        provider === 'windows'
+          ? undefined
+          : provider === 'android'
           ? { startCommand }
           : { runtimeVersion, pmKind, startCommand, internalPort, domain, https }
       await createRoom({
-        sourceType,
-        sourceRef,
+        sourceType: provider === 'windows' ? 'empty' : sourceType,
+        sourceRef: provider === 'windows' ? '' : sourceRef,
         project,
         nickname,
         provider,
-        planOverrides
+        ...(planOverrides ? { planOverrides } : {}),
+        ...(provider === 'windows' && vmwareTemplate
+          ? { windows: { templateGrantId: vmwareTemplate.grantId, snapshot } }
+          : {})
       })
     } finally {
       setLoading(false)
@@ -107,7 +209,10 @@ export function NewRoomWizard(): React.JSX.Element {
   }
 
   const sourceValid =
-    sourceType === 'empty' || (sourceType === 'managed-git' ? /^(https?:\/\/|git@)/.test(sourceRef) : sourceRef.length > 2)
+    provider === 'windows'
+      ? Boolean(vmwareReady && project.trim() && vmwareTemplate && snapshot)
+      : sourceType === 'empty' ||
+        (sourceType === 'managed-git' ? /^(https?:\/\/|git@)/.test(sourceRef) : sourceRef.length > 2)
 
   return (
     <div className="modal-backdrop" onClick={() => !loading && openWizard(false)}>
@@ -118,46 +223,51 @@ export function NewRoomWizard(): React.JSX.Element {
             <div className="field">
               <label>{t('wizard.roomType')}</label>
               <div className="provider-choices">
-                <button className="source-choice" data-active={provider === 'web'} onClick={() => setProvider('web')}>
+                <button className="source-choice" data-active={provider === 'web'} onClick={() => chooseProvider('web')}>
                   <b>{t('wizard.webRoom')}</b>
                   <small>{t('wizard.webRoomHint')}</small>
                 </button>
-                <button className="source-choice" data-active={provider === 'android'} onClick={() => setProvider('android')}>
+                <button className="source-choice" data-active={provider === 'android'} onClick={() => chooseProvider('android')}>
                   <b>{t('android.buildRoom')}</b>
                   <small>{t('wizard.sourceAndroidHint')}</small>
                 </button>
-                {/* Roadmap providers come from the registry, so the tile is
-                    never a hand-written promise: it disappears the day the
-                    provider reports itself available. */}
-                {roadmap.map((info) => (
-                  <button key={info.kind} className="source-choice" disabled title={info.unavailableReason}>
-                    <b>{info.label}</b>
-                    <small>{t('wizard.providerLater')}</small>
+                <button
+                  className="source-choice"
+                  data-active={provider === 'windows'}
+                  onClick={() => chooseProvider('windows')}
+                >
+                  <b>{windowsInfo?.label ?? t('windows.vmwareRoom')}</b>
+                  <small>
+                    {windowsInfo?.available
+                      ? t('windows.roomHint')
+                      : windowsInfo?.unavailableReason ?? t('windows.setupRequiredCard')}
+                  </small>
+                </button>
+              </div>
+            </div>
+            {provider !== 'windows' && (
+              <div className="source-choices">
+                {(
+                  [
+                    ['managed-git', 'wizard.sourceGit', 'wizard.sourceGitHint'],
+                    ['linked-folder', 'wizard.sourceFolder', 'wizard.sourceFolderHint'],
+                    ['empty', 'wizard.sourceEmpty', 'wizard.sourceEmptyHint']
+                  ] as [SourceType, keyof Translation, keyof Translation][]
+                ).map(([type, label, hint]) => (
+                  <button
+                    key={type}
+                    className="source-choice"
+                    data-active={sourceType === type}
+                    onClick={() => chooseSource(type)}
+                  >
+                    <b>{t(label)}</b>
+                    <small>{t(hint)}</small>
                   </button>
                 ))}
               </div>
-            </div>
-            <div className="source-choices">
-              {(
-                [
-                  ['managed-git', 'wizard.sourceGit', 'wizard.sourceGitHint'],
-                  ['linked-folder', 'wizard.sourceFolder', 'wizard.sourceFolderHint'],
-                  ['empty', 'wizard.sourceEmpty', 'wizard.sourceEmptyHint']
-                ] as [SourceType, keyof Translation, keyof Translation][]
-              ).map(([type, label, hint]) => (
-                <button
-                  key={type}
-                  className="source-choice"
-                  data-active={sourceType === type}
-                  onClick={() => chooseSource(type)}
-                >
-                  <b>{t(label)}</b>
-                  <small>{t(hint)}</small>
-                </button>
-              ))}
-            </div>
+            )}
 
-            {sourceType === 'managed-git' && (
+            {provider !== 'windows' && sourceType === 'managed-git' && (
               <div className="field">
                 <label htmlFor="src-url">{t('wizard.repoUrl')}</label>
                 <input
@@ -169,7 +279,7 @@ export function NewRoomWizard(): React.JSX.Element {
                 />
               </div>
             )}
-            {sourceType === 'linked-folder' && (
+            {provider !== 'windows' && sourceType === 'linked-folder' && (
               <div className="field">
                 <label htmlFor="src-path">{t('wizard.projectFolder')}</label>
                 <div className="row">
@@ -187,10 +297,122 @@ export function NewRoomWizard(): React.JSX.Element {
               </div>
             )}
 
+            {provider === 'windows' && (
+              <>
+                {!vmwareReady ? (
+                  <div
+                    className="field"
+                    style={{ border: '1px solid var(--line)', borderRadius: 8, padding: 14 }}
+                    aria-live="polite"
+                  >
+                    <b>{t('windows.setupTitle')}</b>
+                    <span className="small muted">
+                      {vmwareAction === 'checking' || vmwareStatus === null
+                        ? t('windows.detecting')
+                        : vmwareStatus.state === 'unsupported'
+                          ? t('windows.unsupported')
+                          : vmwareStatus.state === 'relaunch-required'
+                            ? t('windows.relaunchRequired')
+                            : vmwareStatus.state === 'unavailable'
+                              ? t('windows.unavailable')
+                              : t('windows.notDetected')}
+                    </span>
+                    {vmwareStatus?.state === 'unavailable' && vmwareStatus.detail && (
+                      <span className="small muted">{vmwareStatus.detail}</span>
+                    )}
+                    {vmwareDownloadOpened &&
+                      (vmwareStatus?.state === 'missing' || vmwareStatus?.state === 'unavailable') && (
+                        <span className="small muted">{t('windows.downloadOpened')}</span>
+                      )}
+                    <div className="row" style={{ marginTop: 6, flexWrap: 'wrap' }}>
+                      {(vmwareStatus?.state === 'missing' || vmwareStatus?.state === 'unavailable') && (
+                        <button
+                          className="btn primary"
+                          disabled={vmwareAction !== null}
+                          onClick={() => void openVmwareDownload()}
+                        >
+                          {vmwareAction === 'download'
+                            ? t('windows.openingDownload')
+                            : vmwareStatus.state === 'unavailable'
+                              ? t('windows.repairVmware')
+                              : t('windows.installVmware')}
+                        </button>
+                      )}
+                      {vmwareStatus?.state === 'relaunch-required' && (
+                        <button
+                          className="btn primary"
+                          disabled={vmwareAction !== null}
+                          onClick={() => void relaunchForVmware()}
+                        >
+                          {vmwareAction === 'relaunch' ? t('windows.relaunching') : t('windows.relaunch')}
+                        </button>
+                      )}
+                      {vmwareStatus?.state !== 'unsupported' && (
+                        <button
+                          className="btn"
+                          disabled={vmwareAction !== null}
+                          onClick={() => void checkVmwareStatus()}
+                        >
+                          {vmwareAction === 'checking' ? t('windows.detecting') : t('windows.checkAgain')}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="field">
+                      <small className="muted">{t('windows.detectedReady')}</small>
+                      <label>{t('windows.template')}</label>
+                      <div className="row">
+                        <input
+                          className="mono"
+                          value={vmwareTemplate?.label ?? ''}
+                          placeholder={t('windows.noTemplate')}
+                          readOnly
+                          style={{ flex: 1 }}
+                        />
+                        <button className="btn" disabled={loading} onClick={() => void pickVmwareTemplate()}>
+                          {vmwareTemplate ? t('windows.changeTemplate') : t('windows.chooseTemplate')}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="field">
+                      <label htmlFor="vmware-snapshot">{t('windows.snapshot')}</label>
+                      <select
+                        id="vmware-snapshot"
+                        value={snapshot}
+                        disabled={!vmwareTemplate || vmwareTemplate.snapshots.length === 0}
+                        onChange={(event) => setSnapshot(event.target.value)}
+                      >
+                        {vmwareTemplate?.snapshots.map((name) => (
+                          <option key={name} value={name}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                      {vmwareTemplate && vmwareTemplate.snapshots.length === 0 && (
+                        <small className="muted">{t('windows.noSnapshots')}</small>
+                      )}
+                    </div>
+                    <ul className="plan-warnings">
+                      <li>{t('windows.linkedCloneHint')}</li>
+                      <li>{t('windows.offlineHint')}</li>
+                      <li>{t('windows.guestAgentLater')}</li>
+                    </ul>
+                  </>
+                )}
+              </>
+            )}
+
             <div className="field-row">
               <div className="field">
                 <label htmlFor="proj">{t('wizard.projectName')}</label>
-                <input id="proj" placeholder={t('wizard.auto')} value={project} onChange={(e) => setProject(e.target.value)} />
+                <input
+                  id="proj"
+                  placeholder={provider === 'windows' ? t('windows.projectPlaceholder') : t('wizard.auto')}
+                  value={project}
+                  onChange={(e) => setProject(e.target.value)}
+                />
               </div>
               <div className="field">
                 <label htmlFor="nick">{t('wizard.nickname')}</label>
@@ -203,7 +425,7 @@ export function NewRoomWizard(): React.JSX.Element {
                 {t('common.cancel')}
               </button>
               <button className="btn primary" disabled={!sourceValid || !nickname || loading} onClick={() => void analyze()}>
-                {loading ? t('wizard.analyzing') : t('wizard.analyze')}
+                {loading ? t('wizard.analyzing') : provider === 'windows' ? t('windows.review') : t('wizard.analyze')}
               </button>
             </div>
           </>
@@ -212,89 +434,110 @@ export function NewRoomWizard(): React.JSX.Element {
             <h2>{t('wizard.planTitle', { project, nickname })}</h2>
             <table className="plan-table">
               <tbody>
-                {plan?.framework && (
-                  <tr>
-                    <td>{t('label.project')}</td>
-                    <td>{plan.framework}</td>
-                  </tr>
-                )}
-                <tr>
-                  <td>{t('label.runtime')}</td>
-                  <td>
-                    <div className="row">
-                      {provider === 'android' ? (
-                        <span>JDK {runtimeVersion}</span>
-                      ) : (
-                        <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
-                          {NODE_MAJORS.map((v) => (
-                            <option key={v} value={v}>
-                              Node {v}
-                            </option>
-                          ))}
-                        </select>
-                      )}
-                      <span className="src">{plan?.runtime.source}</span>
-                    </div>
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.packageManager')}</td>
-                  <td>
-                    <div className="row">
-                      {provider === 'android' ? (
-                        <span>Gradle</span>
-                      ) : (
-                        <select value={pmKind} onChange={(e) => setPmKind(e.target.value as WebPmKind)} style={{ width: 110 }}>
-                          <option value="npm">npm</option>
-                          <option value="pnpm">pnpm</option>
-                        </select>
-                      )}
-                      <span className="src">{plan?.packageManager.source}</span>
-                    </div>
-                  </td>
-                </tr>
-                <tr>
-                  <td>{t('label.startCommand')}</td>
-                  <td>
-                    <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
-                  </td>
-                </tr>
-                {provider === 'web' && (
+                {provider === 'windows' ? (
                   <>
                     <tr>
-                      <td>{t('label.internalPort')}</td>
+                      <td>{t('windows.template')}</td>
+                      <td className="mono">{vmwareTemplate?.label}</td>
+                    </tr>
+                    <tr>
+                      <td>{t('windows.snapshot')}</td>
+                      <td className="mono">{snapshot}</td>
+                    </tr>
+                    <tr>
+                      <td>{t('windows.isolation')}</td>
+                      <td>{t('windows.linkedCloneOffline')}</td>
+                    </tr>
+                  </>
+                ) : (
+                  <>
+                    {plan?.framework && (
+                      <tr>
+                        <td>{t('label.project')}</td>
+                        <td>{plan.framework}</td>
+                      </tr>
+                    )}
+                    <tr>
+                      <td>{t('label.runtime')}</td>
                       <td>
                         <div className="row">
-                          <input
-                            type="number"
-                            value={internalPort}
-                            onChange={(e) => setInternalPort(Number(e.target.value))}
-                            style={{ width: 110 }}
-                          />
-                          <span className="src">{plan?.internalPort.source}</span>
+                          {provider === 'android' ? (
+                            <span>JDK {runtimeVersion}</span>
+                          ) : (
+                            <select value={runtimeVersion} onChange={(e) => setRuntimeVersion(e.target.value)} style={{ width: 110 }}>
+                              {NODE_MAJORS.map((v) => (
+                                <option key={v} value={v}>
+                                  Node {v}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <span className="src">{plan?.runtime.source}</span>
                         </div>
                       </td>
                     </tr>
                     <tr>
-                      <td>{t('label.domain')}</td>
+                      <td>{t('label.packageManager')}</td>
                       <td>
-                        <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
+                        <div className="row">
+                          {provider === 'android' ? (
+                            <span>Gradle</span>
+                          ) : (
+                            <select value={pmKind} onChange={(e) => setPmKind(e.target.value as WebPmKind)} style={{ width: 110 }}>
+                              <option value="npm">npm</option>
+                              <option value="pnpm">pnpm</option>
+                            </select>
+                          )}
+                          <span className="src">{plan?.packageManager.source}</span>
+                        </div>
                       </td>
                     </tr>
                     <tr>
-                      <td>HTTPS</td>
+                      <td>{t('label.startCommand')}</td>
                       <td>
-                        <label className="row" style={{ gap: 6 }}>
-                          <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> {t('wizard.enable')}
-                        </label>
+                        <input className="mono" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} />
                       </td>
                     </tr>
+                    {provider === 'web' && (
+                      <>
+                        <tr>
+                          <td>{t('label.internalPort')}</td>
+                          <td>
+                            <div className="row">
+                              <input
+                                type="number"
+                                value={internalPort}
+                                onChange={(e) => setInternalPort(Number(e.target.value))}
+                                style={{ width: 110 }}
+                              />
+                              <span className="src">{plan?.internalPort.source}</span>
+                            </div>
+                          </td>
+                        </tr>
+                        <tr>
+                          <td>{t('label.domain')}</td>
+                          <td>
+                            <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
+                          </td>
+                        </tr>
+                        <tr>
+                          <td>HTTPS</td>
+                          <td>
+                            <label className="row" style={{ gap: 6 }}>
+                              <input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} />{' '}
+                              {t('wizard.enable')}
+                            </label>
+                          </td>
+                        </tr>
+                      </>
+                    )}
                   </>
                 )}
               </tbody>
             </table>
 
             {provider === 'android' && <p className="small muted">{t('android.buildOnlyHint')}</p>}
+            {provider === 'windows' && <p className="small muted">{t('windows.guestAgentLater')}</p>}
 
             {plan && plan.warnings.length > 0 && (
               <ul className="plan-warnings">
@@ -311,7 +554,12 @@ export function NewRoomWizard(): React.JSX.Element {
               <button
                 className="btn primary"
                 onClick={() => void checkIn()}
-                disabled={loading || !startCommand || (provider === 'web' && !domain)}
+                disabled={
+                  loading ||
+                  (provider === 'windows'
+                    ? !vmwareTemplate || !snapshot
+                    : !startCommand || (provider === 'web' && !domain))
+                }
               >
                 {loading ? t('wizard.preparingRoom') : t('wizard.checkIn')}
               </button>

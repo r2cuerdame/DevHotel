@@ -2,7 +2,15 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell } from 'electron'
-import { Gateway, OciCliBackend, hotelServicesRepo, openDb, RoomOrchestrator, roomsRepo } from '@devhotel/core'
+import {
+  Gateway,
+  OciCliBackend,
+  RoomOrchestrator,
+  WindowsVmBackend,
+  hotelServicesRepo,
+  openDb,
+  roomsRepo
+} from '@devhotel/core'
 import { registerIpc } from './ipc'
 import { PreviewManager } from './previewManager'
 import { TermManager } from './termManager'
@@ -104,9 +112,17 @@ async function bootstrap(): Promise<void> {
     canAdoptLegacyVolume: (roomId) =>
       ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml'))
   })
+  const windowsVm = new WindowsVmBackend({
+    userData,
+    consoleLauncher: async (vmxPath) => {
+      const error = await shell.openPath(vmxPath)
+      if (error) throw new Error(`VMware Workstation could not open the Room: ${error}`)
+    }
+  })
   const orch = new RoomOrchestrator({
     userData,
     backend,
+    windowsVm,
     gateway,
     db,
     appVersion: app.getVersion(),
@@ -179,6 +195,7 @@ async function bootstrap(): Promise<void> {
     void executeShutdownPolicy(action, {
       shutdown: () => orch.shutdown(),
       installUpdate: updater.install,
+      relaunch: () => app.relaunch(),
       exit: (code) => app.exit(code),
       reportFailure: async (failedAction, error) => {
         const detail = error instanceof Error ? error.message : String(error)
@@ -189,6 +206,16 @@ async function bootstrap(): Promise<void> {
             title: 'Update not installed',
             message: 'DevHotel could not safely stop every Room.',
             detail: `The update was not installed. DevHotel will exit with the Room data preserved.\n\n${detail}`,
+            buttons: ['Exit DevHotel'],
+            defaultId: 0,
+            noLink: true
+          })
+        } else if (failedAction === 'relaunch') {
+          await dialog.showMessageBox(mainWindow!, {
+            type: 'error',
+            title: 'DevHotel could not relaunch',
+            message: 'DevHotel could not safely stop every Room.',
+            detail: `DevHotel will exit without scheduling a relaunch. Open it again manually after checking the Rooms.\n\n${detail}`,
             buttons: ['Exit DevHotel'],
             defaultId: 0,
             noLink: true
@@ -208,12 +235,14 @@ async function bootstrap(): Promise<void> {
   registerIpc({
     win: mainWindow,
     orch,
+    windowsVm,
     gateway,
     previews,
     terms,
     userData,
     dataOwnershipId,
     github,
+    requestRelaunch: () => requestShutdown('relaunch'),
     runCleanRemoval: (operation) => cleanRemoval.run(operation),
     // Bypass the removal gate only after the detached coordinator exists. The
     // normal shutdown path still disposes streams/gateway before app.exit.
@@ -224,8 +253,9 @@ async function bootstrap(): Promise<void> {
     win: mainWindow,
     orch,
     onQuit: quit,
-    updateReady: updater.readyVersion,
-    onUpdateReady: updater.onReady,
+    updateStatus: updater.status,
+    onUpdateStatusChange: updater.onStatusChange,
+    checkForUpdates: updater.check,
     installUpdate: () => requestShutdown('install-update')
   })
 
