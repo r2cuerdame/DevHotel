@@ -23,6 +23,12 @@ describe('redactSecrets', () => {
     expect(out).toContain('postgres://app:•••@localhost:5432/app')
   })
 
+  it('masks a credential pasted into a repository URL but keeps the repository', () => {
+    const out = redactSecrets('clone https://me:github_pat_leaked_value@github.com/acme/private.git')
+    expect(out).not.toContain('github_pat_leaked_value')
+    expect(out).toContain('https://me:•••@github.com/acme/private.git')
+  })
+
   it('masks well-known token shapes anywhere in text', () => {
     const out = redactSecrets(
       'log: using ghp_ABCDEFGHIJKLMNOPQRSTUVWX123456 and sk-ant-api03-secret-key-material-here plus AKIAIOSFODNN7EXAMPLE'

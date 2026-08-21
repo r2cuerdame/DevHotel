@@ -59,6 +59,8 @@ export const ptBR: Translation = {
   'wizard.sourceEmpty': 'Quarto vazio',
   'wizard.sourceEmptyHint': 'Começar do zero',
   'wizard.repoUrl': 'URL do repositório',
+  'wizard.repoPrivateHint': 'Repositório privado? Conecte o GitHub nos Serviços do Hotel ou cole https://user:token@… — o token é usado só neste clone e nunca é armazenado.',
+  'wizard.repoPrivateConnected': 'Repositórios privados do GitHub são clonados com a credencial conectada do Serviço GitHub ({account}).',
   'wizard.projectFolder': 'Pasta do projeto',
   'wizard.browse': 'Procurar…',
   'wizard.projectName': 'Nome do projeto',

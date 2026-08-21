@@ -139,6 +139,19 @@ export async function runBounded(exe: string, args: string[], env: NodeJS.Proces
   })
 }
 
+/** https clones of github.com and its gist host; ssh URLs authenticate with the user's own key. */
+export function isGitHubCloneUrl(gitUrl: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(gitUrl)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
+  const host = parsed.hostname.toLowerCase()
+  return host === 'github.com' || host === 'www.github.com' || host === 'gist.github.com'
+}
+
 export class GitHubService {
   private readonly root: string
   private readonly versionsDir: string
@@ -420,6 +433,19 @@ export class GitHubService {
     if (validation.kind === 'temporarily-unavailable') return this.report({ installed: true, installing: this.installing, version, pinnedVersion: PINNED_GH.version, provisionState: 'provisioned', authenticated: false, account: stored.value.account, credentialState: 'temporarily-unavailable', credentialVaultAvailable, detail: 'GitHub is temporarily unreachable; the stored credential was kept' })
     if (validation.kind === 'invalid' || validation.account !== stored.value.account) return this.report({ installed: true, installing: this.installing, version, pinnedVersion: PINNED_GH.version, provisionState: 'provisioned', authenticated: false, account: stored.value.account, credentialState: 'invalid', credentialVaultAvailable, detail: 'Stored credential was rejected by GitHub' })
     return this.report({ installed: true, installing: this.installing, version, pinnedVersion: PINNED_GH.version, provisionState: 'provisioned', authenticated: true, account: validation.account, credentialState: 'connected', credentialVaultAvailable, detail: `Connected as ${validation.account}` })
+  }
+
+  /**
+   * The credential for one clone of a GitHub URL, or null when nothing is connected.
+   * Offered only for github.com — a token the human gave DevHotel for GitHub must never
+   * be handed to some other host that happens to appear in a repository URL.
+   */
+  gitCredentialFor(gitUrl: string): { username: string; secret: string } | null {
+    if (!isGitHubCloneUrl(gitUrl)) return null
+    if (!this.prepareOwnedStorage()) return null
+    const stored = this.readCredential()
+    if (stored.kind !== 'credential') return null
+    return { username: stored.value.account, secret: stored.value.token }
   }
 
   async connect(token: string): Promise<GitHubServiceStatus> {

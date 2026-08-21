@@ -31,7 +31,8 @@ export class WindowsRoomProvider implements RoomProvider {
         : {
             unavailableReason: supported
               ? 'Install VMware Workstation Pro to create Windows Rooms'
-              : 'Windows Rooms require DevHotel on a Windows host'
+              : 'Windows Rooms require DevHotel on a Windows host',
+            unavailableCode: supported ? ('vmware-missing' as const) : ('host-not-windows' as const)
           }),
       execution: 'build-only',
       preview: 'none',

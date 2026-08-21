@@ -121,6 +121,9 @@ async function bootstrap(): Promise<void> {
       if (error) throw new Error(`VMware Workstation could not open the Room: ${error}`)
     }
   })
+  // The GitHub Service is built after the orchestrator, so clone-time credential
+  // lookups go through this holder instead of a construction-order dependency.
+  const githubRef: { current: GitHubService | null } = { current: null }
   const orch = new RoomOrchestrator({
     userData,
     backend,
@@ -132,7 +135,11 @@ async function bootstrap(): Promise<void> {
     // desktop app can clear it; core asks through this hook.
     clearBrowserData: async (roomId) => {
       await session.fromPartition(roomPreviewPartition(roomId)).clearStorageData()
-    }
+    },
+    // Private repositories clone with the credential the human connected to the
+    // GitHub Service; the token stays in the encrypted vault and never reaches
+    // the Room record, the URL, or the logs.
+    gitCredential: async (gitUrl) => githubRef.current?.gitCredentialFor(gitUrl) ?? null
   })
 
   protocol.handle('devhotel-thumb', (request) => {
@@ -185,6 +192,7 @@ async function bootstrap(): Promise<void> {
     })
   )
   hotelForAgents.github = github
+  githubRef.current = github
   // A packaged Hotel provisions its built-in GitHub infrastructure without
   // waiting for the Store UI to be opened. Failure is retryable from there.
   void github.status().catch((error) => console.error('GitHub Service provisioning failed:', error))

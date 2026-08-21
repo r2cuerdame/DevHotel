@@ -5,12 +5,16 @@ export type PmKind = 'npm' | 'pnpm' | 'gradle' | 'none'
 export type ProviderKind = 'web' | 'android' | 'windows'
 export type RuntimeKind = 'node' | 'jdk' | 'windows'
 
+/** Why a provider is unavailable, as a stable code the UI can localize instead of printing English prose. */
+export type ProviderUnavailableCode = 'vmware-missing' | 'host-not-windows'
+
 /** What a Room provider can do in this build — the registry's own answer, so the UI never invents availability. */
 export interface ProviderInfo {
   kind: ProviderKind
   label: string
   available: boolean
   unavailableReason?: string
+  unavailableCode?: ProviderUnavailableCode
   execution: 'served' | 'build-only'
   preview: 'browser' | 'none'
   requiresKvm: boolean

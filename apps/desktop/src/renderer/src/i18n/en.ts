@@ -63,6 +63,8 @@ export const en = {
   'wizard.sourceEmpty': 'Empty room',
   'wizard.sourceEmptyHint': 'Start from nothing',
   'wizard.repoUrl': 'Repository URL',
+  'wizard.repoPrivateHint': 'Private repository? Connect GitHub in Hotel Services, or paste https://user:token@… — DevHotel uses the token for this clone only and never stores it.',
+  'wizard.repoPrivateConnected': 'Private GitHub repositories clone with the connected GitHub Service credential ({account}).',
   'wizard.projectFolder': 'Project folder',
   'wizard.browse': 'Browse…',
   'wizard.projectName': 'Project name',

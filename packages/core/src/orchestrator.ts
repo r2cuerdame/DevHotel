@@ -126,6 +126,7 @@ import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
 import { runDocker } from './backend/cli'
+import { gitCloneRun, splitGitCredential } from './backend/gitClone'
 import {
   EMULATOR_ADB_SERIAL,
   EMULATOR_DEFAULT_DEVICE,
@@ -137,6 +138,8 @@ import {
 import {
   RoomArtifactPublicationError,
   type ExecResult,
+  type GitCredential,
+  type GitCredentialResolver,
   type IsolationBackend,
   type RoomArtifactExpectation,
   type RoomArtifactWebRuntimeFence,
@@ -1019,6 +1022,12 @@ export interface OrchestratorOptions {
   appVersion: string
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
+  /**
+   * Resolves the credential for one clone of a private repository. Supplied by the
+   * desktop app, which owns the encrypted GitHub Service vault; the credential is
+   * used for that single clone and never reaches the Room record.
+   */
+  gitCredential?: GitCredentialResolver
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
 }
@@ -1074,6 +1083,7 @@ export class RoomOrchestrator {
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
+  private readonly gitCredential?: GitCredentialResolver
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -1083,6 +1093,7 @@ export class RoomOrchestrator {
     this.gateway = opts.gateway
     this.appVersion = opts.appVersion
     this.clearBrowserData = opts.clearBrowserData
+    this.gitCredential = opts.gitCredential
     this.rooms = roomsRepo(opts.db)
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
@@ -2810,14 +2821,15 @@ export class RoomOrchestrator {
     project?: string
     provider?: ProviderKind
   }): Promise<RoomPlan> {
-    const project = input.project ?? deriveProjectName(input.sourceType, input.sourceRef)
+    const { url: planSourceRef, credential: planCredential } = splitGitCredential(input.sourceRef)
+    const project = input.project ?? deriveProjectName(input.sourceType, planSourceRef)
     if ((input.provider ?? 'web') === 'windows') {
       if (input.sourceType !== 'empty' || input.sourceRef !== '') {
         throw new Error('Windows Rooms currently start empty; planning never imports Host or Git source')
       }
       return getProvider('windows').detect(EMPTY_READER, { project, nickname: input.nickname })
     }
-    const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
+    const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, planSourceRef, planCredential)
     try {
       return await getProvider(input.provider ?? 'web').detect(reader, { project, nickname: input.nickname })
     } finally {
@@ -2833,7 +2845,9 @@ export class RoomOrchestrator {
     const providerKind: ProviderKind = input.provider ?? 'web'
     if (providerKind === 'windows') return this.createWindowsRoomAdmitted(input)
     const provider = getProvider(providerKind)
-    const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, input.sourceRef)
+    // A token pasted into the URL is used for this Room's clones and never stored.
+    const { url: sourceRef, credential: urlCredential } = splitGitCredential(input.sourceRef)
+    const { reader, cleanup } = await this.sourceReaderFor(input.sourceType, sourceRef, urlCredential)
     let plan: RoomPlan
     try {
       plan = await provider.detect(reader, {
@@ -2862,7 +2876,7 @@ export class RoomOrchestrator {
       roomNumber: this.rooms.nextRoomNumber(),
       provider: providerKind,
       sourceType: input.sourceType,
-      sourceRef: input.sourceRef,
+      sourceRef,
       workspaceMode,
       stateRevision: input.sourceType === 'empty' ? 0 : 1,
       workspaceVolumeRevision,
@@ -2909,7 +2923,12 @@ export class RoomOrchestrator {
           this.rooms.update(id, { workspaceFingerprint: snapshot.fingerprint, lastSyncedAt: new Date().toISOString() })
           this.settings.set(workspaceSyncBaseKey(id), serializeWorkspaceSnapshot(snapshot))
         }
-        const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record))
+        const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record), {
+          gitCredential:
+            record.sourceType === 'managed-git'
+              ? urlCredential ?? (await this.resolveGitCredential(id, record.sourceRef))
+              : null
+        })
         this.rooms.update(id, {
           hostPort,
           status: 'running',
@@ -3188,9 +3207,11 @@ export class RoomOrchestrator {
       // backup is complete, so code, dependencies and databases share one cut.
       await resumeSourceWeb()
 
+      const reclone = source.workspaceMode !== 'hotel' && record.sourceType === 'managed-git'
       const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record), {
         initializeManagedSource: source.workspaceMode !== 'hotel',
-        startWeb: false
+        startWeb: false,
+        gitCredential: reclone ? await this.resolveGitCredential(id, record.sourceRef) : null
       })
       this.rooms.update(id, { hostPort })
 
@@ -8610,7 +8631,8 @@ export class RoomOrchestrator {
 
   private async sourceReaderFor(
     sourceType: SourceType,
-    sourceRef: string
+    sourceRef: string,
+    urlCredential?: GitCredential | null
   ): Promise<{ reader: SourceReader; cleanup: () => void }> {
     if (sourceType === 'linked-folder') return { reader: fsSourceReader(sourceRef), cleanup: () => undefined }
     if (sourceType === 'empty') return { reader: EMPTY_READER, cleanup: () => undefined }
@@ -8618,10 +8640,12 @@ export class RoomOrchestrator {
     // never needs git installed
     const tmp = join(this.userData, 'tmp', `plan-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
-    const result = await runDocker(
-      ['run', '--rm', '-v', `${tmp}:/workspace`, '-w', '/workspace', 'alpine/git', 'clone', '--depth', '1', sourceRef, '.'],
-      { timeoutMs: 180_000 }
-    )
+    const credential = urlCredential ?? (await this.resolveGitCredential('system', sourceRef))
+    const run = gitCloneRun(['-v', `${tmp}:/workspace`, '-w', '/workspace'], sourceRef, ['--depth', '1'], credential)
+    const result = await runDocker(run.args, {
+      timeoutMs: 180_000,
+      ...(run.input === undefined ? {} : { input: run.input })
+    })
     if (result.code !== 0) {
       rmSync(tmp, { recursive: true, force: true })
       throw new Error(`Could not read repository ${sourceRef}: ${result.stderr.slice(-300)}`)
@@ -8719,6 +8743,23 @@ export class RoomOrchestrator {
         }
       })
     )
+  }
+
+  /**
+   * A private repository needs a credential, and the only credential DevHotel holds is
+   * the one the human connected to the GitHub Service. Resolution failure is never fatal:
+   * public repositories must still clone when no credential is connected.
+   */
+  private async resolveGitCredential(roomId: string, gitUrl: string): Promise<GitCredential | null> {
+    if (!this.gitCredential) return null
+    try {
+      const credential = await this.gitCredential(gitUrl)
+      if (credential) this.olog(roomId, 'clone with the connected GitHub Service credential')
+      return credential
+    } catch (error) {
+      this.olog(roomId, `GitHub Service credential unavailable, cloning anonymously: ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
   }
 
   private mustWindowsVm(): WindowsVmLifecycle {

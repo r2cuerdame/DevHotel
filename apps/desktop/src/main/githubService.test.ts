@@ -130,6 +130,30 @@ describe('GitHub Hotel Service', () => {
     expect(calls.some((args) => args.includes('login') || args.includes('logout') || args.includes('auth'))).toBe(false)
   })
 
+  it('offers its stored credential to github.com clone URLs only', () => {
+    const { root } = installedServiceRoot('devhotel-gh-clone-credential-')
+    const vault = new TestVault()
+    const token = 'github_pat_12345678901234567890'
+    writeFileSync(join(root, 'hotel-services', 'github', 'credential.bin'), credentialPayload(vault, token))
+    const service = new GitHubService(root, null, fetch, undefined, vault, trustedDigest)
+
+    expect(service.gitCredentialFor('https://github.com/acme/private.git')).toEqual({ username: 'octocat', secret: token })
+    for (const url of [
+      'https://gitlab.com/acme/private.git',
+      'https://github.com.evil.test/acme/private.git',
+      'git@github.com:acme/private.git',
+      'not a url'
+    ]) {
+      expect(service.gitCredentialFor(url)).toBeNull()
+    }
+  })
+
+  it('has no clone credential to offer before one is connected', () => {
+    const { root } = installedServiceRoot('devhotel-gh-clone-anon-')
+    const service = new GitHubService(root, null, fetch, undefined, new TestVault(), trustedDigest)
+    expect(service.gitCredentialFor('https://github.com/acme/public.git')).toBeNull()
+  })
+
   it('recovers the one exact valid previous credential and deletes uncommitted temp ciphertext', async () => {
     const { root } = installedServiceRoot('devhotel-gh-credential-recovery-')
     const serviceRoot = join(root, 'hotel-services', 'github')
