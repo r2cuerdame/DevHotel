@@ -7742,7 +7742,10 @@ export class RoomOrchestrator {
         if (
           change.kind !== 'package-install' &&
           (change.kind === 'deps-install' || change.kind === 'android-run')
-        ) this.markWorkspaceModified(roomId)
+        ) {
+          this.advanceStateRevision(roomId)
+          await this.refreshSyncStatus(roomId)
+        }
         throw error
       }
       if (change.kind !== 'package-install' && WORKSPACE_MUTATION_KINDS.has(change.kind)) {
@@ -7750,7 +7753,10 @@ export class RoomOrchestrator {
         const possiblyPartialFailure =
           entry.status === 'failed' &&
           ((change.kind === 'deps-install' && !change.clean) || change.kind === 'android-run')
-        if (applied || possiblyPartialFailure) this.markWorkspaceModified(roomId)
+        if (applied || possiblyPartialFailure) {
+          this.advanceStateRevision(roomId)
+          await this.refreshSyncStatus(roomId)
+        }
       }
       this.syncStatusFromVerify(roomId, entry)
       this.reattachLogs(roomId)
@@ -7770,7 +7776,8 @@ export class RoomOrchestrator {
       const original = this.changes.get(changeId)
       const entry = await this.engine.undo(this.ctxFor(roomId), changeId, actor)
       if (original && original.kind !== 'package-install' && WORKSPACE_MUTATION_KINDS.has(original.kind)) {
-        this.markWorkspaceModified(roomId)
+        this.advanceStateRevision(roomId)
+        await this.refreshSyncStatus(roomId)
       }
       this.syncStatusFromVerify(roomId, entry)
       this.reattachLogs(roomId)
@@ -7782,6 +7789,29 @@ export class RoomOrchestrator {
   }
 
   /** Only rooms that are actually awake take their status from a change verify — broken/sleeping rooms keep theirs. */
+  /**
+   * Ask the fingerprint whether the Room actually diverged, instead of inferring
+   * it from what kind of change just ran. `android_run` writes only build
+   * outputs, which are not part of the Room's content identity — inferring
+   * "modified" from the kind is what made every Android Room look diverged after
+   * its first build. This is the same question the sync gate asks, so the label
+   * the human reads and the answer the gate gives can no longer disagree.
+   */
+  private async refreshSyncStatus(roomId: string): Promise<void> {
+    const room = this.mustGet(roomId)
+    if (room.workspaceMode !== 'hotel' || !room.workspaceFingerprint) return
+    try {
+      const current = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
+      this.rooms.update(roomId, {
+        syncStatus: current === room.workspaceFingerprint ? 'synced' : 'modified'
+      })
+    } catch (error) {
+      // A Room whose workspace cannot be read right now keeps its last label;
+      // the sync gate recomputes before it acts either way.
+      this.olog(roomId, `could not refresh sync status: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   private syncStatusFromVerify(roomId: string, entry: ChangeEntry): void {
     const room = this.mustGet(roomId)
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
@@ -7958,7 +7988,7 @@ export class RoomOrchestrator {
       if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
       const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
       if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
-      this.markWorkspaceModified(roomId)
+      this.advanceStateRevision(roomId)
       const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
       let sawStdout = false
       let sawStderr = false
@@ -8042,7 +8072,7 @@ export class RoomOrchestrator {
       if (room.status === 'sleeping' || room.status === 'preparing') {
         throw new Error('The room must be awake for a terminal session')
       }
-      this.markWorkspaceModified(roomId)
+      this.advanceStateRevision(roomId)
       return this.backend.spawnInteractiveExec(roomId, cmd)
     })
   }
@@ -8585,6 +8615,21 @@ export class RoomOrchestrator {
     return raw ? Number.parseInt(raw, 10) : 0
   }
 
+  /**
+   * Something ran that *could* have written. The revision has to move — a later
+   * undo compares against it before discarding work — but the sync label must
+   * not: `syncStatus` is what the human reads, and claiming a Room diverged
+   * because it was asked to list a directory sends them looking for a conflict
+   * that is not there. Whether the Room actually drifted is a question only the
+   * fingerprint can answer, and `roomDrift` answers it on demand.
+   */
+  private advanceStateRevision(roomId: string): void {
+    const room = this.mustGet(roomId)
+    if (room.workspaceMode !== 'hotel') return
+    this.rooms.update(roomId, { stateRevision: room.stateRevision + 1 })
+  }
+
+  /** A write we performed ourselves, so the divergence is a fact, not a guess. */
   private markWorkspaceModified(roomId: string): void {
     const room = this.mustGet(roomId)
     if (room.workspaceMode !== 'hotel') return
