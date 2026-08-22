@@ -108,6 +108,13 @@ const OWNERSHIP_FILE = 'ownership.json'
 const ROOM_VMX_FILE = 'room.vmx'
 const DEFAULT_TIMEOUT_MS = 120_000
 const CLONE_TIMEOUT_MS = 10 * 60_000
+/**
+ * A soft stop asks the guest to shut itself down, and a guest that is installing,
+ * hung, or has no VMware Tools never answers. Parking a Room must still finish, so
+ * the polite request gets a short budget and then the Room is powered off — exactly
+ * what Workstation's own Shut Down → Power Off does.
+ */
+const SOFT_STOP_TIMEOUT_MS = 45_000
 
 function withoutOuterQuotes(value: string): string {
   const trimmed = value.trim()
@@ -294,7 +301,13 @@ export class WindowsVmBackend {
     if (!(await isRegularFile(owned.vmxPath))) return
     await assertDistinctClone(owned.vmxPath, owned.marker.templateVmxPath)
     if ((await this.state(roomId)) !== 'running') return
-    await this.mustRun(['stop', owned.vmxPath, 'soft'], 'sleep Windows Room')
+    const soft = await this.runner(
+      this.vmrunExecutable,
+      ['stop', owned.vmxPath, 'soft'],
+      { timeoutMs: SOFT_STOP_TIMEOUT_MS }
+    ).catch(() => ({ code: -1, stdout: '', stderr: '' }))
+    if (soft.code === 0 && (await this.state(roomId)) !== 'running') return
+    await this.mustRun(['stop', owned.vmxPath, 'hard'], 'sleep Windows Room', SOFT_STOP_TIMEOUT_MS)
   }
 
   async delete(roomId: string): Promise<{ reclaimedBytes: number }> {
@@ -332,18 +345,20 @@ export class WindowsVmBackend {
       snapshot: owned.marker.snapshot
     }
 
+    // Validate the immutable source before destroying the existing clone. A refusal
+    // here has changed nothing, so the Room stays exactly as healthy as it was.
+    const currentTemplate = await this.inspectTemplateInternal({
+      templateVmxPath: template.templateVmxPath,
+      snapshot: template.snapshot
+    })
+    if (currentTemplate.templateId !== template.templateId) {
+      throw new Error('The VMware template identity changed; reset was refused')
+    }
+    if (currentTemplate.templateFingerprint !== template.templateFingerprint) {
+      throw new Error('The VMware template or snapshot fingerprint changed; reset was refused')
+    }
+
     try {
-      // Validate the immutable source before destroying the existing clone.
-      const currentTemplate = await this.inspectTemplateInternal({
-        templateVmxPath: template.templateVmxPath,
-        snapshot: template.snapshot
-      })
-      if (currentTemplate.templateId !== template.templateId) {
-        throw new Error('The VMware template identity changed; reset was refused')
-      }
-      if (currentTemplate.templateFingerprint !== template.templateFingerprint) {
-        throw new Error('The VMware template or snapshot fingerprint changed; reset was refused')
-      }
       if ((await this.state(roomId)) === 'running') await this.sleep(roomId)
       await this.disposeOwnedClone(await this.requireOwnedRoom(roomId))
       return await this.materialize(roomId, template)
@@ -739,8 +754,13 @@ async function assertDistinctClone(cloneVmxPath: string, templateVmxPath: string
  */
 async function templateFingerprintFor(templateVmxPath: string, snapshot: string): Promise<string> {
   const directory = path.dirname(templateVmxPath)
-  const relevantExtensions = new Set(['.vmx', '.vmsd', '.vmdk', '.vmsn', '.nvram'])
-  const contentExtensions = new Set(['.vmx', '.vmsd', '.nvram'])
+  // `.vmsd` is deliberately absent: Workstation rewrites the template's snapshot
+  // dictionary to record every linked clone taken from it, so hashing it would make
+  // DevHotel's own clone invalidate the baseline and refuse every later reset. The
+  // snapshot inventory is verified independently by `listSnapshots`, and the
+  // snapshot's own `.vmsn` still contributes its size and modification time here.
+  const relevantExtensions = new Set(['.vmx', '.vmdk', '.vmsn', '.nvram'])
+  const contentExtensions = new Set(['.vmx', '.nvram'])
   const entries = (await readdir(directory, { withFileTypes: true }))
     .filter((entry) => relevantExtensions.has(path.extname(entry.name).toLowerCase()))
     .sort((left, right) => left.name.localeCompare(right.name, 'en'))

@@ -8701,20 +8701,24 @@ export class RoomOrchestrator {
       return
     }
 
-    for (const room of windowsRooms) {
-      try {
-        const state = await this.windowsVm.state(room.id)
-        if (state === 'running') await this.windowsVm.sleep(room.id)
-        if (room.status === 'preparing' || state === 'missing') {
+    // Parking a Room waits on a guest, so reconcile every Room at once: startup must
+    // cost one slow guest, not the sum of them.
+    await Promise.all(
+      windowsRooms.map(async (room) => {
+        try {
+          const state = await this.windowsVm!.state(room.id)
+          if (state === 'running') await this.windowsVm!.sleep(room.id)
+          if (room.status === 'preparing' || state === 'missing') {
+            this.rooms.update(room.id, { status: 'broken', hostPort: null })
+          } else if (room.status !== 'broken') {
+            this.rooms.update(room.id, { status: 'sleeping', hostPort: null })
+          }
+        } catch (error) {
           this.rooms.update(room.id, { status: 'broken', hostPort: null })
-        } else if (room.status !== 'broken') {
-          this.rooms.update(room.id, { status: 'sleeping', hostPort: null })
+          this.olog(room.id, `VMware reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
         }
-      } catch (error) {
-        this.rooms.update(room.id, { status: 'broken', hostPort: null })
-        this.olog(room.id, `VMware reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    }
+      })
+    )
   }
 
   private mustWindowsVm(): WindowsVmLifecycle {
