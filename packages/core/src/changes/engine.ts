@@ -43,6 +43,7 @@ export class ChangeEngine {
     ctx.log(`change ${entry.seq} [${kind}] ${planned.title} (${actor})`)
 
     const steps: string[] = []
+    let after: unknown = planned.after
     let capturedOverride: { blob: unknown } | null = null
     const stepSink = {
       push: (s: string) => {
@@ -55,6 +56,10 @@ export class ChangeEngine {
       setCaptured: (blob: unknown) => {
         capturedOverride = { blob }
         ctx.changes.setStatus(entry.id, 'pending', { captured: blob, steps: [...steps] })
+      },
+      setResult: (result: Record<string, unknown>) => {
+        after = { ...(typeof after === 'object' && after !== null ? after : {}), ...result }
+        ctx.changes.setStatus(entry.id, 'pending', { after, steps: [...steps] })
       }
     }
 
@@ -62,6 +67,7 @@ export class ChangeEngine {
       await def.apply(ctx, params, stepSink, operation)
       ctx.changes.setStatus(entry.id, 'applied', {
         steps,
+        after,
         ...(capturedOverride ? { captured: (capturedOverride as { blob: unknown }).blob } : {})
       })
     } catch (err) {

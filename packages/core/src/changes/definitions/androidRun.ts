@@ -7,6 +7,7 @@ import {
   sealedAndroidArtifactRef,
   verifySealedAndroidBuild
 } from './androidBuild'
+import { EMULATOR_ADB_SERIAL } from '../../backend/naming'
 import type { ExportedArtifact } from '../../backend/types'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
@@ -259,6 +260,20 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
         steps.push(`Resolve and launch ${target.appId}`)
         if (!ctx.launchTrackedAndroidApp) throw new Error('tracked Android launcher authority is unavailable')
         await ctx.launchTrackedAndroidApp(target.appId)
+
+        // Whatever runs next needs to know what this ran on and what it
+        // installed. Leaving that to be guessed is how a caller ends up on
+        // localhost:5555 — the same emulator under a second serial, which makes
+        // Gradle run every instrumentation test twice. A leased physical device
+        // is reached through the broker and never by serial, so it is named
+        // rather than handed an address the caller must not dial.
+        steps.setResult({
+          ...(ctx.physicalAndroidDevice
+            ? { device: ctx.physicalAndroidDevice.nickname }
+            : { adbSerial: EMULATOR_ADB_SERIAL }),
+          launchedApplicationId: target.appId,
+          installedApplicationIds: apps.map((app) => app.appId)
+        })
       } catch (error) {
         primaryError = error
       }

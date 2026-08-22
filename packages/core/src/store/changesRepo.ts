@@ -56,7 +56,7 @@ function rowToEntry(row: ChangeRow): ChangeEntry {
   }
 }
 
-type SetStatusPatch = Partial<Pick<ChangeEntry, 'verify' | 'undoneAt' | 'captured' | 'steps' | 'rawLogPath'>>
+type SetStatusPatch = Partial<Pick<ChangeEntry, 'verify' | 'undoneAt' | 'captured' | 'steps' | 'rawLogPath' | 'after'>>
 
 export interface ChangesRepo {
   append(e: Omit<ChangeEntry, 'seq'>): ChangeEntry
@@ -143,6 +143,10 @@ export function changesRepo(db: Db): ChangesRepo {
         if ('steps' in patch) {
           assignments.push('steps_json = ?')
           values.push(JSON.stringify(patch.steps ?? []))
+        }
+        if ('after' in patch) {
+          assignments.push('after_json = ?')
+          values.push(toJson(patch.after))
         }
         if ('rawLogPath' in patch) {
           assignments.push('raw_log_path = ?')
