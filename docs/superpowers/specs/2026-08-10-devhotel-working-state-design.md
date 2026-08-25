@@ -161,6 +161,42 @@ Each sync is an operation with plan, preconditions, staged content, verification
 
 Automatic inbound sync may apply non-conflicting Host changes. It must never imply automatic outbound writes.
 
+### 5.2.1 Line endings across the Host boundary
+
+A Windows Host folder crosses into a Linux Room byte for byte. Import does not
+translate line endings, and it should not: the Room's job is to hold the
+project's real bytes, and a silent rewrite of tracked source at the ingress
+would show up as a diff nobody made.
+
+The cost of that correctness is that `gradlew`, `*.sh` and other shebang scripts
+arrive with CRLF and cannot execute. None of the resulting errors name line
+endings — `./gradlew` reports `not found` (the kernel looks for the interpreter
+`/bin/sh\r`), and `sh ./gradlew` reports a stray `\r` or a syntax error — so
+they read as a broken Gradle or toolchain install.
+
+DevHotel therefore separates naming the problem from fixing it:
+
+- **Diagnose, always.** The `line-endings` check step scans the Room's workspace
+  for CRLF in the files Linux actually executes and reports them by path. The
+  Android build refuses before it starts when `gradlew` or `mvnw` is one of
+  them, and a build that fails for any other reason re-scans its immutable build
+  input, so a Gradle-shaped failure caused by a CRLF helper script says so.
+- **Normalize, only when asked.** `normalize-line-endings` is an explicit Quick
+  Change. It rewrites CRLF to LF on a *copy* of the workspace and publishes that
+  copy as a new generation, so it is undoable exactly like a package install,
+  and it moves the Room to `modified` like any other Room-side edit. Nothing
+  normalizes as a side effect of import, sync, wake or build.
+- **Host files are never rewritten.** The change is refused outright for a Room
+  still bound to its Host folder (`legacy-host-bind`), and it never participates
+  in an outbound operation. Fixing the Host copy stays a Host-side act — a
+  `.gitattributes` rule such as `* text=auto eol=lf`, followed by a sync.
+
+The rewrite strips only a CR that ends a line, leaves a lone CR alone, adds no
+trailing newline to a file that lacked one, and writes back through the same
+inode so mode and ownership survive. Symlinks, files over 1 MB and generated or
+vendored trees (`node_modules`, `.git`, `.gradle`, `build`, `dist`, …) are never
+touched.
+
 ### 5.3 Explicit outbound operations
 
 Room changes leave the isolation boundary through one of three user-visible actions:

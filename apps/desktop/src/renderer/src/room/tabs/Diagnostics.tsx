@@ -12,6 +12,7 @@ const STEP_KEY: Record<string, keyof Translation> = {
   runtime: 'label.runtime',
   'package-manager': 'label.packageManager',
   dependencies: 'stack.dependencies',
+  'line-endings': 'diag.stepLineEndings',
   env: 'diag.stepEnv',
   services: 'tabs.services',
   'start-command': 'label.startCommand',

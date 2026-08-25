@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { runChecks, type CheckCtx } from '../checks/engine'
+import { SCAN_SENTINEL } from '../checks/lineEndings'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir } from './fakes'
 
 function ctxWith(overrides: Partial<CheckCtx> = {}): CheckCtx {
@@ -143,5 +144,100 @@ describe('runChecks', () => {
     const port = report.results.find((result) => result.step === 'port')!
     expect(port.status).toBe('broken')
     expect(port.summary).toContain('emulator container missing')
+  })
+})
+
+describe('line-endings check', () => {
+  /** A Room that owns its workspace and is awake enough to be scanned. */
+  function hotelRoom(backend: FakeBackend): CheckCtx {
+    return ctxWith({
+      backend,
+      room: makeRoom({
+        sourceType: 'linked-folder',
+        sourceRef: 'D:\\Projects\\demo',
+        workspaceMode: 'hotel',
+        syncStatus: 'synced',
+        status: 'ready',
+        hostPort: 45000
+      })
+    })
+  }
+
+  it('names the CRLF scripts and offers the normalize fix', async () => {
+    const backend = new FakeBackend()
+    backend.execHandler = (cmd) =>
+      cmd[2]?.includes(SCAN_SENTINEL)
+        ? { code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0./scripts/build.sh\0`, stderr: '' }
+        : { code: 0, stdout: '', stderr: '' }
+    const report = await runChecks(hotelRoom(backend))
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('broken')
+    expect(result.summary).toContain('./gradlew')
+    expect(result.detail).toContain('not a Gradle or build failure')
+    expect(result.fix).toEqual({ kind: 'normalize-line-endings' })
+    expect(report.overall).toBe('broken')
+  })
+
+  it('passes a workspace whose scripts already use LF', async () => {
+    const backend = new FakeBackend()
+    backend.execHandler = () => ({ code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' })
+    const report = await runChecks(hotelRoom(backend))
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('healthy')
+    expect(result.fix).toBeUndefined()
+  })
+
+  it('reports unknown rather than healthy when the scan could not run', async () => {
+    const backend = new FakeBackend()
+    backend.execHandler = () => ({ code: 1, stdout: '', stderr: 'exec failed' })
+    const report = await runChecks(hotelRoom(backend))
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('unknown')
+  })
+
+  it('has nothing to scan in an empty room', async () => {
+    const report = await runChecks(ctxWith())
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('healthy')
+    expect(result.summary).toBe('no scripts in an empty room')
+  })
+
+  it('checks Android rooms too — the CRLF gradlew case that started this', async () => {
+    const backend = new FakeBackend()
+    backend.execHandler = (cmd) =>
+      cmd[2]?.includes(SCAN_SENTINEL)
+        ? { code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0`, stderr: '' }
+        : { code: 0, stdout: '', stderr: '' }
+    const ctx = ctxWith({
+      backend,
+      room: makeRoom({
+        provider: 'android',
+        sourceType: 'linked-folder',
+        sourceRef: 'D:\\Projects\\app',
+        workspaceMode: 'hotel',
+        syncStatus: 'synced',
+        status: 'ready',
+        hostPort: 45000,
+        internalPort: 6080
+      })
+    })
+    const report = await runChecks(ctx)
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('broken')
+    expect(result.fix).toEqual({ kind: 'normalize-line-endings' })
+  })
+})
+
+describe('line-endings check on a legacy Host bind', () => {
+  it('names the Host-side fix instead of offering a Change that would be refused', async () => {
+    const backend = new FakeBackend()
+    backend.execHandler = () => ({ code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0`, stderr: '' })
+    // makeRoom() defaults to legacy-host-bind: the workspace is the user's folder
+    const report = await runChecks(ctxWith({ backend, room: makeRoom({ status: 'ready', hostPort: 45000 }) }))
+    const result = report.results.find((r) => r.step === 'line-endings')!
+    expect(result.status).toBe('broken')
+    expect(result.fix).toBeUndefined()
+    expect(result.detail).toContain('still bound to its Host folder')
+    expect(result.detail).toContain('.gitattributes')
   })
 })

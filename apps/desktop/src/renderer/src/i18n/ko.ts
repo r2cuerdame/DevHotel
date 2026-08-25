@@ -227,6 +227,7 @@ export const ko: Translation = {
     '진단 복사는 비밀 값이 가려진 번들을 만듭니다 — 비밀번호, 토큰, .env 값이 마스킹되어 이슈나 LLM에 바로 붙여 넣을 수 있습니다.',
   'diag.stepBackend': 'Room 실행 기반',
   'diag.stepMetadata': 'Room 정보',
+  'diag.stepLineEndings': '스크립트 줄바꿈',
   'diag.stepEnv': '환경 변수',
   'diag.stepGateway': '로컬 주소 연결',
   'diag.stepHttps': 'DNS / HTTPS',

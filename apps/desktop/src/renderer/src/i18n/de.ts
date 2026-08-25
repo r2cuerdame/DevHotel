@@ -230,6 +230,7 @@ export const de: Translation = {
     'Diagnose kopieren erzeugt ein geschwärztes Paket — Passwörter, Tokens und .env-Werte sind maskiert — bereit zum Einfügen in ein Issue oder an ein LLM.',
   'diag.stepBackend': 'Isolations-Backend',
   'diag.stepMetadata': 'Zimmer-Metadaten',
+  'diag.stepLineEndings': 'Zeilenenden der Skripte',
   'diag.stepEnv': 'Umgebungsvariablen',
   'diag.stepGateway': 'Gateway-Route',
   'diag.stepHttps': 'DNS / HTTPS',

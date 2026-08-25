@@ -227,6 +227,7 @@ export const zhCN: Translation = {
   'diag.copyHint': '复制诊断会生成一份脱敏包 — 密码、令牌和 .env 值都已打码 — 可直接粘贴到 issue 或 LLM。',
   'diag.stepBackend': '隔离后端',
   'diag.stepMetadata': '房间元数据',
+  'diag.stepLineEndings': '脚本换行符',
   'diag.stepEnv': '环境变量',
   'diag.stepGateway': '网关路由',
   'diag.stepHttps': 'DNS / HTTPS',

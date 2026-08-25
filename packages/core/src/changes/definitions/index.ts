@@ -5,6 +5,7 @@ import { domainChange } from './domain'
 import { httpsChange } from './https'
 import { internalPortChange } from './internalPort'
 import { depsInstallChange } from './deps'
+import { normalizeLineEndingsChange } from './lineEndings'
 import { restartWebChange } from './restartWeb'
 import { androidBuildChange } from './androidBuild'
 import { androidRunChange } from './androidRun'
@@ -29,6 +30,7 @@ export function registerQuickChanges(engine: ChangeEngine): void {
   engine.register(httpsChange)
   engine.register(internalPortChange)
   engine.register(depsInstallChange)
+  engine.register(normalizeLineEndingsChange)
   engine.register(restartWebChange)
   engine.register(androidBuildChange)
   engine.register(androidRunChange)

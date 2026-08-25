@@ -230,6 +230,7 @@ export const ptBR: Translation = {
     'Copiar diagnóstico gera um pacote com dados sensíveis ocultados — senhas, tokens e valores de .env são mascarados — pronto para colar em uma issue ou em um LLM.',
   'diag.stepBackend': 'Backend de isolamento',
   'diag.stepMetadata': 'Metadados do quarto',
+  'diag.stepLineEndings': 'Fim de linha dos scripts',
   'diag.stepEnv': 'Variáveis de ambiente',
   'diag.stepGateway': 'Rota do gateway',
   'diag.stepHttps': 'DNS / HTTPS',

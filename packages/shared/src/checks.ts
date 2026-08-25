@@ -6,6 +6,7 @@ export type CheckStep =
   | 'backend'
   | 'metadata'
   | 'source'
+  | 'line-endings'
   | 'runtime'
   | 'package-manager'
   | 'dependencies'
