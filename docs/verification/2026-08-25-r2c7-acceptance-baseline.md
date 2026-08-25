@@ -140,3 +140,92 @@ pass on `main`. Every change made for R2C-8 … R2C-17 must keep them passing.
   which is R2C-17/R2C-14 work, not baseline reproduction.
 - Criterion 1's residual drift paths were not enumerated; that classification is
   R2C-8's first task and is in progress on its own branch.
+
+## Recheck — 2026-08-25, after the first child branches opened
+
+R2C-7 is an umbrella: it does not implement, it states whether the global
+acceptance criteria hold. Five child branches have opened since the pass above,
+so this section re-runs the baseline and adds what the umbrella owes on top of
+it — which candidate now covers which criterion, and in what order those
+candidates can land.
+
+Re-verified against the same installed DevHotel **0.4.3** and against `main` at
+`1399fef`, which has not moved: none of the child branches is merged.
+
+### The table is unchanged
+
+Every ❌/⚠️ above was re-checked at the source, not carried forward:
+
+- Criteria 1–2: Room `cgwwdje7` reproduces identically. `seq 129`
+  `sync-from-host` (`2026-08-22T06:34:37Z`), then `seq 130`/`131` `android-run`
+  with no source edit between them, and `inspect_room` today still returns
+  `syncStatus: "modified"` with `lastSyncedAt` unchanged and fingerprint
+  `f24eaaf9…`. The five `reset-sync-baseline` → `sync-from-host` pairs (R2C-9)
+  are still the last thing in that history.
+- Criterion 3: `startRoomLocked` (`orchestrator.ts:806`) is still one awaited
+  call, `start_room` (`mcp/src/tools.ts:89`) still returns a fixed string, and
+  `ControlClient.req` (`mcp/src/client.ts:47`) still calls `fetch` with no
+  timeout.
+- Criterion 4: `crlf|dos2unix|lineEnding|line-ending` over `packages/*/src` and
+  `apps/*/src` is still **0** matches.
+- Criterion 5: `runDocker` (`backend/cli.ts:142`) still accumulates `stdout` and
+  `stderr` into unbounded strings with no cap and no truncation flag. New
+  evidence from the live Room: every `android-run` entry in `cgwwdje7`'s history
+  carries `rawLogPath: null`, so the Gradle output of a real build is not
+  retained anywhere after the call returns.
+- Criterion 8: `redactSecrets` still has exactly one caller,
+  `diagnostics/bundle.ts:81`.
+- Criterion 9: suite green — `pnpm test` → 53 files (52 passed, 1 skipped),
+  **414 passed / 6 skipped**, exit 0.
+
+One correction to the pass above: `syncStatus: 'modified'` is written in *two*
+places, not one — `orchestrator.ts:1268` (lazy discovery at sync time, the gap
+criteria 1–2 describe) and `orchestrator.ts:1764` `markWorkspaceModified`, the
+explicit path used when the Room itself is mutated (quick changes, apply, undo).
+The criterion 1–2 verdict is unaffected: the build-only flip goes through 1268.
+
+Also still true, and still unowned by any criterion: `hotel_status` reports
+`cgwwdje7`, `9x4uvxhz` and `ild7bey9` as `status: "ready"` with `emulator:
+"exited"`. That is R2C-177, filed out of the previous pass.
+
+### Candidate coverage
+
+Each open branch was checked for the primitive its criterion needs, plus tests
+covering it. This is a coverage check, not a review — approving the change is
+the child issue's own gate.
+
+| # | Criterion | Child | PR | Head | Primitive on the branch |
+|---|-----------|-------|----|------|--------------------------|
+| 1–2 | build outputs / real source drift | R2C-8 | [#8](https://github.com/r2cuerdame/DevHotel/pull/8) | `bff1b47877d9` | `packages/core/src/workspaceDrift.ts` + `workspaceDrift.test.ts`, `backend.workspace-drift.smoke.test.ts` |
+| 3 | trackable startup | R2C-10 | [#4](https://github.com/r2cuerdame/DevHotel/pull/4) | `effc3ee6bace` | `packages/core/src/operations.ts` + `roomStart.operations.test.ts`, `controlApi.operations.test.ts` |
+| 4 | CRLF scripts | R2C-11 | [#5](https://github.com/r2cuerdame/DevHotel/pull/5) | `352c26dcb8bc` | `checks/lineEndings.ts` + `changes/definitions/lineEndings.ts`, covered by `checks.test.ts`/`changes.engine.test.ts` |
+| 5 | long output / retained logs | R2C-12 | [#6](https://github.com/r2cuerdame/DevHotel/pull/6) | `08630f79ac2c` | `packages/core/src/runOutput.ts` + `runOutput.test.ts`, `exec.output.test.ts` |
+| 6 | acceptance session evidence | R2C-17 | — | — | not started |
+| 7 | locale screenshot matrix | R2C-14 | — | — | not started |
+| 8 | secret-safe pairing | R2C-16 | — | — | not started |
+| — | Room input isolation (related) | R2C-6 | [#7](https://github.com/r2cuerdame/DevHotel/pull/7) | `f74b2f8cf490` | `shared/src/hostInput.ts`, `main/hostInputProbe.ts`, `roomSessionPolicy.ts` + `hostInputBoundary.test.ts`, `docs/host-input-isolation.md` |
+
+So four of the five open branches carry a named primitive and dedicated tests
+for the criterion they own; criteria 6, 7 and 8 have no candidate at all yet.
+
+### Merge order is the umbrella's real risk
+
+All five branches report `MERGEABLE` against `main` today, which is misleading:
+they were all cut from the same `1399fef` and they overlap heavily with each
+other, not with `main`. Every pair among them touches
+`packages/core/src/orchestrator.ts`, `packages/mcp/src/tools.ts` and
+`docs/control-api.md` — all ten pairs, without exception. The heaviest pairs are
+R2C-10 × R2C-12 and R2C-12 × R2C-8 at ten shared files each.
+
+The consequence: exactly one of them merges cleanly, and the other four need a
+rebase before they can. The rotation gate already fixes which one that is —
+R2C-8 is the single DevHotel gate, so #8 lands first and #4/#5/#6/#7 rebase onto
+it. Nothing here needs deciding; it needs to be known before the second merge is
+attempted.
+
+### What this pass did not do
+
+No product code was touched, and no child work was started or duplicated — R2C-7
+holds no implementation lane of its own. Criteria 6 and 7 still need a full
+emulator acceptance session on Room `had1yar3`, which stayed asleep; that is
+R2C-17/R2C-14 work.
