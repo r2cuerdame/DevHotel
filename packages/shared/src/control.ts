@@ -241,6 +241,8 @@ export const CONTROL_ROUTES = {
   startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
   sleepRoom: { method: 'POST', path: '/v1/rooms/:id/sleep' },
   execInRoom: { method: 'POST', path: '/v1/rooms/:id/exec' },
+  listRuns: { method: 'GET', path: '/v1/rooms/:id/runs' },
+  readRunOutput: { method: 'GET', path: '/v1/rooms/:id/runs/:runId/output' },
   runChecks: { method: 'POST', path: '/v1/rooms/:id/checks' },
   applyChange: { method: 'POST', path: '/v1/rooms/:id/changes' },
   undoChange: { method: 'POST', path: '/v1/rooms/:id/undo' },
@@ -249,10 +251,44 @@ export const CONTROL_ROUTES = {
 
 export const zApplyChangeBody = z.object({ change: zQuickChange }).strict()
 export const zUndoChangeBody = z.object({ changeId: zChangeId }).strict()
+/**
+ * How much of a command's output the caller wants inline, and which part.
+ * Limits mirror packages/core `runOutput.ts`; anything the response cannot
+ * carry is retained under the Room and read back by run id.
+ */
+export const zOutputSelection = z
+  .object({
+    maxBytes: z.number().int().min(256).max(4_000_000).optional(),
+    maxLines: z.number().int().min(1).max(1_000_000).optional(),
+    mode: z.enum(['head', 'tail']).optional(),
+    include: z.string().max(200).optional(),
+    exclude: z.string().max(200).optional(),
+    ignoreCase: z.boolean().optional()
+  })
+  .strict()
+
 export const zExecBody = z.object({
   cmd: z.array(z.string().max(16_384)).min(1).max(256),
-  timeoutMs: z.number().int().positive().max(600_000).optional()
+  timeoutMs: z.number().int().positive().max(600_000).optional(),
+  output: zOutputSelection.optional()
 }).strict()
+
+export const zRunId = z.string().uuid()
+const zQueryFlag = z.enum(['true', 'false', '1', '0']).transform((value) => value === 'true' || value === '1')
+
+/** Same selection, arriving as query-string text on the run-output read. */
+export const zRunOutputQuery = z
+  .object({
+    stream: z.enum(['stdout', 'stderr']).optional(),
+    offsetBytes: z.coerce.number().int().min(0).optional(),
+    maxBytes: z.coerce.number().int().min(256).max(4_000_000).optional(),
+    maxLines: z.coerce.number().int().min(1).max(1_000_000).optional(),
+    mode: z.enum(['head', 'tail']).optional(),
+    include: z.string().max(200).optional(),
+    exclude: z.string().max(200).optional(),
+    ignoreCase: zQueryFlag.optional()
+  })
+  .strict()
 
 export const zRenameRoomInput = z.object({ roomId: zRoomId, nickname: zNickname }).strict()
 export const zLogKind = z.enum(['web', 'orchestrator'])

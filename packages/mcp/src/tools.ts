@@ -16,6 +16,49 @@ async function screenshotContent(
   return { type: 'image', data: shot.png, mimeType: 'image/png' }
 }
 
+/**
+ * Bounded-output controls shared by run_in_room and read_run_output. They are
+ * the reason an agent no longer has to wrap every command in grep/sed: the
+ * Room applies the selection and keeps whatever the response could not carry.
+ */
+const outputControls = {
+  maxBytes: z
+    .number()
+    .int()
+    .min(256)
+    .max(4_000_000)
+    .optional()
+    .describe('inline budget per stream, in bytes (default 64000)'),
+  maxLines: z.number().int().min(1).max(1_000_000).optional().describe('inline budget per stream, in lines'),
+  mode: z
+    .enum(['head', 'tail'])
+    .optional()
+    .describe("which end to keep when the output does not fit — 'tail' (default) for build/log failures, 'head' for dumps"),
+  include: z.string().max(200).optional().describe('server-side grep: keep only lines matching this regular expression'),
+  exclude: z.string().max(200).optional().describe('server-side grep -v: drop lines matching this regular expression'),
+  ignoreCase: z.boolean().optional().describe('match include/exclude case-insensitively')
+}
+
+type OutputArgs = {
+  maxBytes?: number
+  maxLines?: number
+  mode?: 'head' | 'tail'
+  include?: string
+  exclude?: string
+  ignoreCase?: boolean
+}
+
+function outputSelection(a: OutputArgs): OutputArgs {
+  const out: OutputArgs = {}
+  if (a.maxBytes !== undefined) out.maxBytes = a.maxBytes
+  if (a.maxLines !== undefined) out.maxLines = a.maxLines
+  if (a.mode !== undefined) out.mode = a.mode
+  if (a.include !== undefined) out.include = a.include
+  if (a.exclude !== undefined) out.exclude = a.exclude
+  if (a.ignoreCase !== undefined) out.ignoreCase = a.ignoreCase
+  return out
+}
+
 export interface ToolDef {
   name: string
   description: string
@@ -112,13 +155,45 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits.',
+        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns the exit code plus a BOUNDED view of stdout/stderr: by default the last 64000 bytes of each. Filter server-side with include/exclude regexes instead of wrapping the command in grep/sed, and choose head/tail with mode. Nothing is ever dropped silently — `output` reports raw bytes/lines vs returned bytes/lines, and whenever the response could not carry everything the complete raw output is retained under the Room as run `output.runId`, readable with read_run_output.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
-        timeoutMs: z.number().int().positive().optional()
+        timeoutMs: z.number().int().positive().optional(),
+        ...outputControls
       },
-      handler: wrap(async (a) => (await getClient()).execInRoom(a.roomId, a.cmd, a.timeoutMs))
+      handler: wrap(async (a) => (await getClient()).execInRoom(a.roomId, a.cmd, a.timeoutMs, outputSelection(a)))
+    },
+    {
+      name: 'read_run_output',
+      description:
+        "Read the complete raw output of a command run in the room — the one run_in_room retained when its response was bounded. Page through it with offsetBytes + the nextOffset each read returns, or filter it server-side with include/exclude. Works while the command is still running, so a long Gradle build or logcat capture is readable before it exits.",
+      schema: {
+        roomId: zRoomId,
+        runId: z.string().uuid().describe('run id from run_in_room (output.runId) or list_room_runs'),
+        stream: z.enum(['stdout', 'stderr']).optional().describe("defaults to 'stdout'"),
+        offsetBytes: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('start at this byte offset: pass the previous read nextOffset to continue'),
+        ...outputControls
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).readRunOutput(a.roomId, a.runId, {
+          ...outputSelection(a),
+          ...(a.stream !== undefined ? { stream: a.stream } : {}),
+          ...(a.offsetBytes !== undefined ? { offsetBytes: a.offsetBytes } : {})
+        })
+      )
+    },
+    {
+      name: 'list_room_runs',
+      description:
+        'List the commands running in the room right now and the finished runs whose complete output the room still holds. Running entries show bytes/lines produced so far, which answers "is it hung or just busy" and lets a reconnecting agent pick a run back up after a dropped call.',
+      schema: { roomId: zRoomId },
+      handler: wrap(async (a) => (await getClient()).listRuns(a.roomId))
     },
     {
       name: 'check_room',

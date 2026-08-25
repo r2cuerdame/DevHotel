@@ -33,7 +33,7 @@ import {
   webName,
   workspaceSnapshotVolume,
 } from './naming'
-import type { AnchorSpec, ExecResult, ExportedArtifact, IsolationBackend, ManagedNetwork, WebSpec } from './types'
+import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, ManagedNetwork, WebSpec } from './types'
 
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
@@ -490,10 +490,14 @@ export class OciCliBackend implements IsolationBackend {
     return { reclaimedBytes }
   }
 
-  async execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }): Promise<ExecResult> {
+  async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return runDocker(['exec', exactContainerId(container, roomId), ...cmd], { timeoutMs: opts?.timeoutMs })
+    return runDocker(['exec', exactContainerId(container, roomId), ...cmd], {
+      timeoutMs: opts?.timeoutMs,
+      ...(opts?.onStdout ? { onStdout: opts.onStdout } : {}),
+      ...(opts?.onStderr ? { onStderr: opts.onStderr } : {})
+    })
   }
 
   async spawnInteractiveExec(roomId: string, cmd: string[]) {

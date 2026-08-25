@@ -42,6 +42,14 @@ import { fsSourceReader } from './detect/sourceReader'
 import { buildDiagnostic } from './diagnostics/bundle'
 import type { Gateway } from './gateway/gateway'
 import { LogHub, type LogKind } from './logs'
+import {
+  RunOutputStore,
+  type OutputSelection,
+  type RunReadOptions,
+  type RunReadResult,
+  type RunSummary,
+  type StreamReport
+} from './runOutput'
 import { writeManifest } from './manifest'
 import { reconcile, type ReconcileResult } from './reconcile'
 import type { Db } from './store/db'
@@ -52,6 +60,22 @@ import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey } from './workingState'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
+
+/**
+ * What one Room command returns: the bounded text a caller can actually read,
+ * plus enough accounting to know what was left out and where to get it.
+ */
+export interface RoomExecResult extends ExecResult {
+  output: {
+    runId: string
+    /** The complete raw output is kept under the Room and readable by run id. */
+    retained: boolean
+    stdout: StreamReport
+    stderr: StreamReport
+    /** Plain-language truncation/retention notices; empty when nothing was withheld. */
+    notes: string[]
+  }
+}
 
 const ANDROID_CHANGE_KINDS = new Set([
   'android-build',
@@ -108,6 +132,7 @@ export class RoomOrchestrator {
   readonly checks: ChecksRepo
   readonly settings: SettingsRepo
   readonly logs: LogHub
+  readonly runs: RunOutputStore
   private readonly engine = new ChangeEngine()
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
@@ -134,6 +159,7 @@ export class RoomOrchestrator {
     this.checks = checksRepo(opts.db)
     this.settings = settingsRepo(opts.db)
     this.logs = new LogHub(opts.userData, opts.backend)
+    this.runs = new RunOutputStore(opts.userData)
     registerQuickChanges(this.engine)
   }
 
@@ -1545,7 +1571,18 @@ export class RoomOrchestrator {
     return { roomId: room.id, ranAt: new Date().toISOString(), results, overall }
   }
 
-  execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }, actor: Actor = 'agent'): Promise<ExecResult> {
+  /**
+   * Run one command in the Room and answer with a *bounded* view of its output.
+   * The command streams into Room-owned run storage as it runs, so a caller
+   * that asked for 64KB of a 400MB logcat still gets the complete raw stream
+   * back by run id instead of losing it to a response limit.
+   */
+  execInRoom(
+    roomId: string,
+    cmd: string[],
+    opts?: { timeoutMs?: number; output?: OutputSelection },
+    actor: Actor = 'agent'
+  ): Promise<RoomExecResult> {
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
@@ -1553,8 +1590,58 @@ export class RoomOrchestrator {
         throw new Error('Agent commands are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
       }
       this.markWorkspaceModified(roomId)
-      return this.backend.execInRoom(roomId, cmd, opts)
+      const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
+      let sawStdout = false
+      let sawStderr = false
+      let result: ExecResult
+      try {
+        result = await this.backend.execInRoom(roomId, cmd, {
+          timeoutMs: opts?.timeoutMs,
+          onStdout: (chunk) => {
+            sawStdout = true
+            run.push('stdout', chunk)
+          },
+          onStderr: (chunk) => {
+            sawStderr = true
+            run.push('stderr', chunk)
+          }
+        })
+      } catch (err) {
+        this.runs.complete(run, -1)
+        throw err
+      }
+      // A backend that buffers instead of streaming still gets bounded here.
+      if (!sawStdout && result.stdout) run.push('stdout', result.stdout)
+      if (!sawStderr && result.stderr) run.push('stderr', result.stderr)
+      const outcome = this.runs.complete(run, result.code)
+      return {
+        code: result.code,
+        stdout: outcome.stdout.text,
+        stderr: outcome.stderr.text,
+        output: {
+          runId: outcome.runId,
+          retained: outcome.retained,
+          stdout: outcome.stdout.report,
+          stderr: outcome.stderr.report,
+          notes: outcome.notes
+        }
+      }
     })
+  }
+
+  /** Commands running now plus the runs whose full output this Room still holds. */
+  listRuns(roomId: string): RunSummary[] {
+    this.mustGet(roomId)
+    return this.runs.list(roomId)
+  }
+
+  /**
+   * Read a retained (or still running) command's raw output. Deliberately takes
+   * no Room lock: the point is to be readable while the command still holds it.
+   */
+  readRunOutput(roomId: string, runId: string, opts: RunReadOptions = {}): RunReadResult {
+    this.mustGet(roomId)
+    return this.runs.read(roomId, runId, opts)
   }
 
   spawnInteractiveExec(roomId: string, cmd: string[]) {

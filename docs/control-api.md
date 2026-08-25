@@ -60,7 +60,9 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/restart-web` | | change entry |
 | `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
-| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? }` | `{ code, stdout, stderr }` — buffered until exit; redirect long output to a file |
+| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs?, output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output) |
+| `GET /v1/rooms/:id/runs` | | `{ runs[] }` — commands running now, plus finished runs whose full output the Room still holds |
+| `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
 | `POST /v1/rooms/:id/checks` | | 14-step check report |
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
@@ -73,6 +75,70 @@ room's Changes list. Host boundaries hold:
 | `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | `{ png: base64, source }` — Android rooms; `screen` captures the display (FLAG_SECURE included) |
 | `GET /v1/rooms/:id/file` | `?path=/workspace/…` | `{ path, size, contentBase64 }` (16MB cap) |
 | `PUT /v1/rooms/:id/file` | `{ path: '/workspace/…', contentBase64 }` | `{ path, size }` — creates parents, marks workspace modified |
+
+## Command output
+
+`exec` answers with a **bounded** view of the command's output — never a silent
+truncation, and never the whole of a 400MB logcat inlined into one response.
+
+`output` on the request selects what comes back inline. Every field is optional:
+
+| field | meaning |
+|---|---|
+| `maxBytes` | inline budget **per stream** (default `64000`, min `256`, max `4000000`) |
+| `maxLines` | inline budget per stream, in lines |
+| `mode` | `tail` (default) or `head` — which end to keep when it does not fit |
+| `include` | keep only lines matching this regular expression (server-side `grep`) |
+| `exclude` | drop lines matching this regular expression (server-side `grep -v`) |
+| `ignoreCase` | match `include`/`exclude` case-insensitively |
+
+Filters are regular expressions of at most 200 characters, matched against the
+first 8KB of each line.
+
+`output` on the response reports what happened:
+
+```json
+{
+  "code": 1,
+  "stdout": "…last 64000 bytes…",
+  "stderr": "…",
+  "output": {
+    "runId": "9f2c…",
+    "retained": true,
+    "stdout": { "bytes": 41235904, "lines": 380112, "returnedBytes": 63988,
+                "returnedLines": 611, "truncated": true, "filtered": false, "retained": true },
+    "stderr": { "bytes": 0, "lines": 0, "returnedBytes": 0, "returnedLines": 0,
+                "truncated": false, "filtered": false, "retained": false },
+    "notes": ["stdout: returned 63988 of 41235904 bytes (611 of 380112 lines); complete raw output retained as run 9f2c… — read it with read_run_output"]
+  }
+}
+```
+
+Whenever the response could not carry everything — truncated, or narrowed by a
+filter — the **complete raw output is retained under the Room** and read back
+by run id. When the response did carry everything, nothing is retained and
+`runId` refers to a run that is already gone: there is nothing left to fetch.
+
+Retention lives in Hotel storage beside the Room's logs and artifacts, is
+deleted with the Room, and is bounded — a Room keeps its most recent 20
+retained runs, up to 256MB.
+
+### Reading a run
+
+`GET /v1/rooms/:id/runs/:runId/output` takes the same selection fields plus
+`stream` (`stdout` | `stderr`, default `stdout`) and `offsetBytes`. It returns
+the window plus `bytes` (size of the retained stream), `nextOffset`, `eof`,
+`scannedBytes`, `scannedLines` and the same truncation flags.
+
+- **Page through everything**: `mode=head` and pass each response's
+  `nextOffset` back as `offsetBytes` until `eof` is true.
+- **Search it**: pass `include`; `nextOffset` resumes after the last returned
+  line, so paging stays exact even when the filter skipped the lines between.
+
+Reading takes no Room lock, so a run is readable **while it is still running** —
+`GET /v1/rooms/:id/runs` lists active runs with the bytes and lines they have
+produced so far, which is how a caller tells "hung" from "busy" and how a
+dropped connection is picked back up.
 
 ## MCP registration note
 

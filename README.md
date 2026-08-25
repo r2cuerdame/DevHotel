@@ -136,7 +136,9 @@ Releases are cut locally, not by CI — see [Releasing](./docs/releasing.md).
 
 Settings → **MCP** gives you a one-line registration command for Claude Code and an `mcpServers` snippet for any other client. Register it by absolute path; the bundled server reconnects by itself when the DevHotel app restarts.
 
-The MCP server exposes 27 tools over the same contract the app uses: create/start/sleep/clone/rename/delete a Room, run commands in it, apply and undo Quick Changes, read logs, components and diagnostics, push and pull workspace files, reset a Room, request a Host sync under the Room's revocable grant, and — for Android Rooms — build, install and launch an APK and take a screenshot of the phone.
+The MCP server exposes 29 tools over the same contract the app uses: create/start/sleep/clone/rename/delete a Room, run commands in it, apply and undo Quick Changes, read logs, components and diagnostics, push and pull workspace files, reset a Room, request a Host sync under the Room's revocable grant, and — for Android Rooms — build, install and launch an APK and take a screenshot of the phone.
+
+Long commands do not lose their output. `run_in_room` returns a **bounded** view — by default the last 64KB of each stream, with optional server-side `include`/`exclude` filtering instead of wrapping every command in `grep`/`sed` — and reports raw bytes and lines against what it returned. Whenever the response could not carry everything, the complete raw output is retained under the Room and read back with `read_run_output`, which pages by byte offset and works while the command is still running. `list_room_runs` shows what a Room is running now and what it still holds.
 
 Agents (or any local tool) can drive DevHotel **without MCP** through the same stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), bearer auth, agent semantics, and every endpoint.
 
