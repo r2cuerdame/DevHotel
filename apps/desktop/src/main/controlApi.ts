@@ -13,7 +13,7 @@ import {
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
-import type { RoomOrchestrator } from '@devhotel/core'
+import { WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /** Hotel Services reachable by agents; populated after app startup wiring. */
@@ -152,7 +152,15 @@ export async function startControlApi(
               })
               return
             }
-            sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'agent')))
+            try {
+              sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'agent')))
+            } catch (error) {
+              if (error instanceof WorkspaceDriftError) {
+                sendJson(res, 409, error.toResponse())
+                return
+              }
+              throw error
+            }
             return
           }
           case 'sync-baseline': {

@@ -41,7 +41,7 @@ describe('OciCliBackend Android artifact export', () => {
       if (args[0] === 'image' && args[1] === 'inspect') return ok
       if (args[0] === 'run') {
         if (args.at(-1)?.includes('sync_paths=$(mktemp)')) {
-          return { code: 0, stdout: `${buildInputDigest}  /tmp/sync-records\n`, stderr: '' }
+          return { code: 0, stdout: `fingerprint\t${buildInputDigest}\n`, stderr: '' }
         }
         if (args.at(-1)?.includes('records=$(mktemp)')) {
           return { code: 0, stdout: `${buildInputDigest}  /tmp/records\n`, stderr: '' }
@@ -85,10 +85,16 @@ describe('OciCliBackend Android artifact export', () => {
       ([args]) => args[0] === 'run' && args.at(-1)?.includes('sync_paths=$(mktemp)')
     )?.[0]
     const script = run?.at(-1) ?? ''
-    expect(script).toContain('-print0 > "$sync_paths"; sort -z "$sync_paths" > "$sync_sorted"')
+    expect(script).toContain('-print0 > "$sync_paths"')
+    expect(script).toContain('sort -z "$sync_paths" > "$sync_sorted"')
     expect(script).toContain('done < "$sync_sorted"')
     expect(script).not.toContain('-print |')
     expect(script).toContain('readlink -n')
+    expect(script).toContain('.devhotel-sync-include')
+    for (const generated of ['build', '.gradle', '.kotlin', '.cxx', '.externalNativeBuild', 'target']) {
+      expect(script).toContain(`*/${generated}/*`)
+    }
+    expect(script).toContain('*.apk|*.aab')
     expect(run).toEqual(expect.arrayContaining(['--cap-drop', 'NET_RAW']))
 
     mockedRunDocker.mockImplementation(async (args) => {

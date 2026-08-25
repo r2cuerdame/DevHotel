@@ -300,14 +300,14 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'reset_sync_baseline',
       description:
-        "Accept the room's current files as the Host-sync baseline. Use when sync_from_host reports that Room files changed — e.g. after a build wrote into the workspace — and you want later syncs allowed again. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",
+        "Accept the room's current meaningful source files as the Host-sync baseline. Use after reviewing real source drift reported by sync_from_host; ordinary build outputs are ignored automatically. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).resetSyncBaseline(a.roomId))
     },
     {
       name: 'sync_from_host',
       description:
-        "Re-read the room's linked Host folder into the Room-owned working state. Runs under the room's inbound-sync grant (the human linked that folder when creating the room and can revoke agent sync per room), is journaled as the agent, and reads no other path — agents cannot choose paths. Fails if the grant is revoked, if the room has no Host link, if it is asleep, or if Room files drifted (see reset_sync_baseline). The generation it replaces is retained for recovery.",
+        "Re-read the room's linked Host folder into the Room-owned working state. Runs under the room's inbound-sync grant (the human linked that folder when creating the room and can revoke agent sync per room), is journaled as the agent, and reads no other path — agents cannot choose paths. Build outputs are ignored; real Room source drift fails with conflictReason and exact changedPaths (see reset_sync_baseline). The generation it replaces is retained for recovery.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
     },

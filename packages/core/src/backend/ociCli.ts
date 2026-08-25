@@ -2,6 +2,7 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFi
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
+import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
 import {
   ANCHOR_IMAGE,
@@ -38,6 +39,112 @@ import type { AnchorSpec, ExecResult, ExportedArtifact, IsolationBackend, Manage
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
+const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
+const GENERATED_SYNC_DIRS = [
+  '.git',
+  '.gradle',
+  '.kotlin',
+  '.next',
+  '.dart_tool',
+  '.cxx',
+  '.externalNativeBuild',
+  'node_modules',
+  'build',
+  'dist',
+  'out',
+  'target',
+  'coverage'
+] as const
+
+const GENERATED_SYNC_CASE = GENERATED_SYNC_DIRS.map((name) => `*/${name}/*`).join('|')
+
+function syncIncludeReaderScript(): string {
+  return [
+    `include_file=${SYNC_INCLUDE_FILE}`,
+    'is_opted_in() {',
+    '  path=$1',
+    '  [ -f "$include_file" ] || return 1',
+    '  while IFS= read -r include || [ -n "$include" ]; do',
+    "    include=$(printf '%s' \"$include\" | tr -d '\\r')",
+    "    case \"$include\" in ''|'#'*) continue ;; esac",
+    '    case "$include" in /*|-*|*\\\\*|*:*|*\\**|*\\?*|*\\[*|*\\]*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
+    '    case "/$include/" in */../*|*/./*|*//*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
+    '    include=${include%/}',
+    '    case "$path" in "$include"|"$include"/*) return 0 ;; esac',
+    '  done < "$include_file"',
+    '  return 1',
+    '}'
+  ].join('\n')
+}
+
+export function importHostFolderScript(): string {
+  const excludes = GENERATED_SYNC_DIRS
+    .filter((name) => name !== '.git')
+    .flatMap((name) => [`--exclude='./${name}'`, `--exclude='*/${name}'`])
+    .concat(["--exclude='*.apk'", "--exclude='*.aab'"])
+    .join(' ')
+  return [
+    'set -eu',
+    `tar -C /source ${excludes} -cf - . | tar -C /workspace -xf -`,
+    'cd /source',
+    `include_file=${SYNC_INCLUDE_FILE}`,
+    '[ -f "$include_file" ] || exit 0',
+    'while IFS= read -r include || [ -n "$include" ]; do',
+    "  include=$(printf '%s' \"$include\" | tr -d '\\r')",
+    "  case \"$include\" in ''|'#'*) continue ;; esac",
+    '  case "$include" in /*|-*|*\\\\*|*:*|*\\**|*\\?*|*\\[*|*\\]*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
+    '  case "/$include/" in */../*|*/./*|*//*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
+    '  include=${include%/}',
+    // The lexical checks above cannot see where a path actually lands: tar
+    // resolves intermediate components through symlinks, so an include entry
+    // under a symlinked directory would dereference files outside the folder
+    // the human linked and copy their contents into the Room. Canonicalise the
+    // parent and require it to stay under /source. The final component is left
+    // alone on purpose — tar stores it as a symlink, exactly like the base
+    // import, so an opted-in link keeps pointing nowhere inside the Room.
+    '  include_dir=${include%/*}',
+    '  if [ "$include_dir" = "$include" ]; then include_dir=.; fi',
+    '  include_root=$(realpath "$include_dir" 2>/dev/null) || include_root=',
+    '  case "${include_root:-x}" in',
+    '    /source|/source/*) ;;',
+    '    *) echo "invalid .devhotel-sync-include path leaves the linked folder: $include" >&2; exit 2 ;;',
+    '  esac',
+    '  if [ -e "$include" ] || [ -L "$include" ]; then tar -C /source -cf - "$include" | tar -C /workspace -xf -; fi',
+    'done < "$include_file"'
+  ].join('\n')
+}
+
+export function workspaceSnapshotScript(): string {
+  return [
+    'set -eu',
+    'cd /workspace',
+    syncIncludeReaderScript(),
+    'is_generated() {',
+    '  path=$1',
+    `  case "/$path/" in ${GENERATED_SYNC_CASE}) return 0 ;; esac`,
+    '  case "$path" in *.apk|*.aab) return 0 ;; esac',
+    '  return 1',
+    '}',
+    'sync_paths=$(mktemp)',
+    'sync_sorted=$(mktemp)',
+    'sync_records=$(mktemp)',
+    "find . -mindepth 1 \\( -type f -o -type l \\) -print0 > \"$sync_paths\"",
+    'sort -z "$sync_paths" > "$sync_sorted"',
+    "while IFS= read -r -d '' raw_path; do",
+    '  path=${raw_path#./}',
+    '  if is_generated "$path" && ! is_opted_in "$path"; then continue; fi',
+    "  metadata=$(stat -c '%f:%u:%g' \"$raw_path\")",
+    '  if [ -L "$raw_path" ]; then kind=L; content_hash=$(readlink -n "$raw_path" | sha256sum); else kind=F; content_hash=$(sha256sum "$raw_path"); fi',
+    '  content_hash=${content_hash%% *}',
+    "  path_b64=$(printf '%s' \"$path\" | base64 | tr -d '\\n')",
+    "  printf '%s\\t%s\\t%s\\t%s\\n' \"$kind\" \"$metadata\" \"$path_b64\" \"$content_hash\" >> \"$sync_records\"",
+    'done < "$sync_sorted"',
+    'fingerprint=$(sha256sum "$sync_records")',
+    'fingerprint=${fingerprint%% *}',
+    "printf 'fingerprint\\t%s\\n' \"$fingerprint\"",
+    'cat "$sync_records"'
+  ].join('\n')
+}
 
 /**
  * Matched by class+type because at map time the qemu windows are still titled
@@ -758,7 +865,7 @@ export class OciCliBackend implements IsolationBackend {
             DU_IMAGE,
             'sh',
             '-lc',
-            "tar -C /source --exclude='./node_modules' --exclude='*/node_modules' --exclude='./.next' --exclude='*/.next' --exclude='./dist' --exclude='*/dist' --exclude='./build' --exclude='*/build' --exclude='./coverage' --exclude='*/coverage' --exclude='./.gradle' --exclude='*/.gradle' -cf - . | tar -C /workspace -xf -"
+            importHostFolderScript()
           ],
           { timeoutMs: LONG_TIMEOUT_MS, onLine: log }
         ),
@@ -784,6 +891,14 @@ export class OciCliBackend implements IsolationBackend {
     workspaceVolumeRevision: number,
     workspaceVolumeOverride?: string
   ): Promise<string> {
+    return (await this.snapshotWorkspace(roomId, workspaceVolumeRevision, workspaceVolumeOverride)).fingerprint
+  }
+
+  async snapshotWorkspace(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    workspaceVolumeOverride?: string
+  ): Promise<WorkspaceSnapshot> {
     await this.assertPinnedEngineIdentity()
     const source = workspaceVolumeOverride ?? srcVolume(roomId, workspaceVolumeRevision)
     assertExpectedRoomVolumeName(roomId, source)
@@ -804,17 +919,74 @@ export class OciCliBackend implements IsolationBackend {
         DU_IMAGE,
         'sh',
         '-lc',
-        // Content identity of the Room's *source*, deliberately not a
-        // filesystem snapshot: generated trees are pruned entirely (their own
-        // directory entry included, or a first build would permanently look
-        // like drift) and mtime is excluded (touching a file without changing
-        // it is not a Room-side edit). Mode/uid/gid and content still count.
-        "set -eu; sync_paths=$(mktemp); sync_sorted=$(mktemp); sync_records=$(mktemp); cd /workspace; find . -mindepth 1 \\( -type d \\( -name node_modules -o -name .next -o -name dist -o -name build -o -name coverage -o -name .gradle -o -path '*/.git/objects' \\) \\) -prune -o -print0 > \"$sync_paths\"; sort -z \"$sync_paths\" > \"$sync_sorted\"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' \"$path\" | sha256sum); path_hash=${path_hash%% *}; metadata=$(stat -c '%f:%u:%g' \"$path\"); if [ -L \"$path\" ]; then kind=L; content_hash=$(readlink -n \"$path\" | sha256sum); content_hash=${content_hash%% *}; elif [ -f \"$path\" ]; then kind=F; content_hash=$(sha256sum \"$path\"); content_hash=${content_hash%% *}; elif [ -d \"$path\" ]; then kind=D; content_hash=-; else echo \"unsupported workspace object: $path\" >&2; exit 2; fi; printf '%s %s %s %s\\n' \"$kind\" \"$metadata\" \"$path_hash\" \"$content_hash\" >> \"$sync_records\"; done < \"$sync_sorted\"; sha256sum \"$sync_records\""
+        // Content identity of the Room's source, not a filesystem snapshot.
+        // Generated trees stay out unless the project names a path in
+        // .devhotel-sync-include; mtime and empty directories do not count.
+        workspaceSnapshotScript()
       ]),
       'fingerprint Room workspace'
     )
-    const fingerprint = result.stdout.trim().split(/\s+/)[0] ?? ''
+    const lines = result.stdout.split(/\r?\n/)
+    const header = lines.shift() ?? ''
+    const [label, fingerprint = ''] = header.split('\t')
+    if (label !== 'fingerprint') throw new Error('workspace helper returned an invalid snapshot header')
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('workspace helper returned an invalid fingerprint')
+    const entries: WorkspaceSnapshotEntry[] = []
+    for (const line of lines) {
+      if (!line) continue
+      const [rawKind, metadata, encodedPath, contentHash, ...extra] = line.split('\t')
+      if (
+        extra.length > 0 ||
+        (rawKind !== 'F' && rawKind !== 'L') ||
+        !/^[a-f0-9]+:[0-9]+:[0-9]+$/.test(metadata ?? '') ||
+        !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedPath ?? '') ||
+        !/^[a-f0-9]{64}$/.test(contentHash ?? '')
+      ) throw new Error('workspace helper returned an invalid path record')
+      const pathBytes = Buffer.from(encodedPath!, 'base64')
+      if (pathBytes.toString('base64') !== encodedPath || pathBytes.includes(0)) {
+        throw new Error('workspace helper returned an invalid encoded path')
+      }
+      const path = pathBytes.toString('utf8')
+      if (!isSafeWorkspacePath(path) || Buffer.from(path).compare(pathBytes) !== 0) {
+        throw new Error('workspace helper returned an unsafe path')
+      }
+      entries.push({
+        path,
+        kind: rawKind === 'F' ? 'file' : 'symlink',
+        identity: `${metadata}:${contentHash}`
+      })
+    }
+    return { fingerprint, entries }
+  }
+
+  async fingerprintWorkspaceLegacy(roomId: string, workspaceVolumeRevision: number): Promise<string> {
+    await this.assertPinnedEngineIdentity()
+    const source = srcVolume(roomId, workspaceVolumeRevision)
+    const volume = await this.inspectVolume(source)
+    if (!volume) throw new Error(`workspace generation does not exist: ${source}`)
+    await this.assertRoomVolumeOwnership(volume, roomId, source)
+    await this.ensureImage(DU_IMAGE)
+    const result = must(
+      await runDocker([
+        'run',
+        '--rm',
+        '--network',
+        'none',
+        '--cap-drop',
+        'NET_RAW',
+        '-v',
+        `${source}:/workspace:ro`,
+        DU_IMAGE,
+        'sh',
+        '-lc',
+        // Exact pre-R2C-8 algorithm. Do not broaden this compatibility path:
+        // it exists only to prove an old accepted tree is still unchanged.
+        "set -eu; legacy_sync_paths=$(mktemp); legacy_sync_sorted=$(mktemp); legacy_sync_records=$(mktemp); cd /workspace; find . -mindepth 1 \\( -type d \\( -name node_modules -o -name .next -o -name dist -o -name build -o -name coverage -o -name .gradle -o -path '*/.git/objects' \\) \\) -prune -o -print0 > \"$legacy_sync_paths\"; sort -z \"$legacy_sync_paths\" > \"$legacy_sync_sorted\"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' \"$path\" | sha256sum); path_hash=${path_hash%% *}; metadata=$(stat -c '%f:%u:%g' \"$path\"); if [ -L \"$path\" ]; then kind=L; content_hash=$(readlink -n \"$path\" | sha256sum); content_hash=${content_hash%% *}; elif [ -f \"$path\" ]; then kind=F; content_hash=$(sha256sum \"$path\"); content_hash=${content_hash%% *}; elif [ -d \"$path\" ]; then kind=D; content_hash=-; else echo \"unsupported workspace object: $path\" >&2; exit 2; fi; printf '%s %s %s %s\\n' \"$kind\" \"$metadata\" \"$path_hash\" \"$content_hash\" >> \"$legacy_sync_records\"; done < \"$legacy_sync_sorted\"; sha256sum \"$legacy_sync_records\""
+      ]),
+      'fingerprint legacy Room workspace'
+    )
+    const fingerprint = result.stdout.trim().split(/\s+/)[0] ?? ''
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('legacy workspace helper returned an invalid fingerprint')
     return fingerprint
   }
 

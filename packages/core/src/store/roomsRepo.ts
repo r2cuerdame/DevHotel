@@ -368,9 +368,15 @@ export function roomsRepo(db: Db): RoomsRepo {
         sqlite
           .prepare(
             `DELETE FROM settings
-             WHERE key = ? OR key LIKE ? OR key LIKE ? OR key = ?`
+             WHERE key = ? OR key LIKE ? OR key LIKE ? OR key = ? OR key = ?`
           )
-          .run(`depsGen:${id}`, `depsGen:${id}:%`, `depsGenMax:${id}:%`, `workspaceGenMax:${id}`)
+          .run(
+            `depsGen:${id}`,
+            `depsGen:${id}:%`,
+            `depsGenMax:${id}:%`,
+            `workspaceGenMax:${id}`,
+            `workspaceSyncBase:${id}`
+          )
         sqlite.prepare('DELETE FROM rooms WHERE id = ?').run(id)
         sqlite.exec('COMMIT')
       } catch (err) {

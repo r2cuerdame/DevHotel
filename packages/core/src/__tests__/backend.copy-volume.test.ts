@@ -160,7 +160,16 @@ describe('OciCliBackend.copyVolume', () => {
     expect(helper).toContain('type=bind,source=C:\\approved\\project,target=/source,readonly')
     expect(helper).toContain('--network')
     expect(helper).toContain('none')
-    expect(helper.at(-1)).toMatch(/exclude=.*node_modules.*exclude=.*\.next.*exclude=.*\.gradle/)
+    for (const generated of ['node_modules', '.next', '.gradle', '.kotlin', 'build', 'target']) {
+      expect(helper.at(-1)).toContain(`--exclude='./${generated}'`)
+    }
+    expect(helper.at(-1)).toContain('.devhotel-sync-include')
+    expect(helper.at(-1)).toContain('tar -C /source -cf - "$include"')
+    // An opted-in path must be canonicalised, not just checked lexically: tar
+    // follows symlinked parents, so without this the include list could copy
+    // files from outside the folder the human linked.
+    expect(helper.at(-1)).toContain('include_root=$(realpath "$include_dir"')
+    expect(helper.at(-1)).toMatch(/\/source\|\/source\/\*\)/)
     expect(helper).toContain(`${imported}:/workspace`)
   })
 
