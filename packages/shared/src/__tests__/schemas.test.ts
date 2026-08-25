@@ -3,6 +3,7 @@ import {
   zAgentCreateRoomInput,
   zCloneRoomInput,
   zCreateRoomInput,
+  zExecBody,
   zPackageSearchOffset,
   zPackageSearchQuery,
   zPreviewLayout,
@@ -10,7 +11,8 @@ import {
   zQuickChange,
   zRendererCreateRoomInput,
   zRendererPlanRoomInput,
-  zRoomId
+  zRoomId,
+  zRunOutputQuery
 } from '../control'
 import { zGitHubToken, zHotelServiceAssignmentInput, zHotelServiceManifest } from '../hotelServices'
 
@@ -279,5 +281,35 @@ describe('zCloneRoomInput', () => {
         actor: 'user'
       }).success
     ).toBe(false)
+  })
+})
+
+describe('bounded command output contract', () => {
+  it('accepts an exec body with or without an output selection', () => {
+    expect(zExecBody.safeParse({ cmd: ['node', '--version'] }).success).toBe(true)
+    expect(
+      zExecBody.safeParse({
+        cmd: ['sh', '-lc', 'adb logcat -d'],
+        timeoutMs: 30_000,
+        output: { maxBytes: 4096, maxLines: 200, mode: 'tail', include: 'FATAL', exclude: 'chatty', ignoreCase: true }
+      }).success
+    ).toBe(true)
+  })
+
+  it('refuses budgets and filters the Room cannot honour', () => {
+    expect(zExecBody.safeParse({ cmd: ['echo'], output: { maxBytes: 4 } }).success).toBe(false)
+    expect(zExecBody.safeParse({ cmd: ['echo'], output: { maxBytes: 40_000_000 } }).success).toBe(false)
+    expect(zExecBody.safeParse({ cmd: ['echo'], output: { include: 'x'.repeat(300) } }).success).toBe(false)
+    expect(zExecBody.safeParse({ cmd: ['echo'], output: { mode: 'middle' } }).success).toBe(false)
+    expect(zExecBody.safeParse({ cmd: ['echo'], grep: 'FATAL' }).success).toBe(false)
+  })
+
+  it('reads run-output query strings as typed values', () => {
+    const parsed = zRunOutputQuery.parse({ stream: 'stderr', offsetBytes: '4096', maxBytes: '512', ignoreCase: 'true' })
+    expect(parsed).toEqual({ stream: 'stderr', offsetBytes: 4096, maxBytes: 512, ignoreCase: true })
+    expect(zRunOutputQuery.parse({ ignoreCase: 'false' }).ignoreCase).toBe(false)
+    expect(zRunOutputQuery.safeParse({ offsetBytes: '-1' }).success).toBe(false)
+    expect(zRunOutputQuery.safeParse({ stream: 'both' }).success).toBe(false)
+    expect(zRunOutputQuery.safeParse({ path: '/workspace/secret' }).success).toBe(false)
   })
 })

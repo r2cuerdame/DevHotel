@@ -3,6 +3,45 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentCreateRoomInput, ControlInfo, QuickChange } from '@devhotel/shared'
 
+/** Bounded-output selection understood by the control API's exec and run reads. */
+export interface OutputSelection {
+  maxBytes?: number
+  maxLines?: number
+  mode?: 'head' | 'tail'
+  include?: string
+  exclude?: string
+  ignoreCase?: boolean
+}
+
+export interface RunOutputQuery extends OutputSelection {
+  stream?: 'stdout' | 'stderr'
+  offsetBytes?: number
+}
+
+export interface StreamReport {
+  bytes: number
+  lines: number
+  returnedBytes: number
+  returnedLines: number
+  matchedLines?: number
+  truncated: boolean
+  filtered: boolean
+  retained: boolean
+}
+
+export interface RoomExecResponse {
+  code: number
+  stdout: string
+  stderr: string
+  output: {
+    runId: string
+    retained: boolean
+    stdout: StreamReport
+    stderr: StreamReport
+    notes: string[]
+  }
+}
+
 export function defaultControlFile(): string {
   if (process.env.DEVHOTEL_CONTROL_FILE) return process.env.DEVHOTEL_CONTROL_FILE
   if (process.platform === 'win32') {
@@ -84,11 +123,25 @@ export class ControlClient {
   sleepRoom(roomId: string) {
     return this.req<void>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sleep`)
   }
-  execInRoom(roomId: string, cmd: string[], timeoutMs?: number) {
-    return this.req<{ code: number; stdout: string; stderr: string }>(
-      'POST',
-      `/v1/rooms/${encodeURIComponent(roomId)}/exec`,
-      { cmd, timeoutMs }
+  execInRoom(roomId: string, cmd: string[], timeoutMs?: number, output?: OutputSelection) {
+    return this.req<RoomExecResponse>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/exec`, {
+      cmd,
+      timeoutMs,
+      ...(output && Object.keys(output).length > 0 ? { output } : {})
+    })
+  }
+  listRuns(roomId: string) {
+    return this.req<{ runs: unknown[] }>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/runs`)
+  }
+  readRunOutput(roomId: string, runId: string, query: RunOutputQuery = {}) {
+    const params = new URLSearchParams()
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined) params.set(key, String(value))
+    }
+    const suffix = params.toString()
+    return this.req<unknown>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/runs/${encodeURIComponent(runId)}/output${suffix ? `?${suffix}` : ''}`
     )
   }
   deleteRoom(roomId: string) {

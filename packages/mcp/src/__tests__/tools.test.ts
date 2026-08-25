@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
+const RUN_ID = '11111111-2222-3333-4444-555555555555'
 let server: Server
 let port: number
 const seen: { method: string; url: string; body: any }[] = []
@@ -27,6 +28,12 @@ beforeAll(async () => {
       if (req.url === '/v1/rooms/abc12345/start') return void res.writeHead(204).end()
       if (req.url === '/v1/rooms/abc12345/exec') {
         return void res.end(JSON.stringify({ code: 0, stdout: 'ok', stderr: '' }))
+      }
+      if (req.url === '/v1/rooms/abc12345/runs') {
+        return void res.end(JSON.stringify({ runs: [{ runId: RUN_ID, status: 'running' }] }))
+      }
+      if (req.url?.startsWith(`/v1/rooms/abc12345/runs/${RUN_ID}/output`)) {
+        return void res.end(JSON.stringify({ runId: RUN_ID, stream: 'stderr', text: 'FATAL', eof: true }))
       }
       if (req.url === '/v1/rooms/abc12345/diagnostic') {
         return void res.end(JSON.stringify({ text: 'DevHotel Diagnostic Bundle\n...' }))
@@ -138,6 +145,8 @@ describe('makeTools', () => {
         'restart_web',
         'room_components',
         'room_logs',
+        'list_room_runs',
+        'read_run_output',
         'room_pull_file',
         'room_push_file',
         'run_in_room',
@@ -170,6 +179,47 @@ describe('makeTools', () => {
     expect(firstText(res)).toContain('"code": 0')
     const req = seen.find((s) => s.url === '/v1/rooms/abc12345/exec')
     expect(req?.body.cmd).toEqual(['pnpm', 'install'])
+  })
+
+  it('run_in_room forwards the bounded-output selection to the control API', async () => {
+    await byName.run_in_room!.handler({
+      roomId: 'abc12345',
+      cmd: ['adb', 'logcat', '-d'],
+      maxBytes: 4096,
+      mode: 'head',
+      include: 'FATAL',
+      ignoreCase: true
+    })
+    const req = [...seen].reverse().find((s) => s.url === '/v1/rooms/abc12345/exec')
+    expect(req?.body.output).toEqual({ maxBytes: 4096, mode: 'head', include: 'FATAL', ignoreCase: true })
+  })
+
+  it('run_in_room sends no output selection when the caller chose none', async () => {
+    seen.length = 0
+    await byName.run_in_room!.handler({ roomId: 'abc12345', cmd: ['node', '--version'] })
+    const req = seen.find((s) => s.url === '/v1/rooms/abc12345/exec')
+    expect(req?.body).toEqual({ cmd: ['node', '--version'] })
+  })
+
+  it('read_run_output pages and filters a retained run', async () => {
+    const res = await byName.read_run_output!.handler({
+      roomId: 'abc12345',
+      runId: RUN_ID,
+      stream: 'stderr',
+      offsetBytes: 4096,
+      include: 'FATAL'
+    })
+    expect(firstText(res)).toContain('FATAL')
+    const req = seen.find((s) => s.url?.startsWith(`/v1/rooms/abc12345/runs/${RUN_ID}/output`))
+    const query = new URLSearchParams(req!.url.split('?')[1])
+    expect(query.get('stream')).toBe('stderr')
+    expect(query.get('offsetBytes')).toBe('4096')
+    expect(query.get('include')).toBe('FATAL')
+  })
+
+  it('list_room_runs reports what the Room is running and still holds', async () => {
+    const res = await byName.list_room_runs!.handler({ roomId: 'abc12345' })
+    expect(firstText(res)).toContain(RUN_ID)
   })
 
   it('copy_diagnostic returns plain text', async () => {
