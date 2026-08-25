@@ -65,7 +65,7 @@ describe('Windows VMware Room lifecycle', () => {
     expect(orch.rooms.get(created.id)?.status).toBe('sleeping')
     await orch.startRoom(created.id, 'user')
     expect(orch.rooms.get(created.id)?.status).toBe('ready')
-    await orch.openWindows(created.id)
+    await orch.openWindows(created.id, 'user')
     await orch.resetWindows(created.id, 'user')
     expect(orch.rooms.get(created.id)?.status).toBe('ready')
     expect(await orch.components(created.id)).toEqual(
@@ -83,6 +83,35 @@ describe('Windows VMware Room lifecycle', () => {
     expect(windowsVm.calls).toContain(`openConsole:${created.id}`)
     expect(windowsVm.calls).toContain(`reset:${created.id}`)
     expect(windowsVm.calls).toContain(`delete:${created.id}`)
+    db.close()
+  })
+
+  it('treats the VMware console as a user-only, journaled Host-input capability', async () => {
+    const { orch, windowsVm, db } = setup()
+
+    const created = await orch.createRoom({
+      sourceType: 'empty',
+      sourceRef: '',
+      project: 'win-app',
+      nickname: 'dev',
+      actor: 'user',
+      provider: 'windows',
+      windows: { baseVmxPath: 'C:\\VMs\\Windows 11.vmx', snapshot: 'devhotel-clean' }
+    })
+
+    // The console window holds the real cursor and keyboard while it is
+    // focused, so an Agent must never be able to open it.
+    await expect(orch.openWindows(created.id, 'agent')).rejects.toThrow(/explicit user action/)
+    await expect(orch.openWindows(created.id, 'devhotel')).rejects.toThrow(/explicit user action/)
+    expect(windowsVm.calls).not.toContain(`openConsole:${created.id}`)
+
+    await orch.openWindows(created.id, 'user')
+    expect(windowsVm.calls).toContain(`openConsole:${created.id}`)
+    // Observable after the fact: the takeover is in the Room's own log.
+    expect(orch.logs.tail(created.id, 'orchestrator').join(' ')).toMatch(
+      /VMware Workstation console.*Host cursor and keyboard/
+    )
+
     db.close()
   })
 

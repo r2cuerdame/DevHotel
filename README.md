@@ -22,6 +22,7 @@ Quick Start · Quick Change
 
 - **Isolation First:** Room-owned files, processes, network, dependencies, and service data must not affect another Room or the Host. In the target architecture, a selected Host folder is a scoped source/sync endpoint; the Room imports it into Room-owned working state and writes back only through explicit Apply, Export, or Commit actions.
 - Two rooms can use the same internal web, PostgreSQL, and Redis ports at the same time — each room has its own network namespace.
+- **Your desktop stays yours while tests run.** A Room's UI input is injected inside the Room — in-Room `adb`, the Room's own browser, the emulator's own display — so nothing moves the real cursor, presses real keys, or steals the foreground window. The one path that does take the Host desktop (opening a Windows Room in the VMware console) is a named, user-only, journaled capability. See [Host input isolation](./docs/host-input-isolation.md).
 - Rooms are reached by stable domains like `https://my-project-dev.localhost`, never by port numbers.
 - Sleeping a room stops every process it owns and frees CPU/RAM; its dependencies, data, and browser session survive app restarts and reboots.
 - PostgreSQL and Redis are Room-scoped **Services**, with their own health, storage, version, and connection environment.
@@ -140,7 +141,7 @@ The MCP server exposes 27 tools over the same contract the app uses: create/star
 
 Agents (or any local tool) can drive DevHotel **without MCP** through the same stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), bearer auth, agent semantics, and every endpoint.
 
-Everything an agent changes lands in the Room's Changes list, attributed to `agent` and undoable where an inverse honestly exists. Host resources stay outside that boundary: agents cannot create Host-linked Rooms, choose Host paths, or transfer files in a legacy Host-bound Room.
+Everything an agent changes lands in the Room's Changes list, attributed to `agent` and undoable where an inverse honestly exists. Host resources stay outside that boundary: agents cannot create Host-linked Rooms, choose Host paths, or transfer files in a legacy Host-bound Room. The Host's mouse, keyboard and foreground window are outside it too — drive a Room's UI from inside the Room, never with host automation aimed at the preview window ([Host input isolation](./docs/host-input-isolation.md)).
 
 ## License
 

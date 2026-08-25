@@ -18,6 +18,7 @@ import type {
   RoomRecord,
   SourceType
 } from '@devhotel/shared'
+import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
@@ -907,10 +908,24 @@ export class RoomOrchestrator {
     })
   }
 
-  openWindows(roomId: string): Promise<void> {
+  /**
+   * The one Host-input capability DevHotel still has: the VMware console is a
+   * Host window, and while it has focus the Room holds the real cursor and
+   * keyboard. It is therefore user-only — an Agent must never be able to make
+   * the Host surrender its desktop — and every use is journaled to the Room log
+   * so the takeover is observable afterwards.
+   */
+  async openWindows(roomId: string, actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'windows') throw new Error('Only Windows Rooms open in VMware Workstation')
-    return this.mustWindowsVm().openConsole(roomId)
+    const capability = hostInputCapability(VMWARE_CONSOLE_CAPABILITY)!
+    if (actor !== capability.requiresActor) {
+      throw new Error(
+        'Opening the VMware console takes the Host cursor, keyboard and foreground window, so it requires an explicit user action'
+      )
+    }
+    this.olog(roomId, capability.auditLine)
+    await this.mustWindowsVm().openConsole(roomId)
   }
 
   resetWindows(roomId: string, actor: Actor): Promise<void> {

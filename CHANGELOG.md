@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Your desktop stays yours while a Room's tests run
+
+An audit of every input and focus path DevHotel owns, turned into an enforced contract: **a test running inside a Room must not move the Host cursor, change Host keyboard state, or take the Host foreground window.**
+
+- The audit found no Host-input injection anywhere in the product — Room commands and terminals are `docker exec`, the Android phone strip is in-Room `adb input`, the emulator draws on its own X display inside the container, Windows Rooms boot `vmrun … nogui`, and Windows Room commands are refused outright rather than falling back to the Host. What was missing was anything that *keeps* it that way.
+- **A boundary test now enforces it.** The shipped source is scanned for every API that can drive the real mouse, keyboard or foreground window — robotjs, nut.js, `SendInput`, `keybd_event`, `SetCursorPos`, `SetForegroundWindow`, `SendKeys`, `xdotool`, `pyautogui`, AutoHotkey, `setAlwaysOnTop`, `setKiosk`, `setFullScreen` — and the workspace manifests are scanned for input-synthesis packages. Two user-initiated window-raise sites (tray click, second launch) are listed as exemptions with their reason, and a stale exemption fails the test too.
+- **The Room preview cannot take the Host cursor.** Pointer Lock, Keyboard Lock and fullscreen are the three ways a page seizes the real cursor, keyboard and foreground, and all three arrive through the same permission surface as harmless requests — so the Room session's blanket denial moved into its own policy module and is regression-tested permission by permission.
+- **The one path that does take the Host desktop is now a named capability.** Opening a Windows Room in the VMware Workstation console is a real Host window that grabs the cursor and keyboard while focused. It is user-only (an Agent asking for it is refused, and the Agent REST surface has no route for it) and every use is journaled to the Room's log, so the takeover is visible afterwards.
+- **A live check for the machine itself**: `DEVHOTEL_HOST_INPUT_PROBE=1` samples the real cursor position, foreground window and pressed keys before and after the desktop suite and fails the run if any of them moved. It is opt-in because it measures the physical machine, and it refuses to report success from a session with no interactive desktop.
+- MCP guidance now tells agents where UI input belongs: `adb -s emulator-5554 shell input …` through `run_in_room`, never Host automation aimed at the DevHotel preview window.
+- New: [Host input isolation](./docs/host-input-isolation.md) — the contract, the full audit table, the capability model, the regression coverage, and the platform limits it cannot remove.
+
 ## 0.4.3 — 2026-08-16
 
 ### Reset Room — housekeeping without checking out
