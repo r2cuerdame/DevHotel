@@ -245,6 +245,7 @@ export const en = {
     'Copy diagnostic produces a redacted bundle — passwords, tokens and .env values are masked — ready to paste into an issue or an LLM.',
   'diag.stepBackend': 'Isolation backend',
   'diag.stepMetadata': 'Room metadata',
+  'diag.stepLineEndings': 'Script line endings',
   'diag.stepEnv': 'Environment variables',
   'diag.stepGateway': 'Gateway route',
   'diag.stepHttps': 'DNS / HTTPS',

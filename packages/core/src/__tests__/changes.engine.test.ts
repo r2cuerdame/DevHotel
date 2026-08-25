@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
+import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
+import { LINE_ENDING_NORMALIZE_SCRIPT, LINE_ENDING_SCAN_SCRIPT, SCAN_SENTINEL } from '../checks/lineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../changes/types'
 import { changesRepo, type ChangesRepo } from '../store/changesRepo'
 import { roomsRepo, type RoomsRepo } from '../store/roomsRepo'
@@ -582,5 +584,145 @@ describe('package install change', () => {
     expect(packageInstallCommand('pnpm', { name: 'zod', version: '4.0.0', dev: true })).toBe(
       'pnpm add --save-exact --save-dev zod@4.0.0'
     )
+  })
+})
+
+describe('normalize-line-endings change', () => {
+  const CRLF_SCAN = `${SCAN_SENTINEL}\0./gradlew\0./scripts/build.sh\0`
+  const CLEAN_SCAN = `${SCAN_SENTINEL}\0`
+
+  /** A Room whose Windows-imported workspace still has CRLF launchers. */
+  function crlfRoom(): void {
+    rooms.update('room1abc', { sourceType: 'linked-folder', sourceRef: 'D:\\Projects\\demo', workspaceMode: 'hotel' })
+    backend.execResult = { code: 0, stdout: CRLF_SCAN, stderr: '' }
+    backend.oneShotHandler = (_spec, cmd) => ({
+      code: 0,
+      // the normalizer reports what it rewrote; a later scan finds nothing left
+      stdout: cmd === LINE_ENDING_NORMALIZE_SCRIPT ? CRLF_SCAN : CLEAN_SCAN,
+      stderr: ''
+    })
+  }
+
+  it('normalizes on a copy and publishes it as a new workspace generation', async () => {
+    crlfRoom()
+    const entry = await engine.execute(ctx(), 'normalize-line-endings', {}, 'user')
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toBe('2 scripts now use LF line endings')
+    expect(backend.calls).toContain('copyVolume:dh-room1abc-src:dh-room1abc-src-r1')
+    expect(rooms.get('room1abc')).toMatchObject({ workspaceVolumeRevision: 1, stateRevision: 1, syncStatus: 'modified' })
+    expect(entry.steps.join(' ')).toContain('./gradlew')
+  })
+
+  it('lists the normalized scripts and stays undoable', async () => {
+    crlfRoom()
+    const entry = await engine.execute(ctx(), 'normalize-line-endings', {}, 'user')
+    expect(entry.undoable).toBe(true)
+    expect(entry.undoStrategy).toBe('workspace-generation-swap')
+    expect(changes.lastUndoable('room1abc')?.id).toBe(entry.id)
+  })
+
+  it('undo republishes the untouched generation and drops the normalized copy', async () => {
+    crlfRoom()
+    const entry = await engine.execute(ctx(), 'normalize-line-endings', {}, 'user')
+    await engine.undo(ctx(), entry.id, 'user')
+    expect(rooms.get('room1abc')).toMatchObject({ workspaceVolumeRevision: 0 })
+    expect(backend.calls).toContain('removeWorkspaceVolume:r1')
+  })
+
+  it('never writes to a Room still bound to its Host folder', async () => {
+    // makeRoom() is a legacy Host bind; Host files are not ours to rewrite.
+    backend.execResult = { code: 0, stdout: CRLF_SCAN, stderr: '' }
+    await expect(engine.execute(ctx(), 'normalize-line-endings', {}, 'user')).rejects.toThrow(/protect Host files/)
+    expect(backend.calls.some((call) => call.startsWith('copyVolume'))).toBe(false)
+    expect(changes.list('room1abc')).toHaveLength(0)
+  })
+
+  it('says so plainly instead of copying a workspace for nothing', async () => {
+    rooms.update('room1abc', { workspaceMode: 'hotel' })
+    backend.execResult = { code: 0, stdout: CLEAN_SCAN, stderr: '' }
+    await expect(engine.execute(ctx(), 'normalize-line-endings', {}, 'user')).rejects.toThrow(NOTHING_TO_NORMALIZE)
+    expect(backend.calls.some((call) => call.startsWith('copyVolume'))).toBe(false)
+  })
+
+  it('fails verification when CRLF survived the rewrite', async () => {
+    rooms.update('room1abc', { workspaceMode: 'hotel' })
+    backend.execResult = { code: 0, stdout: CRLF_SCAN, stderr: '' }
+    // the re-scan still reports a CRLF script: the change must not claim success
+    backend.oneShotHandler = () => ({ code: 0, stdout: CRLF_SCAN, stderr: '' })
+    const entry = await engine.execute(ctx(), 'normalize-line-endings', {}, 'user')
+    expect(entry.status).toBe('applied')
+    expect(entry.verify).toMatchObject({ ok: false })
+    expect(entry.verify?.detail).toContain('still CRLF after normalization')
+  })
+})
+
+describe('android build line-ending preflight', () => {
+  function androidRoom(): void {
+    rooms.update('room1abc', {
+      provider: 'android',
+      sourceType: 'linked-folder',
+      sourceRef: 'D:\\Projects\\app',
+      workspaceMode: 'hotel',
+      startCommand: 'sh ./gradlew assembleDebug --no-daemon'
+    })
+    // the build's provenance manifest records real digests
+    backend.workspaceFingerprintValue = 'a'.repeat(64)
+  }
+
+  it('refuses a build with a CRLF gradlew and names the real cause', async () => {
+    androidRoom()
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0`, stderr: '' }
+    await expect(engine.execute(ctx(), 'android-build', {}, 'user')).rejects.toThrow(
+      /not a Gradle or build failure/
+    )
+    // refused before anything ran: no snapshot, no build container
+    expect(backend.calls.some((call) => call.startsWith('copyVolume'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('runOneShot'))).toBe(false)
+  })
+
+  it('builds normally once the launcher uses LF', async () => {
+    androidRoom()
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+    expect(entry.status).toBe('verified')
+  })
+
+  it('does not block a build because an unrelated script has CRLF', async () => {
+    androidRoom()
+    // the launcher scan only ever reports ./gradlew or ./mvnw; a CRLF helper
+    // elsewhere is a check-tab warning, not a reason to refuse a build
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+    expect(entry.status).toBe('verified')
+  })
+
+  it('re-attributes a failed build when the build input still holds CRLF scripts', async () => {
+    androidRoom()
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
+    backend.oneShotHandler = (_spec, cmd) =>
+      cmd === LINE_ENDING_SCAN_SCRIPT
+        ? { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
+        : { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('Execution failed for task')
+    expect(entry.verify?.detail).toContain('./scripts/sign.sh')
+    expect(entry.verify?.detail).toContain('not a Gradle or build failure')
+  })
+})
+
+describe('normalize-line-endings verification', () => {
+  it('does not call a clean scan a success while the Room is down', async () => {
+    rooms.update('room1abc', { workspaceMode: 'hotel' })
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0`, stderr: '' }
+    backend.oneShotHandler = (_spec, cmd) => ({
+      code: 0,
+      stdout: cmd === LINE_ENDING_NORMALIZE_SCRIPT ? `${SCAN_SENTINEL}\0./gradlew\0` : `${SCAN_SENTINEL}\0`,
+      stderr: ''
+    })
+    backend.webStateValue = 'exited'
+    const entry = await engine.execute(ctx(), 'normalize-line-endings', {}, 'user')
+    expect(entry.verify).toMatchObject({ ok: false })
+    expect(entry.verify?.detail).toContain('web process exited')
   })
 })

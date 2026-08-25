@@ -230,6 +230,7 @@ export const ru: Translation = {
     'Копирование диагностики создаёт очищенный отчёт — пароли, токены и значения .env замаскированы — можно сразу вставить в issue или LLM.',
   'diag.stepBackend': 'Бэкенд изоляции',
   'diag.stepMetadata': 'Метаданные номера',
+  'diag.stepLineEndings': 'Переводы строк в скриптах',
   'diag.stepEnv': 'Переменные окружения',
   'diag.stepGateway': 'Маршрут шлюза',
   'diag.stepHttps': 'DNS / HTTPS',

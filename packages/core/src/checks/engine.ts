@@ -8,6 +8,7 @@ import type { Gateway } from '../gateway/gateway'
 import { tcpAnswers } from '../changes/types'
 import { depsVolumeForGen } from '../changes/definitions/deps'
 import { createHttpRelayConnection } from '../relayProtocol'
+import { LINE_ENDING_SCAN_SCRIPT, lineEndingDiagnostic, lineEndingSummary, parseScriptPaths, scanCommand } from './lineEndings'
 
 export interface CheckCtx {
   room: RoomRecord
@@ -67,6 +68,11 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   } else {
     push({ step: 'source', status: 'healthy', summary: room.sourceType === 'empty' ? 'empty room' : 'skipped' })
   }
+
+  // 3b line endings — a CRLF launcher imported from a Windows Host fails with
+  // "not found" or a syntax error, which reads as a broken toolchain. Naming it
+  // here is what keeps that hour of misdirected debugging from happening.
+  push(await lineEndingCheck(ctx, awake, backendOk))
 
   if (room.provider === 'android') {
     return androidChecks(ctx, results, push, awake, backendOk)
@@ -266,6 +272,39 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
   }
 
   return finish(room.id, results)
+}
+
+/**
+ * Reports CRLF in the files Linux actually executes (gradlew, *.sh, anything
+ * with a shebang). Read-only: it never rewrites anything, and the offered fix
+ * is the explicit, undoable normalize-line-endings Change.
+ */
+async function lineEndingCheck(ctx: CheckCtx, awake: boolean, backendOk: boolean): Promise<CheckResult> {
+  const { room, backend } = ctx
+  if (room.workspaceMode === 'empty' || room.sourceType === 'empty') {
+    return { step: 'line-endings', status: 'healthy', summary: 'no scripts in an empty room' }
+  }
+  if (!backendOk || !awake) return { step: 'line-endings', ...ASLEEP }
+  if ((await backend.webState(room.id)) !== 'running') {
+    return { step: 'line-endings', status: 'unknown', summary: 'room is not running' }
+  }
+  const res = await backend.execInRoom(room.id, scanCommand(LINE_ENDING_SCAN_SCRIPT), { timeoutMs: 60_000 })
+  if (res.code !== 0) {
+    return { step: 'line-endings', status: 'unknown', summary: 'line-ending scan did not complete', detail: res.stderr.slice(-400) }
+  }
+  const paths = parseScriptPaths(res.stdout)
+  if (paths.length === 0) return { step: 'line-endings', status: 'healthy', summary: lineEndingSummary(paths) }
+  // A legacy Host bind executes the user's own folder, which DevHotel does not
+  // rewrite — offering the Change here would only produce a Fix button that is
+  // refused, so the row states the Host-side fix instead.
+  const canNormalizeInRoom = room.workspaceMode !== 'legacy-host-bind'
+  return {
+    step: 'line-endings',
+    status: 'broken',
+    summary: lineEndingSummary(paths),
+    detail: lineEndingDiagnostic(paths, canNormalizeInRoom),
+    ...(canNormalizeInRoom ? { fix: { kind: 'normalize-line-endings' as const } } : {})
+  }
 }
 
 /** Android rooms: JDK/Gradle build container plus the emulator screen served through the relay. */

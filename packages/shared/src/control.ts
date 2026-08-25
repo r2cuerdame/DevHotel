@@ -52,6 +52,7 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('https'), enabled: z.boolean() }).strict(),
   z.object({ kind: z.literal('internal-port'), port: z.number().int().min(1).max(65535) }).strict(),
   z.object({ kind: z.literal('deps-install'), clean: z.boolean() }).strict(),
+  z.object({ kind: z.literal('normalize-line-endings') }).strict(),
   z
     .object({
       kind: z.literal('package-install'),

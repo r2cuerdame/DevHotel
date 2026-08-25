@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### CRLF scripts from a Windows Host are named, not guessed at
+
+Reported from an AppDied Android Room: a `gradlew` imported from a Windows
+folder failed with `not found`, which reads as a broken Gradle install. It was
+never Gradle — the kernel was looking for an interpreter called `/bin/sh\r`.
+
+- **A `line-endings` check step.** Room checks now scan the workspace for CRLF
+  in the files Linux actually executes — `gradlew`, `mvnw`, `*.sh` and anything
+  with a shebang — and report them by path with a Fix button. Generated and
+  vendored trees, symlinks and files over 1 MB are skipped.
+- **Builds refuse before they waste your time.** An Android build whose
+  `gradlew` or `mvnw` has CRLF stops in preflight with the real reason instead
+  of a Gradle-shaped failure minutes later. A build that fails for any other
+  reason re-scans its immutable build input, so a Gradle task that shelled out
+  to a CRLF helper script is attributed correctly rather than left ambiguous.
+- **`normalize-line-endings`, and only when asked.** A new Quick Change rewrites
+  CRLF to LF in the Room's copy of those scripts. It runs on a copy of the
+  workspace and publishes it as a new generation, so it is undoable like a
+  package install. Nothing normalizes as a side effect of import, sync, wake or
+  build.
+- **Host files are still never written.** The change is refused for Rooms bound
+  to a Host folder, and the diagnostic also names the Host-side fix — a
+  `.gitattributes` rule such as `* text=auto eol=lf` — for people who would
+  rather fix the source of the problem.
+
 ## 0.4.3 — 2026-08-16
 
 ### Reset Room — housekeeping without checking out

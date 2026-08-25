@@ -123,14 +123,14 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'check_room',
       description:
-        'Run DevHotel health checks on a room (runtime, deps, process, port, gateway, HTTPS, HTTP) and return the report with suggested fixes.',
+        'Run DevHotel health checks on a room (runtime, deps, line endings, process, port, gateway, HTTPS, HTTP) and return the report with suggested fixes.',
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).runChecks(a.roomId))
     },
     {
       name: 'apply_quick_change',
       description:
-        'Apply a quick change to a room as a verified, undoable transaction. Web rooms: node-version, package-manager, start-command, domain, https, internal-port, deps-install, service-install/version/restart/remove (postgres/redis), db-backup/restore, package-install. Android rooms: android-build (provenance APK), android-run (build, install and launch on the emulator screen), emulator-config (device/OS), start-command.',
+        'Apply a quick change to a room as a verified, undoable transaction. Web rooms: node-version, package-manager, start-command, domain, https, internal-port, deps-install, service-install/version/restart/remove (postgres/redis), db-backup/restore, package-install. Android rooms: android-build (provenance APK), android-run (build, install and launch on the emulator screen), emulator-config (device/OS), start-command. Both: normalize-line-endings, which rewrites CRLF to LF in the Room copies of gradlew, mvnw, *.sh and other shebang scripts after a Windows Host import — never applied on its own, and undoable.',
       schema: { roomId: zRoomId, change: zQuickChange },
       handler: wrap(async (a) => (await getClient()).applyChange(a.roomId, a.change))
     },

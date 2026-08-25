@@ -61,8 +61,8 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
 | `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? }` | `{ code, stdout, stderr }` — buffered until exit; redirect long output to a file |
-| `POST /v1/rooms/:id/checks` | | 14-step check report |
-| `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
+| `POST /v1/rooms/:id/checks` | | 15-step check report (includes `line-endings`) |
+| `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
 | `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined |
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
