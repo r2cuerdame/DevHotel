@@ -146,6 +146,27 @@ export const migrations: Migration[] = [
     // source migration sequence. The final v3 schema above is authoritative.
     version: 4,
     sql: 'SELECT 1;'
+  },
+  {
+    // Long operations (waking a Room) outlive the call that started them, so
+    // their progress has to survive both a caller timeout and an app restart.
+    version: 5,
+    sql: `
+      CREATE TABLE operations (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        status TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        stages_json TEXT NOT NULL DEFAULT '[]',
+        error_json TEXT,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+      );
+      CREATE INDEX idx_operations_room_started ON operations(room_id, started_at DESC);
+    `
   }
 ]
 

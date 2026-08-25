@@ -365,6 +365,7 @@ export function roomsRepo(db: Db): RoomsRepo {
       try {
         sqlite.prepare('DELETE FROM changes WHERE room_id = ?').run(id)
         sqlite.prepare('DELETE FROM checks WHERE room_id = ?').run(id)
+        sqlite.prepare('DELETE FROM operations WHERE room_id = ?').run(id)
         sqlite
           .prepare(
             `DELETE FROM settings

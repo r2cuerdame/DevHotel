@@ -6,6 +6,20 @@ import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
+const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
+const runningOperation = {
+  id: OPERATION_ID,
+  kind: 'room-start',
+  roomId: 'abc12345',
+  actor: 'agent',
+  status: 'running',
+  stage: 'container-start',
+  stages: [],
+  error: null,
+  startedAt: '2026-08-25T00:00:00.000Z',
+  updatedAt: '2026-08-25T00:00:00.000Z',
+  finishedAt: null
+}
 let server: Server
 let port: number
 const seen: { method: string; url: string; body: any }[] = []
@@ -24,7 +38,16 @@ beforeAll(async () => {
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
       }
-      if (req.url === '/v1/rooms/abc12345/start') return void res.writeHead(204).end()
+      if (req.url?.startsWith('/v1/rooms/abc12345/start')) {
+        return void res.end(JSON.stringify({ operation: runningOperation }))
+      }
+      if (req.url === '/v1/rooms/abc12345/sleep') return void res.writeHead(204).end()
+      if (req.url?.startsWith(`/v1/operations/${OPERATION_ID}`)) {
+        return void res.end(JSON.stringify({ operation: { ...runningOperation, status: 'succeeded', stage: 'complete' } }))
+      }
+      if (req.url?.startsWith('/v1/rooms/abc12345/operations')) {
+        return void res.end(JSON.stringify({ operations: [runningOperation] }))
+      }
       if (req.url === '/v1/rooms/abc12345/exec') {
         return void res.end(JSON.stringify({ code: 0, stdout: 'ok', stderr: '' }))
       }
@@ -60,7 +83,11 @@ describe('ControlClient', () => {
   })
 
   it('maps 204 to undefined', async () => {
-    await expect(client().startRoom('abc12345')).resolves.toBeUndefined()
+    await expect(client().sleepRoom('abc12345')).resolves.toBeUndefined()
+  })
+
+  it('answers a start with the wake operation instead of a bare success', async () => {
+    await expect(client().startRoom('abc12345')).resolves.toEqual({ operation: runningOperation })
   })
 })
 
@@ -113,6 +140,7 @@ describe('makeTools', () => {
         'android_run',
         'android_screenshot',
         'apply_quick_change',
+        'check_operation',
         'check_room',
         'clone_room',
         'copy_diagnostic',
@@ -186,5 +214,34 @@ describe('makeTools', () => {
   it('errors surface as isError content, not throws', async () => {
     const res = await byName.inspect_room!.handler({ roomId: 'nope' })
     expect(res.isError).toBe(true)
+  })
+
+  it('start_room hands back the wake operation, not a "started" claim', async () => {
+    const res = await byName.start_room!.handler({ roomId: 'abc12345', waitMs: 0 })
+    expect(res.isError).toBeUndefined()
+    const operation = JSON.parse(firstText(res)) as { id: string; status: string; stage: string }
+    expect(operation).toMatchObject({ id: OPERATION_ID, status: 'running', stage: 'container-start' })
+    const req = seen.findLast((s) => s.url?.startsWith('/v1/rooms/abc12345/start'))
+    expect(req?.body).toEqual({ waitMs: 0 })
+  })
+
+  it('check_operation follows an operation id through to its terminal status', async () => {
+    const res = await byName.check_operation!.handler({ operationId: OPERATION_ID, waitMs: 1000 })
+    const operation = JSON.parse(firstText(res)) as { status: string; stage: string }
+    expect(operation).toMatchObject({ status: 'succeeded', stage: 'complete' })
+    expect(seen.findLast((s) => s.url?.startsWith('/v1/operations/'))?.url).toContain('waitMs=1000')
+  })
+
+  it('check_operation lists a Room’s recent operations', async () => {
+    const res = await byName.check_operation!.handler({ roomId: 'abc12345' })
+    const operations = JSON.parse(firstText(res)) as { id: string }[]
+    expect(operations).toHaveLength(1)
+    expect(operations[0]?.id).toBe(OPERATION_ID)
+  })
+
+  it('check_operation asks for an id or a Room instead of guessing', async () => {
+    const res = await byName.check_operation!.handler({})
+    expect(res.isError).toBe(true)
+    expect(firstText(res)).toMatch(/operationId|roomId/)
   })
 })

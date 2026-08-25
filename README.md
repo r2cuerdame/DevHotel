@@ -45,7 +45,7 @@ DevHotel distinguishes two service layers. A **Room Service** belongs to one Roo
 
 The first concrete Hotel Service is **GitHub Service**. This preview provisions a checksum-verified, pinned `gh` build in Hotel-owned storage and can keep an explicitly supplied GitHub token in Electron's encrypted credential vault; it does not resolve or authenticate through Host `gh`. Provisioning makes the service available but does not enable it for an Agent. The current vertical slice covers owned installation, version/health checks, credential Connect/Disconnect, and cleanup with Hotel data. Agent assignment, scoped permission enforcement, native-interface connection, and revoke are still target control-plane work. Project-versioned Node, pnpm, Vite, Prisma, and compilers remain Room-owned because they affect reproducibility. MCP and Skills are later Hotel Service categories, not Room package installs. The DevHotel MCP adapter remains a replaceable client of the stable REST API, not the foundation or lifecycle owner. See the [Agent Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-agent-runtime-design.md) and [sandbox/backend research ADR](./docs/superpowers/specs/2026-08-10-devhotel-sandbox-research.md).
 
-> **Target architecture:** the current developer preview still keeps orchestration in the Electron main process and does not yet provide the independent daemon, durable Job recovery, Room Key, lease, fencing, or capability-grant model described above.
+> **Target architecture:** the current developer preview still keeps orchestration in the Electron main process and does not yet provide the independent daemon, Room Key, lease, fencing, or capability-grant model described above. Waking a Room is the one long operation that already survives a client's disconnect — it has a durable ID, stages and a terminal outcome ([Long operations](./docs/control-api.md#long-operations)); builds and tests are not Jobs yet.
 
 ## One Installer. Zero Prerequisites.
 
@@ -136,7 +136,9 @@ Releases are cut locally, not by CI — see [Releasing](./docs/releasing.md).
 
 Settings → **MCP** gives you a one-line registration command for Claude Code and an `mcpServers` snippet for any other client. Register it by absolute path; the bundled server reconnects by itself when the DevHotel app restarts.
 
-The MCP server exposes 27 tools over the same contract the app uses: create/start/sleep/clone/rename/delete a Room, run commands in it, apply and undo Quick Changes, read logs, components and diagnostics, push and pull workspace files, reset a Room, request a Host sync under the Room's revocable grant, and — for Android Rooms — build, install and launch an APK and take a screenshot of the phone.
+The MCP server exposes 28 tools over the same contract the app uses: create/start/sleep/clone/rename/delete a Room, run commands in it, apply and undo Quick Changes, read logs, components and diagnostics, push and pull workspace files, reset a Room, request a Host sync under the Room's revocable grant, and — for Android Rooms — build, install and launch an APK and take a screenshot of the phone.
+
+Waking a Room outlasts most tool timeouts, so `start_room` answers with the wake as an **operation** — a durable ID, a `running`/`succeeded`/`failed` status, the stage it reached, and the terminal error if there was one. `check_operation` follows that ID to the end. Your own timeout no longer reads as a failure, and asking again joins the wake in progress instead of starting a second one. The same thing over REST: [Long operations](./docs/control-api.md#long-operations).
 
 Agents (or any local tool) can drive DevHotel **without MCP** through the same stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), bearer auth, agent semantics, and every endpoint.
 
