@@ -179,4 +179,27 @@ describe('agent control API host boundary', () => {
       control.stop()
     }
   })
+
+  it('exposes no Host-input operation to Agents', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-host-input-'))
+    roots.push(userData)
+    const openWindows = vi.fn()
+    const control = await startControlApi({ openWindows } as unknown as RoomOrchestrator, userData, 'test')
+
+    try {
+      const headers = { authorization: `Bearer ${control.info.token}` }
+      // The VMware console takes the Host cursor, keyboard and foreground
+      // window; it is a user-only capability and must have no Agent route.
+      for (const op of ['open-console', 'open-windows', 'console', 'input', 'focus']) {
+        const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/${op}`, {
+          method: 'POST',
+          headers
+        })
+        expect(response.status, `POST /v1/rooms/:id/${op} must not exist`).toBe(404)
+      }
+      expect(openWindows).not.toHaveBeenCalled()
+    } finally {
+      control.stop()
+    }
+  })
 })

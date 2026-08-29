@@ -36,6 +36,11 @@ room's Changes list. Host boundaries hold:
   journaled as `agent`, and retains the replaced workspace generation so a
   wrong sync stays recoverable. Moving a legacy Room into the Hotel remains
   user-only.
+- The Host's mouse, keyboard and foreground window are not on this API. UI
+  input belongs inside the Room — for an Android Room, `exec` an
+  `adb -s emulator-5554 shell input …` command rather than automating the Host
+  desktop against the DevHotel preview window. See
+  [Host input isolation](./host-input-isolation.md).
 
 ## Endpoints
 

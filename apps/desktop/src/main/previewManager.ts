@@ -20,6 +20,7 @@ import {
   roomPreviewPartition
 } from './previewSecurity'
 import { PreviewSyncGuard } from './previewSync'
+import { hardenRoomSession } from './roomSessionPolicy'
 
 const THUMB_INTERVAL_MS = 30_000
 
@@ -421,10 +422,9 @@ export class PreviewManager {
     this.configuredPartitions.add(partition)
     const caPath = join(this.userData, 'ca', 'rootCA.pem')
     const roomSession = session.fromPartition(partition)
-    roomSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
-    roomSession.setPermissionCheckHandler(() => false)
-    roomSession.setDevicePermissionHandler(() => false)
-    roomSession.on('will-download', (event) => event.preventDefault())
+    // Closes the Host-input surface (Pointer Lock, Keyboard Lock, fullscreen)
+    // along with every other Host capability. See roomSessionPolicy.ts.
+    hardenRoomSession(roomSession)
     roomSession.webRequest.onBeforeRequest((details, callback) => {
       const home = this.safeHomeUrl(roomId)
       callback({

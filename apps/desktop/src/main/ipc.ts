@@ -53,6 +53,7 @@ import {
   validateCleanRemovalTarget
 } from './cleanRemoval'
 import type { CleanRemovalOperation } from './cleanRemovalGate'
+import { androidActionCommand } from './androidInput'
 import { assertTrustedMainFrame, type RendererIpcEvent } from './ipcSecurity'
 import { LinkedFolderGrants, requirePathWithinRoots } from './linkedFolderGrants'
 import { makeMcpSetupInfo } from './mcpSetup'
@@ -216,7 +217,7 @@ export function registerIpc(opts: {
       throw error
     }
   })
-  handle(IPC.roomsOpenWindows, (_event, roomId) => orch.openWindows(zRoomId.parse(roomId)))
+  handle(IPC.roomsOpenWindows, (_event, roomId) => orch.openWindows(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsResetWindows, (_event, roomId) => orch.resetWindows(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsResetSyncBaseline, (_event, roomId) => orch.resetSyncBaseline(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsSetAgentHostSync, (_event, roomId, allowed) =>
@@ -384,16 +385,9 @@ export function registerIpc(opts: {
   handle(IPC.androidAction, (_event, roomId, action) => {
     const safeRoomId = zRoomId.parse(roomId)
     const safeAction = zAndroidAction.parse(action)
-    const keycodes = { back: 4, home: 3, recents: 187 } as const
-    // Rotation steps the guest through its four orientations. The emulator
-    // screen keeps the size the Room was created with, so a rotated device is
-    // letterboxed inside it — Stack's orientation setting resizes the screen
-    // itself for a full-size landscape Room.
-    const command =
-      safeAction === 'rotate'
-        ? "adb -s emulator-5554 shell 'settings put system accelerometer_rotation 0; r=$(settings get system user_rotation); case \"$r\" in 0|1|2|3) ;; *) r=0 ;; esac; settings put system user_rotation $(((r + 1) % 4))'"
-        : `adb -s emulator-5554 shell input keyevent ${keycodes[safeAction]}`
-    return orch.execInRoom(safeRoomId, ['sh', '-lc', command], { timeoutMs: 20_000 }, 'user')
+    // Room-local input: an in-Room `adb` command against the Room's own
+    // emulator, never a synthetic Host click on the preview. See androidInput.ts.
+    return orch.execInRoom(safeRoomId, androidActionCommand(safeAction), { timeoutMs: 20_000 }, 'user')
   })
 
   handle(IPC.previewSetBounds, (_event, roomId, bounds) =>

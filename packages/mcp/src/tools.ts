@@ -112,7 +112,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits.',
+        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at the DevHotel preview — that would take over the real desktop of whoever is running DevHotel.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
@@ -215,7 +215,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_screenshot',
       description:
-        "Capture the Android room's phone screen and return it as an image. Default 'auto' uses sharp guest-side screencap; pass mode 'screen' to grab the emulator display instead — that also captures apps that set FLAG_SECURE. The room must be awake.",
+        "Capture the Android room's phone screen and return it as an image. Default 'auto' uses sharp guest-side screencap; pass mode 'screen' to grab the emulator display instead — that also captures apps that set FLAG_SECURE. The room must be awake. Read the returned image; never point host screen-capture or host input automation at the DevHotel preview window.",
       schema: {
         roomId: zRoomId,
         mode: z.enum(['auto', 'screen']).optional().describe("'screen' captures the display output, including FLAG_SECURE apps")
