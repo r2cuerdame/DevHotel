@@ -13,7 +13,7 @@ import {
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
-import type { RoomOrchestrator } from '@devhotel/core'
+import { isDevHotelError, type RoomOrchestrator } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /** Hotel Services reachable by agents; populated after app startup wiring. */
@@ -35,6 +35,10 @@ export async function startControlApi(
 
   const server = createServer((req, res) => {
     void handle(req, res).catch((err) => {
+      if (isDevHotelError(err)) {
+        sendJson(res, err.httpStatus, { error: err.message, code: err.code, recoveryHint: err.recoveryHint })
+        return
+      }
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) })
     })
   })
@@ -83,7 +87,7 @@ export async function startControlApi(
       const op = parts[3]
 
       if (!roomId && req.method === 'GET') {
-        sendJson(res, 200, orch.listRooms().map(roomForAgent))
+        sendJson(res, 200, (await orch.listRoomsRuntime()).map(roomForAgent))
         return
       }
       if (!roomId && req.method === 'POST') {
@@ -93,7 +97,7 @@ export async function startControlApi(
         return
       }
       if (safeRoomId && !op && req.method === 'GET') {
-        const inspection = orch.inspectRoom(safeRoomId)
+        const inspection = await orch.inspectRoomRuntime(safeRoomId)
         sendJson(res, 200, { ...inspection, room: roomForAgent(inspection.room), dataDir: '[Hotel data hidden]' } satisfies RoomInspection)
         return
       }

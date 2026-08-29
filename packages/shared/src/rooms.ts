@@ -23,6 +23,20 @@ export type ResetServiceMode = 'keep' | 'empty' | 'remove'
 /** Where `/workspace` actually lives. Legacy host binds are compatibility-only. */
 export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
+export type RuntimeComponentState = 'running' | 'exited' | 'stopped' | 'missing' | 'unknown' | 'not-checked'
+export type RoomRuntimeState = 'running' | 'degraded' | 'dead' | 'stopped' | 'unknown'
+
+/** Live, read-only runtime observation. This never replaces persisted working-state or sync metadata. */
+export interface RoomRuntimeStatus {
+  state: RoomRuntimeState
+  expected: 'running' | 'stopped' | 'transitional'
+  recordedStatus: RoomStatus
+  main: RuntimeComponentState
+  emulator: RuntimeComponentState | null
+  observedAt: string
+  detail: string
+  recoveryHint: string | null
+}
 
 export type ServiceKind = 'postgres' | 'redis'
 export type CloneServiceMode = 'copy' | 'empty' | 'exclude'
@@ -162,6 +176,8 @@ export interface BackupInfo {
 
 export interface RoomInspection {
   room: RoomRecord
+  /** Present on revalidated user/Agent inspection surfaces; absent on internal metadata-only reads. */
+  runtimeStatus?: RoomRuntimeStatus
   /** Windows VM Rooms do not expose an embedded browser URL. */
   urls: { app: string | null }
   /** host folder holding this room's manifest.yaml, logs/, thumbnail */

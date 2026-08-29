@@ -153,7 +153,7 @@ export function registerIpc(opts: {
   })
 
   /* rooms */
-  handle(IPC.roomsList, () => orch.listRooms())
+  handle(IPC.roomsList, () => orch.listRoomsRuntime())
   handle(IPC.roomsPlan, (_event, input) => {
     const parsed = authorizeLinkedFolder(zRendererPlanRoomInput.parse(input))
     return orch.planRoom(parsed)
@@ -177,7 +177,7 @@ export function registerIpc(opts: {
   handle(IPC.roomsSleep, (_event, roomId) => orch.sleepRoom(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsDelete, (_event, roomId) => orch.deleteRoom(zRoomId.parse(roomId), 'user'))
   handle(IPC.roomsRestartWeb, (_event, roomId) => orch.restartWeb(zRoomId.parse(roomId), 'user'))
-  handle(IPC.roomsInspect, (_event, roomId) => orch.inspectRoom(zRoomId.parse(roomId)))
+  handle(IPC.roomsInspect, (_event, roomId) => orch.inspectRoomRuntime(zRoomId.parse(roomId)))
   handle(IPC.roomsRename, (_event, roomId, nickname) => {
     const parsed = zRenameRoomInput.parse({ roomId, nickname })
     return orch.renameRoom(parsed.roomId, parsed.nickname)

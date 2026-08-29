@@ -45,7 +45,8 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
   return [
     {
       name: 'list_rooms',
-      description: 'List all DevHotel rooms with project, nickname, status, stack, and domain.',
+      description:
+        'List all DevHotel rooms with project, nickname, live runtime status, stack, and domain. The read-only liveness check never starts or repairs a Room.',
       schema: {},
       handler: wrap(async () => (await getClient()).listRooms())
     },
@@ -105,14 +106,15 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     },
     {
       name: 'inspect_room',
-      description: 'Inspect a room: status, URL, stack, latest health check, recent changes and undoable change.',
+      description:
+        'Inspect a room with read-only runtime revalidation: recorded status, live/degraded/dead components, recovery hint, URL, stack, latest health check, recent changes and undoable change.',
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).inspectRoom(a.roomId))
     },
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at the DevHotel preview — that would take over the real desktop of whoever is running DevHotel.',
+        'Run a command inside the room (never on the host). Dead runtimes are rejected with a stable DevHotel error code and recovery hint before Docker exec. Use for installs, builds, scripts. Returns exit code, stdout, stderr. Output is buffered until exit — for long/verbose commands redirect to a file (`... > /workspace/out.log 2>&1`) and fetch it with room_pull_file so nothing is lost to message limits. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at the DevHotel preview — that would take over the real desktop of whoever is running DevHotel.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
@@ -208,7 +210,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'hotel_status',
       description:
-        'One call answering "is DevHotel ready and what is running": app version, isolation backend health, gateway ports/routes, and every room with provider, status, domain, URL, and (for awake Android rooms) emulator state.',
+        'One read-only call answering "is DevHotel ready and what is actually running": app version, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
       schema: {},
       handler: wrap(async () => (await getClient()).hotelStatus())
     },
