@@ -151,6 +151,31 @@ export class ControlClient {
       contentBase64
     })
   }
+  androidDevices() {
+    return this.req<unknown>('GET', '/v1/devices')
+  }
+  refreshAndroidDevices() {
+    return this.req<unknown>('POST', '/v1/devices/refresh')
+  }
+  attachAndroidDevice(roomId: string, body: Record<string, unknown>) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/device/attach`, body)
+  }
+  releaseAndroidDevice(roomId: string, reason?: string) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/device/release`, reason ? { reason } : {})
+  }
+  adbOnDevice(roomId: string, args: string[], timeoutMs?: number) {
+    return this.req<{ code: number; stdout: string; stderr: string }>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/device/adb`,
+      { args, timeoutMs }
+    )
+  }
+  heartbeatAndroidDevice(leaseId: string, busy?: boolean) {
+    return this.req<unknown>('POST', '/v1/devices/heartbeat', { leaseId, busy })
+  }
+  cancelAndroidDeviceRequest(requestId: string) {
+    return this.req<unknown>('POST', '/v1/devices/cancel', { requestId })
+  }
   hotelGithubStatus() {
     return this.req<unknown>('GET', '/v1/hotel/github')
   }

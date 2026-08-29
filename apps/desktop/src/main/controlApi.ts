@@ -7,8 +7,13 @@ import {
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
+  zAgentAdbBody,
+  zAttachDeviceBody,
+  zCancelRequestBody,
   zExecBody,
+  zHeartbeatBody,
   zLogKind,
+  zReleaseDeviceBody,
   zRoomId,
   zUndoChangeBody,
   type ControlInfo
@@ -62,6 +67,29 @@ export async function startControlApi(
       return
     }
 
+    // The shared Android phones are Hotel-scoped, not Room-scoped: an agent may
+    // always see who holds what, so it can explain why it is waiting.
+    if (parts[1] === 'devices') {
+      if (!parts[2] && req.method === 'GET') {
+        sendJson(res, 200, orch.androidDeviceStatus())
+        return
+      }
+      if (parts[2] === 'refresh' && req.method === 'POST') {
+        sendJson(res, 200, await orch.refreshAndroidDevices())
+        return
+      }
+      if (parts[2] === 'heartbeat' && req.method === 'POST') {
+        const body = zHeartbeatBody.parse(await readBody(req))
+        sendJson(res, 200, orch.heartbeatAndroidDevice(body.leaseId, { busy: body.busy }))
+        return
+      }
+      if (parts[2] === 'cancel' && req.method === 'POST') {
+        const body = zCancelRequestBody.parse(await readBody(req))
+        sendJson(res, 200, orch.cancelAndroidDeviceRequest(body.requestId))
+        return
+      }
+    }
+
     if (parts[1] === 'hotel' && parts[2] === 'github') {
       if (!hotel.github) {
         sendJson(res, 503, { error: 'Hotel services are still starting' })
@@ -108,6 +136,28 @@ export async function startControlApi(
         sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
         return
       }
+      // /v1/rooms/:id/device/(attach|release|adb)
+      if (safeRoomId && op === 'device' && req.method === 'POST') {
+        const action = parts[4]
+        if (action === 'attach') {
+          // The Room owns the project name on the lease; an agent cannot claim
+          // to be a different project when it takes the phone.
+          const body = zAttachDeviceBody.parse(await readBody(req))
+          sendJson(res, 200, await orch.attachAndroidDevice(safeRoomId, body))
+          return
+        }
+        if (action === 'release') {
+          const body = zReleaseDeviceBody.parse(await readBody(req))
+          sendJson(res, 200, await orch.releaseAndroidDevice(safeRoomId, body.reason))
+          return
+        }
+        if (action === 'adb') {
+          const body = zAgentAdbBody.parse(await readBody(req))
+          sendJson(res, 200, await orch.adbOnDevice(safeRoomId, body.args, { timeoutMs: body.timeoutMs }))
+          return
+        }
+      }
+
       if (safeRoomId && op && req.method === 'POST') {
         switch (op) {
           case 'start':

@@ -172,4 +172,6 @@ export interface RoomInspection {
   recentChanges: import('./changes').ChangeEntry[]
   lastUndoable: import('./changes').ChangeEntry | null
   storage: Record<string, number> | null
+  /** The shared Android phone this Room currently holds, if any. */
+  device: import('./androidDevices').DeviceLease | null
 }

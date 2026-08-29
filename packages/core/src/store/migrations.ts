@@ -146,6 +146,81 @@ export const migrations: Migration[] = [
     // source migration sequence. The final v3 schema above is authoritative.
     version: 4,
     sql: 'SELECT 1;'
+  },
+  {
+    // Android Device Broker. A physical phone is Hotel-owned and shared, so its
+    // ownership record cannot live in a Room row: the lease has to outlive the
+    // Room process that took it, and a Room deletion must free the phone rather
+    // than cascade the device away with it.
+    version: 5,
+    sql: `
+      CREATE TABLE android_devices (
+        id TEXT PRIMARY KEY,
+        serial TEXT NOT NULL UNIQUE,
+        nickname TEXT NOT NULL,
+        model TEXT,
+        android_version TEXT,
+        api_level INTEGER,
+        connection TEXT NOT NULL CHECK (connection IN ('usb', 'wireless', 'emulator')),
+        health TEXT NOT NULL CHECK (health IN ('ready', 'unauthorized', 'offline', 'disconnected')),
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE TABLE android_device_leases (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES android_devices(id) ON DELETE CASCADE,
+        room_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        issue_ref TEXT,
+        run_id TEXT,
+        worker_id TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'released', 'expired', 'revoked')),
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        activity_at TEXT NOT NULL,
+        ttl_ms INTEGER NOT NULL,
+        max_duration_ms INTEGER NOT NULL,
+        released_at TEXT,
+        release_reason TEXT
+      );
+      -- The exclusivity invariant itself: at most one active lease per device,
+      -- enforced by the database rather than by careful callers.
+      CREATE UNIQUE INDEX idx_android_lease_exclusive
+        ON android_device_leases(device_id) WHERE state = 'active';
+      CREATE INDEX idx_android_lease_room ON android_device_leases(room_id, state);
+      CREATE TABLE android_device_queue (
+        id TEXT PRIMARY KEY,
+        device_id TEXT REFERENCES android_devices(id) ON DELETE CASCADE,
+        room_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        issue_ref TEXT,
+        run_id TEXT,
+        constraints_json TEXT NOT NULL DEFAULT '{}',
+        priority INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL CHECK (state IN ('waiting', 'granted', 'cancelled')),
+        requested_at TEXT NOT NULL,
+        resolved_at TEXT,
+        ttl_ms INTEGER NOT NULL,
+        max_duration_ms INTEGER NOT NULL
+      );
+      -- One waiting request per Room per device: a retrying agent rejoins its
+      -- own place in line instead of stacking duplicates ahead of everyone.
+      CREATE UNIQUE INDEX idx_android_queue_dedupe
+        ON android_device_queue(room_id, IFNULL(device_id, '')) WHERE state = 'waiting';
+      CREATE INDEX idx_android_queue_order ON android_device_queue(state, priority DESC, requested_at);
+      CREATE TABLE android_device_events (
+        id TEXT PRIMARY KEY,
+        device_id TEXT,
+        room_id TEXT,
+        kind TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        at TEXT NOT NULL
+      );
+      CREATE INDEX idx_android_events_at ON android_device_events(at DESC);
+    `
   }
 ]
 

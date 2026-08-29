@@ -19,6 +19,10 @@ import type {
   SourceType
 } from '@devhotel/shared'
 import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
+import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
+import { AndroidDeviceBroker } from './devices/broker'
+import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
+import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
@@ -96,6 +100,8 @@ export interface OrchestratorOptions {
   appVersion: string
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
+  /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
+  adb?: AdbHost
 }
 
 const EMPTY_READER: SourceReader = {
@@ -122,6 +128,8 @@ export class RoomOrchestrator {
   private readonly gateway: Gateway
   private readonly appVersion: string
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
+  /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
+  readonly devices: AndroidDeviceBroker
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -135,6 +143,16 @@ export class RoomOrchestrator {
     this.checks = checksRepo(opts.db)
     this.settings = settingsRepo(opts.db)
     this.logs = new LogHub(opts.userData, opts.backend)
+    this.devices = new AndroidDeviceBroker({
+      repo: androidDevicesRepo(opts.db),
+      adb: opts.adb ?? new SpawnedAdbHost(),
+      // A lease survives only while its Room is awake. A sleeping or deleted
+      // Room cannot be running a test, so its phone belongs to the queue.
+      ownerLiveness: (lease) => {
+        const room = this.rooms.get(lease.roomId)
+        return room !== null && room.status !== 'sleeping'
+      }
+    })
     registerQuickChanges(this.engine)
   }
 
@@ -883,6 +901,7 @@ export class RoomOrchestrator {
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'sleep room')
+    await this.releaseAndroidDevice(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
       this.rooms.update(roomId, { status: 'sleeping', hostPort: null, lastUsedAt: new Date().toISOString() })
@@ -1020,6 +1039,7 @@ export class RoomOrchestrator {
   private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
+    await this.releaseAndroidDevice(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
       const { reclaimedBytes } = await windowsVm.delete(roomId)
@@ -1103,11 +1123,121 @@ export class RoomOrchestrator {
    * 'screen' grabs the X display instead, which also shows FLAG_SECURE apps
    * (exactly what the preview shows).
    */
+  // ---------------------------------------------------------------------------
+  // Shared Android devices
+  //
+  // A USB phone is Hotel infrastructure shared by every Room, so the Room-facing
+  // API is deliberately narrow: attach, release, heartbeat, and "run this on
+  // whatever is attached". Rooms never name a serial, and never reach the phone
+  // except through the broker's lease check.
+  // ---------------------------------------------------------------------------
+
+  refreshAndroidDevices(): Promise<ReturnType<AndroidDeviceBroker['listDevices']>> {
+    return this.devices.refreshInventory()
+  }
+
+  androidDeviceStatus(): DeviceBrokerStatus {
+    return this.devices.status()
+  }
+
+  /** Ask for a phone for this Room. Returns a lease, or a place in the queue. */
+  async attachAndroidDevice(
+    roomId: string,
+    request: Omit<DeviceRequest, 'roomId' | 'project'> & { project?: string }
+  ): Promise<DeviceRequestResult> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Only Android Rooms can attach an Android device')
+    const result = await this.devices.requestDevice({ ...request, roomId, project: request.project ?? room.project })
+    this.olog(
+      roomId,
+      result.state === 'granted'
+        ? `attached device ${result.device.nickname} for ${request.purpose}`
+        : `queued for a device (#${result.position}): ${result.reason}`
+    )
+    this.emit(roomId, 'status')
+    return result
+  }
+
+  async releaseAndroidDevice(roomId: string, reason = 'released by the Room'): Promise<DeviceLease | null> {
+    const released = await this.devices.releaseRoom(roomId, reason)
+    if (released) {
+      this.olog(roomId, `released the attached device: ${reason}`)
+      this.emit(roomId, 'status')
+    }
+    return released?.lease ?? null
+  }
+
+  heartbeatAndroidDevice(leaseId: string, opts: { busy?: boolean } = {}): DeviceLease {
+    return this.devices.heartbeat(leaseId, opts)
+  }
+
+  cancelAndroidDeviceRequest(requestId: string): DeviceQueueEntry {
+    return this.devices.cancelRequest(requestId)
+  }
+
+  setAndroidDeviceNickname(deviceId: string, nickname: string): ReturnType<AndroidDeviceBroker['setNickname']> {
+    return this.devices.setNickname(deviceId, nickname)
+  }
+
+  /** Reclaim phones from dead owners; the desktop app calls this on a timer. */
+  reapAndroidDevices(): ReturnType<AndroidDeviceBroker['reap']> {
+    return this.devices.reap()
+  }
+
+  /**
+   * Where a Room's Android automation should point.
+   *
+   * This is the whole reason a high-level primitive never has to write a serial:
+   * a Room with a phone attached targets that phone, and a Room without one
+   * targets its own emulator. Attaching a device changes what `android-run` and
+   * screenshots drive, with nothing else in the caller changing.
+   */
+  async resolveAdbTarget(roomId: string): Promise<{ kind: 'physical' | 'emulator'; serial: string; deviceId: string | null; nickname: string }> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Only Android Rooms have an ADB target')
+    const lease = this.devices.leaseForRoom(roomId)
+    if (lease) {
+      const device = this.devices.listDevices().find((entry) => entry.id === lease.deviceId)
+      if (device && device.health === 'ready') {
+        return { kind: 'physical', serial: device.serial, deviceId: device.id, nickname: device.nickname }
+      }
+    }
+    return { kind: 'emulator', serial: EMULATOR_ADB_SERIAL, deviceId: null, nickname: 'Room emulator' }
+  }
+
+  /**
+   * Run an ADB command against the Room's attached phone, through the lease
+   * check. An interfering command from a Room that does not hold the lease is
+   * refused here — before anything reaches the device.
+   */
+  async adbOnDevice(roomId: string, args: string[], opts: { deviceId?: string; timeoutMs?: number } = {}): Promise<ExecResult> {
+    const target = opts.deviceId
+      ? { deviceId: opts.deviceId }
+      : { deviceId: (await this.resolveAdbTarget(roomId)).deviceId }
+    if (!target.deviceId) {
+      throw new Error('This Room has no physical Android device attached. Use run_in_room for its own emulator.')
+    }
+    const authorized = this.devices.authorize(roomId, target.deviceId, args)
+    return this.devices.hostAdb.exec(authorized.serial, args, { timeoutMs: opts.timeoutMs })
+  }
   async androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
     if (!awake) throw new Error('Wake the room before taking a screenshot')
+    // Follow whatever this Room is actually driving. With a phone attached the
+    // useful picture is the phone, and the caller never names a serial for it.
+    const target = await this.resolveAdbTarget(roomId)
+    if (target.kind === 'physical') {
+      const result = await this.devices.hostAdb.exec(
+        this.devices.authorize(roomId, target.deviceId!, ['exec-out', 'screencap', '-p']).serial,
+        ['exec-out', 'screencap', '-p'],
+        { timeoutMs: 60_000 }
+      )
+      const png = result.stdout.trim()
+      if (result.code === 0 && png.length > 100) return { png, source: 'adb' }
+      throw new Error(`screenshot of ${target.nickname} failed: ${(result.stderr || result.stdout).trim().slice(0, 200)}`)
+    }
     if (mode !== 'screen') {
       const result = await this.backend.execInRoom(
         roomId,
@@ -1125,6 +1255,7 @@ export class RoomOrchestrator {
     backend: { ok: boolean; detail: string }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
+    devices: DeviceBrokerStatus
   }> {
     const backend = await this.backend.health()
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
@@ -1155,7 +1286,7 @@ export class RoomOrchestrator {
         emulator
       })
     }
-    return { backend, gateway: this.gateway.status(), rooms }
+    return { backend, gateway: this.gateway.status(), rooms, devices: this.devices.status() }
   }
 
   inspectRoom(roomId: string): RoomInspection {
@@ -1177,7 +1308,9 @@ export class RoomOrchestrator {
       latestCheck: this.checks.latest(roomId),
       recentChanges: recent,
       lastUndoable: this.changes.lastUndoable(roomId),
-      storage: null
+      storage: null,
+      // Which shared phone, if any, this Room currently owns.
+      device: this.devices.leaseForRoom(roomId)
     }
   }
 
