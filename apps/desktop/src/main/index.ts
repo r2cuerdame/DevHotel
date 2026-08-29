@@ -17,6 +17,7 @@ import { TermManager } from './termManager'
 import { createTray } from './tray'
 import { setupUpdater } from './updater'
 import { startControlApi } from './controlApi'
+import { startDeviceSweeper } from './deviceSweeper'
 import { ensureDataOwnership } from './cleanRemoval'
 import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGate'
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
@@ -154,6 +155,12 @@ async function bootstrap(): Promise<void> {
     return null
   })
 
+  // Shared phones are discovered, and dead owners are reclaimed, on the Hotel's
+  // own clock: an owner that died will never call anything again.
+  const deviceSweeper = startDeviceSweeper(orch, {
+    onError: (error) => console.error('Android device sweep failed:', error)
+  })
+
   mainWindow = createWindow()
   const previews = new PreviewManager(mainWindow, orch, userData)
   const terms = new TermManager(orch)
@@ -191,6 +198,7 @@ async function bootstrap(): Promise<void> {
     quitting = true
     previews.dispose()
     terms.dispose()
+    deviceSweeper.stop()
     control?.stop()
     void executeShutdownPolicy(action, {
       shutdown: () => orch.shutdown(),

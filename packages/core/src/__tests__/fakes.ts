@@ -7,6 +7,7 @@ import type { RoomRecord } from '@devhotel/shared'
 import type { ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
+import type { AdbDeviceLine, AdbHost, AdbHostAvailability } from '../devices/adbHost'
 import type { WindowsVmLifecycle } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
 
@@ -417,4 +418,63 @@ export async function listeningPort(): Promise<{ port: number; close: () => void
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = (server.address() as { port: number }).port
   return { port, close: () => server.close() }
+}
+
+
+/** A phone as the Host adb reports it, plus the getprop values it would answer. */
+export interface FakePhone {
+  serial: string
+  state: string
+  model?: string
+  release?: string
+  sdk?: string
+  usb?: string
+}
+
+/**
+ * A Host adb with no phone attached to it. Recording every exec is the point:
+ * the broker's whole contract is which commands reach the device and which are
+ * refused before they get there.
+ */
+export class FakeAdbHost implements AdbHost {
+  execs: { serial: string; args: string[] }[] = []
+  availability: AdbHostAvailability = { ok: true, detail: 'fake adb 35.0.0' }
+  devicesError: Error | null = null
+  /** base64 PNG this fake phone answers exec-out screencap with. */
+  screencapPng = ''
+
+  constructor(public phones: FakePhone[] = []) {}
+
+  async available(): Promise<AdbHostAvailability> {
+    return this.availability
+  }
+
+  async devices(): Promise<AdbDeviceLine[]> {
+    if (this.devicesError) throw this.devicesError
+    return this.phones.map((phone) => ({
+      serial: phone.serial,
+      state: phone.state,
+      model: phone.model ?? null,
+      usb: phone.usb ?? null,
+      transportId: null
+    }))
+  }
+
+  async exec(serial: string, args: string[]): Promise<ExecResult> {
+    this.execs.push({ serial, args })
+    const phone = this.phones.find((candidate) => candidate.serial === serial)
+    if (args[0] === 'shell' && args[1] === 'getprop') {
+      const values: Record<string, string | undefined> = {
+        'ro.build.version.release': phone?.release,
+        'ro.build.version.sdk': phone?.sdk,
+        'ro.product.model': phone?.model?.replaceAll('_', ' ')
+      }
+      const value = values[args[2] ?? '']
+      return { code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' }
+    }
+    if (args[0] === 'exec-out' && args[1] === 'screencap') {
+      return { code: 0, stdout: this.screencapPng, stderr: '' }
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  }
 }

@@ -172,8 +172,12 @@ describe('makeTools', () => {
   it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
+        'android_device_adb',
+        'android_devices',
         'android_run',
         'android_screenshot',
+        'attach_android_device',
+        'cancel_android_device_request',
         'apply_quick_change',
         'check_operation',
         'check_room',
@@ -184,9 +188,11 @@ describe('makeTools', () => {
         'hotel_github_install',
         'hotel_github_status',
         'hotel_status',
+        'heartbeat_android_device',
         'inspect_room',
         'list_changes',
         'list_rooms',
+        'release_android_device',
         'rename_room',
         'reset_room',
         'reset_sync_baseline',

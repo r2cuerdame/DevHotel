@@ -35,7 +35,8 @@ cannot remove. The contract is also expressed in code, in
 | --- | --- | --- |
 | `run_in_room` / `exec` / Room terminal | `docker exec` inside the Room's container | No |
 | Android phone strip (Back / Home / Recents / Rotate) | in-Room `adb -s emulator-5554 shell input keyevent …` (`apps/desktop/src/main/androidInput.ts`) | No |
-| `android_run`, `android_screenshot` | in-Room `adb`, or an `x11grab` of the emulator's own X display inside the container | No |
+| `android_run`, `android_screenshot` (Room emulator) | in-Room `adb`, or an `x11grab` of the emulator's own X display inside the container | No |
+| `android_device_adb`, `android_screenshot` on a leased phone | Host-side `adb` from the Device Broker, addressed to a USB phone's own serial. It runs on the Host but injects only into that phone — no Host cursor, keys, or foreground window. Requires a live device lease ([Android Device Broker](./android-device-broker.md)) | No |
 | Android emulator display | Xvfb + openbox **inside** the emulator container; the window manager only ever moves the guest's own windows | No |
 | Room web preview | an Electron `WebContentsView` on a Room-scoped session with every permission denied | No |
 | Windows (VMware) Room lifecycle | `vmrun start … nogui` — the VM runs headless, with no console window | No |

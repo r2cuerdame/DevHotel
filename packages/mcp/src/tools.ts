@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { zChangeId, zPmKind, zQuickChange, zRoomId } from '@devhotel/shared'
+import { zChangeId, zLeasePurpose, zPmKind, zQuickChange, zRoomId } from '@devhotel/shared'
 import type { ControlClient } from './client'
 
 type ToolContent =
@@ -192,7 +192,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Dead runtimes are rejected with a stable DevHotel error code and recovery hint before Docker exec. Returns the exit code plus a BOUNDED view of stdout/stderr: by default the last 64000 bytes of each. Filter server-side with literal include/exclude substrings and choose head/tail with mode. Nothing is dropped silently — `output` reports raw versus returned bytes/lines, and complete raw output is retained under `output.runId` whenever the response omits content. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at DevHotel.',
+        'Run a command inside the room (never on the host). Dead runtimes are rejected with a stable DevHotel error code and recovery hint before Docker exec. Returns the exit code plus a BOUNDED view of stdout/stderr: by default the last 64000 bytes of each. Filter server-side with literal include/exclude substrings and choose head/tail with mode. Nothing is dropped silently — `output` reports raw versus returned bytes/lines, and complete raw output is retained under `output.runId` whenever the response omits content. UI input belongs here too: drive the Room emulator with `adb -s emulator-5554 shell input ...`; a leased physical phone goes through android_device_adb. Never use Host mouse/keyboard automation aimed at DevHotel.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
@@ -442,6 +442,71 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         "Low-level compatibility operation; prefer safe_resync_from_host so inspection, confirmation and publication stay under one guard. Re-read the room's linked Host folder into the Room-owned working state under its revocable inbound-sync grant. It is journaled as the agent and reads no other path — agents cannot choose paths. Build outputs are ignored; meaningful Room source drift is refused. The generation it replaces is retained for recovery.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
+    },
+    {
+      name: 'android_devices',
+      description:
+        'Who has the shared Android test phones right now. Lists every connected physical device with its nickname, health, current lease owner (project, Room, purpose, how long it has held it) and the queue waiting behind it, plus recent grant/release/stale-recovery events. Call this first when an Android device operation was refused — it answers "why can I not use the test phone" without guessing.',
+      schema: {},
+      handler: wrap(async () => (await getClient()).androidDevices())
+    },
+    {
+      name: 'attach_android_device',
+      description:
+        'Request an exclusive lease on a shared physical Android phone for this Room. Returns either a granted lease or a queue position with the current owner — a busy phone queues rather than failing. Development belongs on the Room emulator: build, install, UI checks and ordinary instrumentation run there with no lease at all. Ask for a physical device only for final acceptance/release verification, or for behaviour an emulator cannot reproduce (notifications, keyboard, background execution, sensors, battery, OEM quirks), then release it immediately.',
+      schema: {
+        roomId: zRoomId,
+        purpose: zLeasePurpose.describe("why the phone is needed; 'acceptance' for a release gate"),
+        workerId: z.string().describe('stable ID for this agent session, used to detect a dead owner'),
+        issueRef: z.string().optional().describe('issue or ticket this run belongs to, shown to whoever is waiting'),
+        priority: z.number().int().min(0).max(100).optional().describe('higher goes first; use for an urgent release gate'),
+        ttlMs: z.number().int().optional().describe('heartbeat interval budget; the lease goes stale after this'),
+        maxDurationMs: z.number().int().optional().describe('hard ceiling for this lease'),
+        constraints: z
+          .object({
+            deviceId: z.string().optional(),
+            nickname: z.string().optional(),
+            minApiLevel: z.number().int().optional(),
+            connection: z.enum(['usb', 'wireless']).optional()
+          })
+          .optional()
+          .describe('which phone will do; omit to take any free one')
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...body } = a
+        return (await getClient()).attachAndroidDevice(roomId, body)
+      })
+    },
+    {
+      name: 'release_android_device',
+      description:
+        'Give the phone back and let the next queued Room have it. The phone is handed on exactly as it was left: DevHotel runs no uninstall, no pm clear and no data wipe, so the build you just verified stays installed for a human to open. Always release as soon as your device work is done.',
+      schema: { roomId: zRoomId, reason: z.string().optional().describe('what finished, shown in the device history') },
+      handler: wrap(async (a) => (await getClient()).releaseAndroidDevice(a.roomId, a.reason))
+    },
+    {
+      name: 'heartbeat_android_device',
+      description:
+        "Keep this Room's device lease alive. Pass busy:true while a long instrumentation run or OS dialog is genuinely working the phone so the broker warns instead of reclaiming it at the maximum lease time. A lease with no heartbeat whose Room is gone is reclaimed automatically.",
+      schema: { leaseId: z.string().describe('lease ID from attach_android_device'), busy: z.boolean().optional() },
+      handler: wrap(async (a) => (await getClient()).heartbeatAndroidDevice(a.leaseId, a.busy))
+    },
+    {
+      name: 'cancel_android_device_request',
+      description: 'Leave the queue for a shared Android phone without waiting for it.',
+      schema: { requestId: z.string().describe('request ID from a queued attach_android_device') },
+      handler: wrap(async (a) => (await getClient()).cancelAndroidDeviceRequest(a.requestId))
+    },
+    {
+      name: 'android_device_adb',
+      description:
+        "Run an ADB command against the physical phone this Room has leased. Give the argv WITHOUT db or -s <serial> — the broker picks the device this Room holds, so no serial is ever hand-written. State-changing commands (install, uninstall, shell am/pm/input/monkey, reboot…) require a live lease and are refused with a structured reason if another Room owns the phone; read-only inventory commands are shared. For the Room's own emulator use run_in_room instead.",
+      schema: {
+        roomId: zRoomId,
+        args: z.array(z.string()).min(1).describe('adb argv without the leading db, e.g. ["install","-r","/workspace/app.apk"]'),
+        timeoutMs: z.number().int().positive().optional()
+      },
+      handler: wrap(async (a) => (await getClient()).adbOnDevice(a.roomId, a.args, a.timeoutMs))
     },
     {
       name: 'hotel_github_status',
