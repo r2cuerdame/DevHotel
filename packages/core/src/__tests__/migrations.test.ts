@@ -45,6 +45,7 @@ describe('database migrations', () => {
           .map(({ name }) => name)
       ).toEqual(expect.arrayContaining([
         'operations',
+        'android_device_broker_secrets',
         'android_devices',
         'android_device_leases',
         'android_device_queue',
@@ -57,6 +58,11 @@ describe('database migrations', () => {
         "ON android_device_queue(room_id) WHERE state = 'waiting'"
       )
       expect(queueDedupe.sql).not.toContain('IFNULL')
+      expect(
+        sqlite.prepare("SELECT length(value) AS bytes FROM android_device_broker_secrets WHERE name = 'physical-identity-hmac-v1'").get()
+      ).toEqual({ bytes: 32 })
+      const deviceColumns = sqlite.prepare('PRAGMA table_info(android_devices)').all() as { name: string; notnull: number }[]
+      expect(deviceColumns.find(({ name }) => name === 'physical_identity')).toMatchObject({ notnull: 1 })
     } finally {
       sqlite.close()
     }

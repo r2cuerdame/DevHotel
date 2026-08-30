@@ -279,6 +279,261 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     expect(granted).toMatchObject({ state: 'granted', device: { id: device.id, connection: 'wireless' } })
   })
 
+  it('collapses simultaneous USB and wireless transports into one exclusive lease domain', async () => {
+    const { broker, adb, db } = makeBroker()
+    const hardwareSerial = 'PHYSICAL-SERIAL-001'
+    const wirelessSerial = 'adb-PHYSICAL-SERIAL-001._adb-tls-connect._tcp.local.'
+    adb.phones = [
+      {
+        serial: hardwareSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        usb: '1-4',
+        hardwareSerial
+      },
+      {
+        serial: wirelessSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        hardwareSerial
+      }
+    ]
+
+    await broker.refreshInventory()
+
+    const devices = broker.listDevices()
+    expect(devices).toHaveLength(1)
+    expect(devices[0]).toMatchObject({ connection: 'usb', health: 'ready' })
+    expect(db.sqlite.prepare('SELECT count(*) AS count FROM android_devices').get()).toEqual({ count: 1 })
+    const privateRow = db.sqlite.prepare('SELECT physical_identity FROM android_devices').get() as { physical_identity: string }
+    expect(privateRow.physical_identity).toMatch(/^[a-f0-9]{64}$/)
+    expect(privateRow.physical_identity).not.toContain(hardwareSerial)
+    expect(JSON.stringify(broker.status())).not.toMatch(/PHYSICAL-SERIAL|adb-PHYSICAL/i)
+
+    const otherInstall = makeBroker()
+    otherInstall.adb.phones = [{
+      serial: hardwareSerial,
+      state: 'device',
+      model: 'Pixel_Dual',
+      release: '15',
+      sdk: '35',
+      usb: '1-4',
+      hardwareSerial
+    }]
+    await otherInstall.broker.refreshInventory()
+    const otherIdentity = otherInstall.db.sqlite
+      .prepare('SELECT physical_identity FROM android_devices')
+      .get() as { physical_identity: string }
+    expect(otherIdentity.physical_identity).not.toBe(privateRow.physical_identity)
+
+    const first = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'UsbOwner', purpose: 'acceptance', workerId: 'worker-a'
+    })
+    const second = await broker.requestDevice({
+      roomId: 'bbbb2222', project: 'WirelessContender', purpose: 'smoke', workerId: 'worker-b'
+    })
+    expect(first).toMatchObject({ state: 'granted', device: { id: devices[0]!.id } })
+    expect(second).toMatchObject({ state: 'queued', owner: { roomId: 'aaaa1111' }, position: 1 })
+    expect(db.sqlite.prepare("SELECT count(*) AS count FROM android_device_leases WHERE state = 'active'").get()).toEqual({ count: 1 })
+  })
+
+  it('keeps an active lease on its exact wireless transport until release, then prefers USB', async () => {
+    const { broker, adb, db, now } = makeBroker()
+    const hardwareSerial = 'PHYSICAL-SERIAL-002'
+    const wirelessSerial = 'adb-PHYSICAL-SERIAL-002._adb-tls-connect._tcp'
+    adb.phones = [{
+      serial: wirelessSerial,
+      state: 'device',
+      model: 'Pixel_Dual',
+      release: '15',
+      sdk: '35',
+      hardwareSerial
+    }]
+    await broker.refreshInventory()
+    const device = broker.listDevices()[0]!
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'WirelessOwner', purpose: 'acceptance', workerId: 'worker-a'
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    expect(broker.authorizeInternalOperation('aaaa1111', device.id, 'test', granted.lease.id).serial).toBe(wirelessSerial)
+
+    const physicalIdentity = (db.sqlite.prepare('SELECT physical_identity FROM android_devices WHERE id = ?').get(device.id) as {
+      physical_identity: string
+    }).physical_identity
+    const racingRepo = androidDevicesRepo(db)
+    expect(() => racingRepo.upsertDevice({
+      id: `d${'f'.repeat(32)}`,
+      serial: hardwareSerial,
+      physicalIdentity,
+      nickname: 'Racing-USB',
+      model: 'Pixel Dual',
+      androidVersion: '15',
+      apiLevel: 35,
+      connection: 'usb',
+      health: 'ready',
+      seenAt: new Date(now.value).toISOString()
+    })).toThrow(/active Android device transport changed/)
+    expect(broker.authorizeInternalOperation('aaaa1111', device.id, 'test', granted.lease.id).serial).toBe(wirelessSerial)
+
+    adb.phones = [
+      {
+        serial: hardwareSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        usb: '1-4',
+        hardwareSerial
+      },
+      {
+        serial: wirelessSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        hardwareSerial
+      }
+    ]
+    await broker.refreshInventory()
+
+    expect(broker.listDevices()).toHaveLength(1)
+    expect(broker.listDevices()[0]).toMatchObject({ id: device.id, connection: 'wireless' })
+    expect(broker.authorizeInternalOperation('aaaa1111', device.id, 'test', granted.lease.id).serial).toBe(wirelessSerial)
+
+    adb.phones[1]!.hardwareSerial = 'CHANGED-PHYSICAL-IDENTITY'
+    await broker.refreshInventory()
+    expect(broker.status()).toMatchObject({
+      available: false,
+      detail: 'Host ADB reported a changed identity for an actively leased transport; release the lease and retry.'
+    })
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+    expect(() => broker.authorizeInternalOperation('aaaa1111', device.id, 'test', granted.lease.id)).toThrow(DeviceLeaseError)
+
+    adb.phones[1]!.hardwareSerial = hardwareSerial
+    await broker.refreshInventory()
+    expect(broker.status().available).toBe(true)
+
+    await broker.release(granted.lease.id, 'wireless run finished')
+    await broker.refreshInventory()
+    expect(broker.listDevices()).toHaveLength(1)
+    expect(broker.listDevices()[0]).toMatchObject({ id: device.id, connection: 'usb', health: 'ready' })
+  })
+
+  it('fails the whole inventory fence closed when a ready transport cannot prove identity', async () => {
+    const { broker, adb } = makeBroker()
+    const hardwareSerial = 'PHYSICAL-SERIAL-003'
+    adb.phones = [{
+      serial: hardwareSerial,
+      state: 'device',
+      model: 'Pixel_USB',
+      release: '15',
+      sdk: '35',
+      usb: '1-4',
+      hardwareSerial
+    }]
+    await broker.refreshInventory()
+    const deviceId = broker.listDevices()[0]!.id
+
+    adb.phones = [
+      ...adb.phones,
+      {
+        serial: 'adb-unverified._adb-tls-connect._tcp',
+        state: 'device',
+        model: 'Pixel_Unknown',
+        release: '15',
+        sdk: '35',
+        hardwareSerial: null
+      }
+    ]
+    await broker.refreshInventory()
+
+    expect(broker.status()).toMatchObject({
+      available: false,
+      detail: 'Host ADB could not verify a stable physical-device identity; reconnect the device and retry.'
+    })
+    expect(broker.listDevices()).toHaveLength(1)
+    await expect(broker.requestDevice({
+      roomId: 'aaaa1111', project: 'Blocked', purpose: 'smoke', workerId: 'worker-a', constraints: { deviceId }
+    })).rejects.toMatchObject({ code: 'device-unhealthy' })
+    expect(JSON.stringify(broker.status())).not.toContain('adb-unverified')
+
+    adb.phones[1]!.hardwareSerial = hardwareSerial
+    await broker.refreshInventory()
+    expect(broker.status().available).toBe(true)
+    expect(broker.listDevices()).toHaveLength(1)
+  })
+
+  it('atomically merges a provisional USB row and its pinned waiter after identity becomes available', async () => {
+    const { broker, adb, db } = makeBroker()
+    const usbSerial = 'USB-ALIAS-004'
+    const hardwareSerial = 'PHYSICAL-SERIAL-004'
+    const wirelessSerial = 'adb-PHYSICAL-SERIAL-004._adb-tls-connect._tcp'
+    adb.phones = [
+      {
+        serial: usbSerial,
+        state: 'offline',
+        model: 'Pixel_Dual',
+        usb: '1-4'
+      },
+      {
+        serial: wirelessSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        hardwareSerial
+      }
+    ]
+    await broker.refreshInventory()
+    const provisional = broker.listDevices().find((device) => device.connection === 'usb')!
+    const canonical = broker.listDevices().find((device) => device.connection === 'wireless')!
+    expect(provisional.id).not.toBe(canonical.id)
+    const queued = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'PinnedWhileOffline',
+      purpose: 'acceptance',
+      workerId: 'worker-a',
+      constraints: { deviceId: provisional.id }
+    })
+    expect(queued).toMatchObject({ state: 'queued', deviceId: provisional.id })
+
+    adb.phones = [
+      {
+        serial: usbSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        usb: '1-4',
+        hardwareSerial
+      },
+      {
+        serial: wirelessSerial,
+        state: 'device',
+        model: 'Pixel_Dual',
+        release: '15',
+        sdk: '35',
+        hardwareSerial
+      }
+    ]
+    await broker.refreshInventory()
+
+    expect(broker.listDevices()).toHaveLength(1)
+    expect(broker.listDevices()[0]).toMatchObject({ id: canonical.id, connection: 'usb', leaseOwner: { roomId: 'aaaa1111' } })
+    expect(broker.leaseForRoom('aaaa1111')).toMatchObject({ deviceId: canonical.id })
+    expect(db.sqlite.prepare('SELECT count(*) AS count FROM android_devices').get()).toEqual({ count: 1 })
+    expect(db.sqlite.prepare('SELECT count(*) AS count FROM android_devices WHERE id = ?').get(provisional.id)).toEqual({ count: 0 })
+    const grantedQueue = db.sqlite
+      .prepare('SELECT device_id, constraints_json, state FROM android_device_queue WHERE id = ?')
+      .get(queued.state === 'queued' ? queued.requestId : '') as { device_id: string; constraints_json: string; state: string }
+    expect(grantedQueue).toMatchObject({ device_id: canonical.id, state: 'granted' })
+    expect(JSON.parse(grantedQueue.constraints_json)).toMatchObject({ deviceId: canonical.id })
+  })
+
   it('hands the phone to the next queued Room when the owner releases it', async () => {
     const { broker, db } = makeBroker()
     await broker.refreshInventory()

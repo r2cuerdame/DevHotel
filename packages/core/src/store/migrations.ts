@@ -172,12 +172,20 @@ export const migrations: Migration[] = [
     // Android Device Broker. A physical phone is Hotel-owned and shared, so its
     // ownership record cannot live in a Room row: the lease has to outlive the
     // Room process that took it, and a Room deletion must free the phone rather
-    // than cascade the device away with it.
+    // than cascade the device away with it. The install secret correlates USB
+    // and wireless routes without persisting the raw hardware identity.
     version: 6,
     sql: `
+      CREATE TABLE android_device_broker_secrets (
+        name TEXT PRIMARY KEY,
+        value BLOB NOT NULL CHECK (length(value) = 32)
+      );
+      INSERT INTO android_device_broker_secrets (name, value)
+        VALUES ('physical-identity-hmac-v1', randomblob(32));
       CREATE TABLE android_devices (
         id TEXT PRIMARY KEY,
         serial TEXT NOT NULL UNIQUE,
+        physical_identity TEXT NOT NULL UNIQUE CHECK (length(physical_identity) = 64),
         nickname TEXT NOT NULL,
         model TEXT,
         android_version TEXT,

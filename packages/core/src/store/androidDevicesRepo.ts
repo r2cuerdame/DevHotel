@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import type {
   AndroidDevice,
   DeviceConstraints,
@@ -13,6 +13,7 @@ import type { Db } from './db'
 interface DeviceRow {
   id: string
   serial: string
+  physical_identity: string
   nickname: string
   model: string | null
   android_version: string | null
@@ -131,6 +132,7 @@ const toEvent = (row: EventRow): DeviceEvent => ({
 export interface DeviceUpsert {
   id: string
   serial: string
+  physicalIdentity: string
   nickname: string
   model: string | null
   androidVersion: string | null
@@ -177,6 +179,10 @@ export interface AndroidDevicesRepo {
   listDevices(): AndroidDevice[]
   getDevice(id: string): AndroidDevice | null
   getDeviceBySerial(serial: string): AndroidDevice | null
+  getDeviceByPhysicalIdentity(physicalIdentity: string): AndroidDevice | null
+  getPhysicalIdentityBySerial(serial: string): string | null
+  /** Install-keyed correlation token; raw probe output never enters a correlation column or event. */
+  physicalIdentity(material: string, domain: 'physical' | 'transport'): string
   upsertDevice(input: DeviceUpsert): AndroidDevice
   markHealth(id: string, health: AndroidDevice['health'], at: string): void
   setNickname(id: string, nickname: string): AndroidDevice
@@ -201,49 +207,149 @@ export interface AndroidDevicesRepo {
 
 export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
   const { sqlite } = db
+  const secret = sqlite
+    .prepare("SELECT value FROM android_device_broker_secrets WHERE name = 'physical-identity-hmac-v1'")
+    .get() as { value: Uint8Array } | undefined
+  if (!secret || secret.value.byteLength !== 32) throw new Error('Android Device Broker identity key is unavailable')
+  const identityKey = Buffer.from(secret.value)
+  const deviceRowById = (id: string): DeviceRow | undefined =>
+    sqlite.prepare('SELECT * FROM android_devices WHERE id = ?').get(id) as unknown as DeviceRow | undefined
+  const deviceRowBySerial = (serial: string): DeviceRow | undefined =>
+    sqlite.prepare('SELECT * FROM android_devices WHERE serial = ?').get(serial) as unknown as DeviceRow | undefined
+  const deviceRowByPhysicalIdentity = (physicalIdentity: string): DeviceRow | undefined =>
+    sqlite.prepare('SELECT * FROM android_devices WHERE physical_identity = ?').get(physicalIdentity) as unknown as DeviceRow | undefined
   const repo: AndroidDevicesRepo = {
     listDevices: () =>
       (sqlite.prepare('SELECT * FROM android_devices ORDER BY nickname, serial').all() as unknown as DeviceRow[]).map(toDevice),
     getDevice(id) {
-      const row = sqlite.prepare('SELECT * FROM android_devices WHERE id = ?').get(id) as unknown as DeviceRow | undefined
+      const row = deviceRowById(id)
       return row ? toDevice(row) : null
     },
     getDeviceBySerial(serial) {
-      const row = sqlite.prepare('SELECT * FROM android_devices WHERE serial = ?').get(serial) as unknown as DeviceRow | undefined
+      const row = deviceRowBySerial(serial)
       return row ? toDevice(row) : null
     },
+    getDeviceByPhysicalIdentity(physicalIdentity) {
+      const row = deviceRowByPhysicalIdentity(physicalIdentity)
+      return row ? toDevice(row) : null
+    },
+    getPhysicalIdentityBySerial(serial) {
+      return deviceRowBySerial(serial)?.physical_identity ?? null
+    },
+    physicalIdentity(material, domain) {
+      return createHmac('sha256', identityKey)
+        .update(`devhotel.android-device.${domain}\0`, 'utf8')
+        .update(material, 'utf8')
+        .digest('hex')
+    },
     upsertDevice(input) {
-      // A reconnect must keep the nickname a human gave the phone, and must not
-      // rewrite when the device was first seen.
-      sqlite
-        .prepare(
-          `INSERT INTO android_devices
-             (id, serial, nickname, model, android_version, api_level, connection, health, first_seen_at, last_seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(serial) DO UPDATE SET
-             model = COALESCE(excluded.model, android_devices.model),
-             android_version = COALESCE(excluded.android_version, android_devices.android_version),
-             api_level = COALESCE(excluded.api_level, android_devices.api_level),
-             connection = excluded.connection,
-             health = excluded.health,
-             last_seen_at = excluded.last_seen_at`
-        )
-        .run(
-          input.id,
-          input.serial,
-          input.nickname,
-          input.model,
-          input.androidVersion,
-          input.apiLevel,
-          input.connection,
-          input.health,
-          input.seenAt,
-          input.seenAt
-        )
-      // The serial is private but is the durable identity key. The public ID is
-      // random, so a racing discovery must retain whichever opaque ID was
-      // persisted first rather than fail or replace it.
-      return repo.getDeviceBySerial(input.serial)!
+      sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        const identityRow = deviceRowByPhysicalIdentity(input.physicalIdentity)
+        const serialRow = deviceRowBySerial(input.serial)
+        let survivor = identityRow ?? serialRow
+        let merged: DeviceRow | null = null
+
+        if (identityRow && serialRow && identityRow.id !== serialRow.id) {
+          const identityActive = sqlite
+            .prepare("SELECT 1 FROM android_device_leases WHERE device_id = ? AND state = 'active'")
+            .get(identityRow.id)
+          const serialActive = sqlite
+            .prepare("SELECT 1 FROM android_device_leases WHERE device_id = ? AND state = 'active'")
+            .get(serialRow.id)
+          if (identityActive && serialActive) {
+            throw new Error('one physical Android device has multiple active lease records')
+          }
+
+          // An active lease owns its exact transport until release. Otherwise
+          // the existing physical-identity row keeps its public opaque ID and
+          // human nickname while an alternate transport is folded into it.
+          survivor = serialActive ? serialRow : identityRow
+          merged = survivor.id === identityRow.id ? serialRow : identityRow
+
+          sqlite.prepare('UPDATE android_device_leases SET device_id = ? WHERE device_id = ?').run(survivor.id, merged.id)
+          const pinnedRows = sqlite
+            .prepare('SELECT id, constraints_json FROM android_device_queue WHERE device_id = ?')
+            .all(merged.id) as unknown as { id: string; constraints_json: string }[]
+          for (const row of pinnedRows) {
+            const constraints = JSON.parse(row.constraints_json) as DeviceConstraints
+            if (constraints.deviceId === merged.id) constraints.deviceId = survivor.id
+            sqlite
+              .prepare('UPDATE android_device_queue SET device_id = ?, constraints_json = ? WHERE id = ?')
+              .run(survivor.id, JSON.stringify(constraints), row.id)
+          }
+          sqlite.prepare('UPDATE android_device_events SET device_id = ? WHERE device_id = ?').run(survivor.id, merged.id)
+          sqlite.prepare('DELETE FROM android_devices WHERE id = ?').run(merged.id)
+        }
+
+        if (!survivor) {
+          sqlite
+            .prepare(
+              `INSERT INTO android_devices
+                 (id, serial, physical_identity, nickname, model, android_version, api_level,
+                  connection, health, first_seen_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              input.id,
+              input.serial,
+              input.physicalIdentity,
+              input.nickname,
+              input.model,
+              input.androidVersion,
+              input.apiLevel,
+              input.connection,
+              input.health,
+              input.seenAt,
+              input.seenAt
+            )
+          survivor = deviceRowById(input.id)!
+        } else {
+          const activeLease = sqlite
+            .prepare("SELECT 1 FROM android_device_leases WHERE device_id = ? AND state = 'active'")
+            .get(survivor.id)
+          if (activeLease && survivor.serial !== input.serial) {
+            // A different broker process may have granted between inventory
+            // planning and this transaction. Never rewrite the exact serial an
+            // in-flight lease captured; the caller retries from fresh state.
+            throw new Error('active Android device transport changed during inventory reconciliation')
+          }
+          const firstSeenAt = merged && merged.first_seen_at < survivor.first_seen_at
+            ? merged.first_seen_at
+            : survivor.first_seen_at
+          sqlite
+            .prepare(
+              `UPDATE android_devices
+                 SET serial = ?, physical_identity = ?,
+                     model = COALESCE(?, model, ?),
+                     android_version = COALESCE(?, android_version, ?),
+                     api_level = COALESCE(?, api_level, ?),
+                     connection = ?, health = ?, first_seen_at = ?, last_seen_at = ?
+               WHERE id = ?`
+            )
+            .run(
+              input.serial,
+              input.physicalIdentity,
+              input.model,
+              merged?.model ?? null,
+              input.androidVersion,
+              merged?.android_version ?? null,
+              input.apiLevel,
+              merged?.api_level ?? null,
+              input.connection,
+              input.health,
+              firstSeenAt,
+              input.seenAt,
+              survivor.id
+            )
+        }
+        const persistedId = survivor.id
+        sqlite.exec('COMMIT')
+        return repo.getDevice(persistedId)!
+      } catch (err) {
+        sqlite.exec('ROLLBACK')
+        throw err
+      }
     },
     markHealth(id, health, at) {
       sqlite.prepare('UPDATE android_devices SET health = ?, last_seen_at = ? WHERE id = ?').run(health, at, id)

@@ -436,6 +436,8 @@ export interface FakePhone {
   release?: string
   sdk?: string
   usb?: string
+  /** Shared by USB and wireless transports; null models an identity-probe failure. */
+  hardwareSerial?: string | null
 }
 
 /**
@@ -480,10 +482,13 @@ export class FakeAdbHost implements AdbHost {
     if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
     const phone = this.phones.find((candidate) => candidate.serial === serial)
     if (args[0] === 'shell' && args[1] === 'getprop') {
+      const hardwareSerial = phone?.hardwareSerial === undefined ? phone?.serial : (phone.hardwareSerial ?? undefined)
       const values: Record<string, string | undefined> = {
         'ro.build.version.release': phone?.release,
         'ro.build.version.sdk': phone?.sdk,
-        'ro.product.model': phone?.model?.replaceAll('_', ' ')
+        'ro.product.model': phone?.model?.replaceAll('_', ' '),
+        'ro.serialno': hardwareSerial,
+        'ro.boot.serialno': hardwareSerial
       }
       const value = values[args[2] ?? '']
       return { code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' }

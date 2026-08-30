@@ -335,21 +335,43 @@ export interface DeviceProps {
   model: string | null
 }
 
+async function readDeviceProperty(adb: AdbHost, serial: string, name: string): Promise<string | null> {
+  try {
+    const result = await adb.exec(serial, ['shell', 'getprop', name], {
+      timeoutMs: 10_000,
+      maxStdoutBytes: 256,
+      maxStderrBytes: 256
+    })
+    const value = result.stdout.trim()
+    return result.code === 0 && value ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Host-private physical identity material shared by USB and TLS/mDNS
+ * transports. Callers must immediately turn this into an install-keyed HMAC;
+ * the probe value is never logged, returned, or stored as a correlation key.
+ */
+export async function readPhysicalDeviceIdentity(adb: AdbHost, serial: string): Promise<string | null> {
+  for (const name of ['ro.serialno', 'ro.boot.serialno']) {
+    const value = await readDeviceProperty(adb, serial, name)
+    if (
+      value &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) &&
+      !/^(?:unknown|0123456789abcdef|0+)$/i.test(value)
+    ) return value
+  }
+  return null
+}
+
 export async function readDeviceProps(adb: AdbHost, serial: string): Promise<DeviceProps> {
   const props: DeviceProps = { androidVersion: null, apiLevel: null, model: null }
-  const read = async (name: string): Promise<string | null> => {
-    try {
-      const result = await adb.exec(serial, ['shell', 'getprop', name], { timeoutMs: 10_000 })
-      const value = result.stdout.trim()
-      return result.code === 0 && value ? value : null
-    } catch {
-      return null
-    }
-  }
-  props.androidVersion = await read('ro.build.version.release')
-  const sdk = await read('ro.build.version.sdk')
+  props.androidVersion = await readDeviceProperty(adb, serial, 'ro.build.version.release')
+  const sdk = await readDeviceProperty(adb, serial, 'ro.build.version.sdk')
   props.apiLevel = sdk && /^\d+$/.test(sdk) ? Number.parseInt(sdk, 10) : null
-  props.model = await read('ro.product.model')
+  props.model = await readDeviceProperty(adb, serial, 'ro.product.model')
   return props
 }
 

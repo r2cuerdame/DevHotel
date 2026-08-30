@@ -60,6 +60,25 @@ A lease is exclusive and records who has the phone and why:
 Exclusivity is enforced by a partial unique index on the lease table, not by
 careful callers: at most one `active` lease can exist per device.
 
+### One handset, multiple ADB transports
+
+Android Wireless Debugging can expose the same handset twice at once: once by
+its USB serial and again by a TLS/mDNS service name. Inventory probes a stable
+Host-private hardware identity on every ready physical transport, immediately
+turns it into an install-keyed HMAC, and groups all matching transports before
+persisting or granting anything. Raw identity-probe output is never logged,
+returned, or stored in the correlation column; the selected ADB transport
+serial remains in the Host-private row under the existing broker contract.
+Thus USB and wireless routes share one opaque device ID, one queue, and one
+database-enforced lease domain.
+
+When both routes are healthy and no lease exists, USB is preferred. An active
+lease remains pinned to its exact transport and opaque ID so an in-flight
+operation never changes serial underneath its fence; if that route disappears,
+the lease is revoked before an alternate route can be selected. A ready route
+whose identity cannot be verified makes the physical inventory unavailable
+instead of being admitted as a second, independently leasable device.
+
 ## Queue
 
 A request for a busy phone **queues** rather than failing. A project that

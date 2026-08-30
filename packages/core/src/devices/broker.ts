@@ -19,7 +19,14 @@ import {
 } from '@devhotel/shared'
 import type { AndroidDevicesRepo } from '../store/androidDevicesRepo'
 import { classifyAdbCommand } from './adbOperations'
-import { connectionForSerial, defaultNickname, healthForState, readDeviceProps, type AdbHost } from './adbHost'
+import {
+  connectionForSerial,
+  defaultNickname,
+  healthForState,
+  readDeviceProps,
+  readPhysicalDeviceIdentity,
+  type AdbHost
+} from './adbHost'
 
 export interface DeviceBrokerOptions {
   repo: AndroidDevicesRepo
@@ -144,14 +151,110 @@ export class AndroidDeviceBroker {
 
     const at = this.at()
     const seen = new Set<string>()
+    const identified: {
+      line: (typeof lines)[number]
+      connection: AndroidDevice['connection']
+      health: AndroidDevice['health']
+      physicalIdentity: string
+    }[] = []
+
     for (const line of lines) {
-      // The public ID is random and persisted with the private serial. A digest
-      // of an IP:port wireless serial can be reversed by dictionary search and
-      // a short digest can collide, so no serial-derived material is exposed.
-      const known = this.repo.getDeviceBySerial(line.serial)
-      const id = known?.id ?? `d${randomUUID().replaceAll('-', '')}`
       const connection = connectionForSerial(line.serial, line.usb)
       const health = healthForState(line.state)
+      let physicalIdentity: string | null = null
+      if (connection === 'emulator') {
+        physicalIdentity = this.repo.physicalIdentity(line.serial, 'transport')
+      } else if (health === 'ready') {
+        const rawIdentity = await readPhysicalDeviceIdentity(this.adb, line.serial)
+        if (!rawIdentity) {
+          // A ready transport without a stable identity might be an alternate
+          // route to an already-known handset. Fail the whole inventory fence
+          // closed rather than minting a second independently leasable row.
+          this.lastAvailability = {
+            ok: false,
+            detail: 'Host ADB could not verify a stable physical-device identity; reconnect the device and retry.'
+          }
+          return this.listDevices()
+        }
+        physicalIdentity = this.repo.physicalIdentity(rawIdentity, 'physical')
+      } else if (connection === 'usb') {
+        // The USB transport serial is the handset serial even when Android is
+        // not ready to answer getprop. It uses the same HMAC domain as the
+        // property probe, so the row remains stable when the phone becomes ready.
+        physicalIdentity = this.repo.physicalIdentity(line.serial, 'physical')
+      } else {
+        // An unknown unhealthy wireless transport cannot prove whether it is
+        // an alternate path to an existing handset. Existing mappings remain
+        // visible, but a new one is deliberately not made leasable.
+        physicalIdentity = this.repo.getPhysicalIdentityBySerial(line.serial)
+      }
+      if (physicalIdentity) identified.push({ line, connection, health, physicalIdentity })
+    }
+
+    const groups = new Map<string, typeof identified>()
+    for (const candidate of identified) {
+      const group = groups.get(candidate.physicalIdentity) ?? []
+      group.push(candidate)
+      groups.set(candidate.physicalIdentity, group)
+    }
+
+    const planned: { candidate: (typeof identified)[number]; known: AndroidDevice | null }[] = []
+    for (const [physicalIdentity, candidates] of groups) {
+      const knownDevices = new Map<string, AndroidDevice>()
+      const identityDevice = this.repo.getDeviceByPhysicalIdentity(physicalIdentity)
+      if (identityDevice) knownDevices.set(identityDevice.id, identityDevice)
+      for (const candidate of candidates) {
+        const known = this.repo.getDeviceBySerial(candidate.line.serial)
+        if (known) {
+          const storedIdentity = this.repo.getPhysicalIdentityBySerial(candidate.line.serial)
+          if (storedIdentity !== physicalIdentity && this.repo.activeLease(known.id)) {
+            this.lastAvailability = {
+              ok: false,
+              detail: 'Host ADB reported a changed identity for an actively leased transport; release the lease and retry.'
+            }
+            return this.listDevices()
+          }
+          knownDevices.set(known.id, known)
+        }
+      }
+      const activeDevices = [...knownDevices.values()].filter((device) => this.repo.activeLease(device.id))
+      if (activeDevices.length > 1) {
+        this.lastAvailability = {
+          ok: false,
+          detail: 'Host ADB found ambiguous transports for an actively leased physical device; release the leases and retry.'
+        }
+        return this.listDevices()
+      }
+
+      let candidate: (typeof identified)[number] | undefined
+      const activeDevice = activeDevices[0]
+      if (activeDevice) {
+        // Never switch the serial underneath an operation that captured this
+        // lease. If its exact transport disappeared, the normal missing-device
+        // path revokes it; an alternate route can be selected next refresh.
+        candidate = candidates.find((entry) => entry.line.serial === activeDevice.serial)
+        if (!candidate) continue
+      } else {
+        candidate = [...candidates].sort((left, right) => {
+          const rank = (entry: (typeof identified)[number]): number => {
+            if (entry.health === 'ready' && entry.connection === 'usb') return 0
+            if (entry.health === 'ready' && entry.connection === 'wireless') return 1
+            if (entry.connection === 'usb') return 2
+            if (entry.connection === 'wireless') return 3
+            return 4
+          }
+          return rank(left) - rank(right)
+        })[0]
+      }
+      if (candidate) planned.push({ candidate, known: identityDevice ?? this.repo.getDeviceBySerial(candidate.line.serial) })
+    }
+
+    for (const { candidate, known } of planned) {
+      const { line, connection, health, physicalIdentity } = candidate
+      // The public ID is random and the stable physical correlation key is an
+      // install-keyed HMAC. Neither raw hardware identity nor transport serial
+      // is exposed by any public broker surface.
+      const id = known?.id ?? `d${randomUUID().replaceAll('-', '')}`
       // Properties need an authorized device; an unauthorized phone still
       // belongs in the inventory so the user can see why it is unusable.
       const props =
@@ -159,17 +262,27 @@ export class AndroidDeviceBroker {
           ? await readDeviceProps(this.adb, line.serial)
           : { androidVersion: known?.androidVersion ?? null, apiLevel: known?.apiLevel ?? null, model: known?.model ?? null }
       const model = props.model ?? line.model ?? known?.model ?? null
-      const persisted = this.repo.upsertDevice({
-        id,
-        serial: line.serial,
-        nickname: known?.nickname ?? defaultNickname(model, connection, this.repo.listDevices()),
-        model,
-        androidVersion: props.androidVersion,
-        apiLevel: props.apiLevel,
-        connection,
-        health,
-        seenAt: at
-      })
+      let persisted: AndroidDevice
+      try {
+        persisted = this.repo.upsertDevice({
+          id,
+          serial: line.serial,
+          physicalIdentity,
+          nickname: known?.nickname ?? defaultNickname(model, connection, this.repo.listDevices()),
+          model,
+          androidVersion: props.androidVersion,
+          apiLevel: props.apiLevel,
+          connection,
+          health,
+          seenAt: at
+        })
+      } catch {
+        this.lastAvailability = {
+          ok: false,
+          detail: 'Host ADB could not safely reconcile physical-device identities; retry after the current lease settles.'
+        }
+        return this.listDevices()
+      }
       // A second broker process may have won the unique-serial insert with a
       // different random ID. Always continue from the row SQLite retained.
       seen.add(persisted.id)
