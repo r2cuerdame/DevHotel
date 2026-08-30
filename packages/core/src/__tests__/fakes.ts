@@ -178,6 +178,10 @@ export class FakeBackend implements IsolationBackend {
   async fingerprintWorkspaceLegacy() {
     return this.legacyWorkspaceFingerprintValue ?? this.workspaceFingerprintValue
   }
+  legacyCurrentExclusionsFingerprintValue: string | null = null
+  async fingerprintWorkspaceLegacyCurrentExclusions() {
+    return this.legacyCurrentExclusionsFingerprintValue ?? this.workspaceFingerprintValue
+  }
   async fingerprintBuildInput(_roomId: string, workspaceVolume: string) {
     this.calls.push(`fingerprintBuildInput:${workspaceVolume}`)
     return this.workspaceFingerprintValue

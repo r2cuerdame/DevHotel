@@ -69,11 +69,18 @@ function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'):
     '    case "/$include/" in */../*|*/./*|*//*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
     '    include_dir=${include%/*}',
     '    if [ "$include_dir" = "$include" ]; then include_dir=.; fi',
-    '    include_root=$(realpath "$include_dir" 2>/dev/null) || include_root=',
+    '    include_probe=$include_dir',
+    '    while [ ! -e "$include_probe" ] && [ ! -L "$include_probe" ]; do',
+    '      include_parent=${include_probe%/*}',
+    '      if [ "$include_parent" = "$include_probe" ]; then include_parent=.; fi',
+    '      include_probe=$include_parent',
+    '    done',
+    '    include_root=$(realpath "$include_probe" 2>/dev/null) || include_root=',
     '    case "${include_root:-x}" in',
     '      /workspace|/workspace/*) ;;',
     '      *) echo "invalid .devhotel-sync-include path leaves the Room workspace: $include" >&2; exit 2 ;;',
     '    esac',
+    '    if [ ! -e "$include" ] && [ ! -L "$include" ]; then continue; fi',
     '    if [ -L "$include" ] || [ -f "$include" ]; then',
     `      printf './%s\\0' "$include" >> "${output}"`,
     '    elif [ -d "$include" ]; then',
@@ -116,11 +123,18 @@ export function importHostFolderScript(): string {
     // import, so an opted-in link keeps pointing nowhere inside the Room.
     '  include_dir=${include%/*}',
     '  if [ "$include_dir" = "$include" ]; then include_dir=.; fi',
-    '  include_root=$(realpath "$include_dir" 2>/dev/null) || include_root=',
+    '  include_probe=$include_dir',
+    '  while [ ! -e "$include_probe" ] && [ ! -L "$include_probe" ]; do',
+    '    include_parent=${include_probe%/*}',
+    '    if [ "$include_parent" = "$include_probe" ]; then include_parent=.; fi',
+    '    include_probe=$include_parent',
+    '  done',
+    '  include_root=$(realpath "$include_probe" 2>/dev/null) || include_root=',
     '  case "${include_root:-x}" in',
     '    /source|/source/*) ;;',
     '    *) echo "invalid .devhotel-sync-include path leaves the linked folder: $include" >&2; exit 2 ;;',
     '  esac',
+    '  if [ ! -e "$include" ] && [ ! -L "$include" ]; then continue; fi',
     '  if [ -e "$include" ] || [ -L "$include" ]; then tar -C /source -cf - "$include" | tar -C /workspace -xf -; fi',
     'done < "$include_file"'
   ].join('\n')
@@ -1041,12 +1055,33 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async fingerprintWorkspaceLegacy(roomId: string, workspaceVolumeRevision: number): Promise<string> {
+    return this.fingerprintWorkspaceLegacyPolicy(roomId, workspaceVolumeRevision, false)
+  }
+
+  async fingerprintWorkspaceLegacyCurrentExclusions(
+    roomId: string,
+    workspaceVolumeRevision: number
+  ): Promise<string> {
+    return this.fingerprintWorkspaceLegacyPolicy(roomId, workspaceVolumeRevision, true)
+  }
+
+  private async fingerprintWorkspaceLegacyPolicy(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    currentGeneratedExclusions: boolean
+  ): Promise<string> {
     await this.assertPinnedEngineIdentity()
     const source = srcVolume(roomId, workspaceVolumeRevision)
     const volume = await this.inspectVolume(source)
     if (!volume) throw new Error(`workspace generation does not exist: ${source}`)
     await this.assertRoomVolumeOwnership(volume, roomId, source)
     await this.ensureImage(DU_IMAGE)
+    const originalGeneratedDirs = ['node_modules', '.next', 'dist', 'build', 'coverage', '.gradle']
+    const generatedDirs = currentGeneratedExclusions
+      ? GENERATED_SYNC_DIRS.filter((name) => name !== '.git')
+      : originalGeneratedDirs
+    const generatedPrunes = generatedDirs.map((name) => `-name ${name}`).join(' -o ')
+    const generatedFiles = currentGeneratedExclusions ? " ! -name '*.apk' ! -name '*.aab'" : ''
     const result = must(
       await runDocker([
         'run',
@@ -1060,11 +1095,16 @@ export class OciCliBackend implements IsolationBackend {
         DU_IMAGE,
         'sh',
         '-lc',
-        // Exact pre-R2C-8 algorithm. Do not broaden this compatibility path:
-        // it exists only to prove an old accepted tree is still unchanged.
-        "set -eu; legacy_sync_paths=$(mktemp); legacy_sync_sorted=$(mktemp); legacy_sync_records=$(mktemp); cd /workspace; find . -mindepth 1 \\( -type d \\( -name node_modules -o -name .next -o -name dist -o -name build -o -name coverage -o -name .gradle -o -path '*/.git/objects' \\) \\) -prune -o -print0 > \"$legacy_sync_paths\"; sort -z \"$legacy_sync_paths\" > \"$legacy_sync_sorted\"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' \"$path\" | sha256sum); path_hash=${path_hash%% *}; metadata=$(stat -c '%f:%u:%g' \"$path\"); if [ -L \"$path\" ]; then kind=L; content_hash=$(readlink -n \"$path\" | sha256sum); content_hash=${content_hash%% *}; elif [ -f \"$path\" ]; then kind=F; content_hash=$(sha256sum \"$path\"); content_hash=${content_hash%% *}; elif [ -d \"$path\" ]; then kind=D; content_hash=-; else echo \"unsupported workspace object: $path\" >&2; exit 2; fi; printf '%s %s %s %s\\n' \"$kind\" \"$metadata\" \"$path_hash\" \"$content_hash\" >> \"$legacy_sync_records\"; done < \"$legacy_sync_sorted\"; sha256sum \"$legacy_sync_records\""
+        // Keep the old record format so a stored pre-path-baseline digest can
+        // be compared directly. The fallback variant adds only today's
+        // generated-output exclusions; it intentionally retains the legacy
+        // Git control-state policy, so unrelated repository edits still fail
+        // migration closed.
+        `set -eu; legacy_sync_paths=$(mktemp); legacy_sync_sorted=$(mktemp); legacy_sync_records=$(mktemp); cd /workspace; find . -mindepth 1 \\( -type d \\( ${generatedPrunes} -o -path '*/.git/objects' \\) \\) -prune -o${generatedFiles} -print0 > "$legacy_sync_paths"; sort -z "$legacy_sync_paths" > "$legacy_sync_sorted"; while IFS= read -r -d '' path; do path_hash=$(printf '%s' "$path" | sha256sum); path_hash=\${path_hash%% *}; metadata=$(stat -c '%f:%u:%g' "$path"); if [ -L "$path" ]; then kind=L; content_hash=$(readlink -n "$path" | sha256sum); content_hash=\${content_hash%% *}; elif [ -f "$path" ]; then kind=F; content_hash=$(sha256sum "$path"); content_hash=\${content_hash%% *}; elif [ -d "$path" ]; then kind=D; content_hash=-; else echo "unsupported workspace object: $path" >&2; exit 2; fi; printf '%s %s %s %s\\n' "$kind" "$metadata" "$path_hash" "$content_hash" >> "$legacy_sync_records"; done < "$legacy_sync_sorted"; sha256sum "$legacy_sync_records"`
       ]),
-      'fingerprint legacy Room workspace'
+      currentGeneratedExclusions
+        ? 'fingerprint legacy Room workspace with current generated exclusions'
+        : 'fingerprint legacy Room workspace'
     )
     const fingerprint = result.stdout.trim().split(/\s+/)[0] ?? ''
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('legacy workspace helper returned an invalid fingerprint')

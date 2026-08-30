@@ -107,6 +107,8 @@ export interface IsolationBackend {
   snapshotWorkspace(roomId: string, workspaceVolumeRevision: number, workspaceVolumeOverride?: string): Promise<WorkspaceSnapshot>
   /** Pre-R2C-8 fingerprint, used only to migrate a clean existing Room without accepting unknown drift. */
   fingerprintWorkspaceLegacy(roomId: string, workspaceVolumeRevision: number): Promise<string>
+  /** Same legacy record format with today's generated-output exclusions, for a conservative migration fallback. */
+  fingerprintWorkspaceLegacyCurrentExclusions(roomId: string, workspaceVolumeRevision: number): Promise<string>
   /**
    * Full immutable build-input digest. No workspace path is excluded; paths are
    * NUL-delimited and file type/metadata/content or symlink target are hashed.

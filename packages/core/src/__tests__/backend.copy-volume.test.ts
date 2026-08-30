@@ -168,7 +168,8 @@ describe('OciCliBackend.copyVolume', () => {
     // An opted-in path must be canonicalised, not just checked lexically: tar
     // follows symlinked parents, so without this the include list could copy
     // files from outside the folder the human linked.
-    expect(helper.at(-1)).toContain('include_root=$(realpath "$include_dir"')
+    expect(helper.at(-1)).toContain('include_probe=$include_dir')
+    expect(helper.at(-1)).toContain('include_root=$(realpath "$include_probe"')
     expect(helper.at(-1)).toMatch(/\/source\|\/source\/\*\)/)
     expect(helper).toContain(`${imported}:/workspace`)
   })

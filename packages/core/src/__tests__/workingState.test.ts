@@ -178,6 +178,28 @@ describe('Room-owned working state', () => {
     expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('app/src/main/java/App.kt')
   })
 
+  it('upgrades a legacy baseline when only newly excluded generated output appeared', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'legacy-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'new-policy-fingerprint'
+    backend.legacyWorkspaceFingerprintValue = 'legacy-with-new-output'
+    backend.legacyCurrentExclusionsFingerprintValue = 'legacy-fingerprint'
+    backend.workspaceSnapshotEntries = [
+      { path: 'app/src/main/java/App.kt', kind: 'file', identity: 'source' }
+    ]
+
+    await expect(orch.syncFromHost(room.id, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('app/src/main/java/App.kt')
+  })
+
   it('lets agents sync under the Room grant, refuses once revoked, and never lets them migrate', async () => {
     const room = makeRoom({
       sourceType: 'linked-folder',

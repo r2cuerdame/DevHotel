@@ -140,9 +140,17 @@ describe('OciCliBackend Android artifact export', () => {
   })
 
   it('normalizes one trailing include slash before rejecting empty path components', () => {
-    for (const script of [importHostFolderScript(), workspaceSnapshotScript()]) {
+    for (const script of [
+      importHostFolderScript(),
+      workspaceSnapshotScript(),
+      workspaceTransactionalFingerprintScript()
+    ]) {
       expect(script.indexOf('include=${include%/}')).toBeGreaterThanOrEqual(0)
       expect(script.indexOf('include=${include%/}')).toBeLessThan(script.indexOf('case "/$include/"'))
+      expect(script).toContain('include_probe=$include_dir')
+      expect(script.indexOf('realpath "$include_probe"')).toBeLessThan(
+        script.indexOf('if [ ! -e "$include" ]')
+      )
     }
   })
 

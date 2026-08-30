@@ -22,7 +22,11 @@ describe.skipIf(!process.env.DEVHOTEL_SMOKE)('Windows linked-folder to Linux Roo
 
   beforeAll(async () => {
     await runDocker(['volume', 'rm', '-f', SOURCE_VOLUME])
-    write(source, '.devhotel-sync-include', 'app/build/generated/\r\n')
+    write(
+      source,
+      '.devhotel-sync-include',
+      'app/build/generated/\r\napp/build/not-yet-generated/schema.ts\r\n'
+    )
     write(source, 'app/src/main/java/App.kt', 'class App\n')
     write(source, 'app/build/generated/tracked.txt', 'tracked generated input\n')
     write(source, 'app/build/outputs/apk/debug/app-debug.apk', 'disposable apk\n')
@@ -47,6 +51,7 @@ describe.skipIf(!process.env.DEVHOTEL_SMOKE)('Windows linked-folder to Linux Roo
       'app/src/main/java/App.kt'
     ])
     const transactionBaseline = await backend.fingerprintWorkspace(ROOM_ID, 1)
+    const legacyBaseline = await backend.fingerprintWorkspaceLegacy(ROOM_ID, 1)
 
     const mutate = await runDocker([
       'run',
@@ -56,12 +61,14 @@ describe.skipIf(!process.env.DEVHOTEL_SMOKE)('Windows linked-folder to Linux Roo
       'alpine',
       'sh',
       '-lc',
-      "mkdir -p /workspace/.gradle/new /workspace/app/build/outputs/apk/debug /workspace/.git/objects/22; printf disposable > /workspace/.gradle/new/cache.bin; printf apk > /workspace/app/build/outputs/apk/debug/new.apk; printf object > /workspace/.git/objects/22/object"
+      "mkdir -p /workspace/.gradle/new /workspace/.kotlin/new /workspace/app/build/outputs/apk/debug /workspace/.git/objects/22; printf disposable > /workspace/.gradle/new/cache.bin; printf kotlin > /workspace/.kotlin/new/cache.bin; printf apk > /workspace/app/build/outputs/apk/debug/new.apk; printf object > /workspace/.git/objects/22/object"
     ])
     expect(mutate.code, mutate.stderr).toBe(0)
     const buildOnly = await backend.snapshotWorkspace(ROOM_ID, 1)
     expect(buildOnly).toEqual(baseline)
     await expect(backend.fingerprintWorkspace(ROOM_ID, 1)).resolves.toBe(transactionBaseline)
+    await expect(backend.fingerprintWorkspaceLegacy(ROOM_ID, 1)).resolves.not.toBe(legacyBaseline)
+    await expect(backend.fingerprintWorkspaceLegacyCurrentExclusions(ROOM_ID, 1)).resolves.toBe(legacyBaseline)
 
     const optedInEdit = await runDocker([
       'run',

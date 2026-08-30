@@ -1467,7 +1467,13 @@ export class RoomOrchestrator {
       let acceptedFingerprint = room.workspaceFingerprint
       if (acceptedFingerprint && !baseline && currentSnapshot.fingerprint !== acceptedFingerprint) {
         const legacyFingerprint = await this.backend.fingerprintWorkspaceLegacy(room.id, room.workspaceVolumeRevision)
-        if (legacyFingerprint === acceptedFingerprint) {
+        const generatedOnlyFingerprint = legacyFingerprint === acceptedFingerprint
+          ? legacyFingerprint
+          : await this.backend.fingerprintWorkspaceLegacyCurrentExclusions(
+              room.id,
+              room.workspaceVolumeRevision
+            )
+        if (legacyFingerprint === acceptedFingerprint || generatedOnlyFingerprint === acceptedFingerprint) {
           acceptedFingerprint = currentSnapshot.fingerprint
           this.rooms.update(room.id, { workspaceFingerprint: acceptedFingerprint })
           this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
