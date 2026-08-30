@@ -57,10 +57,20 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
   }
   const appId = assertApplicationId(record.applicationId, 'build metadata')
   const outputFile = element.outputFile
-  if (outputFile.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9._+-]*\.apk$/i.test(outputFile)) {
+  const stem = outputFile.slice(0, -4)
+  if (
+    Buffer.byteLength(outputFile, 'utf8') > 255 ||
+    stem.length === 0 ||
+    stem === '.' ||
+    stem === '..' ||
+    !/\.apk$/i.test(outputFile) ||
+    /^[A-Za-z]:/.test(outputFile) ||
+    /[\\/\p{C}\p{Zl}\p{Zp}]/u.test(outputFile)
+  ) {
     throw new Error('Android build output metadata contains an unsafe APK filename')
   }
-  return { appId, apkPath: metaPath.replace(/output-metadata\.json$/, outputFile) }
+  const outputDirectory = metaPath.slice(0, metaPath.lastIndexOf('/') + 1)
+  return { appId, apkPath: `${outputDirectory}${outputFile}` }
 }
 
 /** Every module's debug APK, resolved strictly from its own output-metadata.json. */

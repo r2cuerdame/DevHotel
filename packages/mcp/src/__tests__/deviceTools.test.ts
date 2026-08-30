@@ -127,4 +127,11 @@ describe('Android device broker MCP tools', () => {
     expect(tool('attach_android_device').description).toMatch(/emulator/i)
     expect(tool('attach_android_device').description).toMatch(/acceptance|release/i)
   })
+
+  it('describes android-run target selection for both Room attachment states', () => {
+    const description = tool('android_run').description
+    expect(description).toMatch(/without a physical lease.*Room emulator/i)
+    expect(description).toMatch(/attached physical-device lease.*shared phone/i)
+    expect(description).toMatch(/release the device before an emulator-only run/i)
+  })
 })

@@ -447,7 +447,7 @@ describe('Android automation targets the attached device without a hand-written 
       if (command.startsWith("cat '/workspace/")) {
         return {
           code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'My 앱-$&-debug.APK' }] }),
           stderr: ''
         }
       }
@@ -465,6 +465,7 @@ describe('Android automation targets the attached device without a hand-written 
     expect(entry.status).toBe('verified')
     expect(entry.verify?.detail).toMatch(/running on SM-G991N-01/)
     expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state', 'install', 'shell', 'shell', 'shell'])
+    expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/My 앱-$&-debug.APK')
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
     expect(adb.execs.find((call) => call.args[1] === 'am')?.serial).toBe('R5CT30ABCDE')
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
@@ -557,9 +558,57 @@ describe('Android automation targets the attached device without a hand-written 
       expected: /Invalid Android applicationId/
     },
     {
-      name: 'APK filename traversal',
+      name: 'POSIX APK filename traversal',
       findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '../../secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'Windows APK filename traversal',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '..\\secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'absolute POSIX APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '/tmp/secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'drive-relative APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'C:secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'UNC APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '\\\\server\\share\\secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'dot-segment APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '..apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'parent-dot-segment APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '...apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'control character in APK filename',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'My\u0000App.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'APK filename over the UTF-8 byte limit',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: `${'앱'.repeat(90)}.apk` }] },
       expected: /unsafe APK filename/
     },
     {
@@ -675,7 +724,7 @@ describe('Android automation targets the attached device without a hand-written 
       if (command.startsWith("cat '/workspace/")) {
         return {
           code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: "My App's $&-debug.APK" }] }),
           stderr: ''
         }
       }
@@ -691,6 +740,13 @@ describe('Android automation targets the attached device without a hand-written 
     expect(entry.verify?.detail).toMatch(/Room emulator/)
     expect(adb.execs).toEqual([])
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('adb -s emulator-5554'))).toBe(true)
+    expect(
+      backend.execInRoomCalls.some((call) =>
+        call.cmd
+          .at(-1)
+          ?.includes("'install' '-r' '/workspace/app/build/outputs/apk/debug/My App'\\''s $&-debug.APK'")
+      )
+    ).toBe(true)
   })
 })
 
