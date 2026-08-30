@@ -23,6 +23,7 @@ import { PreviewSyncGuard } from './previewSync'
 import { hardenRoomSession } from './roomSessionPolicy'
 
 const THUMB_INTERVAL_MS = 30_000
+const ATTACH_RETRY_DELAY_MS = 100
 
 /**
  * The Android preview is a phone screen, not a VNC client: noVNC's own control
@@ -93,30 +94,41 @@ export class PreviewManager {
     this.pendingRoomId = roomId
     this.pendingBounds = bounds
     this.pendingVisible = true
-    let inspection: Awaited<ReturnType<RoomOrchestrator['inspectRoomRuntime']>>
-    try {
-      inspection = await this.orch.inspectRoomRuntime(roomId)
-    } catch {
-      if (attempt === this.attachAttempt) {
-        this.pendingRoomId = null
-        this.pendingBounds = null
-        this.pendingVisible = true
-        if (this.roomId) this.detach()
+    let inspection: Awaited<ReturnType<RoomOrchestrator['inspectRoomRuntime']>> | null = null
+    for (let probe = 0; probe < 2; probe += 1) {
+      try {
+        inspection = await this.orch.inspectRoomRuntime(roomId)
+      } catch {
+        inspection = null
       }
+      if (attempt !== this.attachAttempt) return
+      const observedRoom = inspection ? { ...inspection.room, runtimeStatus: inspection.runtimeStatus } : null
+      if (isPreviewableRoom(observedRoom)) break
+
+      const transientFailure = inspection === null || inspection.runtimeStatus.state === 'unknown'
+      const recordedRoomStillOpen = isPreviewableRoom(this.orch.rooms.get(roomId))
+      if (probe === 0 && transientFailure && recordedRoomStillOpen) {
+        await new Promise((resolve) => setTimeout(resolve, ATTACH_RETRY_DELAY_MS))
+        if (attempt !== this.attachAttempt) return
+        continue
+      }
+
+      this.pendingRoomId = null
+      this.pendingBounds = null
+      this.pendingVisible = true
+      // Refresh live controls after a terminal rejection so a stale renderer
+      // snapshot cannot continue presenting the Room as healthy.
+      if (!this.win.isDestroyed()) this.win.webContents.send(IPC.evRoomsChanged)
+      if (this.roomId) this.detach()
       return
     }
-    if (attempt !== this.attachAttempt) return
+    if (!inspection) return
     const latestBounds = this.pendingBounds ?? bounds
     const latestVisible = this.pendingVisible
     this.pendingRoomId = null
     this.pendingBounds = null
     this.pendingVisible = true
     const room = { ...inspection.room, runtimeStatus: inspection.runtimeStatus }
-    if (!isPreviewableRoom(room)) {
-      // A forged/stale renderer attach must never leave another Room visible.
-      if (this.roomId) this.detach()
-      return
-    }
     if (this.roomId !== roomId) {
       this.detach()
       this.visible = latestVisible

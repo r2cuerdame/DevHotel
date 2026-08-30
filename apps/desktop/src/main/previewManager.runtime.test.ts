@@ -163,4 +163,39 @@ describe('PreviewManager runtime attachment', () => {
     expect(electronMocks.views).toHaveLength(0)
     manager.detach()
   })
+
+  it('retries one transient unknown observation while the recorded Room remains open', async () => {
+    const room = { id: 'room1abc', provider: 'web', status: 'ready' }
+    const inspectRoomRuntime = vi
+      .fn()
+      .mockResolvedValueOnce({
+        room,
+        runtimeStatus: { state: 'unknown' },
+        urls: { app: null }
+      })
+      .mockResolvedValueOnce({
+        room,
+        runtimeStatus: { state: 'running' },
+        urls: { app: 'https://demo-dev.localhost/' }
+      })
+    const orch = {
+      onEvent: () => () => undefined,
+      rooms: { get: () => room },
+      inspectRoomRuntime,
+      inspectRoom: () => ({ urls: { app: 'https://demo-dev.localhost/' } }),
+      setThumbnail: () => undefined
+    } as unknown as RoomOrchestrator
+    const win = {
+      contentView: { addChildView: () => undefined, removeChildView: () => undefined },
+      isDestroyed: () => false,
+      webContents: { send: () => undefined }
+    }
+    const manager = new PreviewManager(win as never, orch, 'C:\\devhotel-test')
+
+    await manager.attach(room.id, { x: 10, y: 20, width: 800, height: 600 })
+
+    expect(inspectRoomRuntime).toHaveBeenCalledTimes(2)
+    expect(electronMocks.views).toHaveLength(1)
+    manager.detach()
+  })
 })
