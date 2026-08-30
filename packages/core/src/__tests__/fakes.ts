@@ -106,9 +106,16 @@ export class FakeBackend implements IsolationBackend {
   }
   async pauseWeb(roomId: string) {
     this.calls.push(`pauseWeb:${roomId}`)
+    this.webPausedValue = true
   }
   async unpauseWeb(roomId: string) {
     this.calls.push(`unpauseWeb:${roomId}`)
+    this.webPausedValue = false
+  }
+  webPausedValue = false
+  async webPaused(roomId: string) {
+    this.calls.push(`webPaused:${roomId}`)
+    return this.webPausedValue
   }
   async restartWeb(roomId: string) {
     this.calls.push(`restartWeb:${roomId}`)
@@ -154,7 +161,7 @@ export class FakeBackend implements IsolationBackend {
     const hostDir = join(artifactsRoot, operationId)
     this.calls.push(`exportAndroidArtifacts:${workspaceVolume}:${hostDir}`)
     const { mkdirSync, writeFileSync } = await import('node:fs')
-    const { dirname } = await import('node:path')
+    const { dirname, join: joinPath } = await import('node:path')
     const { createHash } = await import('node:crypto')
     const exported: ExportedArtifact[] = []
     for (const artifact of this.exportedArtifacts) {
@@ -162,6 +169,10 @@ export class FakeBackend implements IsolationBackend {
       const content = Buffer.from(`fake-apk:${artifact.relativePath}`)
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, content)
+      writeFileSync(
+        joinPath(dirname(path), 'output-metadata.json'),
+        JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: artifact.relativePath.split('/').at(-1) }] })
+      )
       exported.push({
         relativePath: artifact.relativePath,
         size: content.byteLength,
@@ -298,6 +309,15 @@ export class FakeBackend implements IsolationBackend {
     await this.copyFromRoomHook?.(roomId, containerPath, hostPath)
     const { existsSync, writeFileSync } = await import('node:fs')
     if (!existsSync(hostPath)) writeFileSync(hostPath, 'fake-room-file')
+  }
+  fencedEmulatorExecHandler: ((args: string[]) => Promise<ExecResult> | ExecResult) | null = null
+  async execFencedEmulatorAdb(_roomId: string, args: string[], _opts?: ExecOpts): Promise<ExecResult> {
+    this.calls.push(`execFencedEmulatorAdb:${args.join(' ')}`)
+    return this.fencedEmulatorExecHandler?.(args) ?? this.execResult
+  }
+  async installFencedEmulatorApk(_roomId: string, hostApkPath: string, _opts?: ExecOpts): Promise<ExecResult> {
+    this.calls.push(`installFencedEmulatorApk:${hostApkPath}`)
+    return this.fencedEmulatorExecHandler?.(['install', '-r', '[private-staged-apk]']) ?? this.execResult
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   async createEmulator(

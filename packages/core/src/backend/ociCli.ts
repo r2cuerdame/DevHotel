@@ -2,6 +2,8 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFi
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
+import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
+import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
 import {
@@ -25,6 +27,7 @@ import {
   effectiveDepsVolume,
   imageFor,
   isJobName,
+  jobName,
   parsePortOutput,
   roomNetworkName,
   srcVolume,
@@ -34,7 +37,7 @@ import {
   webName,
   workspaceSnapshotVolume,
 } from './naming'
-import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, ManagedNetwork, WebSpec } from './types'
+import type { AnchorSpec, ExecOpts, ExecOutputChunk, ExecResult, ExportedArtifact, IsolationBackend, ManagedNetwork, WebSpec } from './types'
 
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
@@ -55,6 +58,97 @@ const GENERATED_SYNC_DIRS = [
   'target',
   'coverage'
 ] as const
+
+function boundedCommandOutput(maxBytes: number): {
+  push(chunk: ExecOutputChunk): Uint8Array | null
+  text(): string
+  readonly exceeded: boolean
+} {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  let exceeded = false
+  return {
+    push(chunk) {
+      if (exceeded) return null
+      const data = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk)
+      const remaining = Math.max(0, maxBytes - bytes)
+      if (remaining > 0) {
+        const captured = data.subarray(0, remaining)
+        chunks.push(captured)
+        bytes += captured.byteLength
+      }
+      if (data.byteLength > remaining) exceeded = true
+      return remaining > 0 ? data.subarray(0, remaining) : null
+    },
+    text: () => Buffer.concat(chunks, bytes).toString('utf8'),
+    get exceeded() { return exceeded }
+  }
+}
+
+const FENCED_EMULATOR_ADB_SCRIPT = `set -eu
+state=$1
+stdout_limit=$2
+stderr_limit=$3
+command_timeout=$4
+shift 4
+socket_path=$state/server.sock
+socket=localfilesystem:$socket_path
+adb=/opt/android-sdk/platform-tools/adb
+rm -rf -- "$state"
+mkdir -m 700 -p "$state/home" "$state/tmp"
+run_adb() {
+  env -i \
+    HOME="$state/home" \
+    TMPDIR="$state/tmp" \
+    PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    ADB_SERVER_SOCKET="$socket" \
+    "$adb" -L "$socket" "$@"
+}
+cleanup() {
+  run_adb kill-server >/dev/null 2>&1 || true
+  rm -rf -- "$state"
+}
+trap cleanup EXIT HUP INT TERM
+[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
+run_adb start-server >/dev/null 2>&1
+[ -S "$socket_path" ] || exit 71
+[ "$(stat -c %u "$socket_path")" = "$(id -u)" ] || exit 72
+ready=0
+i=0
+while [ "$i" -lt 20 ]; do
+  if [ "$(run_adb -s emulator-5554 get-state 2>/dev/null || true)" = device ]; then ready=1; break; fi
+  i=$((i + 1))
+  sleep 0.25
+done
+[ "$ready" -eq 1 ] || exit 73
+stdout_pipe=$state/stdout.pipe
+stderr_pipe=$state/stderr.pipe
+stdout_file=$state/stdout
+stderr_file=$state/stderr
+mkfifo -m 600 "$stdout_pipe" "$stderr_pipe"
+head -c "$((stdout_limit + 1))" < "$stdout_pipe" > "$stdout_file" &
+stdout_reader=$!
+head -c "$((stderr_limit + 1))" < "$stderr_pipe" > "$stderr_file" &
+stderr_reader=$!
+set +e
+timeout -k 1 "$command_timeout" env -i \
+  HOME="$state/home" \
+  TMPDIR="$state/tmp" \
+  PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
+  ANDROID_SDK_ROOT=/opt/android-sdk \
+  ADB_SERVER_SOCKET="$socket" \
+  "$adb" -L "$socket" -s emulator-5554 "$@" > "$stdout_pipe" 2> "$stderr_pipe"
+status=$?
+wait "$stdout_reader"
+wait "$stderr_reader"
+set -e
+stdout_size=$(wc -c < "$stdout_file")
+stderr_size=$(wc -c < "$stderr_file")
+head -c "$stdout_limit" "$stdout_file"
+head -c "$stderr_limit" "$stderr_file" >&2
+if [ "$stdout_size" -gt "$stdout_limit" ] || [ "$stderr_size" -gt "$stderr_limit" ]; then exit 97; fi
+exit "$status"`
 
 function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
   const findFilter = entries === 'files' ? "\\( -type f -o -type l \\) " : ''
@@ -574,6 +668,12 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['unpause', webName(roomId)]), 'unpause web container')
   }
 
+  async webPaused(roomId: string): Promise<boolean> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
+    return container.State?.Paused === true
+  }
+
   async restartWeb(roomId: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.assertRoomContainer(roomId, webName(roomId), 'web')
@@ -749,7 +849,7 @@ export class OciCliBackend implements IsolationBackend {
             DU_IMAGE,
             'sh',
             '-lc',
-            "cd /workspace && find . -type f -path '*/build/outputs/apk/*' -name '*.apk' -exec sh -c 'for file do rel=${file#./}; mkdir -p \"/out/${rel%/*}\"; cp \"$file\" \"/out/$rel\"; done' sh {} +"
+            "cd /workspace && find . -type f \\( \\( -path '*/build/outputs/apk/*' -name '*.apk' \\) -o -path '*/build/outputs/apk/*/output-metadata.json' \\) -exec sh -c 'for file do rel=${file#./}; mkdir -p \"/out/${rel%/*}\"; cp \"$file\" \"/out/$rel\"; done' sh {} +"
           ],
           { timeoutMs: LONG_TIMEOUT_MS }
         ),
@@ -761,6 +861,19 @@ export class OciCliBackend implements IsolationBackend {
       for (const path of filesBelow(canonicalOutput)) {
         const relativePath = relative(canonicalOutput, path).replaceAll('\\', '/')
         const segments = relativePath.split('/')
+        if (relativePath.endsWith('/output-metadata.json')) {
+          const metadata = lstatSync(path)
+          if (
+            metadata.isSymbolicLink() ||
+            !metadata.isFile() ||
+            metadata.size < 2 ||
+            metadata.size > 256 * 1024 ||
+            !(relativePath.startsWith('build/outputs/apk/') || relativePath.includes('/build/outputs/apk/'))
+          ) {
+            throw new Error(`invalid exported Android output metadata: ${relativePath}`)
+          }
+          continue
+        }
         if (
           relativePath.startsWith('/') ||
           segments.some((segment) => segment === '' || segment === '.' || segment === '..') ||
@@ -1378,6 +1491,145 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), 'copy from room')
   }
 
+  async execFencedEmulatorAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
+    return this.runFencedEmulatorAdb(roomId, args, opts)
+  }
+
+  async installFencedEmulatorApk(roomId: string, hostApkPath: string, opts: ExecOpts = {}): Promise<ExecResult> {
+    const canonicalApk = realpathSync.native(hostApkPath)
+    const apkStat = lstatSync(canonicalApk)
+    if (
+      canonicalApk !== resolve(hostApkPath) ||
+      apkStat.isSymbolicLink() ||
+      !apkStat.isFile() ||
+      apkStat.size < 1 ||
+      apkStat.size > 512 * 1024 * 1024
+    ) {
+      throw new Error('fenced emulator install refused an invalid private APK stage')
+    }
+    return this.runFencedEmulatorAdb(roomId, ['install', '-r', '/devhotel-install/app.apk'], opts, canonicalApk)
+  }
+
+  private async runFencedEmulatorAdb(
+    roomId: string,
+    args: string[],
+    opts: ExecOpts,
+    hostApkPath?: string
+  ): Promise<ExecResult> {
+    await this.assertPinnedEngineIdentity()
+    if (!args[0] || args[0].startsWith('-')) throw new Error('fenced emulator ADB requires a command without selectors')
+    if (!hostApkPath && ['install', 'install-multiple', 'install-multi-package'].includes(args[0])) {
+      throw new Error('fenced emulator installs require a private staged APK capability')
+    }
+    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+    const emulator = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
+    if (emulator.State?.Status !== 'running') throw new Error('Room emulator is not running under the execution fence')
+    await this.ensureImage(ANDROID_IMAGE)
+    const id = randomUUID()
+    const name = jobName(roomId, id)
+    const abortToken = randomUUID()
+    const state = `/tmp/devhotel-fenced-adb-${id}`
+    const mount = hostApkPath
+      ? ['--mount', `type=bind,source=${hostApkPath},target=/devhotel-install/app.apk,readonly`]
+      : []
+    const stdoutLimit = Math.min(opts.maxStdoutBytes ?? 1024 * 1024, 1024 * 1024)
+    const stderrLimit = Math.min(opts.maxStderrBytes ?? 64 * 1024, 64 * 1024)
+    if (
+      !Number.isSafeInteger(stdoutLimit) || stdoutLimit < 1 ||
+      !Number.isSafeInteger(stderrLimit) || stderrLimit < 1
+    ) throw new Error('fenced emulator ADB output limits must be positive safe integers')
+    const timeoutMs = Math.min(opts.timeoutMs ?? 120_000, 10 * 60_000)
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new Error('fenced emulator ADB timeout must be a positive safe integer')
+    }
+    const stdout = boundedCommandOutput(stdoutLimit)
+    const stderr = boundedCommandOutput(stderrLimit)
+    const result = await runDocker([
+      'run',
+      '--rm',
+      '--name',
+      name,
+      '--network',
+      `container:${exactContainerId(anchor, roomId)}`,
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '--read-only',
+      '--tmpfs',
+      '/tmp:rw,nosuid,nodev,noexec,size=4m',
+      '-l',
+      `devhotel.room=${roomId}`,
+      '-l',
+      'devhotel.role=job',
+      '-l',
+      'devhotel.managed=1',
+      '-l',
+      `devhotel.abort-token=${abortToken}`,
+      ...mount,
+      '-e',
+      `ADB_SERVER_SOCKET=localfilesystem:${state}/server.sock`,
+      '--entrypoint',
+      '/bin/sh',
+      ANDROID_IMAGE,
+      '-c',
+      FENCED_EMULATOR_ADB_SCRIPT,
+      'devhotel-fenced-adb',
+      state,
+      String(stdoutLimit),
+      String(stderrLimit),
+      String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      ...args
+    ], {
+      timeoutMs,
+      maxStdoutBytes: stdoutLimit,
+      maxStderrBytes: stderrLimit,
+      onAbort: () => this.removeAbortedFencedJob(roomId, name, abortToken),
+      onStdout: (chunk) => {
+        const accepted = stdout.push(chunk)
+        if (accepted) opts.onStdout?.(accepted)
+      },
+      onStderr: (chunk) => {
+        const accepted = stderr.push(chunk)
+        if (accepted) opts.onStderr?.(accepted)
+      }
+    })
+    const exceeded = result.outputLimitExceeded === true || result.code === 97 || stdout.exceeded || stderr.exceeded
+    return {
+      code: exceeded ? -1 : result.code,
+      stdout: opts.onStdout ? '' : stdout.text(),
+      stderr: opts.onStderr
+        ? ''
+        : `${stderr.text()}${exceeded ? '\nFenced emulator ADB output exceeded its safety limit.' : ''}`
+    }
+  }
+
+  private async removeAbortedFencedJob(roomId: string, name: string, abortToken: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.inspectContainer(name)
+    if (!container) return
+    const actualName = (container.Name ?? '').replace(/^\//, '')
+    const labels = container.Config?.Labels ?? {}
+    if (
+      actualName !== name ||
+      labels['devhotel.room'] !== roomId ||
+      labels['devhotel.role'] !== 'job' ||
+      labels['devhotel.managed'] !== '1' ||
+      labels['devhotel.abort-token'] !== abortToken ||
+      !isJobName(roomId, name)
+    ) return
+    let id: string
+    try {
+      id = exactContainerId(container, roomId)
+    } catch {
+      return
+    }
+    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
+      throw new Error('Could not clean up the exact aborted fenced Android helper')
+    }
+  }
+
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
@@ -1874,7 +2126,7 @@ interface DockerContainerInspect {
   Id?: string
   Name?: string
   Config?: { Labels?: Record<string, string> | null } | null
-  State?: { Status?: string } | null
+  State?: { Status?: string; Paused?: boolean } | null
 }
 
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {

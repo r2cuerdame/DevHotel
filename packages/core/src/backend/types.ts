@@ -41,12 +41,17 @@ export interface ExecResult {
   code: number
   stdout: string
   stderr: string
+  /** The process was killed as soon as a configured stdout/stderr byte cap was crossed. */
+  outputLimitExceeded?: boolean
 }
 
 export type ExecOutputChunk = string | Uint8Array
 
 export interface ExecOpts {
   timeoutMs?: number
+  /** Optional hard capture caps used by fenced helpers and high-level automation. */
+  maxStdoutBytes?: number
+  maxStderrBytes?: number
   /**
    * Receive stdout as it is produced. A backend that honours this must not also
    * accumulate the stream into `ExecResult.stdout` — that is the whole point:
@@ -83,6 +88,8 @@ export interface IsolationBackend {
   /** Freeze/unfreeze the web container while taking a consistent volume copy. */
   pauseWeb(roomId: string): Promise<void>
   unpauseWeb(roomId: string): Promise<void>
+  /** Exact execution fence state; acceptance code must not infer this from `running`. */
+  webPaused(roomId: string): Promise<boolean>
   restartWeb(roomId: string): Promise<void>
   recreateWeb(spec: WebSpec): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
@@ -180,6 +187,10 @@ export interface IsolationBackend {
   copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void>
   /** copy a file out of the room's web/build container to the host */
   copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
+  /** Controlled emulator ADB outside the user Room; acceptance callers separately require a pause fence. */
+  execFencedEmulatorAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /** Install one Host-private staged APK without reopening the Room workspace. */
+  installFencedEmulatorApk(roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult>
   /* --- android emulator sidecar (KVM) --- */
   createEmulator(
     roomId: string,

@@ -76,6 +76,27 @@ describe('runDocker output sinks', () => {
     expect(result.stderr).toBe('')
   })
 
+  it('kills immediately at the byte cap and never emits a post-limit chunk', async () => {
+    const chunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    const startedAt = Date.now()
+    const result = await runDocker([
+      '-e',
+      `process.stdout.write('abcdefgh'); setTimeout(() => process.stdout.write('post-limit'), 30000)`
+    ], {
+      timeoutMs: 30_000,
+      maxStdoutBytes: 4,
+      maxStderrBytes: 64,
+      onStdout: (chunk) => chunks.push(Buffer.from(chunk)),
+      onStderr: (chunk) => stderrChunks.push(Buffer.from(chunk))
+    })
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000)
+    expect(result).toMatchObject({ code: -1, outputLimitExceeded: true })
+    expect(Buffer.concat(chunks).toString('utf8')).toBe('abcd')
+    expect(Buffer.concat(stderrChunks)).toHaveLength(0)
+  })
+
   it('refuses to combine chunk sinks with the file/line sinks', async () => {
     await expect(
       runDocker(['-e', ''], { onStdout: () => {}, outputFile: 'ignored.log' })

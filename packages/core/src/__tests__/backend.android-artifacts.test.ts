@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
-import { workspaceSnapshotVolume } from '../backend/naming'
+import { anchorName, emulatorName, webName, workspaceSnapshotVolume } from '../backend/naming'
 import {
   importHostFolderScript,
   OciCliBackend,
@@ -11,6 +11,7 @@ import {
   workspaceTransactionalFingerprintScript
 } from '../backend/ociCli'
 import { tempDir } from './fakes'
+import { ANDROID_IMAGE } from '../providers/androidProvider'
 
 vi.mock('../backend/cli', () => ({ runDocker: vi.fn() }))
 
@@ -204,5 +205,165 @@ describe('OciCliBackend Android artifact export', () => {
       new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID)
     ).rejects.toThrow(/copy failed/)
     expect(existsSync(join(root, OPERATION_ID))).toBe(false)
+  })
+
+  it('runs fenced emulator ADB through one private owned server in the anchor network namespace', async () => {
+    const ids = {
+      web: 'a'.repeat(64),
+      anchor: 'b'.repeat(64),
+      emulator: 'c'.repeat(64)
+    }
+    const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
+      Id: id,
+      Name: `/${name}`,
+      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      State: { Status: 'running', Paused: paused }
+    }])
+    mockedRunDocker.mockImplementation(async (args, opts) => {
+      if (args[0] === 'inspect') {
+        if (args[1] === webName(ROOM_ID)) {
+          return { code: 0, stdout: inspect(webName(ROOM_ID), 'web', ids.web, true), stderr: '' }
+        }
+        if (args[1] === anchorName(ROOM_ID)) {
+          return { code: 0, stdout: inspect(anchorName(ROOM_ID), 'anchor', ids.anchor), stderr: '' }
+        }
+        if (args[1] === emulatorName(ROOM_ID)) {
+          return { code: 0, stdout: inspect(emulatorName(ROOM_ID), 'svc-emulator', ids.emulator), stderr: '' }
+        }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'run') {
+        opts?.onStdout?.('device\n')
+        return ok
+      }
+      return ok
+    })
+
+    const result = await new OciCliBackend().execFencedEmulatorAdb(
+      ROOM_ID,
+      ['shell', 'getprop', 'sys.boot_completed'],
+      { timeoutMs: 20_000, maxStdoutBytes: 128, maxStderrBytes: 64 }
+    )
+
+    expect(result).toEqual({ code: 0, stdout: 'device\n', stderr: '' })
+    const call = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'run')!
+    const run = call[0]
+    const runOpts = call[1]
+    expect(run).toEqual(expect.arrayContaining([
+      '--network', `container:${ids.anchor}`,
+      '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges',
+      '--entrypoint', '/bin/sh',
+      ANDROID_IMAGE
+    ]))
+    expect(run).not.toContain('/workspace')
+    expect(run).not.toContain('--entrypoint=adb')
+    const script = run[run.indexOf('-c') + 1]!
+    expect(script).toContain('env -i')
+    expect(script).toContain('localfilesystem:$socket_path')
+    expect(script).toContain('"$adb" -L "$socket" -s emulator-5554')
+    expect(script).toContain('[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ]')
+    expect(script).toContain('[ -S "$socket_path" ]')
+    expect(script).toContain('run_adb kill-server')
+    expect(script).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
+    expect(run.slice(-3)).toEqual(['shell', 'getprop', 'sys.boot_completed'])
+    expect(run).toEqual(expect.arrayContaining(['shell', 'getprop', 'sys.boot_completed']))
+    expect(runOpts).toMatchObject({
+      timeoutMs: 20_000,
+      maxStdoutBytes: 128,
+      maxStderrBytes: 64,
+      onAbort: expect.any(Function)
+    })
+  })
+
+  it('cuts off fenced helper sinks at the requested cap and rejects all later chunks', async () => {
+    const inspect = (name: string, role: string, paused = false) => JSON.stringify([{
+      Id: role === 'anchor' ? 'b'.repeat(64) : role === 'svc-emulator' ? 'c'.repeat(64) : 'a'.repeat(64),
+      Name: `/${name}`,
+      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      State: { Status: 'running', Paused: paused }
+    }])
+    mockedRunDocker.mockImplementation(async (args, opts) => {
+      if (args[0] === 'inspect') {
+        const name = args[1]!
+        if (name === webName(ROOM_ID)) return { code: 0, stdout: inspect(name, 'web', true), stderr: '' }
+        if (name === anchorName(ROOM_ID)) return { code: 0, stdout: inspect(name, 'anchor'), stderr: '' }
+        if (name === emulatorName(ROOM_ID)) return { code: 0, stdout: inspect(name, 'svc-emulator'), stderr: '' }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'run') {
+        opts?.onStdout?.('abcdefgh')
+        opts?.onStdout?.('must-not-pass')
+        return ok
+      }
+      return ok
+    })
+    const chunks: Buffer[] = []
+
+    const result = await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], {
+      maxStdoutBytes: 4,
+      maxStderrBytes: 4,
+      onStdout: (chunk) => chunks.push(Buffer.from(chunk))
+    })
+
+    expect(result).toMatchObject({ code: -1, stdout: '', stderr: expect.stringContaining('safety limit') })
+    expect(Buffer.concat(chunks).toString('utf8')).toBe('abcd')
+  })
+
+  it('aborted helper cleanup removes only the exact labeled container ID and ignores name reuse', async () => {
+    const ownedIds = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), helper: 'c'.repeat(64) }
+    let helperInspect: Record<string, unknown> | null = null
+    const roomContainer = (name: string, role: string, id: string) => ({
+      Id: id,
+      Name: `/${name}`,
+      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      State: { Status: 'running' }
+    })
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        if (args[1] === anchorName(ROOM_ID)) {
+          return { code: 0, stdout: JSON.stringify([roomContainer(args[1], 'anchor', ownedIds.anchor)]), stderr: '' }
+        }
+        if (args[1] === emulatorName(ROOM_ID)) {
+          return { code: 0, stdout: JSON.stringify([roomContainer(args[1], 'svc-emulator', ownedIds.emulator)]), stderr: '' }
+        }
+        return helperInspect
+          ? { code: 0, stdout: JSON.stringify([helperInspect]), stderr: '' }
+          : { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      return ok
+    })
+    await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'])
+    const helperCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'run')!
+    const helperArgs = helperCall[0]
+    const helperOpts = helperCall[1]!
+    const helperName = helperArgs[helperArgs.indexOf('--name') + 1]!
+    const tokenLabel = helperArgs.find((arg) => arg.startsWith('devhotel.abort-token='))!
+    const abortToken = tokenLabel.slice('devhotel.abort-token='.length)
+
+    helperInspect = {
+      ...roomContainer(helperName, 'job', 'd'.repeat(64)),
+      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'job', 'devhotel.managed': '1' } }
+    }
+    await helperOpts.onAbort?.()
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm')).toBe(false)
+
+    helperInspect = {
+      ...roomContainer(helperName, 'job', ownedIds.helper),
+      Config: {
+        Labels: {
+          'devhotel.room': ROOM_ID,
+          'devhotel.role': 'job',
+          'devhotel.managed': '1',
+          'devhotel.abort-token': abortToken
+        }
+      }
+    }
+    await helperOpts.onAbort?.()
+    expect(mockedRunDocker.mock.calls.some(([args]) =>
+      args[0] === 'rm' && args[1] === '-f' && args[2] === ownedIds.helper
+    )).toBe(true)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args[2] === helperName)).toBe(false)
   })
 })
