@@ -53,7 +53,14 @@ import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
 import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
-import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey } from './workingState'
+import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey, workspaceSyncBaseKey } from './workingState'
+import {
+  WorkspaceDriftError,
+  diffWorkspaceSnapshots,
+  parseWorkspaceSnapshot,
+  serializeWorkspaceSnapshot,
+  type WorkspaceSnapshot
+} from './workspaceDrift'
 
 const newRoomId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
 
@@ -558,8 +565,9 @@ export class RoomOrchestrator {
         if (record.sourceType === 'linked-folder') {
           this.olog(id, 'import Host source into Room-owned workspace')
           await this.backend.importHostFolder(id, record.sourceRef, record.workspaceVolumeRevision, (line) => this.olog(id, line))
-          const fingerprint = await this.backend.fingerprintWorkspace(id, record.workspaceVolumeRevision)
-          this.rooms.update(id, { workspaceFingerprint: fingerprint, lastSyncedAt: new Date().toISOString() })
+          const snapshot = await this.backend.snapshotWorkspace(id, record.workspaceVolumeRevision)
+          this.rooms.update(id, { workspaceFingerprint: snapshot.fingerprint, lastSyncedAt: new Date().toISOString() })
+          this.settings.set(workspaceSyncBaseKey(id), serializeWorkspaceSnapshot(snapshot))
         }
         const { hostPort } = await this.backend.createRoomPod(this.webSpecFor(record))
         this.rooms.update(id, {
@@ -1403,9 +1411,11 @@ export class RoomOrchestrator {
       if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
         throw new Error('This Room is detached from its original Host folder')
       }
-      const fingerprint = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
+      const snapshot = await this.backend.snapshotWorkspace(roomId, room.workspaceVolumeRevision)
+      const fingerprint = snapshot.fingerprint
       const before = { syncStatus: room.syncStatus, workspaceFingerprint: room.workspaceFingerprint }
       this.rooms.update(roomId, { workspaceFingerprint: fingerprint, syncStatus: 'synced' })
+      this.settings.set(workspaceSyncBaseKey(roomId), serializeWorkspaceSnapshot(snapshot))
       this.appendJournal(
         roomId,
         'reset-sync-baseline',
@@ -1451,14 +1461,34 @@ export class RoomOrchestrator {
       throw new Error('Wake the Room before importing Host changes')
     }
     if (!migrateLegacy) {
-      const currentFingerprint = await this.backend.fingerprintWorkspace(roomId, room.workspaceVolumeRevision)
-      if (!room.workspaceFingerprint || currentFingerprint !== room.workspaceFingerprint) {
+      const currentSnapshot = await this.backend.snapshotWorkspace(roomId, room.workspaceVolumeRevision)
+      const baseline = await this.workspaceSyncBaseline(room)
+      const changedPaths = baseline ? diffWorkspaceSnapshots(baseline, currentSnapshot) : null
+      let acceptedFingerprint = room.workspaceFingerprint
+      if (acceptedFingerprint && !baseline && currentSnapshot.fingerprint !== acceptedFingerprint) {
+        const legacyFingerprint = await this.backend.fingerprintWorkspaceLegacy(room.id, room.workspaceVolumeRevision)
+        const generatedOnlyFingerprint = legacyFingerprint === acceptedFingerprint
+          ? legacyFingerprint
+          : await this.backend.fingerprintWorkspaceLegacyCurrentExclusions(
+              room.id,
+              room.workspaceVolumeRevision
+            )
+        if (legacyFingerprint === acceptedFingerprint || generatedOnlyFingerprint === acceptedFingerprint) {
+          acceptedFingerprint = currentSnapshot.fingerprint
+          this.rooms.update(room.id, { workspaceFingerprint: acceptedFingerprint })
+          this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
+        }
+      }
+      if (!acceptedFingerprint || currentSnapshot.fingerprint !== acceptedFingerprint) {
         this.rooms.update(roomId, { syncStatus: 'modified' })
+        if (changedPaths && changedPaths.length > 0) throw new WorkspaceDriftError(changedPaths)
         throw new Error(
           'Room files changed since the last Host sync. Export or commit them first, ' +
             'or accept the current Room files as the new baseline (Reset baseline) and sync again.'
         )
       }
+      // Upgrade pre-path-baseline Rooms without changing their accepted source.
+      if (!baseline) this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
     }
 
     const nextVolumeRevision = nextWorkspaceVolumeRevision(
@@ -1468,10 +1498,10 @@ export class RoomOrchestrator {
     // Reserve before import. A failed/staged generation must never be reused.
     this.settings.set(workspaceGenMaxKey(room.id), String(nextVolumeRevision))
     this.olog(roomId, `${migrateLegacy ? 'move into Hotel' : 'sync from Host'}: stage workspace r${nextVolumeRevision}`)
-    let nextFingerprint: string
+    let nextSnapshot: WorkspaceSnapshot
     try {
       await this.backend.importHostFolder(roomId, room.sourceRef, nextVolumeRevision, (line) => this.olog(roomId, line))
-      nextFingerprint = await this.backend.fingerprintWorkspace(roomId, nextVolumeRevision)
+      nextSnapshot = await this.backend.snapshotWorkspace(roomId, nextVolumeRevision)
     } catch (err) {
       await this.backend.removeWorkspaceVolume(roomId, nextVolumeRevision).catch(() => undefined)
       throw err
@@ -1517,9 +1547,10 @@ export class RoomOrchestrator {
       stateRevision: room.stateRevision + 1,
       syncStatus: 'synced',
       lastSyncedAt: syncedAt,
-      workspaceFingerprint: nextFingerprint,
+      workspaceFingerprint: nextSnapshot.fingerprint,
       lastUsedAt: syncedAt
     })
+    this.settings.set(workspaceSyncBaseKey(roomId), serializeWorkspaceSnapshot(nextSnapshot))
     const updated = this.mustGet(roomId)
     await writeManifest(this.userData, updated)
     this.appendJournal(
@@ -1553,6 +1584,27 @@ export class RoomOrchestrator {
       }
     }
     return updated
+  }
+
+  private async workspaceSyncBaseline(room: RoomRecord): Promise<WorkspaceSnapshot | null> {
+    const stored = parseWorkspaceSnapshot(this.settings.get(workspaceSyncBaseKey(room.id)))
+    if (stored) return stored
+
+    // Older builds retained the replaced generation but stored only a whole-tree
+    // digest. Recover a path-addressable base from that immutable spare when it
+    // still exists; otherwise a matching current digest is upgraded in place.
+    const retained = this.settings.get(retainedWorkspaceGenKey(room.id))
+    if (retained === null) return null
+    const revision = Number.parseInt(retained, 10)
+    if (!Number.isSafeInteger(revision) || revision < 1 || revision === room.workspaceVolumeRevision) return null
+    try {
+      const snapshot = await this.backend.snapshotWorkspace(room.id, revision)
+      if (snapshot.fingerprint !== room.workspaceFingerprint) return null
+      this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(snapshot))
+      return snapshot
+    } catch {
+      return null
+    }
   }
 
   listChanges(roomId: string): ChangeEntry[] {

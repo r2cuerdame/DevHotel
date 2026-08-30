@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { srcVolume } from '../backend/naming'
 import { depsGenKey, depsGenMaxKey, depsVolumeForGen } from '../changes/definitions/deps'
 import { RoomOrchestrator } from '../orchestrator'
-import { retainedWorkspaceGenKey } from '../workingState'
+import { retainedWorkspaceGenKey, workspaceSyncBaseKey } from '../workingState'
+import { serializeWorkspaceSnapshot, WorkspaceDriftError } from '../workspaceDrift'
 import { buildDiagnostic } from '../diagnostics/bundle'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
@@ -117,6 +118,86 @@ describe('Room-owned working state', () => {
     await expect(orch.syncFromHost(room.id, 'user')).rejects.toThrow(/Room files changed/)
     expect(orch.rooms.get(room.id)?.syncStatus).toBe('modified')
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('reports only meaningful source drift with exact paths and reasons', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(
+      workspaceSyncBaseKey(room.id),
+      serializeWorkspaceSnapshot({
+        fingerprint: 'a'.repeat(64),
+        entries: [{ path: 'app/src/main/java/App.kt', kind: 'file', identity: 'old-source' }]
+      })
+    )
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    // The OCI snapshot policy has already removed app/build/** and .gradle/**;
+    // mixed build output plus this edit therefore exposes only the source path.
+    backend.workspaceSnapshotEntries = [
+      { path: 'app/src/main/java/App.kt', kind: 'file', identity: 'new-source' }
+    ]
+
+    const error = await orch.syncFromHost(room.id, 'user').catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(WorkspaceDriftError)
+    expect((error as WorkspaceDriftError).toResponse()).toMatchObject({
+      error: 'workspace_drift',
+      conflictReason: 'room-source-modified',
+      changedPaths: [{ path: 'app/src/main/java/App.kt', reason: 'modified' }]
+    })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('upgrades a clean pre-path-baseline Room without accepting unknown drift', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'legacy-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'new-policy-fingerprint'
+    backend.legacyWorkspaceFingerprintValue = 'legacy-fingerprint'
+    backend.workspaceSnapshotEntries = [
+      { path: 'app/src/main/java/App.kt', kind: 'file', identity: 'source' }
+    ]
+
+    await expect(orch.syncFromHost(room.id, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('app/src/main/java/App.kt')
+  })
+
+  it('upgrades a legacy baseline when only newly excluded generated output appeared', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'legacy-fingerprint'
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'new-policy-fingerprint'
+    backend.legacyWorkspaceFingerprintValue = 'legacy-with-new-output'
+    backend.legacyCurrentExclusionsFingerprintValue = 'legacy-fingerprint'
+    backend.workspaceSnapshotEntries = [
+      { path: 'app/src/main/java/App.kt', kind: 'file', identity: 'source' }
+    ]
+
+    await expect(orch.syncFromHost(room.id, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('app/src/main/java/App.kt')
   })
 
   it('lets agents sync under the Room grant, refuses once revoked, and never lets them migrate', async () => {

@@ -71,7 +71,7 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/checks` | | 14-step check report |
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
-| `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined |
+| `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |
@@ -80,6 +80,16 @@ room's Changes list. Host boundaries hold:
 | `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | `{ png: base64, source }` — Android rooms; `screen` captures the display (FLAG_SECURE included) |
 | `GET /v1/rooms/:id/file` | `?path=/workspace/…` | `{ path, size, contentBase64 }` (16MB cap) |
 | `PUT /v1/rooms/:id/file` | `{ path: '/workspace/…', contentBase64 }` | `{ path, size }` — creates parents, marks workspace modified |
+
+Room source drift ignores generated directory segments such as `build`,
+`.gradle`, `.kotlin`, `.cxx`, `dist`, `target`, and `node_modules`, plus APK/AAB
+files. A project that intentionally tracks generated input can add exact
+Room-relative files or directory prefixes (one per line, `#` comments allowed)
+to `.devhotel-sync-include`; globs, absolute paths, backslashes, and `..` are
+rejected, as is any entry whose parent directory resolves outside the linked
+folder through a symlink. Included generated paths participate in the baseline
+and are copied during linked-folder import. A real conflict response has the shape
+`{ error: "workspace_drift", message, conflictReason: "room-source-modified", changedPaths: [{ path, reason }] }`.
 
 ## MCP registration note
 

@@ -8,6 +8,11 @@ export function workspaceGenMaxKey(roomId: string): string {
   return `workspaceGenMax:${roomId}`
 }
 
+/** Per-path common base used to explain Room-side Host-sync conflicts. */
+export function workspaceSyncBaseKey(roomId: string): string {
+  return `workspaceSyncBase:${roomId}`
+}
+
 export function nextWorkspaceVolumeRevision(current: number, recordedMax: string | null): number {
   const parsed = recordedMax === null ? current : Number.parseInt(recordedMax, 10)
   const max = Number.isSafeInteger(parsed) && parsed >= 0 ? Math.max(current, parsed) : current

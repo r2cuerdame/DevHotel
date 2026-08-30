@@ -64,6 +64,12 @@ Room-local changes made only in a container's writable root filesystem are not y
 
 New Local Folder Rooms import Host source through a short-lived read-only mount into a Room-owned source volume. **Sync from Host** stages and fingerprints a new generation, rejects detected Room-side drift, and never writes back implicitly. Existing Local Folder Rooms stay in visible `legacy-host-bind` compatibility mode with Agent mutation/Clone blocked until the user selects **Move into Hotel**. Import is currently a full staged copy rather than incremental/COW sync. Android Clean Build snapshots the complete Room-owned source, uses the pinned image with disposable SDK/Gradle state, and exports APKs plus verified provenance under the Room; Web Build/Test and durable per-Job recovery still lack the shared immutable `StateRevision` implementation.
 
+Drift checks ignore common generated outputs (`build`, `.gradle`, `.kotlin`,
+`.cxx`, `dist`, `target`, `node_modules`, APK/AAB files, and similar caches) so
+a normal build does not hide real source edits. Projects that intentionally
+track a generated input can list its exact Room-relative file or directory
+prefix in `.devhotel-sync-include`; those paths are imported and checked again.
+
 Current preview requirements:
 
 - Windows 11 (first supported OS)

@@ -4,7 +4,12 @@ import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
 import { workspaceSnapshotVolume } from '../backend/naming'
-import { OciCliBackend } from '../backend/ociCli'
+import {
+  importHostFolderScript,
+  OciCliBackend,
+  workspaceSnapshotScript,
+  workspaceTransactionalFingerprintScript
+} from '../backend/ociCli'
 import { tempDir } from './fakes'
 
 vi.mock('../backend/cli', () => ({ runDocker: vi.fn() }))
@@ -40,8 +45,11 @@ describe('OciCliBackend Android artifact export', () => {
       }
       if (args[0] === 'image' && args[1] === 'inspect') return ok
       if (args[0] === 'run') {
+        if (args.at(-1)?.includes('transaction_paths=$(mktemp)')) {
+          return { code: 0, stdout: `${buildInputDigest}  /tmp/transaction-records\n`, stderr: '' }
+        }
         if (args.at(-1)?.includes('sync_paths=$(mktemp)')) {
-          return { code: 0, stdout: `${buildInputDigest}  /tmp/sync-records\n`, stderr: '' }
+          return { code: 0, stdout: `fingerprint\t${buildInputDigest}\n`, stderr: '' }
         }
         if (args.at(-1)?.includes('records=$(mktemp)')) {
           return { code: 0, stdout: `${buildInputDigest}  /tmp/records\n`, stderr: '' }
@@ -78,17 +86,46 @@ describe('OciCliBackend Android artifact export', () => {
     await expect(backend.fingerprintBuildInput(ROOM_ID, SNAPSHOT)).resolves.toBe('f'.repeat(64))
   })
 
-  it('makes the filtered sync fingerprint NUL-safe and fails closed when listing or hashing fails', async () => {
+  it('keeps Git control state in the NUL-safe transactional fingerprint while pruning Git objects', async () => {
     const backend = new OciCliBackend()
     await expect(backend.fingerprintWorkspace(ROOM_ID, 0, SNAPSHOT)).resolves.toBe('e'.repeat(64))
+    const run = mockedRunDocker.mock.calls.find(
+      ([args]) => args[0] === 'run' && args.at(-1)?.includes('transaction_paths=$(mktemp)')
+    )?.[0]
+    const script = run?.at(-1) ?? ''
+    expect(script).toContain('-print0 > "$transaction_paths"')
+    expect(script).toContain('sort -zu "$transaction_paths" > "$transaction_sorted"')
+    expect(script).toContain('done < "$transaction_sorted"')
+    expect(script).toContain("-path '*/.git/objects'")
+    expect(script).not.toContain("-name '.git'")
+    expect(script).toContain('find "./$include" -print0 >> "$transaction_paths"')
+    expect(script).toContain('.devhotel-sync-include')
+    expect(script).toContain('readlink -n')
+    expect(run).toEqual(expect.arrayContaining(['--cap-drop', 'NET_RAW']))
+  })
+
+  it('makes the filtered source snapshot NUL-safe and fails closed when listing or hashing fails', async () => {
+    const backend = new OciCliBackend()
+    await expect(backend.snapshotWorkspace(ROOM_ID, 0, SNAPSHOT)).resolves.toMatchObject({
+      fingerprint: 'e'.repeat(64),
+      entries: []
+    })
     const run = mockedRunDocker.mock.calls.find(
       ([args]) => args[0] === 'run' && args.at(-1)?.includes('sync_paths=$(mktemp)')
     )?.[0]
     const script = run?.at(-1) ?? ''
-    expect(script).toContain('-print0 > "$sync_paths"; sort -z "$sync_paths" > "$sync_sorted"')
+    expect(script).toContain('-print0 > "$sync_paths"')
+    expect(script).toContain('sort -zu "$sync_paths" > "$sync_sorted"')
     expect(script).toContain('done < "$sync_sorted"')
     expect(script).not.toContain('-print |')
     expect(script).toContain('readlink -n')
+    expect(script).toContain('.devhotel-sync-include')
+    for (const generated of ['build', '.gradle', '.kotlin', '.cxx', '.externalNativeBuild', 'target']) {
+      expect(script).toContain(`-name '${generated}'`)
+    }
+    expect(script).toContain("! -name '*.apk' ! -name '*.aab'")
+    expect(script.indexOf('-prune -o')).toBeLessThan(script.indexOf('-print0 > "$sync_paths"'))
+    expect(script).toContain('find "./$include" \\( -type f -o -type l \\) -print0 >> "$sync_paths"')
     expect(run).toEqual(expect.arrayContaining(['--cap-drop', 'NET_RAW']))
 
     mockedRunDocker.mockImplementation(async (args) => {
@@ -98,7 +135,23 @@ describe('OciCliBackend Android artifact export', () => {
       return ok
     })
     await expect(backend.fingerprintWorkspace(ROOM_ID, 0, SNAPSHOT)).rejects.toThrow(/permission denied/)
+    await expect(backend.snapshotWorkspace(ROOM_ID, 0, SNAPSHOT)).rejects.toThrow(/permission denied/)
     await expect(backend.fingerprintBuildInput(ROOM_ID, SNAPSHOT)).rejects.toThrow(/permission denied/)
+  })
+
+  it('normalizes one trailing include slash before rejecting empty path components', () => {
+    for (const script of [
+      importHostFolderScript(),
+      workspaceSnapshotScript(),
+      workspaceTransactionalFingerprintScript()
+    ]) {
+      expect(script.indexOf('include=${include%/}')).toBeGreaterThanOrEqual(0)
+      expect(script.indexOf('include=${include%/}')).toBeLessThan(script.indexOf('case "/$include/"'))
+      expect(script).toContain('include_probe=$include_dir')
+      expect(script.indexOf('realpath "$include_probe"')).toBeLessThan(
+        script.indexOf('if [ ! -e "$include" ]')
+      )
+    }
   })
 
   it('exports only from the exact owned snapshot into a derived Hotel directory and hashes the APK', async () => {
