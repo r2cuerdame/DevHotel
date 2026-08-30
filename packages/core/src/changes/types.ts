@@ -36,6 +36,10 @@ export interface ChangeCtx {
     /** Keep the lease alive while a long build prepares the next device action. */
     keepAlive<T>(run: () => Promise<T>): Promise<T>
   }
+  /** Persist the app capability only after this tracked install succeeded. */
+  recordAndroidInstall?: (applicationId: string, apkPath: string, changeId: string) => Promise<void>
+  /** Recreating a Room emulator invalidates every receipt for its old OS instance. */
+  clearAndroidEmulatorInstalls?: () => void
 }
 
 export interface ChangePlanned {

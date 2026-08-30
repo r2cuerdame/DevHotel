@@ -20,6 +20,13 @@ import {
   zAndroidPairingCodeSubmission,
   zAndroidPairingPromptRef
 } from '../androidDevices'
+import {
+  zAndroidLaunchAppBody,
+  zAndroidLogcatBody,
+  zAndroidRunCrashScenarioBody,
+  zAndroidTapTextBody,
+  zAndroidTargetSelector
+} from '../androidAutomation'
 
 const serviceManifest = {
   schemaVersion: 1 as const,
@@ -147,6 +154,39 @@ describe('zQuickChange', () => {
       expect(zQuickChange.safeParse({ kind: 'package-install', name, version: '1.2.3', dev: false }).success).toBe(false)
     }
     expect(zQuickChange.safeParse({ kind: 'package-install', name: 'zod', version: 'latest', dev: false }).success).toBe(false)
+  })
+})
+
+describe('Android automation schemas', () => {
+  it('accepts typed extras and explicit opaque targets', () => {
+    expect(zAndroidLaunchAppBody.parse({
+      applicationId: 'com.example.app',
+      activity: '.MainActivity',
+      extras: { name: 'AppDied', retries: 2, enabled: true },
+      target: { kind: 'physical', deviceId: `d${'a'.repeat(32)}` }
+    })).toMatchObject({ applicationId: 'com.example.app', extras: { retries: 2 } })
+    expect(zAndroidTargetSelector.parse({ kind: 'emulator' })).toEqual({ kind: 'emulator' })
+  })
+
+  it('refuses shell-shaped identifiers, oversized extras and unknown fields', () => {
+    expect(zAndroidLaunchAppBody.safeParse({ applicationId: 'com.example.app;id' }).success).toBe(false)
+    expect(zAndroidLaunchAppBody.safeParse({
+      applicationId: 'com.example.app',
+      extras: Object.fromEntries(Array.from({ length: 17 }, (_, index) => [`key${index}`, index]))
+    }).success).toBe(false)
+    expect(zAndroidTapTextBody.safeParse({
+      applicationId: 'com.example.app', text: 'Crash', serial: 'R5CT30ABCDE'
+    }).success).toBe(false)
+  })
+
+  it('bounds log and crash inputs to literal, named scenarios', () => {
+    expect(zAndroidLogcatBody.safeParse({ applicationId: 'com.example.app', maxLines: 501 }).success).toBe(false)
+    expect(zAndroidRunCrashScenarioBody.safeParse({
+      applicationId: 'com.example.app', scenario: 'shell', runId: 'run-1'
+    }).success).toBe(false)
+    expect(zAndroidRunCrashScenarioBody.safeParse({
+      applicationId: 'com.example.app', scenario: 'am-crash', runId: 'run-1'
+    }).success).toBe(true)
   })
 })
 

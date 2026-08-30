@@ -474,6 +474,16 @@ describe('Android automation targets the attached device without a hand-written 
 
     expect(entry.status).toBe('verified')
     expect(entry.verify?.detail).toMatch(/running on SM-G991N-01/)
+    expect(orch.androidInstalls.list('aaaa1111', {
+      kind: 'physical', targetId: attached.device.id, deviceId: attached.device.id, leaseId: attached.lease.id
+    })).toEqual([
+      expect.objectContaining({
+        roomId: 'aaaa1111',
+        applicationId: 'com.example.app',
+        changeId: entry.id,
+        apkSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })
+    ])
     expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state', 'install', 'shell', 'shell', 'shell'])
     expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/My 앱-$&-debug.APK')
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
@@ -748,6 +758,11 @@ describe('Android automation targets the attached device without a hand-written 
 
     expect(entry.status).toBe('verified')
     expect(entry.verify?.detail).toMatch(/Room emulator/)
+    expect(orch.androidInstalls.list('aaaa1111', {
+      kind: 'emulator', targetId: 'aaaa1111', deviceId: null
+    })).toEqual([
+      expect.objectContaining({ applicationId: 'com.example.app', changeId: entry.id })
+    ])
     expect(adb.execs).toEqual([])
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('adb -s emulator-5554'))).toBe(true)
     expect(
@@ -757,6 +772,148 @@ describe('Android automation targets the attached device without a hand-written 
           ?.includes("'install' '-r' '/workspace/app/build/outputs/apk/debug/My App'\\''s $&-debug.APK'")
       )
     ).toBe(true)
+  })
+
+  it('uses an explicitly selected Room emulator even while a physical lease is attached', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    backend.emulatorStateValue = 'running'
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z'
+    })
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
+      }
+      if (cmd[4] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const status = await orch.androidAutomationStatus('aaaa1111', { kind: 'emulator' })
+
+    expect(status).toMatchObject({
+      target: { kind: 'emulator', deviceId: null },
+      installedApplicationIds: ['com.example.app'],
+      foregroundApplicationId: 'com.example.app',
+      locale: 'ko-KR'
+    })
+    expect(adb.execs).toEqual([])
+  })
+
+  it('fails closed when streamed emulator evidence exceeds the operation limit', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z'
+    })
+    backend.execInRoomHandler = (_roomId, cmd, opts) => {
+      if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
+        opts?.onStdout?.(`mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n${'x'.repeat(3_000)}`)
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (cmd[4] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const status = await orch.androidAutomationStatus('aaaa1111', { kind: 'emulator' })
+
+    expect(status.installedApplicationIds).toEqual(['com.example.app'])
+    expect(status.foregroundApplicationId).toBeNull()
+    expect(status.locale).toBe('ko-KR')
+  })
+
+  it('rechecks the exact physical lease between UI evidence and input', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: {
+        kind: 'physical',
+        targetId: attached.device.id,
+        deviceId: attached.device.id,
+        leaseId: attached.lease.id
+      },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z'
+    })
+    let replaced = false
+    adb.execResultFor = async (_serial, args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
+      }
+      if (args[1] === 'uiautomator') return { code: 0, stdout: 'UI hierarchy dumped\n', stderr: '' }
+      if (args[0] === 'exec-out') {
+        await orch.devices.release(attached.lease.id, 'replace after evidence')
+        const next = await orch.devices.requestDevice({
+          roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-b',
+          constraints: { deviceId: attached.device.id }
+        })
+        expect(next.state).toBe('granted')
+        replaced = true
+        return {
+          code: 0,
+          stdout: '<hierarchy><node package="com.example.app" text="Crash" bounds="[0,0][20,20]" /></hierarchy>',
+          stderr: ''
+        }
+      }
+      return null
+    }
+
+    await expect(orch.androidTapText('aaaa1111', {
+      applicationId: 'com.example.app', text: 'Crash'
+    })).rejects.toMatchObject({ code: 'lease-expired' })
+    expect(replaced).toBe(true)
+    expect(adb.execs.some((call) => call.args[1] === 'input')).toBe(false)
+  })
+
+  it('does not reuse a physical install receipt after the phone is leased again', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    const first = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (first.state !== 'granted') throw new Error('unreachable')
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: {
+        kind: 'physical',
+        targetId: first.device.id,
+        deviceId: first.device.id,
+        leaseId: first.lease.id
+      },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z'
+    })
+    await orch.releaseAndroidDevice('aaaa1111', 'rotate lease')
+    const second = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-b' })
+    if (second.state !== 'granted') throw new Error('unreachable')
+    expect(second.lease.id).not.toBe(first.lease.id)
+    adb.execs = []
+
+    await expect(orch.androidForceStop('aaaa1111', {
+      applicationId: 'com.example.app',
+      target: { kind: 'physical', deviceId: second.device.id }
+    })).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_TRACKED' })
+    expect(adb.execs).toEqual([])
   })
 })
 

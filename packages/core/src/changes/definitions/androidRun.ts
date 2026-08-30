@@ -165,7 +165,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     }
     await assertLaunchersAreExecutable(ctx)
   },
-  async apply(ctx, p, steps) {
+  async apply(ctx, p, steps, operation) {
     const apply = async (): Promise<void> => {
       const room = ctx.room()
       steps.push(`Run ${room.startCommand}`)
@@ -207,6 +207,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
         if (install.code !== 0) {
           throw new Error(`adb install ${app.appId} failed: ${(install.stderr || install.stdout).slice(-300)}`)
         }
+        await ctx.recordAndroidInstall?.(app.appId, app.apkPath, operation.id)
       }
 
       steps.push(`Resolve and launch ${target.appId}`)

@@ -77,6 +77,7 @@ export const emulatorConfigChange: ChangeDefinition<{
     ctx.rooms.update(ctx.roomId, { android: next })
     if (ctx.isAwake()) {
       steps.push(`Start ${label(next)} (a new OS version downloads its image first)`)
+      ctx.clearAndroidEmulatorInstalls?.()
       await ctx.backend.removeEmulator(ctx.roomId)
       await ctx.backend.createEmulator(ctx.roomId, next)
     } else {
@@ -99,6 +100,7 @@ export const emulatorConfigChange: ChangeDefinition<{
       (entry.before as EmulatorSelection)
     ctx.rooms.update(ctx.roomId, { android: prev })
     if (ctx.isAwake()) {
+      ctx.clearAndroidEmulatorInstalls?.()
       await ctx.backend.removeEmulator(ctx.roomId)
       await ctx.backend.createEmulator(ctx.roomId, prev)
     }
