@@ -363,12 +363,74 @@ describe('tracked Android automation session', () => {
     expect(result.since).toBe(INSTALLED_AT)
     expect(result.lines.join('\n')).not.toContain('ghp_')
     expect(calls.find((args) => args[0] === 'logcat')).toEqual(expect.arrayContaining([
-      '--uid=10123', '-t', `${Math.floor(Date.parse(INSTALLED_AT) / 1000)}.000`, '-m', '20'
+      '--uid=10123', '-t', `${Math.floor(Date.parse(INSTALLED_AT) / 1000)}.000`
     ]))
+    expect(calls.find((args) => args[0] === 'logcat')).not.toContain('-m')
     expect(calls.filter((args) => args[1] === 'pm' && args[2] === 'list')).toEqual([
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', APP_ID],
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', '10123']
     ])
+  })
+
+  it('preserves a fractional cutoff and applies the requested line cap after literal filtering', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        return {
+          code: 0,
+          stdout: 'noise before the match\nlate MATCH one\nlate MATCH two\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const requestedSince = '2026-08-31T01:02:04.567Z'
+
+    const result = await session.logcat({
+      applicationId: APP_ID,
+      since: requestedSince,
+      filter: 'MATCH',
+      maxLines: 1
+    })
+
+    expect(result).toMatchObject({
+      since: requestedSince,
+      lines: ['late MATCH one'],
+      sourceLines: 3,
+      truncated: true
+    })
+    const logcat = calls.find((args) => args[0] === 'logcat')
+    expect(logcat).toEqual(expect.arrayContaining([
+      '-t', `${Math.floor(Date.parse(requestedSince) / 1000)}.567`
+    ]))
+    expect(logcat).not.toContain('-m')
+  })
+
+  it('fails closed with an actionable since hint when bounded logcat source overflows', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        return {
+          code: -1,
+          stdout: 'bounded prefix',
+          stderr: 'Android emulator command output exceeded its safety limit.'
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.logcat({
+      applicationId: APP_ID,
+      filter: 'MATCH',
+      maxLines: 1
+    })).rejects.toMatchObject({
+      code: 'ANDROID_OUTPUT_LIMIT',
+      recoveryHint: expect.stringMatching(/since/i)
+    })
   })
 
   it('composes safe foreground metadata with its exact install receipt', async () => {

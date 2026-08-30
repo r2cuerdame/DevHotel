@@ -149,6 +149,12 @@ function literalIncludes(value: string, wanted: string, ignoreCase = false): boo
     : value.includes(wanted)
 }
 
+function epochSecondsWithMillis(epochMs: number): string {
+  const seconds = Math.floor(epochMs / 1000)
+  const millis = epochMs - (seconds * 1000)
+  return `${seconds}.${String(millis).padStart(3, '0')}`
+}
+
 function matchesText(node: AndroidUiNode, text: string, match: 'exact' | 'contains'): boolean {
   const values = [node.text, node.contentDescription]
   return match === 'exact'
@@ -177,6 +183,7 @@ export class AndroidAutomationSession {
     opts: AndroidAutomationExecOptions & {
       deadline?: AndroidAutomationDeadline
       stdoutLimit?: number
+      outputLimitRecovery?: string
       operation: string
     }
   ): Promise<ExecResult> {
@@ -202,11 +209,13 @@ export class AndroidAutomationSession {
     if (opts.deadline && this.now() >= opts.deadline.at) {
       throw waitTimeoutError(opts.deadline.applicationId)
     }
-    if (opts.stdoutLimit !== undefined && Buffer.byteLength(result.stdout, 'utf8') > opts.stdoutLimit) {
+    const outputLimitExceeded = opts.stdoutLimit !== undefined &&
+      Buffer.byteLength(result.stdout, 'utf8') > opts.stdoutLimit
+    if (outputLimitExceeded) {
       throw automationError(
         'ANDROID_OUTPUT_LIMIT',
         `${opts.operation} exceeded its ${opts.stdoutLimit}-byte safety limit.`,
-        'Narrow the filter or reduce the requested result size.'
+        opts.outputLimitRecovery ?? 'Narrow the filter or reduce the requested result size.'
       )
     }
     return result
@@ -684,10 +693,22 @@ export class AndroidAutomationSession {
     const result = await this.command(
       [
         'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${uid}`,
-        '-t', `${Math.floor(sinceMs / 1000)}.000`, '-m', String(input.maxLines ?? 200)
+        '-t', epochSecondsWithMillis(sinceMs)
       ],
-      { operation: 'Android package logcat', timeoutMs: 30_000, stdoutLimit: 1024 * 1024 }
+      {
+        operation: 'Android package logcat',
+        timeoutMs: 30_000,
+        stdoutLimit: 1024 * 1024,
+        outputLimitRecovery: 'Move since closer to the failure and retry so the bounded source window contains less log history.'
+      }
     )
+    if (/(?:adb stdout exceeded the \d+-byte Host safety limit|Android emulator command output exceeded its safety limit\.)/i.test(result.stderr)) {
+      throw automationError(
+        'ANDROID_OUTPUT_LIMIT',
+        'Android package logcat exceeded its 1048576-byte safety limit.',
+        'Move since closer to the failure and retry so the bounded source window contains less log history.'
+      )
+    }
     if (result.code !== 0) {
       throw automationError(
         'ANDROID_LOGCAT_UNSUPPORTED',
@@ -702,9 +723,14 @@ export class AndroidAutomationSession {
       ? source.filter((line) => literalIncludes(line, input.filter!))
       : source
     const lines: string[] = []
+    const maxLines = input.maxLines ?? 200
     let bytes = 0
     let truncated = false
     for (const line of filtered) {
+      if (lines.length >= maxLines) {
+        truncated = true
+        break
+      }
       const safe = redactSecrets(line).replaceAll('emulator-5554', '[room-emulator]')
       const size = Buffer.byteLength(`${safe}\n`, 'utf8')
       if (bytes + size > MAX_LOGCAT_BYTES) {
