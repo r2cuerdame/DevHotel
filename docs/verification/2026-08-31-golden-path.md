@@ -89,12 +89,17 @@ The fresh Hotel-owned Android Room started synchronized with a live build runtim
 
 For the final physical stage, the Room-only debug build was given an `.devhotel` application-ID suffix. This avoids replacing or deleting the differently signed protected copy already on the test phone while proving the same source and UI as an independently installable final acceptance build.
 
-- Final debug-ID provenance build verified:
+- A clean immutable debug-ID build verified and exported build evidence:
   - `app-debug.apk`: 81,584,021 bytes, SHA-256 `ddcc4f39473c1d764303635390972efae2befc542311c4e01318dd15f5b3ab2a`
   - `crashsample-debug.apk`: 2,647,875 bytes, SHA-256 `b1713ea547bd01a4fdc408159e48eef69f36d7086ed7c20919aa16276ac70a81`
   - provenance SHA-256 `46266974d47b74d93ef3618a5a95c876835135cd249a96e2d77a563503fcc7ea`
-- The exact debug-ID build first passed emulator install and launch. Its UI hierarchy was 9,830 bytes, SHA-256 `c68084938adac1a8e7deae0fc099a645a77a47bffdd9cbd4ea0540cc159221c3`, with all 27 nodes owned by `com.purpleship.appdied.devhotel`.
-- The corresponding emulator screenshot was 540×1140, 135,714 bytes, SHA-256 `5c584938c4567b4072e7c2d533320b161ba71836f9a30e6ae5e137fad8ae6944`.
+
+`android-run` intentionally recompiles from the live workspace, so its APKs were not assumed to equal the immutable export. After the last run, the two actual workspace install inputs were measured separately:
+
+- `app-debug.apk`: 81,584,021 bytes, SHA-256 `aab47b659b6ca6f2b3d3b069581ce5a2d4e0716e9f4e6ce58fe3ddcf869df5a6`
+- `crashsample-debug.apk`: 2,647,875 bytes, SHA-256 `64eec2589fc2b74d186de02a88f314eb23a4183a885841170ecc9a4b679d0c4a`
+
+Those exact files were then installed without another build. Emulator install and cold launch passed first. Its UI hierarchy was 9,830 bytes, SHA-256 `c68084938adac1a8e7deae0fc099a645a77a47bffdd9cbd4ea0540cc159221c3`, with all 27 nodes owned by `com.purpleship.appdied.devhotel`. The corresponding emulator screenshot was 540×1140, 135,293 bytes, SHA-256 `54162352f525a5a22ac4e8ae88d306fcc019b5d9ed3e6b91050cd4a7d3dfcb97`.
 
 ## Physical acceptance
 
@@ -106,7 +111,9 @@ The broker reported one ready USB target, no owner, and an empty queue before th
 
 The first install attempt correctly failed with Android's `INSTALL_FAILED_UPDATE_INCOMPATIBLE` because the protected existing AppDied package had a different signing key. DevHotel surfaced the exact install stage and Android reason. The lease was immediately released; no uninstall, data clear, downgrade, or signature bypass was attempted.
 
-After the debug-ID build passed the emulator, the fresh Room reacquired the lease and `android-run` verified all five physical steps: build, exclusive-lease use, both APK installs, launcher resolution, and launch. The Control API then captured the foreground physical display with `source: adb`: 1080×2340 PNG, 227,254 bytes, SHA-256 `f752732cc0ec56165cecc1b9f28b410873f2274e3d602287861ac9a75e2133e5`. The lease was released and the final debug-ID app was deliberately left installed on the phone.
+The fresh Room later reacquired the lease and `android-run` verified all five physical steps: build, exclusive-lease use, both APK installs, launcher resolution, and launch. To close the artifact-identity gap caused by that internal rebuild, the resulting workspace APKs were hashed as shown above, installed on the emulator without rebuilding, and passed launch/UI capture there. Only after that exact-file emulator pass did the Room reacquire the USB lease and reinstall those same two workspace paths through the broker, again without a build. Both installs and the explicit activity launch returned code 0 and success.
+
+The first physical capture after reinstall was a screen-off black frame and was rejected rather than counted as evidence. After waking the shared test display through the leased Control API and relaunching the same activity, the accepted `source: adb` capture was a non-black 1080×2340 PNG with 40 sampled colors and average sampled brightness 228: 227,356 bytes, SHA-256 `583b370409b272153bf8215b939ebb29ce3b3d3474f03ad432419018f6fb3a82`. The lease was released and that exact emulator-tested debug-ID app was deliberately left installed on the phone.
 
 ## Safety invariants
 
