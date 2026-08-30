@@ -51,6 +51,8 @@ export interface HostInputMonitor {
 
 export const HOST_INPUT_PROBE_SUPPORTED = process.platform === 'win32'
 
+const MOUSE_BUTTON_VIRTUAL_KEYS = [0x01, 0x02, 0x04, 0x05, 0x06] as const
+
 const PROBE_SCRIPT = `$ErrorActionPreference = 'Stop'
 Add-Type @"
 using System;
@@ -66,6 +68,7 @@ $point = New-Object DevHotelPoint
 $cursorOk = [DevHotelHostInputProbe]::GetCursorPos([ref]$point)
 $pressedKeyCount = 0
 foreach ($key in 1..254) {
+  if ($key -in @(${MOUSE_BUTTON_VIRTUAL_KEYS.join(', ')})) { continue }
   if (([DevHotelHostInputProbe]::GetAsyncKeyState($key) -band 0x8000) -ne 0) { $pressedKeyCount++ }
 }
 $state = @{ x = $point.X; y = $point.Y; fg = [int64][DevHotelHostInputProbe]::GetForegroundWindow(); keyCount = $pressedKeyCount; interactive = $cursorOk }

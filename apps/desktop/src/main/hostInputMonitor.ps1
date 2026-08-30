@@ -446,6 +446,7 @@ public static class DevHotelHostInputMonitor
         if (Report.KeyboardChanged) return;
         for (int key = 1; key <= 254; key++)
         {
+            if (IsMouseButtonVirtualKey(key)) continue;
             bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
             if (down != BaselineKeys[key])
             {
@@ -461,6 +462,7 @@ public static class DevHotelHostInputMonitor
         int pressedKeyCount = 0;
         for (int key = 1; key <= 254; key++)
         {
+            if (IsMouseButtonVirtualKey(key)) continue;
             if ((GetAsyncKeyState(key) & 0x8000) != 0)
             {
                 keys[key] = true;
@@ -468,6 +470,18 @@ public static class DevHotelHostInputMonitor
             }
         }
         return pressedKeyCount;
+    }
+
+    private static bool IsMouseButtonVirtualKey(int key)
+    {
+        // GetAsyncKeyState exposes mouse buttons through the VK namespace too.
+        // They are already latched by WH_MOUSE_LL and must not be reported as
+        // keyboard state or included in the privacy-preserving key count.
+        return key == 0x01 // VK_LBUTTON
+            || key == 0x02 // VK_RBUTTON
+            || key == 0x04 // VK_MBUTTON
+            || key == 0x05 // VK_XBUTTON1
+            || key == 0x06; // VK_XBUTTON2
     }
 
     private static bool KeysDiffer(bool[] before, bool[] after)

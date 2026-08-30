@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   captureHostInputSnapshot,
@@ -33,6 +35,17 @@ function monitorSnapshot(overrides: Partial<HostInputMonitorSnapshot> = {}): Hos
 }
 
 describe('Host input drift detection', () => {
+  it('keeps mouse-button virtual keys out of every keyboard-state sampler', () => {
+    const helper = readFileSync(join(import.meta.dirname, 'hostInputMonitor.ps1'), 'utf8')
+    expect(helper.match(/if \(IsMouseButtonVirtualKey\(key\)\) continue;/g)).toHaveLength(2)
+    for (const virtualKey of ['0x01', '0x02', '0x04', '0x05', '0x06']) {
+      expect(helper).toContain(`key == ${virtualKey}`)
+    }
+
+    const snapshotSource = readFileSync(join(import.meta.dirname, 'hostInputProbe.ts'), 'utf8')
+    expect(snapshotSource).toContain('MOUSE_BUTTON_VIRTUAL_KEYS.join')
+  })
+
   it('reports nothing when the Host was left alone', () => {
     expect(hostInputDrift(snapshot(), snapshot())).toEqual([])
   })
