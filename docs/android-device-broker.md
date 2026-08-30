@@ -131,8 +131,8 @@ Commands are classified by *whether another project would notice*, not by
 whether they write files.
 
 - **Interfering** (needs a live lease): `install`, `uninstall`,
-  approved mutating `shell am` / `shell pm` / `shell settings` subcommands,
-  `shell input`, and `shell monkey`.
+  approved mutating `shell am` / `shell pm` subcommands, `shell input`, and
+  `shell monkey`.
 - **Shared** (no lease): a deliberately small bounded set such as `get-state`,
   selected non-identifying `getprop` keys, and exact `wm size` / `wm density`
   queries.
@@ -141,11 +141,15 @@ whether they write files.
   queries such as `get-serialno`, unapproved `getprop` keys, caller-supplied
   target selectors, Host-path reads such as `push` / `pull`, Host SDK path
   disclosure through `adb version`, transport/runtime restart operations such
-  as `reboot`, `root`, `tcpip`, `usb`, `shell svc`, and `shell setprop`, and cross-app or large-output reads
-  including `logcat`, `dumpsys`, `exec-out`, `pm list/path/dump`, `ps`, `top`,
-  `jdwp`, raw `screenrecord`, and `wm` modes other than the two exact queries. Screen
-  capture and tracked-app checks are available only through their high-level
-  operations, which build the argv internally.
+  as `reboot`, `root`, `tcpip`, `usb`, `shell svc`, and `shell setprop`, raw
+  shared-configuration surfaces including `shell settings`, `shell content`,
+  `shell device_config`, and `shell cmd`, runtime-stopping `shell am hang` /
+  `shell am restart`, and cross-app or large-output reads including `logcat`,
+  `dumpsys`, `exec-out`, `pm list/path/dump`, `ps`, `top`, `jdwp`, raw
+  `screenrecord`, and `wm` modes other than the two exact queries.
+  A physical lease does not make those shared configuration surfaces safe.
+  Screen capture and tracked-app checks are available only through their
+  high-level operations, which build the argv internally.
 - **Anything unrecognised fails closed.** An unknown Host verb or shell program
   is categorically refused rather than made safe by a lease, and a "safe"
   program that smuggles a second command, remote expansion, or glob after `;`,

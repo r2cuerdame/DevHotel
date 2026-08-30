@@ -403,7 +403,17 @@ describe('Android automation targets the attached device without a hand-written 
       ['logcat', '-d'],
       ['exec-out', 'screencap', '-p'],
       ['jdwp'],
-      ['tcpip', '5555']
+      ['tcpip', '5555'],
+      ['shell', 'settings', 'put', 'global', 'adb_enabled', '0'],
+      ['shell', 'settings', '--user', '0', 'delete', 'secure', 'adb_enabled'],
+      ['shell', 'content', 'insert', '--uri', 'content://settings/global', '--bind', 'name:s:adb_enabled'],
+      ['shell', 'content', 'call', '--uri', 'content://settings/global', '--method', 'PUT_global'],
+      ['shell', 'device_config', 'put', 'adb', 'mdns_enabled', 'false'],
+      ['shell', 'device_config', 'set_sync_disabled_for_tests', 'persistent'],
+      ['shell', 'cmd', 'settings', 'put', 'global', 'adb_enabled', '0'],
+      ['shell', 'setprop', 'persist.sys.usb.config', 'none'],
+      ['shell', 'am', 'hang'],
+      ['shell', 'am', 'restart']
     ]) {
       await expect(orch.adbOnDevice('aaaa1111', args)).rejects.toMatchObject({ code: 'adb-command-forbidden' })
     }

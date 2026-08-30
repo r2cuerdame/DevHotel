@@ -82,9 +82,11 @@ const SAFE_GETPROP_KEYS = new Set([
   'sys.boot_completed'
 ])
 
-/** Commands whose read modes can bypass identity/output policy despite a lease. */
+/** Raw cross-app reads and Host-owned configuration/runtime surfaces forbidden despite a lease. */
 const FORBIDDEN_SHELL_COMMANDS = new Map<string, string>([
+  ['content', 'reading or changing shared content providers through raw ADB'],
   ['dd', 'reading arbitrary protected device bytes with `dd`'],
+  ['device_config', 'reading or changing shared Android runtime configuration through raw ADB'],
   ['dumpsys', 'dumping cross-app Android service state through raw ADB'],
   ['echo', 'expanding arbitrary remote-shell data with `echo`'],
   ['logcat', 'reading the shared device log through raw ADB'],
@@ -93,6 +95,7 @@ const FORBIDDEN_SHELL_COMMANDS = new Map<string, string>([
   ['printf', 'expanding arbitrary remote-shell data with `printf`'],
   ['reboot', 'rebooting and disconnecting the shared device transport'],
   ['screencap', 'streaming binary screenshots through raw ADB'],
+  ['settings', 'reading or changing shared Android settings through raw ADB'],
   ['setprop', 'changing properties that can restart the shared device transport'],
   ['start', 'restarting the shared Android runtime through raw ADB'],
   ['stop', 'stopping the shared Android runtime through raw ADB'],
@@ -137,14 +140,11 @@ const PM_MUTATING_SUBCOMMANDS = new Set([
   'trim-caches', 'unhide', 'unsuspend'
 ])
 const AM_MUTATING_SUBCOMMANDS = new Set([
-  'broadcast', 'clear-debug-app', 'force-stop', 'hang', 'idle-maintenance', 'instrument',
-  'kill', 'kill-all', 'profile', 'restart', 'screen-compat', 'set-debug-app', 'set-watch-heap',
+  'broadcast', 'clear-debug-app', 'force-stop', 'idle-maintenance', 'instrument',
+  'kill', 'kill-all', 'profile', 'screen-compat', 'set-debug-app', 'set-watch-heap',
   'start', 'start-activity', 'start-foreground-service', 'startservice', 'stopservice'
 ])
-const SETTINGS_MUTATING_SUBCOMMANDS = new Set(['put', 'delete', 'reset'])
-const CONTENT_MUTATING_SUBCOMMANDS = new Set(['insert', 'update', 'delete'])
 const IME_MUTATING_SUBCOMMANDS = new Set(['set', 'enable', 'disable', 'reset'])
-const DEVICE_CONFIG_MUTATING_SUBCOMMANDS = new Set(['put', 'delete', 'reset'])
 const APPOPS_MUTATING_SUBCOMMANDS = new Set(['set', 'reset'])
 
 /** A caller-supplied selector could override the serial inserted by the Host. */
@@ -212,10 +212,7 @@ function classifyShell(words: string[]): AdbClassification {
   if (forbidden) return { interfering: true, forbidden: true, reason: forbidden }
 
   if (program === 'am') return classifyMutatingSubcommand(program, words, AM_MUTATING_SUBCOMMANDS)
-  if (program === 'settings') return classifyMutatingSubcommand(program, words, SETTINGS_MUTATING_SUBCOMMANDS)
-  if (program === 'content') return classifyMutatingSubcommand(program, words, CONTENT_MUTATING_SUBCOMMANDS)
   if (program === 'ime') return classifyMutatingSubcommand(program, words, IME_MUTATING_SUBCOMMANDS)
-  if (program === 'device_config') return classifyMutatingSubcommand(program, words, DEVICE_CONFIG_MUTATING_SUBCOMMANDS)
 
   const interfering = INTERFERING_SHELL_COMMANDS.get(program)
   if (interfering) return { interfering: true, reason: interfering }
