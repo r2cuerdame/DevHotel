@@ -114,6 +114,14 @@ describe('Android device broker MCP tools', () => {
     })
   })
 
+  it('warns that a physical lease never permits shared runtime configuration', () => {
+    const description = tool('android_device_adb').description
+    expect(description).toMatch(/Host-owned raw configuration surfaces/i)
+    expect(description).toMatch(/settings, content, device_config, cmd, setprop, and svc/i)
+    expect(description).toMatch(/always refused even with a lease/i)
+    expect(description).toMatch(/am hang\/restart/i)
+  })
+
   it('releases without pretending the phone was wiped', async () => {
     const release = tool('release_android_device')
     const result = await release.handler({ roomId: 'abc12345', reason: 'acceptance finished' })

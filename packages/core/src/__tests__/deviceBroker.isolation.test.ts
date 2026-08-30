@@ -31,6 +31,44 @@ function makeBroker(phones: FakePhone[] = [{ serial: 'R5CT30ABCDE', state: 'devi
   return { broker, adb, db, now }
 }
 
+const SHARED_RUNTIME_CONFIG_BYPASSES = [
+  ...['global', 'secure', 'system'].flatMap((scope) => [
+    ['shell', 'settings', 'put', scope, 'adb_enabled', '0'],
+    ['shell', 'settings', 'delete', scope, 'adb_enabled'],
+    ['shell', 'settings', 'reset', scope, 'untrusted_defaults']
+  ]),
+  ['shell', 'settings', '--user', '0', 'put', 'global', 'adb_enabled', '0'],
+  ['shell', 'settings', 'put', '--user', '0', 'secure', 'development_settings_enabled', '0'],
+  ['shell', 'settings', 'delete', '--user', 'current', 'secure', 'enabled_accessibility_services'],
+  ['shell', 'settings', 'reset', '--user', '0', 'secure', 'untrusted_clear'],
+  ['shell', 'settings', 'PUT', 'GLOBAL', 'adb_wifi_enabled', '0'],
+  ['shell', 'settings', 'put', 'global', 'adb_enabled', '0', 'transport-tag', 'default'],
+  ['shell', 'settings', 'reset', 'global', 'com.android.shell'],
+  ['shell', 'content', 'insert', '--uri', 'content://settings/global', '--bind', 'name:s:adb_enabled', '--bind', 'value:i:0'],
+  ['shell', 'content', 'update', '--user', '0', '--uri', 'content://settings/secure', '--bind', 'value:s:invalid', '--where', "name='default_input_method'"],
+  ['shell', 'content', 'delete', '--uri', 'content://settings/system', '--where', "name='screen_off_timeout'"],
+  ['shell', 'content', 'call', '--uri', 'content://settings/global', '--method', 'PUT_global', '--arg', 'adb_enabled', '--extra', 'value:i:0'],
+  ['shell', 'content', 'call', '--uri', 'content://settings/global', '--method', 'DELETE_global', '--arg', 'adb_enabled'],
+  ['shell', 'content', 'call', '--uri', 'content://settings/global', '--method', 'RESET_global'],
+  ['shell', 'content', 'write', '--uri', 'content://settings/system/ringtone_cache'],
+  ['shell', 'device_config', 'put', 'activity_manager', 'max_phantom_processes', '0'],
+  ['shell', 'device_config', 'delete', 'activity_manager', 'max_phantom_processes'],
+  ['shell', 'device_config', 'reset', 'trusted_defaults'],
+  ['shell', 'device_config', 'reset', 'untrusted_clear', 'runtime_native_boot'],
+  ['shell', 'device_config', 'set_sync_disabled_for_tests', 'persistent'],
+  ['shell', 'device_config', 'set_sync_disabled_for_tests', 'until_reboot'],
+  ['shell', 'device_config', 'set_sync_disabled_for_tests', 'none'],
+  ['shell', 'cmd', 'settings', 'put', 'global', 'adb_enabled', '0'],
+  ['shell', 'cmd', 'device_config', 'set_sync_disabled_for_tests', 'persistent'],
+  ['shell', 'cmd', 'usb', 'setFunctions', 'none'],
+  ['shell', 'setprop', 'sys.usb.config', 'none'],
+  ['shell', 'setprop', 'persist.sys.usb.config', 'none'],
+  ['shell', 'setprop', 'persist.adb.tls_server.enable', '0'],
+  ['shell', '/system/bin/setprop', 'persist.sys.usb.config', 'none'],
+  ['shell', 'sh', '-c', 'settings put global adb_enabled 0'],
+  ['exec-out', 'settings', 'put', 'global', 'adb_enabled', '0']
+] satisfies string[][]
+
 describe('classifying ADB commands by whether another project would notice', () => {
   it.each([
     [['install', '-r', '/tmp/app.apk']],
@@ -104,6 +142,8 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['shell', 'stop']],
     [['shell', 'start']],
     [['shell', 'svc', 'usb', 'setFunctions', 'none']],
+    [['shell', 'am', 'hang']],
+    [['shell', 'am', 'restart']],
     [['shell', 'pm', 'list', 'packages']],
     [['shell', 'pm', 'path', 'com.example.app']],
     [['shell', 'pm', '--user', '0', 'list', 'packages']],
@@ -142,6 +182,10 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['host-features']],
     [['get-state', 'extra']]
   ])('forbids Host-wide, Host-file, and identity-revealing command %j even with a lease', (argv: string[]) => {
+    expect(classifyAdbCommand(argv)).toMatchObject({ interfering: true, forbidden: true })
+  })
+
+  it.each(SHARED_RUNTIME_CONFIG_BYPASSES)('forbids shared runtime configuration bypass %j even with a lease', (...argv) => {
     expect(classifyAdbCommand(argv)).toMatchObject({ interfering: true, forbidden: true })
   })
 
@@ -267,8 +311,11 @@ describe('Android device broker — no lease, no writes', () => {
       ['shell', 'reboot'],
       ['shell', 'setprop', 'sys.usb.config', 'none'],
       ['shell', 'svc', 'usb', 'setFunctions', 'none'],
+      ['shell', 'am', 'hang'],
+      ['shell', 'am', 'restart'],
       ['version'],
-      ['root']
+      ['root'],
+      ...SHARED_RUNTIME_CONFIG_BYPASSES
   ])('refuses %j even when the requesting Room holds the lease', async (...argv: string[]) => {
     const { broker } = makeBroker()
     await broker.refreshInventory()
