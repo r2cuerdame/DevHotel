@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import type { RoomRecord } from '@devhotel/shared'
+import type { RuntimeRoomRecord } from '@devhotel/shared'
 import type { Translation } from '../i18n'
 import { useStore, useT } from '../state/store'
 import { ActivityTab } from './tabs/Activity'
@@ -29,7 +29,7 @@ export function RoomConfig({
   onClose,
   closable = true
 }: {
-  room: RoomRecord
+  room: RuntimeRoomRecord
   tab: ConfigTab
   onTabChange: (tab: ConfigTab) => void
   onClose: () => void

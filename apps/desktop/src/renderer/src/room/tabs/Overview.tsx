@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import type { RoomRecord } from '@devhotel/shared'
+import type { RoomRecord, RuntimeRoomRecord } from '@devhotel/shared'
 import { statusLabel, useStore, useT } from '../../state/store'
 import { api } from '../../api'
+import { runtimeCapabilities } from '../runtimeCapabilities'
 
 /** Latest verified Room-owned APK path. Artifact export arrives with the Device Service. */
 function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
@@ -24,7 +25,7 @@ function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
   )
 }
 
-export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHealth: () => void }): React.JSX.Element {
+export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; onShowHealth: () => void }): React.JSX.Element {
   const inspection = useStore((s) => s.inspections[room.id])
   const undoChange = useStore((s) => s.undoChange)
   const roomAction = useStore((s) => s.roomAction)
@@ -35,7 +36,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
   const busy = useStore((s) => s.busy[room.id])
   const t = useT()
   const url = inspection?.urls.app
-  const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+  const { fullyRunning: running, hasLiveComponent, androidBuildReady, androidRunReady } = runtimeCapabilities(room)
   const android = room.provider === 'android'
   const windows = room.provider === 'windows'
   const [pending, setPending] = useState<string | null>(null)
@@ -127,7 +128,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <button
               className={running ? 'btn primary' : 'btn'}
               onClick={() => void run('run', () => applyChange(room.id, { kind: 'android-run' }))}
-              disabled={!running || !!busy || pending !== null}
+              disabled={!androidRunReady || !!busy || pending !== null}
             >
               {pending === 'run' ? t('android.launching') : t('android.run')}
             </button>
@@ -136,16 +137,17 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
             <button
               className="btn"
               onClick={() => void run('build', () => applyChange(room.id, { kind: 'android-build' }))}
-              disabled={!running || !!busy || pending !== null}
+              disabled={!androidBuildReady || !!busy || pending !== null}
             >
               {pending === 'build' ? t('android.building') : t('android.buildApk')}
             </button>
           )}
-          {running ? (
+          {hasLiveComponent && (
             <button className="btn" onClick={() => void roomAction(room.id, 'sleep')} disabled={!!busy}>
               {t('bar.sleep')}
             </button>
-          ) : (
+          )}
+          {!running && (
             <button
               className="btn primary"
               onClick={() => void roomAction(room.id, 'start')}

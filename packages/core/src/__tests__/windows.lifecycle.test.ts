@@ -115,6 +115,29 @@ describe('Windows VMware Room lifecycle', () => {
     db.close()
   })
 
+  it('attempts a recovery start when an awake Windows VM state probe fails', async () => {
+    const { orch, windowsVm, db } = setup()
+    const created = await orch.createRoom({
+      sourceType: 'empty',
+      sourceRef: '',
+      project: 'win-app',
+      nickname: 'recover',
+      actor: 'user',
+      provider: 'windows',
+      windows: { baseVmxPath: 'C:\\VMs\\Windows 11.vmx', snapshot: 'devhotel-clean' }
+    })
+
+    windowsVm.calls.length = 0
+    windowsVm.failNextState = true
+
+    await expect(orch.startRoom(created.id, 'user')).resolves.toBeUndefined()
+    expect(windowsVm.calls).toEqual([`state:${created.id}`, `start:${created.id}`, `state:${created.id}`])
+    expect(orch.rooms.get(created.id)?.status).toBe('ready')
+    expect(orch.logs.tail(created.id, 'orchestrator').join(' ')).toMatch(/attempting recovery start: fake state probe failed/)
+
+    db.close()
+  })
+
   it('rejects unapproved actors and source-bearing Windows Rooms before materialization', async () => {
     const { orch, windowsVm, db } = setup()
 

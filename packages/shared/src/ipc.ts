@@ -1,7 +1,7 @@
 import type { ChangeEntry, QuickChange } from './changes'
 import type { CheckReport } from './checks'
 import type { RendererCreateRoomInput, RendererPlanRoomInput } from './control'
-import type { CloneRoomInput, RoomInspection, RoomPlan, RoomRecord } from './rooms'
+import type { CloneRoomInput, RoomInspection, RoomPlan, RoomRecord, RuntimeRoomRecord } from './rooms'
 import type { GitHubServiceStatus, McpRegistryPage } from './hotelServices'
 
 /** IPC channel names. Events (`ev*`) flow main → renderer; the rest are invoke/handle. */
@@ -204,7 +204,7 @@ export type VmwareSetupStatusInfo =
 /** The API surface exposed to the renderer as `window.devhotel`. */
 export interface IpcApi {
   rooms: {
-    list(): Promise<RoomRecord[]>
+    list(): Promise<RuntimeRoomRecord[]>
     plan(input: RendererPlanRoomInput): Promise<RoomPlan>
     create(input: RendererCreateRoomInput): Promise<RoomRecord>
     clone(

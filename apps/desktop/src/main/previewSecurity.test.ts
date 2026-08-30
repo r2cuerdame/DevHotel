@@ -57,6 +57,10 @@ describe('preview boundary policy', () => {
   it('permits native preview attachment only for live Web and Android Rooms', () => {
     expect(isPreviewableRoom({ provider: 'web', status: 'ready' })).toBe(true)
     expect(isPreviewableRoom({ provider: 'web', status: 'attention' })).toBe(true)
+    expect(isPreviewableRoom({ provider: 'web', status: 'ready', runtimeStatus: { state: 'running' } })).toBe(true)
+    expect(isPreviewableRoom({ provider: 'web', status: 'attention', runtimeStatus: { state: 'degraded' } })).toBe(false)
+    expect(isPreviewableRoom({ provider: 'web', status: 'attention', runtimeStatus: { state: 'unknown' } })).toBe(false)
+    expect(isPreviewableRoom({ provider: 'android', status: 'ready', runtimeStatus: { state: 'dead' } })).toBe(false)
     expect(isPreviewableRoom({ provider: 'web', status: 'sleeping' })).toBe(false)
     expect(isPreviewableRoom({ provider: 'android', status: 'ready' })).toBe(true)
     expect(isPreviewableRoom({ provider: 'android', status: 'sleeping' })).toBe(false)

@@ -9,6 +9,7 @@ import type {
   RoomInspection,
   RoomPlan,
   RoomRecord,
+  RuntimeRoomRecord,
   RendererCreateRoomInput,
   RendererPlanRoomInput,
   UpdateStatusInfo
@@ -17,6 +18,7 @@ import { IPC } from '@devhotel/shared'
 import { api } from '../api'
 import { detectLocale, isLocaleId, translate } from '../i18n'
 import type { LocaleId, TFunc, Translation } from '../i18n'
+import { listRoomsWithRuntimeRetry } from './roomRefresh'
 
 export interface Toast {
   id: number
@@ -28,7 +30,7 @@ type View = { name: 'lobby' } | { name: 'room'; roomId: string }
 
 interface DhState {
   view: View
-  rooms: RoomRecord[]
+  rooms: RuntimeRoomRecord[]
   inspections: Record<string, RoomInspection>
   previews: Record<string, PreviewState>
   logs: Record<string, string[]>
@@ -66,6 +68,7 @@ interface DhState {
 }
 
 let toastSeq = 1
+let roomRefreshSequence = 0
 
 export const useStore = create<DhState>((set, get) => ({
   view: { name: 'lobby' },
@@ -137,8 +140,10 @@ export const useStore = create<DhState>((set, get) => ({
   },
 
   async refreshRooms() {
+    const sequence = ++roomRefreshSequence
     try {
-      set({ rooms: await api.rooms.list() })
+      const rooms = await listRoomsWithRuntimeRetry(() => api.rooms.list())
+      if (sequence === roomRefreshSequence) set({ rooms })
     } catch {
       // main not ready yet
     }
