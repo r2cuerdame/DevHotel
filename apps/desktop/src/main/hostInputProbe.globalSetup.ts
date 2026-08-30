@@ -1,9 +1,14 @@
-import { captureHostInputSnapshot, hostInputDrift, HOST_INPUT_PROBE_SUPPORTED, type HostInputSnapshot } from './hostInputProbe'
+import {
+  hostInputMonitorDrift,
+  HOST_INPUT_PROBE_SUPPORTED,
+  startHostInputMonitor,
+  type HostInputMonitor
+} from './hostInputProbe'
 
 /**
- * Wraps the whole desktop suite in a live Host observation: sample the real
- * cursor, foreground window and keyboard before the first test, sample again
- * after the last one, and fail the run if any of them moved.
+ * Wraps the whole desktop suite in a live Host observation. A dedicated
+ * Windows helper subscribes to mouse, keyboard and foreground changes for the
+ * entire run and latches a violation even if teardown sees the original state.
  *
  * Opt-in, because it is a measurement of the physical machine — a human who
  * uses the mouse while it runs is drift the run cannot distinguish from a
@@ -13,7 +18,7 @@ import { captureHostInputSnapshot, hostInputDrift, HOST_INPUT_PROBE_SUPPORTED, t
  */
 const ENABLED = process.env.DEVHOTEL_HOST_INPUT_PROBE === '1'
 
-let before: HostInputSnapshot | null = null
+let monitor: HostInputMonitor | null = null
 
 export async function setup(): Promise<void> {
   if (!ENABLED) return
@@ -22,22 +27,18 @@ export async function setup(): Promise<void> {
       `DEVHOTEL_HOST_INPUT_PROBE=1 was set but the Host input probe is Windows-only (this Host is ${process.platform})`
     )
   }
-  before = await captureHostInputSnapshot()
-  if (!before.interactiveDesktop) {
-    throw new Error(
-      'Host input probe found no interactive desktop (cursor and foreground window both read zero). ' +
-        'Run it from a logged-in session; a session-0 sample cannot prove the Host was left alone.'
-    )
-  }
+  monitor = await startHostInputMonitor()
 }
 
 export async function teardown(): Promise<void> {
-  if (!ENABLED || !before) return
-  const after = await captureHostInputSnapshot()
-  const drift = hostInputDrift(before, after)
+  if (!ENABLED || !monitor) return
+  const activeMonitor = monitor
+  monitor = null
+  const report = await activeMonitor.stop()
+  const drift = hostInputMonitorDrift(report)
   if (drift.length) {
     throw new Error(
-      `The test run changed Host input state, which breaks the Room isolation contract:\n  ${drift.join('\n  ')}\n` +
+      `The test run changed Host input state at some point, which breaks the Room isolation contract:\n  ${drift.join('\n  ')}\n` +
         'If a human used the machine during the run, repeat it on an idle desktop before treating this as a regression.'
     )
   }
