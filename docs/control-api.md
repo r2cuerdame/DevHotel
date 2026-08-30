@@ -136,7 +136,12 @@ are not brokered and never enter this queue.
 | `POST /v1/devices/cancel` | `{ requestId }` | leave the queue |
 | `POST /v1/rooms/:id/device/attach` | `{ purpose, workerId, issueRef?, runId?, priority?, ttlMs?, maxDurationMs?, constraints? }` | `{ state: 'granted', lease, device }` or `{ state: 'queued', requestId, position, owner, reason }`. `project` is taken from the Room and is rejected in the body. |
 | `POST /v1/rooms/:id/device/release` | `{ reason? }` | the closed lease; promotes the next queued Room. Nothing is uninstalled or cleared. |
-| `POST /v1/rooms/:id/device/adb` | `{ args: string[], timeoutMs? }` | `{ code, stdout, stderr }` — argv without `adb` or `-s <serial>`; the broker picks this Room's leased device. State-changing commands need a live lease and are otherwise refused with a structured reason. |
+| `POST /v1/rooms/:id/device/adb` | `{ args: string[], timeoutMs? }` | `{ code, stdout, stderr }` — argv without `adb` or any global target selector; the broker picks this Room's leased device. Install inputs must be `/workspace/*.apk` paths, whose bytes are staged in private Host temp files. State-changing commands need a live lease and are otherwise refused with HTTP 409 plus a structured broker code. |
+
+Use `pid:<OS process id>` for `workerId` when the caller can provide it, so the
+broker can distinguish a live worker from a dead one directly. Other stable
+worker IDs are supported but must heartbeat; after TTL plus grace an opaque,
+silent owner is reclaimed rather than parking a phone indefinitely.
 
 Development belongs on the Room emulator (`POST /v1/rooms/:id/exec`); request
 a physical device for final acceptance/release verification and for behaviour an

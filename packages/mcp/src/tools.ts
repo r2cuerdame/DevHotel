@@ -250,7 +250,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'apply_quick_change',
       description:
-        'Apply a quick change to a room as a verified, undoable transaction. Web rooms: node-version, package-manager, start-command, domain, https, internal-port, deps-install, service-install/version/restart/remove (postgres/redis), db-backup/restore, package-install. Android rooms: android-build (provenance APK), android-run (build, install and launch on the emulator screen), emulator-config (device/OS), start-command. Both: normalize-line-endings, which rewrites CRLF to LF in the Room copies of gradlew, mvnw, *.sh and other shebang scripts after a Windows Host import — never applied on its own, and undoable.',
+        'Apply a quick change to a room as a verified, undoable transaction. Web rooms: node-version, package-manager, start-command, domain, https, internal-port, deps-install, service-install/version/restart/remove (postgres/redis), db-backup/restore, package-install. Android rooms: android-build (provenance APK), android-run (build, install and launch on the Room emulator by default or its exclusively attached physical device for final proof), emulator-config (device/OS), start-command. Both: normalize-line-endings, which rewrites CRLF to LF in the Room copies of gradlew, mvnw, *.sh and other shebang scripts after a Windows Host import — never applied on its own, and undoable.',
       schema: { roomId: zRoomId, change: zQuickChange },
       handler: wrap(async (a) => (await getClient()).applyChange(a.roomId, a.change))
     },
@@ -457,7 +457,9 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       schema: {
         roomId: zRoomId,
         purpose: zLeasePurpose.describe("why the phone is needed; 'acceptance' for a release gate"),
-        workerId: z.string().describe('stable ID for this agent session, used to detect a dead owner'),
+        workerId: z
+          .string()
+          .describe('worker identity; use pid:<OS process id> when available for direct liveness checks, otherwise heartbeat this lease'),
         issueRef: z.string().optional().describe('issue or ticket this run belongs to, shown to whoever is waiting'),
         priority: z.number().int().min(0).max(100).optional().describe('higher goes first; use for an urgent release gate'),
         ttlMs: z.number().int().optional().describe('heartbeat interval budget; the lease goes stale after this'),
@@ -487,7 +489,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'heartbeat_android_device',
       description:
-        "Keep this Room's device lease alive. Pass busy:true while a long instrumentation run or OS dialog is genuinely working the phone so the broker warns instead of reclaiming it at the maximum lease time. A lease with no heartbeat whose Room is gone is reclaimed automatically.",
+        "Keep this Room's device lease alive. Pass busy:true while a long instrumentation run or OS dialog is genuinely working the phone so the broker warns instead of reclaiming it at the maximum lease time. A lease with no heartbeat whose Room or PID worker is dead — or whose opaque worker stays unobservable through grace — is reclaimed automatically.",
       schema: { leaseId: z.string().describe('lease ID from attach_android_device'), busy: z.boolean().optional() },
       handler: wrap(async (a) => (await getClient()).heartbeatAndroidDevice(a.leaseId, a.busy))
     },
@@ -500,10 +502,10 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_device_adb',
       description:
-        "Run an ADB command against the physical phone this Room has leased. Give the argv WITHOUT db or -s <serial> — the broker picks the device this Room holds, so no serial is ever hand-written. State-changing commands (install, uninstall, shell am/pm/input/monkey, reboot…) require a live lease and are refused with a structured reason if another Room owns the phone; read-only inventory commands are shared. For the Room's own emulator use run_in_room instead.",
+        "Run an ADB command against the physical phone this Room has leased. Give argv without the leading adb or any global target selector — the broker picks the device this Room holds, so no serial is ever hand-written. APK installs must name /workspace APKs; DevHotel copies those bytes to a private Host temp before Host adb runs and deletes the temp afterwards. State-changing commands (install, uninstall, shell am/pm/input/monkey, reboot…) require a live lease and are refused with a structured reason if another Room owns the phone; the small allowlist of read-only commands is shared. For the Room's own emulator use run_in_room instead.",
       schema: {
         roomId: zRoomId,
-        args: z.array(z.string()).min(1).describe('adb argv without the leading db, e.g. ["install","-r","/workspace/app.apk"]'),
+        args: z.array(z.string()).min(1).describe('adb argv without the leading adb, e.g. ["install","-r","/workspace/app.apk"]'),
         timeoutMs: z.number().int().positive().optional()
       },
       handler: wrap(async (a) => (await getClient()).adbOnDevice(a.roomId, a.args, a.timeoutMs))

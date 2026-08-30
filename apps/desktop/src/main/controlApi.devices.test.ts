@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DeviceLeaseError } from '@devhotel/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoomOrchestrator } from '@devhotel/core'
 import { startControlApi } from './controlApi'
@@ -122,9 +123,9 @@ describe('agents reach the shared phone only through the broker', () => {
     })
   })
 
-  it('surfaces a refused ADB command as an error rather than a silent success', async () => {
+  it('preserves the broker denial code in a structured conflict response', async () => {
     const adbOnDevice = vi.fn(async () => {
-      throw new Error('installing an APK needs a device lease. Attach Pixel-USB-01 to Room room1abc first.')
+      throw new DeviceLeaseError('no-lease', 'installing an APK needs a device lease. Attach Pixel-USB-01 to Room room1abc first.')
     })
 
     await withApi({ adbOnDevice } as unknown as Partial<RoomOrchestrator>, async (call) => {
@@ -133,8 +134,9 @@ describe('agents reach the shared phone only through the broker', () => {
         body: JSON.stringify({ args: ['install', '-r', '/workspace/app.apk'] })
       })
 
-      expect(result.status).toBe(500)
+      expect(result.status).toBe(409)
       expect(result.body.error).toMatch(/needs a device lease/)
+      expect(result.body.code).toBe('no-lease')
     })
   })
 

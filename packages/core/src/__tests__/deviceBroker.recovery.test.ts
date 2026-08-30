@@ -18,19 +18,25 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function makeBroker(opts: { alive?: boolean; graceMs?: number } = {}) {
+function makeBroker(
+  opts: {
+    alive?: boolean | 'unknown'
+    graceMs?: number
+    ownerLiveness?: () => Promise<boolean | 'unknown'> | boolean | 'unknown'
+  } = {}
+) {
   const dir = mkdtempSync(join(tmpdir(), 'devhotel-recovery-'))
   dirs.push(dir)
   const db = openDb(dir)
   dbs.push(db)
   const now = { value: Date.parse('2026-08-29T00:00:00.000Z') }
-  const liveness = { alive: opts.alive ?? false }
+  const liveness: { alive: boolean | 'unknown' } = { alive: opts.alive ?? false }
   const adb = new FakeAdbHost([{ serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' }])
   const broker = new AndroidDeviceBroker({
     repo: androidDevicesRepo(db),
     adb,
     now: () => now.value,
-    ownerLiveness: () => liveness.alive,
+    ownerLiveness: opts.ownerLiveness ?? (() => liveness.alive),
     graceMs: opts.graceMs ?? 30_000
   })
   return { broker, adb, db, now, liveness }
@@ -69,6 +75,99 @@ describe('Android device broker — stale lease recovery', () => {
     }
 
     expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+  })
+
+  it('reclaims a silent opaque worker after TTL and grace instead of parking the phone forever', async () => {
+    const { broker, now } = makeBroker({ alive: 'unknown' })
+    await broker.refreshInventory()
+    await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'opaque-agent-session',
+      ttlMs: 30_000
+    })
+
+    now.value += 31_000
+    expect((await broker.reap()).recovered).toHaveLength(0)
+    now.value += 31_000
+    const recovered = await broker.reap()
+
+    expect(recovered.recovered).toHaveLength(1)
+    expect(recovered.recovered[0]!.reason).toMatch(/worker liveness is unavailable/)
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('does not reclaim over a heartbeat that arrives while liveness is being checked', async () => {
+    let finishProbe!: (alive: boolean) => void
+    let probeStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve
+    })
+    const probe = new Promise<boolean>((resolve) => {
+      finishProbe = resolve
+    })
+    const { broker, now } = makeBroker({
+      graceMs: 0,
+      ownerLiveness: () => {
+        probeStarted()
+        return probe
+      }
+    })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a',
+      ttlMs: 30_000
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    now.value += 31_000
+
+    const sweeping = broker.reap()
+    await started
+    broker.heartbeat(granted.lease.id)
+    finishProbe(false)
+
+    expect((await sweeping).recovered).toHaveLength(0)
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+  })
+
+  it('does not double-close a lease released while liveness is being checked', async () => {
+    let finishProbe!: (alive: boolean) => void
+    let probeStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve
+    })
+    const probe = new Promise<boolean>((resolve) => {
+      finishProbe = resolve
+    })
+    const { broker, now } = makeBroker({
+      graceMs: 0,
+      ownerLiveness: () => {
+        probeStarted()
+        return probe
+      }
+    })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a',
+      ttlMs: 30_000
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    now.value += 31_000
+
+    const sweeping = broker.reap()
+    await started
+    await broker.release(granted.lease.id, 'finished during liveness probe')
+    finishProbe(false)
+
+    expect((await sweeping).recovered).toHaveLength(0)
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
   })
 
   it('does not cut off a long instrumentation run that is still reporting activity', async () => {
@@ -137,6 +236,28 @@ describe('Android device broker — stale lease recovery', () => {
 
     expect(broker.listDevices()[0]).toMatchObject({ health: 'ready', leaseOwner: null })
     expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('promotes queued work when an offline device becomes ready', async () => {
+    const { broker, adb } = makeBroker({ alive: true })
+    adb.phones = [{ serial: 'R5CT30ABCDE', state: 'offline', model: 'SM_G991N', release: '14', sdk: '34' }]
+    await broker.refreshInventory()
+    const deviceId = broker.listDevices()[0]!.id
+    const queued = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'Movit',
+      purpose: 'smoke',
+      workerId: 'worker-b',
+      constraints: { deviceId }
+    })
+    expect(queued.state).toBe('queued')
+
+    adb.phones = [{ serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' }]
+    await broker.refreshInventory()
+
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ deviceId, project: 'Movit' })
+    expect(broker.listDevices()[0]).toMatchObject({ health: 'ready', queueDepth: 0, leaseOwner: { roomId: 'bbbb2222' } })
+    expect(broker.status().recentEvents.map((event) => event.kind)).toEqual(expect.arrayContaining(['reconnected', 'granted']))
   })
 
   it('keeps the nickname a human gave the phone across a reconnect', async () => {

@@ -20,6 +20,12 @@ export interface AdbHostAvailability {
   detail: string
 }
 
+export interface AdbBinaryResult {
+  code: number
+  stdout: Buffer
+  stderr: string
+}
+
 /**
  * The Host-side `adb` the broker owns. Physical phones hang off the Host's USB
  * bus, not off a Room's network namespace, so the broker is the one component
@@ -29,6 +35,8 @@ export interface AdbHost {
   available(): Promise<AdbHostAvailability>
   devices(): Promise<AdbDeviceLine[]>
   exec(serial: string, args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
+  /** Binary-safe variant for commands such as `exec-out screencap -p`. */
+  execBinary(serial: string, args: string[], opts?: { timeoutMs?: number }): Promise<AdbBinaryResult>
 }
 
 /**
@@ -116,7 +124,6 @@ export function resolveAdbExecutable(opts: ResolveAdbOptions = {}): string {
     if (fileExists(pathApi.join(dir, name))) return pathApi.join(dir, name)
   }
 
-  const home = opts.home ?? env.ANDROID_SDK_ROOT ?? env.ANDROID_HOME ?? null
   const roots = [
     env.ANDROID_SDK_ROOT,
     env.ANDROID_HOME,
@@ -125,8 +132,8 @@ export function resolveAdbExecutable(opts: ResolveAdbOptions = {}): string {
         ? pathApi.join(env.LOCALAPPDATA, 'Android', 'Sdk')
         : null
       : pathApi.join(opts.home ?? homedir(), platform === 'darwin' ? 'Library/Android/sdk' : 'Android/Sdk')
-  ].filter((root): root is string => Boolean(root) && root !== home)
-  for (const root of roots) {
+  ].filter((root): root is string => Boolean(root))
+  for (const root of new Set(roots)) {
     const candidate = pathApi.join(root, 'platform-tools', name)
     if (fileExists(candidate)) return candidate
   }
@@ -135,16 +142,15 @@ export function resolveAdbExecutable(opts: ResolveAdbOptions = {}): string {
 
 const DEFAULT_TIMEOUT_MS = 60_000
 
-function run(executable: string, args: string[], timeoutMs: number): Promise<ExecResult> {
+function runBinary(executable: string, args: string[], timeoutMs: number): Promise<AdbBinaryResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { windowsHide: true })
-    let stdout = ''
+    const stdout: Buffer[] = []
     let stderr = ''
     let timedOut = false
-    child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    child.stdout.on('data', (chunk: string) => {
-      stdout += chunk
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout.push(chunk)
     })
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk
@@ -160,9 +166,14 @@ function run(executable: string, args: string[], timeoutMs: number): Promise<Exe
     child.on('close', (code) => {
       clearTimeout(timer)
       if (timedOut) stderr += `\nadb ${args[0] ?? ''} timed out after ${timeoutMs}ms`
-      resolve({ code: code ?? -1, stdout, stderr })
+      resolve({ code: code ?? -1, stdout: Buffer.concat(stdout), stderr })
     })
   })
+}
+
+async function run(executable: string, args: string[], timeoutMs: number): Promise<ExecResult> {
+  const result = await runBinary(executable, args, timeoutMs)
+  return { code: result.code, stdout: result.stdout.toString('utf8'), stderr: result.stderr }
 }
 
 /** The real Host adb. Every call names an explicit serial — never a default device. */
@@ -192,6 +203,10 @@ export class SpawnedAdbHost implements AdbHost {
 
   exec(serial: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
     return run(this.executable, ['-s', serial, ...args], opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  }
+
+  execBinary(serial: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<AdbBinaryResult> {
+    return runBinary(this.executable, ['-s', serial, ...args], opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   }
 }
 

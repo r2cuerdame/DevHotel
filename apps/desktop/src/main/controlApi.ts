@@ -23,6 +23,7 @@ import {
   zStartRoomBody,
   zSafeHostResyncBody,
   zUndoChangeBody,
+  DeviceLeaseError,
   type ControlInfo
 } from '@devhotel/shared'
 import { isDevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
@@ -61,6 +62,10 @@ export async function startControlApi(
 
   const server = createServer((req, res) => {
     void handle(req, res).catch((err) => {
+      if (err instanceof DeviceLeaseError) {
+        sendJson(res, 409, { error: err.message, code: err.code })
+        return
+      }
       if (isDevHotelError(err)) {
         sendJson(res, err.httpStatus, { error: err.message, code: err.code, recoveryHint: err.recoveryHint })
         return

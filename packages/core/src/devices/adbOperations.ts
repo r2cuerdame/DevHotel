@@ -50,7 +50,6 @@ const SAFE_VERBS = new Set([
   'version',
   'features',
   'start-server',
-  'bugreport',
   'jdwp'
 ])
 
@@ -64,14 +63,8 @@ const SAFE_SHELL_COMMANDS = new Set([
   'id',
   'whoami',
   'uptime',
-  'date',
   'echo',
   'printf',
-  'wm',
-  'dumpsys',
-  'screencap',
-  'screenrecord',
-  'logcat',
   'top',
   'free',
   'stat',
@@ -128,7 +121,41 @@ function stripGlobalFlags(argv: string[]): string[] {
 }
 
 /** Tokens that let one shell word smuggle a second command past the check. */
-const SHELL_CHAINING = /[;&|]|\$\(|`|\n/
+const SHELL_CHAINING = /[;&|<>]|\$\(|`|[\r\n]/
+
+function classifyWm(words: string[]): AdbClassification {
+  const subcommand = words[1]
+  // With no value these two forms only report the current override. `reset`,
+  // `WxH`, and a numeric density all mutate the shared display.
+  if ((subcommand === 'size' || subcommand === 'density') && words.length === 2) {
+    return { interfering: false, reason: `\`wm ${subcommand}\`` }
+  }
+  return { interfering: true, reason: `changing display state with \`wm${subcommand ? ` ${subcommand}` : ''}\`` }
+}
+
+function classifyDumpsys(words: string[]): AdbClassification {
+  const service = words[1]
+  // Keep the unauthenticated surface deliberately small. These exact forms are
+  // observations; services such as `battery set`, `deviceidle force-idle`, and
+  // vendor extensions are commands despite living behind `dumpsys`.
+  if (words.length === 1 || (service === 'battery' && words.length === 2)) {
+    return { interfering: false, reason: `\`dumpsys${service ? ` ${service}` : ''}\`` }
+  }
+  if (service === 'package' && words.length <= 3 && words.every((word) => !word.startsWith('-'))) {
+    return { interfering: false, reason: '`dumpsys package`' }
+  }
+  return { interfering: true, reason: `the unrecognised \`dumpsys${service ? ` ${service}` : ''}\` operation` }
+}
+
+function classifyLogcat(words: string[]): AdbClassification {
+  // A tiny read-only surface is easier to keep honest than mirroring logcat's
+  // evolving option parser. In particular -c, -G, -P and -f mutate shared
+  // buffers or device storage; unfamiliar variants therefore need a lease.
+  if (words.length === 1 || (words.length === 2 && (words[1] === '-d' || words[1] === '--dump'))) {
+    return { interfering: false, reason: '`logcat`' }
+  }
+  return { interfering: true, reason: 'the unrecognised or mutating `logcat` operation' }
+}
 
 function classifyShell(words: string[]): AdbClassification {
   const flagless = words.filter((word) => !word.startsWith('-'))
@@ -141,6 +168,21 @@ function classifyShell(words: string[]): AdbClassification {
 
   const interfering = INTERFERING_SHELL_COMMANDS.get(program)
   if (interfering) return { interfering: true, reason: interfering }
+
+  if (program === 'wm') return classifyWm(words)
+  if (program === 'dumpsys') return classifyDumpsys(words)
+  if (program === 'screencap') {
+    return words.length === 1 || (words.length === 2 && words[1] === '-p')
+      ? { interfering: false, reason: '`screencap`' }
+      : { interfering: true, reason: 'writing a screenshot onto device storage' }
+  }
+  if (program === 'screenrecord') return { interfering: true, reason: 'recording the shared screen' }
+  if (program === 'logcat') return classifyLogcat(words)
+  if (program === 'date') {
+    return words.length === 1
+      ? { interfering: false, reason: '`date`' }
+      : { interfering: true, reason: 'changing or invoking an unrecognised `date` operation' }
+  }
 
   if (program === 'pm' || program === 'cmd' || program === 'appops') {
     const sub = flagless[1]
@@ -166,11 +208,13 @@ export function classifyAdbCommand(argv: string[]): AdbClassification {
   if (verb === 'shell' || verb === 'exec-out') return classifyShell(rest.slice(1))
 
   if (verb === 'pull') return { interfering: false, reason: '`adb pull`' }
+  if (verb === 'bugreport') {
+    return rest.length === 1
+      ? { interfering: false, reason: '`adb bugreport`' }
+      : { interfering: true, reason: 'writing a bugreport onto the Host' }
+  }
   if (verb === 'logcat') {
-    // `logcat -c` wipes the buffer another project is reading from.
-    return rest.includes('-c') || rest.includes('--clear')
-      ? { interfering: true, reason: 'clearing the shared logcat buffer' }
-      : { interfering: false, reason: '`adb logcat`' }
+    return classifyLogcat(rest)
   }
   if (SAFE_VERBS.has(verb)) return { interfering: false, reason: `\`adb ${verb}\`` }
   return { interfering: true, reason: `the unrecognised adb command \`${verb}\`` }

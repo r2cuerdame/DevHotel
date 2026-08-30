@@ -1,4 +1,5 @@
-import { rmSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
@@ -56,6 +57,8 @@ describe('Rooms attach and release the shared phone', () => {
     const result = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
 
     expect(result.state).toBe('granted')
+    if (result.state !== 'granted') throw new Error('unreachable')
+    expect(result.device).not.toHaveProperty('serial')
     expect(orch.inspectRoom('aaaa1111').device).toMatchObject({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance' })
   })
 
@@ -121,6 +124,7 @@ describe('Rooms attach and release the shared phone', () => {
     const status = await orch.hotelStatus()
 
     expect(status.devices.devices).toHaveLength(2)
+    expect(status.devices.devices[0]).not.toHaveProperty('serial')
     expect(status.devices.devices.filter((device) => device.leaseOwner !== null)).toHaveLength(1)
     expect(status.devices.recentEvents.some((event) => event.kind === 'granted')).toBe(true)
   })
@@ -160,7 +164,7 @@ describe('Android automation targets the attached device without a hand-written 
       hostPort: 45000
     })
     orch.rooms.create(room)
-    return { orch, adb, backend }
+    return { orch, adb, backend, userData }
   }
 
   it('resolves to the Room-owned emulator when no phone is attached', async () => {
@@ -178,16 +182,44 @@ describe('Android automation targets the attached device without a hand-written 
     expect(await orch.resolveAdbTarget('aaaa1111')).toMatchObject({ kind: 'physical', serial: 'R5CT30ABCDE', nickname: expect.any(String) })
   })
 
-  it('runs an authorized ADB command on the leased phone', async () => {
+  it('stages Room APK bytes in a private Host temp before installing, then removes them', async () => {
+    const { orch, adb, backend, userData } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    let stagedPath = ''
+    adb.execHook = (_serial, args) => {
+      if (args[0] !== 'install') return
+      stagedPath = args[2]!
+      expect(stagedPath).not.toContain('/workspace/')
+      expect(stagedPath.startsWith(join(userData, 'tmp', 'device-adb-'))).toBe(true)
+      expect(existsSync(stagedPath)).toBe(true)
+      expect(readFileSync(stagedPath, 'utf8')).toBe('fake-room-file')
+    }
+
+    const result = await orch.adbOnDevice('aaaa1111', ['install', '-r', '/workspace/app/build/outputs/apk/debug/app-debug.apk'])
+
+    expect(result.code).toBe(0)
+    expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/app-debug.apk')
+    expect(adb.execs).toEqual([{ serial: 'R5CT30ABCDE', args: ['install', '-r', stagedPath] }])
+    expect(stagedPath).not.toBe('')
+    expect(existsSync(stagedPath)).toBe(false)
+  })
+
+  it('rejects Host APK paths and every leading ADB target-selector form', async () => {
     const { orch, adb } = setup()
     await orch.refreshAndroidDevices()
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
     adb.execs = []
 
-    const result = await orch.adbOnDevice('aaaa1111', ['install', '-r', '/tmp/app.apk'])
-
-    expect(result.code).toBe(0)
-    expect(adb.execs).toEqual([{ serial: 'R5CT30ABCDE', args: ['install', '-r', '/tmp/app.apk'] }])
+    await expect(orch.adbOnDevice('aaaa1111', ['install', '-r', 'C:\\tmp\\app.apk'])).rejects.toThrow(/only from \/workspace|Host/)
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install-multiple', '/workspace/app.apk', '/tmp/secret-without-extension'])
+    ).rejects.toThrow(/Host/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-s', 'OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-sOTHER', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['--one-device=OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
+    expect(adb.execs).toEqual([])
   })
 
   it('refuses an interfering ADB command from a Room with no lease, and never reaches the phone', async () => {
@@ -196,8 +228,80 @@ describe('Android automation targets the attached device without a hand-written 
     const deviceId = orch.androidDeviceStatus().devices[0]!.id
     adb.execs = []
 
-    await expect(orch.adbOnDevice('aaaa1111', ['install', '-r', '/tmp/app.apk'], { deviceId })).rejects.toThrow(/needs a device lease/)
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install', '-r', '/workspace/app/build/outputs/apk/debug/app-debug.apk'], { deviceId })
+    ).rejects.toThrow(/needs a device lease/)
     expect(adb.execs).toEqual([])
+  })
+
+  it('automatically installs and launches android-run on the attached phone', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    backend.execInRoomCalls = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    adb.execResultFor = (_serial, args) => {
+      if (args[0] === 'shell' && args[1] === 'cmd') {
+        return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
+      }
+      return args[0] === 'shell' && args[1] === 'pidof' ? { code: 0, stdout: '1234\n', stderr: '' } : null
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toMatch(/running on SM-G991N-01/)
+    expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state', 'install', 'shell', 'shell', 'shell'])
+    expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
+    expect(adb.execs.find((call) => call.args[1] === 'am')?.serial).toBe('R5CT30ABCDE')
+    expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
+  })
+
+  it('keeps android-run on the Room emulator by default', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    adb.execs = []
+    backend.emulatorStateValue = 'running'
+    backend.execInRoomCalls = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.includes('resolve-activity')) return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
+      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
+      if (command.includes('pidof')) return { code: 0, stdout: '1234\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toMatch(/Room emulator/)
+    expect(adb.execs).toEqual([])
+    expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('adb -s emulator-5554'))).toBe(true)
   })
 })
 
@@ -258,11 +362,12 @@ describe('Screenshots follow the attached device', () => {
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
     adb.execs = []
     backend.execResult = { code: 0, stdout: 'A'.repeat(200), stderr: '' }
-    adb.screencapPng = 'B'.repeat(200)
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x80, 0x42])
+    adb.screencapPng = png
 
     const shot = await orch.androidScreenshot('aaaa1111')
 
-    expect(shot).toMatchObject({ source: 'adb', png: 'B'.repeat(200) })
+    expect(shot).toMatchObject({ source: 'adb', png: png.toString('base64') })
     // The phone answered, not the Room's own emulator, whose stdout differs.
     expect(adb.execs[0]).toMatchObject({ serial: 'R5CT30ABCDE' })
   })

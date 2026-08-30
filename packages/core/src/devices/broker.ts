@@ -5,6 +5,7 @@ import {
   LEASE_DEFAULT_TTL_MS,
   zDeviceRequest,
   type AndroidDevice,
+  type AndroidDeviceSummary,
   type DeviceBrokerStatus,
   type DeviceEvent,
   type DeviceInventoryEntry,
@@ -28,7 +29,7 @@ export interface DeviceBrokerOptions {
    * heartbeat alone must not reclaim a phone from a Room that is merely busy;
    * only a heartbeat gap *and* a dead owner does.
    */
-  ownerLiveness?: (lease: DeviceLease) => Promise<boolean> | boolean
+  ownerLiveness?: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
   graceMs?: number
 }
 
@@ -53,7 +54,7 @@ export class AndroidDeviceBroker {
   private readonly repo: AndroidDevicesRepo
   private readonly adb: AdbHost
   private readonly now: () => number
-  private readonly ownerLiveness: (lease: DeviceLease) => Promise<boolean> | boolean
+  private readonly ownerLiveness: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
   private readonly graceMs: number
   /** When a dead owner was first observed, so the grace period is real time. */
   private readonly deathObservedAt = new Map<string, number>()
@@ -63,7 +64,7 @@ export class AndroidDeviceBroker {
     this.repo = opts.repo
     this.adb = opts.adb
     this.now = opts.now ?? (() => Date.now())
-    this.ownerLiveness = opts.ownerLiveness ?? (() => true)
+    this.ownerLiveness = opts.ownerLiveness ?? (() => 'unknown')
     this.graceMs = opts.graceMs ?? LEASE_DEFAULT_GRACE_MS
   }
 
@@ -121,7 +122,7 @@ export class AndroidDeviceBroker {
       })
       if (!known) {
         this.repo.recordEvent({ deviceId: id, roomId: null, kind: 'discovered', detail: `${model ?? 'Android device'} (${connection})`, at })
-      } else if (known.health === 'disconnected' && health !== 'disconnected') {
+      } else if (known.health !== 'ready' && health === 'ready') {
         this.repo.recordEvent({ deviceId: id, roomId: null, kind: 'reconnected', detail: `back as ${health}`, at })
       }
     }
@@ -146,6 +147,12 @@ export class AndroidDeviceBroker {
         })
       }
     }
+    // A request may have queued while its only candidate was offline or before
+    // a crash interrupted promotion. Every healthy free phone gets a chance to
+    // serve the durable queue; promote() is idempotent while a lease is active.
+    for (const device of this.repo.listDevices()) {
+      if (device.health === 'ready' && this.brokered(device)) this.promote(device.id)
+    }
     return this.listDevices()
   }
 
@@ -157,11 +164,25 @@ export class AndroidDeviceBroker {
     const lease = this.repo.activeLease(device.id)
     const waiters = this.brokered(device) ? this.repo.waiting(device.id) : []
     return {
-      ...device,
+      ...this.publicDevice(device),
       brokered: this.brokered(device),
       leaseOwner: lease ? this.owner(lease) : null,
       queueDepth: waiters.length,
       waiters: waiters.map((entry) => this.waiter(entry))
+    }
+  }
+
+  private publicDevice(device: AndroidDevice): AndroidDeviceSummary {
+    return {
+      id: device.id,
+      nickname: device.nickname,
+      model: device.model,
+      androidVersion: device.androidVersion,
+      apiLevel: device.apiLevel,
+      connection: device.connection,
+      health: device.health,
+      firstSeenAt: device.firstSeenAt,
+      lastSeenAt: device.lastSeenAt
     }
   }
 
@@ -225,7 +246,9 @@ export class AndroidDeviceBroker {
     const existingLease = this.repo.activeLeaseForRoom(request.roomId)
     if (existingLease) {
       const device = this.repo.getDevice(existingLease.deviceId)!
-      if (this.matches(device, request.constraints)) return { state: 'granted', lease: existingLease, device }
+      if (this.matches(device, request.constraints)) {
+        return { state: 'granted', lease: existingLease, device: this.publicDevice(device) }
+      }
       throw new DeviceLeaseError(
         'lease-held-by-another-room',
         `Room ${request.roomId} already holds ${device.nickname}. Release it before requesting a different device.`
@@ -259,7 +282,7 @@ export class AndroidDeviceBroker {
         detail: `${request.project} took ${free.nickname} for ${request.purpose}`,
         at
       })
-      return { state: 'granted', lease, device: free }
+      return { state: 'granted', lease, device: this.publicDevice(free) }
     }
 
     // Pin the queue to a specific device only when the request named one;
@@ -404,11 +427,25 @@ export class AndroidDeviceBroker {
 
       if (heartbeatAgeMs > lease.ttlMs) {
         const live = await this.ownerLiveness(lease)
-        if (!live) {
+        // Liveness probes may be asynchronous. A heartbeat or explicit
+        // release that wins while the probe is in flight must fence this stale
+        // snapshot off instead of being overwritten by a late reclaim.
+        const current = this.repo.getLease(lease.id)
+        if (!current || current.state !== 'active') {
+          this.deathObservedAt.delete(lease.id)
+          continue
+        }
+        if (now - Date.parse(current.heartbeatAt) <= current.ttlMs) {
+          this.deathObservedAt.delete(lease.id)
+          continue
+        }
+        if (live !== true) {
           const firstSeen = this.deathObservedAt.get(lease.id) ?? now
           this.deathObservedAt.set(lease.id, firstSeen)
           if (now - firstSeen >= this.graceMs) {
-            const reason = `owner gone: no heartbeat for ${Math.round(heartbeatAgeMs / 1000)}s and the worker is not running`
+            const reason = live === false
+              ? `owner gone: no heartbeat for ${Math.round(heartbeatAgeMs / 1000)}s and the Room or worker is not running`
+              : `owner silent: no heartbeat for ${Math.round(heartbeatAgeMs / 1000)}s and worker liveness is unavailable`
             result.recovered.push({ ...(await this.close(lease, 'expired', reason)), reason })
             continue
           }
@@ -457,6 +494,12 @@ export class AndroidDeviceBroker {
     return this.repo.activeLeaseForRoom(roomId)
   }
 
+  /** Internal target lookup; public status intentionally does not choose a serial. */
+  deviceForRoom(roomId: string): AndroidDevice | null {
+    const lease = this.repo.activeLeaseForRoom(roomId)
+    return lease ? this.repo.getDevice(lease.deviceId) : null
+  }
+
   /**
    * The fail-closed gate. An ADB command that can change the phone's state runs
    * only for the Room that holds a live lease on it; everything else gets a
@@ -465,14 +508,14 @@ export class AndroidDeviceBroker {
   authorize(roomId: string, deviceId: string, argv: string[]): { serial: string; device: AndroidDevice } {
     const device = this.repo.getDevice(deviceId)
     if (!device) throw new DeviceLeaseError('device-unknown', `unknown Android device: ${deviceId}`)
+    if (device.health !== 'ready') {
+      throw new DeviceLeaseError('device-unhealthy', `${device.nickname} is ${device.health} and cannot accept ADB commands.`)
+    }
 
     const classification = classifyAdbCommand(argv)
     if (!this.brokered(device)) return { serial: device.serial, device }
     if (!classification.interfering) return { serial: device.serial, device }
 
-    if (device.health !== 'ready') {
-      throw new DeviceLeaseError('device-unhealthy', `${device.nickname} is ${device.health} — it cannot accept ${classification.reason}.`)
-    }
     const lease = this.repo.activeLease(deviceId)
     if (!lease) {
       throw new DeviceLeaseError(

@@ -97,6 +97,9 @@ export interface AndroidDevice {
   lastSeenAt: string
 }
 
+/** Public device identity. The raw adb serial stays inside the Host broker. */
+export type AndroidDeviceSummary = Omit<AndroidDevice, 'serial'>
+
 export interface DeviceLease {
   id: string
   deviceId: string
@@ -181,7 +184,7 @@ export interface DeviceWaiter {
   waitedMs: number
 }
 
-export interface DeviceInventoryEntry extends AndroidDevice {
+export interface DeviceInventoryEntry extends AndroidDeviceSummary {
   brokered: boolean
   leaseOwner: DeviceLeaseOwner | null
   queueDepth: number
@@ -189,7 +192,7 @@ export interface DeviceInventoryEntry extends AndroidDevice {
 }
 
 export type DeviceRequestResult =
-  | { state: 'granted'; lease: DeviceLease; device: AndroidDevice }
+  | { state: 'granted'; lease: DeviceLease; device: AndroidDeviceSummary }
   | {
       state: 'queued'
       requestId: string

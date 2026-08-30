@@ -42,8 +42,17 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['push', 'local', '/sdcard/remote']],
     [['shell', 'settings', 'put', 'global', 'airplane_mode_on', '1']],
     [['logcat', '-c']],
+    [['logcat', '-G', '16M']],
     [['shell', 'setprop', 'debug.foo', '1']],
-    [['shell', 'uiautomator', 'runtest']]
+    [['shell', 'uiautomator', 'runtest']],
+    [['shell', 'wm', 'size', '1080x2400']],
+    [['shell', 'wm', 'density', 'reset']],
+    [['shell', 'wm', 'size', '--display=0']],
+    [['shell', 'dumpsys', 'battery', 'set', 'level', '5']],
+    [['shell', 'screencap', '-p', '/sdcard/stolen.png']],
+    [['shell', 'screenrecord', '/sdcard/run.mp4']],
+    [['shell', 'logcat', '-f', '/sdcard/log.txt']],
+    [['shell', 'date', '-s', '20300101.000000']]
   ])('treats %j as interfering', (argv: string[]) => {
     expect(classifyAdbCommand(argv).interfering).toBe(true)
   })
@@ -53,6 +62,9 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['get-state']],
     [['shell', 'getprop', 'ro.build.version.sdk']],
     [['shell', 'dumpsys', 'battery']],
+    [['shell', 'dumpsys', 'package', 'com.example.app']],
+    [['shell', 'wm', 'size']],
+    [['shell', 'wm', 'density']],
     [['exec-out', 'screencap', '-p']],
     [['logcat', '-d']],
     [['shell', 'pm', 'list', 'packages']],
@@ -70,6 +82,8 @@ describe('classifying ADB commands by whether another project would notice', () 
     expect(classifyAdbCommand(['shell', 'getprop; pm clear com.example.app']).interfering).toBe(true)
     expect(classifyAdbCommand(['shell', 'dumpsys', '&&', 'reboot']).interfering).toBe(true)
     expect(classifyAdbCommand(['shell', 'echo', '$(pm clear com.example.app)']).interfering).toBe(true)
+    expect(classifyAdbCommand(['shell', 'cat', '/proc/version', '>', '/sdcard/changed']).interfering).toBe(true)
+    expect(classifyAdbCommand(['shell', 'getprop\rpm clear com.example.app']).interfering).toBe(true)
   })
 
   it('looks past the serial selector so `-s` cannot hide the verb', () => {

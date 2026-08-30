@@ -91,9 +91,11 @@ A worker that is killed must not park the phone forever — and a worker that is
 merely busy must not lose it.
 
 - The owner heartbeats; `busy: true` marks real device activity.
-- **A missed heartbeat alone is not death.** The lease is reclaimed only when
-  the heartbeat has lapsed *and* the owner is gone (its Room is deleted or
-  asleep), and it stays gone through a grace period.
+- **A missed heartbeat alone is not an immediate reclaim.** After the TTL, a
+  known-live `pid:<process id>` worker keeps its lease. A deleted, sleeping or
+  broken Room, a dead PID, or an opaque worker that remains silent through the
+  grace period is reclaimed, so an unobservable crashed agent cannot park the
+  phone forever. Opaque worker IDs therefore must heartbeat.
 - Past `maxDurationMs`, a lease still reporting activity gets a warning, not a
   reclaim — a long `connectedAndroidTest` or a stuck OS dialog is real work.
   A lease that overran with no device activity is reclaimed.
@@ -110,8 +112,9 @@ whether they write files.
   `reboot`, `shell am`, `shell pm clear`, `shell input`, `shell monkey`,
   `shell settings`, `shell setprop`, `uiautomator`, instrumentation,
   `logcat -c`, …
-- **Shared** (no lease): `devices`, `get-state`, `shell getprop`,
-  `shell dumpsys`, `shell pm list`, `exec-out screencap`, `logcat -d`, `pull`.
+- **Shared** (no lease): a deliberately small read-only set such as `devices`,
+  `get-state`, `shell getprop`, exact query forms of `dumpsys` / `wm`,
+  `shell pm list`, `exec-out screencap -p`, and `logcat -d`.
 - **Anything unrecognised fails closed.** A command DevHotel has never seen is
   treated as interfering rather than allowed through, and a "safe" program that
   smuggles a second command after `;`, `&&`, or `$( )` is refused too.
@@ -136,8 +139,10 @@ connection type, current owner (project, Room, purpose, lease age, last
 heartbeat), queue depth with the waiting projects, and a recent event history
 including grants, releases and stale recoveries.
 
-Devices are addressed by a **nickname** and a short opaque device ID derived
-from the serial. The raw serial is not what the UI, MCP, or logs lead with.
+Devices are addressed publicly by a **nickname** and a short opaque device ID
+derived from the serial. Status, queue and attach responses do not return the
+raw hardware serial; only the Host broker retains it to execute an authorized
+ADB command.
 
 ## Surfaces
 
@@ -164,5 +169,8 @@ that died will never call anything again.
   remote multi-host scheduling, and an iOS broker are out of scope.
 - Physical-device ADB runs on the Host through the broker
   (`/device/adb`), not from inside the Room container: a USB phone is on the
-  Host's bus, not in the Room's network namespace. In-room `android-run` still
-  targets the Room's own emulator, which is the intended development path.
+  Host's bus, not in the Room's network namespace. APK paths are accepted only
+  under `/workspace`; DevHotel copies their bytes into a private Host temp,
+  rechecks the lease, installs from that temp, and removes it afterwards.
+  `android-run` targets the Room emulator by default and automatically follows
+  an exclusive physical-device attachment for the final proof.
