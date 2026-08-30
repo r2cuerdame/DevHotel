@@ -439,7 +439,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'sync_from_host',
       description:
-        "Re-read the room's linked Host folder into the Room-owned working state. Runs under the room's inbound-sync grant (the human linked that folder when creating the room and can revoke agent sync per room), is journaled as the agent, and reads no other path — agents cannot choose paths. Build outputs are ignored; real Room source drift fails with conflictReason and exact changedPaths (see reset_sync_baseline). The generation it replaces is retained for recovery.",
+        "Low-level compatibility operation; prefer safe_resync_from_host so inspection, confirmation and publication stay under one guard. Re-read the room's linked Host folder into the Room-owned working state under its revocable inbound-sync grant. It is journaled as the agent and reads no other path — agents cannot choose paths. Build outputs are ignored; meaningful Room source drift is refused. The generation it replaces is retained for recovery.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
     },
