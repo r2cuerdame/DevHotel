@@ -214,4 +214,15 @@ describe('agents reach the shared phone only through the broker', () => {
       expect(JSON.stringify(result.body)).not.toMatch(/112358|192\.0\.2\.77|37777/)
     })
   })
+
+  it('preserves opaque screenshot bytes at the final Control API boundary', async () => {
+    const encodedPng = 'AKIAABCDEFGHIJKLMNOP'
+    const androidScreenshot = vi.fn(async () => ({ png: encodedPng, source: 'adb' as const }))
+
+    await withApi({ androidScreenshot } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/screenshot')
+      expect(result.status).toBe(200)
+      expect(result.body).toEqual({ png: encodedPng, source: 'adb' })
+    })
+  })
 })

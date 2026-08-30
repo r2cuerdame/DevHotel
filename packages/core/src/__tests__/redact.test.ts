@@ -106,6 +106,26 @@ describe('redactSecrets', () => {
     })
   })
 
+  it('preserves opaque base64 bytes while structured pairing fields still mask', () => {
+    // This is valid base64 and deliberately contains an AWS-token-shaped
+    // substring that normal prose redaction would replace.
+    const encodedBytes = 'AKIAABCDEFGHIJKLMNOP'
+
+    expect(redactStructuredSecrets({
+      contentBase64: encodedBytes,
+      nested: { png: encodedBytes },
+      malformedPayload: { contentBase64: 'pairing code: 918274' },
+      detail: encodedBytes,
+      pairingCode: encodedBytes
+    })).toEqual({
+      contentBase64: encodedBytes,
+      nested: { png: encodedBytes },
+      malformedPayload: { contentBase64: 'pairing code: •••' },
+      detail: '•••',
+      pairingCode: '•••'
+    })
+  })
+
   it('reference-counts exact ephemeral values and releases them idempotently', () => {
     const endpoint = '192.0.2.88:38888'
     const first = registerSensitiveSecrets([endpoint])

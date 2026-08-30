@@ -91,6 +91,24 @@ describe('agent control API bounded command output', () => {
     })
   })
 
+  it('preserves exact base64 run-output bytes at the response boundary', async () => {
+    const encodedBytes = 'AKIAABCDEFGHIJKLMNOP'
+    const readRunOutput = vi.fn(() => ({
+      runId: RUN_ID,
+      encoding: 'base64',
+      contentBase64: encodedBytes,
+      eof: true
+    }))
+    await withApi({ readRunOutput } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {
+      const res = await fetch(
+        `${base}/v1/rooms/room1abc/runs/${RUN_ID}/output?encoding=base64`,
+        { headers }
+      )
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ contentBase64: encodedBytes })
+    })
+  })
+
   it('refuses a run id that is not a run id', async () => {
     const readRunOutput = vi.fn()
     await withApi({ readRunOutput } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {

@@ -54,6 +54,14 @@ const PAIRING_STRUCTURED_KEYS = new Set([
 ])
 const PAIRING_CONTAINER_KEYS = new Set(['adbpair', 'adbpairing', 'pair', 'pairing'])
 const PAIRING_CHILD_SECRET_KEYS = new Set(['address', 'code', 'endpoint', 'port', 'service', 'token'])
+// These response contracts carry encoded bytes rather than prose. Pattern
+// replacement inside them corrupts the decoded file/image/output. Pairing-key
+// masking above still wins before this exemption is considered.
+const OPAQUE_BASE64_KEYS = new Set(['contentbase64', 'png'])
+
+function isCanonicalBase64(value: string): boolean {
+  return value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value)
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -128,7 +136,10 @@ export class SecretRedactor {
       ) {
         return MASK
       }
-      if (typeof current === 'string') return this.redactText(current, customPatterns)
+      if (typeof current === 'string') {
+        if (normalizedKey && OPAQUE_BASE64_KEYS.has(normalizedKey) && isCanonicalBase64(current)) return current
+        return this.redactText(current, customPatterns)
+      }
       if (current === null || typeof current !== 'object') return current
       if (current instanceof Date || current instanceof Uint8Array) return current
       const childPairingContext = pairingContext || (normalizedKey !== undefined && PAIRING_CONTAINER_KEYS.has(normalizedKey))
