@@ -34,6 +34,7 @@ import type {
   AndroidUiDumpResult,
   AndroidWaitForTextInput,
   AndroidWaitForTextResult,
+  AndroidScreenshotArtifactMetadata,
   ArtifactExportResult,
   BackupInfo,
   ChangeEntry,
@@ -52,11 +53,19 @@ import type {
   RoomRecord,
   RoomRuntimeStatus,
   RoomArtifact,
+  CaptureScreenshotArtifactBody,
   RuntimeRoomRecord,
   SafeHostResyncOutcome,
   SourceType
 } from '@devhotel/shared'
-import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY, zArtifactExportBody, zArtifactListLimit } from '@devhotel/shared'
+import {
+  hostInputCapability,
+  SCREENSHOT_ARTIFACT_MAX_BYTES,
+  VMWARE_CONSOLE_CAPABILITY,
+  zArtifactExportBody,
+  zArtifactListLimit,
+  zCaptureScreenshotArtifactBody
+} from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
@@ -65,6 +74,7 @@ import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstal
 import { AndroidAutomationSession } from './devices/androidAutomation'
 import { artifactsRepo } from './store/artifactsRepo'
 import { RoomArtifactStore } from './artifacts/store'
+import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
@@ -229,6 +239,45 @@ function emulatorApiLevel(version: string): number | null {
   const major = Number.parseInt(version, 10)
   const levels: Record<number, number> = { 11: 30, 12: 31, 13: 33, 14: 34, 15: 35 }
   return levels[major] ?? null
+}
+
+function decodeScreenshotBase64(value: string): Buffer {
+  const maxEncodedBytes = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
+  if (
+    value.length === 0 ||
+    value.length > maxEncodedBytes ||
+    value.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(value)
+  ) {
+    throw new DevHotelError('SCREENSHOT_INVALID', 'Android capture did not return a bounded canonical PNG.', {
+      recoveryHint: 'Retry the capture after the Android target is fully ready.'
+    })
+  }
+  const bytes = Buffer.from(value, 'base64')
+  if (bytes.byteLength > SCREENSHOT_ARTIFACT_MAX_BYTES || bytes.toString('base64') !== value) {
+    throw new DevHotelError('SCREENSHOT_INVALID', 'Android capture did not return a bounded canonical PNG.', {
+      recoveryHint: 'Retry the capture after the Android target is fully ready.'
+    })
+  }
+  return bytes
+}
+
+function artifactMetadataText(value: string | null, maxLength: number): string | null {
+  if (value === null) return null
+  const safe = Array.from(value)
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 0x1f || codePoint === 0x7f ? ' ' : character
+    })
+    .join('')
+    .trim()
+    .slice(0, maxLength)
+  return safe || null
+}
+
+function artifactLocale(value: string | null): string | null {
+  const normalized = artifactMetadataText(value, 64)?.replaceAll('_', '-') ?? null
+  return normalized && /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/.test(normalized) ? normalized : null
 }
 
 function boundedTextCapture(maxBytes: number): {
@@ -1699,6 +1748,134 @@ export class RoomOrchestrator {
         cause: error
       })
     }
+  }
+
+  captureAndroidScreenshotArtifact(
+    roomId: string,
+    rawInput: CaptureScreenshotArtifactBody,
+    actor: Actor
+  ): Promise<RoomArtifact> {
+    return this.withRoomLock(roomId, async () => {
+      const input = zCaptureScreenshotArtifactBody.parse(rawInput)
+      const room = this.mustGet(roomId)
+      if (input.association?.changeId) {
+        const change = this.changes.get(input.association.changeId)
+        if (!change || change.roomId !== roomId) {
+          throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
+            recoveryHint: 'Use a change ID from this Room’s change journal.',
+            httpStatus: 404
+          })
+        }
+      }
+      if (
+        input.association?.runId &&
+        !this.runs.list(roomId).some((run) => run.runId === input.association?.runId)
+      ) {
+        throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
+          recoveryHint: 'Use a run ID currently returned by list_room_runs for this Room.',
+          httpStatus: 404
+        })
+      }
+
+      // Resolve one exact target before capture. The session retains the
+      // physical lease fence; its post-capture status call therefore aborts
+      // publication if the phone was handed to a new lease mid-capture.
+      const target: AndroidTargetSelector = input.mode === 'screen' ? { kind: 'emulator' } : { kind: 'auto' }
+      const releaseCapture = this.devices.beginCapturePermit()
+      try {
+        const session = await this.openAndroidAutomationSessionLocked(roomId, target)
+        const shot = await this.androidScreenshotWithCapturePermit(roomId, input.mode ?? 'auto')
+        const capturedAt = new Date().toISOString()
+        let validated: ReturnType<typeof validateAndSanitizeScreenshotPng>
+        try {
+          validated = validateAndSanitizeScreenshotPng(decodeScreenshotBase64(shot.png))
+        } catch (error) {
+          if (error instanceof DevHotelError) throw error
+          throw new DevHotelError('SCREENSHOT_INVALID', 'Android capture did not return a valid bounded PNG.', {
+            recoveryHint: 'Retry the capture after the Android target is fully ready.',
+            cause: error
+          })
+        }
+        const { status, receipt } = await session.foregroundInstallContext()
+        if (
+          receipt &&
+          (receipt.applicationId !== status.foregroundApplicationId ||
+            receipt.target.kind !== status.target.kind ||
+            receipt.target.deviceId !== status.target.deviceId)
+        ) {
+          throw new DevHotelError('SCREENSHOT_TARGET_CHANGED', 'Android target changed while screenshot evidence was captured.', {
+            recoveryHint: 'Reacquire the intended target and capture a fresh artifact.'
+          })
+        }
+        const packageName = status.foregroundApplicationId
+        const locale = artifactLocale(status.locale)
+        const metadata: AndroidScreenshotArtifactMetadata = {
+          schema: 1,
+          room: {
+            id: room.id,
+            stateRevision: room.stateRevision,
+            workspaceVolumeRevision: room.workspaceVolumeRevision
+          },
+          capture: {
+            source: shot.source,
+            capturedAt,
+            width: validated.width,
+            height: validated.height,
+            orientation: validated.orientation
+          },
+          device: {
+            kind: status.target.kind,
+            deviceId: status.target.deviceId,
+            model: artifactMetadataText(status.target.model, 200),
+            androidVersion: artifactMetadataText(status.target.androidVersion, 64),
+            apiLevel: status.target.apiLevel
+          },
+          app: {
+            status: packageName ? 'tracked-active' : 'untracked-or-none',
+            packageName
+          },
+          locale: {
+            tag: locale,
+            scope: locale ? 'system' : 'unknown'
+          },
+          build: receipt
+            ? {
+                exact: true,
+                changeId: receipt.changeId,
+                apkSha256: receipt.apkSha256,
+                installedAt: receipt.installedAt
+              }
+            : { exact: false, changeId: null, apkSha256: null, installedAt: null },
+          association: {
+            changeId: input.association?.changeId ?? null,
+            runId: input.association?.runId ?? null
+          }
+        }
+        try {
+          return this.artifacts.publishScreenshot({
+            roomId,
+            filename: input.filename,
+            png: validated.png,
+            actor,
+            createdAt: capturedAt,
+            metadata
+          })
+        } catch (error) {
+          if (error instanceof Error && /artifact quota reached/i.test(error.message)) {
+            throw new DevHotelError('ARTIFACT_QUOTA_REACHED', 'This Room’s screenshot artifact quota is full.', {
+              recoveryHint: 'Delete the Room when its evidence is no longer needed, or capture in a fresh Room.'
+            })
+          }
+          throw new DevHotelError('ARTIFACT_STORE_FAILED', 'Screenshot artifact could not be published safely.', {
+            recoveryHint: 'Retry the capture; no partial artifact was made visible.',
+            cause: error,
+            httpStatus: 500
+          })
+        }
+      } finally {
+        releaseCapture()
+      }
+    })
   }
 
   exportRoomArtifact(

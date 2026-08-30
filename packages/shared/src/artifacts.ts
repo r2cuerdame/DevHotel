@@ -9,6 +9,13 @@ export const zArtifactKind = z.literal('android-screenshot')
 
 const WINDOWS_RESERVED_BASENAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i
 
+function containsControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f
+  })
+}
+
 /** Portable basename used for download and export; storage never trusts it as a path. */
 export const zArtifactFilename = z
   .string()
@@ -43,7 +50,7 @@ export const zArtifactExportBody = z
       .min(5)
       .max(1024)
       .refine((value) => {
-        if (value.startsWith('/') || value.includes('\\') || /[\0-\x1f\x7f]/.test(value)) return false
+        if (value.startsWith('/') || value.includes('\\') || containsControlCharacter(value)) return false
         const segments = value.split('/')
         if (
           segments.some(

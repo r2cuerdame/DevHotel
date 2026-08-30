@@ -300,6 +300,7 @@ export class FakeBackend implements IsolationBackend {
     if (!existsSync(hostPath)) writeFileSync(hostPath, 'fake-room-file')
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
+  emulatorScreenPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
@@ -309,7 +310,7 @@ export class FakeBackend implements IsolationBackend {
   }
   async captureEmulatorScreen(roomId: string) {
     this.calls.push(`captureEmulatorScreen:${roomId}`)
-    return 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+    return this.emulatorScreenPng
   }
   async removeEmulator(roomId: string) {
     this.calls.push(`removeEmulator:${roomId}`)

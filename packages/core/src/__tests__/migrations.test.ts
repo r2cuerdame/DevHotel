@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { applyMigrations, migrations } from '../store/migrations'
 
 describe('database migrations', () => {
-  it('upgrades an async-startup v5 database through install receipts v7 without losing operations', () => {
+  it('upgrades an async-startup v5 database through screenshot artifacts v8 without losing operations', () => {
     const sqlite = new DatabaseSync(':memory:')
     try {
       for (const migration of migrations.filter(({ version }) => version <= 5)) {
@@ -35,7 +35,7 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
@@ -50,7 +50,8 @@ describe('database migrations', () => {
         'android_device_leases',
         'android_device_queue',
         'android_device_events',
-        'android_app_installs'
+        'android_app_installs',
+        'room_artifacts'
       ]))
       const queueDedupe = sqlite
         .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_android_queue_dedupe'")
@@ -73,6 +74,11 @@ describe('database migrations', () => {
       expect(installTable.sql.replace(/\s+/g, ' ')).toContain(
         "target_kind = 'physical' AND lease_id IS NOT NULL"
       )
+      const artifactTable = sqlite
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'room_artifacts'")
+        .get() as { sql: string }
+      expect(artifactTable.sql.replace(/\s+/g, ' ')).toContain('REFERENCES rooms(id) ON DELETE CASCADE')
+      expect(artifactTable.sql.replace(/\s+/g, ' ')).toContain("media_type TEXT NOT NULL CHECK (media_type = 'image/png')")
     } finally {
       sqlite.close()
     }

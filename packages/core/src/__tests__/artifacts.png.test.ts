@@ -17,7 +17,7 @@ describe('screenshot PNG validation', () => {
 
   it('rejects corrupt, truncated, oversized-dimension and invalid-filter PNGs', () => {
     const corrupt = screenshotPng()
-    corrupt[corrupt.length - 5] ^= 1
+    corrupt[corrupt.length - 5] = (corrupt[corrupt.length - 5] ?? 0) ^ 1
     expect(() => validateAndSanitizeScreenshotPng(corrupt)).toThrow(/checksum/)
 
     expect(() => validateAndSanitizeScreenshotPng(screenshotPng().subarray(0, -2))).toThrow(/truncated|incomplete/)
