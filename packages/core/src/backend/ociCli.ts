@@ -56,24 +56,36 @@ const GENERATED_SYNC_DIRS = [
   'coverage'
 ] as const
 
-const GENERATED_SYNC_CASE = GENERATED_SYNC_DIRS.map((name) => `*/${name}/*`).join('|')
-
-function syncIncludeReaderScript(): string {
+function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
+  const findFilter = entries === 'files' ? "\\( -type f -o -type l \\) " : ''
   return [
     `include_file=${SYNC_INCLUDE_FILE}`,
-    'is_opted_in() {',
-    '  path=$1',
-    '  [ -f "$include_file" ] || return 1',
+    'if [ -f "$include_file" ]; then',
     '  while IFS= read -r include || [ -n "$include" ]; do',
     "    include=$(printf '%s' \"$include\" | tr -d '\\r')",
     "    case \"$include\" in ''|'#'*) continue ;; esac",
     '    case "$include" in /*|-*|*\\\\*|*:*|*\\**|*\\?*|*\\[*|*\\]*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
     '    include=${include%/}',
     '    case "/$include/" in */../*|*/./*|*//*) echo "invalid .devhotel-sync-include path: $include" >&2; exit 2 ;; esac',
-    '    case "$path" in "$include"|"$include"/*) return 0 ;; esac',
+    '    include_dir=${include%/*}',
+    '    if [ "$include_dir" = "$include" ]; then include_dir=.; fi',
+    '    include_root=$(realpath "$include_dir" 2>/dev/null) || include_root=',
+    '    case "${include_root:-x}" in',
+    '      /workspace|/workspace/*) ;;',
+    '      *) echo "invalid .devhotel-sync-include path leaves the Room workspace: $include" >&2; exit 2 ;;',
+    '    esac',
+    '    if [ -L "$include" ] || [ -f "$include" ]; then',
+    `      printf './%s\\0' "$include" >> "${output}"`,
+    '    elif [ -d "$include" ]; then',
+    '      include_root=$(realpath "$include" 2>/dev/null) || include_root=',
+    '      case "${include_root:-x}" in',
+    '        /workspace|/workspace/*) ;;',
+    '        *) echo "invalid .devhotel-sync-include directory leaves the Room workspace: $include" >&2; exit 2 ;;',
+    '      esac',
+    `      find "./$include" ${findFilter}-print0 >> "${output}"`,
+    '    fi',
     '  done < "$include_file"',
-    '  return 1',
-    '}'
+    'fi'
   ].join('\n')
 }
 
@@ -115,24 +127,18 @@ export function importHostFolderScript(): string {
 }
 
 export function workspaceSnapshotScript(): string {
+  const generatedPrunes = GENERATED_SYNC_DIRS.map((name) => `-name '${name}'`).join(' -o ')
   return [
     'set -eu',
     'cd /workspace',
-    syncIncludeReaderScript(),
-    'is_generated() {',
-    '  path=$1',
-    `  case "/$path/" in ${GENERATED_SYNC_CASE}) return 0 ;; esac`,
-    '  case "$path" in *.apk|*.aab) return 0 ;; esac',
-    '  return 1',
-    '}',
     'sync_paths=$(mktemp)',
     'sync_sorted=$(mktemp)',
     'sync_records=$(mktemp)',
-    "find . -mindepth 1 \\( -type f -o -type l \\) -print0 > \"$sync_paths\"",
-    'sort -z "$sync_paths" > "$sync_sorted"',
+    `find . -mindepth 1 \\( ${generatedPrunes} \\) -prune -o \\( -type f -o -type l \\) ! -name '*.apk' ! -name '*.aab' -print0 > "$sync_paths"`,
+    appendSyncIncludePathsScript('$sync_paths', 'files'),
+    'sort -zu "$sync_paths" > "$sync_sorted"',
     "while IFS= read -r -d '' raw_path; do",
     '  path=${raw_path#./}',
-    '  if is_generated "$path" && ! is_opted_in "$path"; then continue; fi',
     "  metadata=$(stat -c '%f:%u:%g' \"$raw_path\")",
     '  if [ -L "$raw_path" ]; then kind=L; content_hash=$(readlink -n "$raw_path" | sha256sum); else kind=F; content_hash=$(sha256sum "$raw_path"); fi',
     '  content_hash=${content_hash%% *}',
@@ -165,7 +171,8 @@ export function workspaceTransactionalFingerprintScript(): string {
     'transaction_records=$(mktemp)',
     'cd /workspace',
     `find . -mindepth 1 \\( -type d \\( ${generatedPrunes} -o -path '*/.git/objects' \\) \\) -prune -o -print0 > "$transaction_paths"`,
-    'sort -z "$transaction_paths" > "$transaction_sorted"',
+    appendSyncIncludePathsScript('$transaction_paths', 'all'),
+    'sort -zu "$transaction_paths" > "$transaction_sorted"',
     "while IFS= read -r -d '' path; do",
     "  path_hash=$(printf '%s' \"$path\" | sha256sum)",
     '  path_hash=${path_hash%% *}',

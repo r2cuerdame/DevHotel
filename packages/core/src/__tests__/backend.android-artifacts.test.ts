@@ -94,10 +94,12 @@ describe('OciCliBackend Android artifact export', () => {
     )?.[0]
     const script = run?.at(-1) ?? ''
     expect(script).toContain('-print0 > "$transaction_paths"')
-    expect(script).toContain('sort -z "$transaction_paths" > "$transaction_sorted"')
+    expect(script).toContain('sort -zu "$transaction_paths" > "$transaction_sorted"')
     expect(script).toContain('done < "$transaction_sorted"')
     expect(script).toContain("-path '*/.git/objects'")
     expect(script).not.toContain("-name '.git'")
+    expect(script).toContain('find "./$include" -print0 >> "$transaction_paths"')
+    expect(script).toContain('.devhotel-sync-include')
     expect(script).toContain('readlink -n')
     expect(run).toEqual(expect.arrayContaining(['--cap-drop', 'NET_RAW']))
   })
@@ -113,15 +115,17 @@ describe('OciCliBackend Android artifact export', () => {
     )?.[0]
     const script = run?.at(-1) ?? ''
     expect(script).toContain('-print0 > "$sync_paths"')
-    expect(script).toContain('sort -z "$sync_paths" > "$sync_sorted"')
+    expect(script).toContain('sort -zu "$sync_paths" > "$sync_sorted"')
     expect(script).toContain('done < "$sync_sorted"')
     expect(script).not.toContain('-print |')
     expect(script).toContain('readlink -n')
     expect(script).toContain('.devhotel-sync-include')
     for (const generated of ['build', '.gradle', '.kotlin', '.cxx', '.externalNativeBuild', 'target']) {
-      expect(script).toContain(`*/${generated}/*`)
+      expect(script).toContain(`-name '${generated}'`)
     }
-    expect(script).toContain('*.apk|*.aab')
+    expect(script).toContain("! -name '*.apk' ! -name '*.aab'")
+    expect(script.indexOf('-prune -o')).toBeLessThan(script.indexOf('-print0 > "$sync_paths"'))
+    expect(script).toContain('find "./$include" \\( -type f -o -type l \\) -print0 >> "$sync_paths"')
     expect(run).toEqual(expect.arrayContaining(['--cap-drop', 'NET_RAW']))
 
     mockedRunDocker.mockImplementation(async (args) => {

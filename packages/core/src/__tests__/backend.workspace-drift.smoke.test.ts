@@ -63,6 +63,35 @@ describe.skipIf(!process.env.DEVHOTEL_SMOKE)('Windows linked-folder to Linux Roo
     expect(buildOnly).toEqual(baseline)
     await expect(backend.fingerprintWorkspace(ROOM_ID, 1)).resolves.toBe(transactionBaseline)
 
+    const optedInEdit = await runDocker([
+      'run',
+      '--rm',
+      '-v',
+      `${SOURCE_VOLUME}:/workspace`,
+      'alpine',
+      'sh',
+      '-lc',
+      "printf 'changed generated input\\n' > /workspace/app/build/generated/tracked.txt"
+    ])
+    expect(optedInEdit.code, optedInEdit.stderr).toBe(0)
+    await expect(backend.fingerprintWorkspace(ROOM_ID, 1)).resolves.not.toBe(transactionBaseline)
+    expect(diffWorkspaceSnapshots(baseline, await backend.snapshotWorkspace(ROOM_ID, 1))).toEqual([
+      { path: 'app/build/generated/tracked.txt', reason: 'modified' }
+    ])
+
+    const restoreOptedIn = await runDocker([
+      'run',
+      '--rm',
+      '-v',
+      `${SOURCE_VOLUME}:/workspace`,
+      'alpine',
+      'sh',
+      '-lc',
+      "printf 'tracked generated input\\n' > /workspace/app/build/generated/tracked.txt"
+    ])
+    expect(restoreOptedIn.code, restoreOptedIn.stderr).toBe(0)
+    await expect(backend.fingerprintWorkspace(ROOM_ID, 1)).resolves.toBe(transactionBaseline)
+
     const gitControlEdit = await runDocker([
       'run',
       '--rm',
