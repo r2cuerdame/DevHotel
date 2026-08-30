@@ -470,6 +470,85 @@ describe('Android automation targets the attached device without a hand-written 
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
   })
 
+  it('refuses to launch a component resolved for a different package', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    adb.execResultFor = (_serial, args) =>
+      args[0] === 'shell' && args[1] === 'cmd'
+        ? { code: 0, stdout: 'com.other.app/.MainActivity\n', stderr: '' }
+        : null
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
+    expect(entry.verify?.detail).toMatch(/could not resolve launcher/)
+    expect(adb.execs.some((call) => call.args[0] === 'shell' && call.args[1] === 'am')).toBe(false)
+  })
+
+  it('durably records a safe failed verify when the physical PID probe loses its lease', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    adb.execResultFor = async (_serial, args) => {
+      if (args[0] === 'shell' && args[1] === 'cmd') {
+        return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
+      }
+      if (args[0] === 'shell' && args[1] === 'pidof') {
+        await orch.devices.release(attached.lease.id, 'simulated disconnect during physical verification')
+        throw new Error('R5CT30ABCDE C:\\Users\\private\\adb.exe token=ghp_12345678901234567890')
+      }
+      return null
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({
+      status: 'applied',
+      verify: {
+        ok: false,
+        detail: expect.stringMatching(/could not be verified on the attached physical device/)
+      }
+    })
+    expect(entry.verify!.detail.length).toBeLessThanOrEqual(300)
+    expect(entry.verify!.detail).not.toMatch(/R5CT30ABCDE|Users|adb\.exe|ghp_/i)
+    expect(orch.listChanges('aaaa1111').find((change) => change.id === entry.id)).toMatchObject({
+      status: 'applied',
+      verify: { ok: false }
+    })
+  })
+
   it.each([
     {
       name: 'applicationId shell metacharacters',

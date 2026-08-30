@@ -49,6 +49,10 @@ export function startDeviceSweeper(orch: RoomOrchestrator, opts: DeviceSweeperOp
     }
   }
 
+  // Prime discovery before returning. requestDevice() can then join the
+  // broker's in-flight inventory promise instead of seeing "not probed yet"
+  // throughout the first interval after desktop startup.
+  void sweep()
   const timer = setInterval(() => void sweep(), intervalMs)
   timer.unref?.()
 

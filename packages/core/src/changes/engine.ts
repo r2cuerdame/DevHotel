@@ -3,6 +3,8 @@ import type { Actor, ChangeEntry } from '@devhotel/shared'
 import type { ChangeCtx, ChangeDefinition } from './types'
 import { verifyWebUp } from './types'
 
+const VERIFY_EXCEPTION_DETAIL = 'Verification could not complete because its probe failed unexpectedly.'
+
 export class ChangeEngine {
   private defs = new Map<string, ChangeDefinition<any>>()
 
@@ -83,7 +85,15 @@ export class ChangeEngine {
     }
 
     const effectiveCaptured = capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured
-    const verify = await def.verify(ctx, params, effectiveCaptured, operation)
+    let verify: { ok: boolean; detail: string }
+    try {
+      verify = await def.verify(ctx, params, effectiveCaptured, operation)
+    } catch {
+      // A verifier runs after apply has already been durably recorded. Never
+      // let a rejected probe strand that row at applied/verify:null, and never
+      // copy a backend/Host error (paths, argv or secrets) into public state.
+      verify = { ok: false, detail: VERIFY_EXCEPTION_DETAIL }
+    }
     if (verify.ok) {
       ctx.changes.setStatus(entry.id, 'verified', { verify })
       ctx.log(`  verified: ${verify.detail}`)

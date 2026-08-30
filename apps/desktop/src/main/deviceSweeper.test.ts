@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { startDeviceSweeper } from './deviceSweeper'
 
 function orchStub(overrides: Record<string, unknown> = {}) {
@@ -9,19 +9,23 @@ function orchStub(overrides: Record<string, unknown> = {}) {
   }
 }
 
+afterEach(() => vi.useRealTimers())
+
 describe('the device sweeper keeps the shared phone honest while DevHotel runs', () => {
-  it('discovers devices and reclaims stale leases on every tick', async () => {
+  it('sweeps immediately at startup and then on every tick', async () => {
     vi.useFakeTimers()
     const orch = orchStub()
     const sweeper = startDeviceSweeper(orch as never, { intervalMs: 10_000 })
 
-    await vi.advanceTimersByTimeAsync(10_000)
-    await vi.advanceTimersByTimeAsync(10_000)
+    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(orch.reapAndroidDevices).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(20_000)
     sweeper.stop()
 
-    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(2)
-    expect(orch.reapAndroidDevices).toHaveBeenCalledTimes(2)
-    vi.useRealTimers()
+    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(3)
+    expect(orch.reapAndroidDevices).toHaveBeenCalledTimes(3)
   })
 
   it('keeps sweeping after a failed discovery instead of giving up', async () => {
@@ -35,7 +39,7 @@ describe('the device sweeper keeps the shared phone honest while DevHotel runs',
     })
     const sweeper = startDeviceSweeper(orch as never, { intervalMs: 10_000, onError })
 
-    await vi.advanceTimersByTimeAsync(10_000)
+    await vi.advanceTimersByTimeAsync(0)
     await vi.advanceTimersByTimeAsync(10_000)
     sweeper.stop()
 
@@ -43,18 +47,21 @@ describe('the device sweeper keeps the shared phone honest while DevHotel runs',
     expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(2)
     // A phone that failed to enumerate must still not park a dead lease forever.
     expect(orch.reapAndroidDevices).toHaveBeenCalledTimes(2)
-    vi.useRealTimers()
   })
 
   it('does not overlap sweeps when one runs longer than the interval', async () => {
     vi.useFakeTimers()
+    let finishRefresh!: () => void
+    const heldRefresh = new Promise<void>((resolve) => {
+      finishRefresh = resolve
+    })
     let running = 0
     let overlapped = false
     const orch = orchStub({
       refreshAndroidDevices: vi.fn(async () => {
         running += 1
         if (running > 1) overlapped = true
-        await new Promise((resolve) => setTimeout(resolve, 25_000))
+        await heldRefresh
         running -= 1
         return []
       })
@@ -62,10 +69,16 @@ describe('the device sweeper keeps the shared phone honest while DevHotel runs',
     const sweeper = startDeviceSweeper(orch as never, { intervalMs: 10_000 })
 
     await vi.advanceTimersByTimeAsync(60_000)
+    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(1)
+    expect(overlapped).toBe(false)
+
+    finishRefresh()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(10_000)
     sweeper.stop()
 
+    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(2)
     expect(overlapped).toBe(false)
-    vi.useRealTimers()
   })
 
   it('stops cleanly so app shutdown is not held open by a timer', async () => {
@@ -76,7 +89,8 @@ describe('the device sweeper keeps the shared phone honest while DevHotel runs',
     sweeper.stop()
     await vi.advanceTimersByTimeAsync(60_000)
 
-    expect(orch.refreshAndroidDevices).not.toHaveBeenCalled()
-    vi.useRealTimers()
+    // The startup pass is already in flight, but stop prevents every later tick.
+    expect(orch.refreshAndroidDevices).toHaveBeenCalledTimes(1)
+    expect(orch.reapAndroidDevices).toHaveBeenCalledTimes(1)
   })
 })

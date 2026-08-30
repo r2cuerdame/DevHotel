@@ -111,6 +111,22 @@ function targetLabel(ctx: ChangeCtx): string {
   return ctx.physicalAndroidDevice?.nickname ?? 'the Room emulator'
 }
 
+function resolvedLauncher(stdout: string, appId: string): string | undefined {
+  const exactPackagePrefix = `${appId}/`
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith(exactPackagePrefix) && /^[A-Za-z0-9._]+\/[A-Za-z0-9._$]+$/.test(line))
+}
+
+function androidProbeFailure(ctx: ChangeCtx, appId: string): { ok: false; detail: string } {
+  const target = ctx.physicalAndroidDevice ? 'the attached physical device' : 'the Room emulator'
+  return {
+    ok: false,
+    detail: `${appId} could not be verified on ${target}; its bounded probe failed or the target became unavailable`
+  }
+}
+
 export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
   kind: 'android-run',
   plan(ctx, p) {
@@ -201,10 +217,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
         ],
         30_000
       )
-      const component = resolved.stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => /^[A-Za-z0-9._]+\/[A-Za-z0-9._$]+$/.test(line))
+      const component = resolvedLauncher(resolved.stdout, target.appId)
       if (resolved.code !== 0 || !component) {
         throw new Error(`could not resolve launcher for ${target.appId}: ${(resolved.stderr || resolved.stdout).slice(-300)}`)
       }
@@ -226,13 +239,25 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     let appId: string
     try {
       appId = pickTarget(await builtApps(ctx), p.applicationId).appId
-    } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) }
+    } catch {
+      return { ok: false, detail: 'Android run verification could not read validated build metadata' }
     }
-    for (let i = 0; i < 6; i++) {
-      const pid = await runAdb(ctx, ['shell', 'pidof', appId], 20_000)
-      if (pid.stdout.trim()) return { ok: true, detail: `${appId} running on ${targetLabel(ctx)}` }
-      await sleep(2000)
+    try {
+      for (let i = 0; i < 6; i++) {
+        const pid = await runAdb(ctx, ['shell', 'pidof', appId], 20_000)
+        // Android's pidof normally exits 1 while a just-launched process is
+        // still absent. That is a retryable no-match, not a transport failure.
+        const processIds = pid.stdout.trim()
+        if (pid.code === 0 && /^\d+(?:\s+\d+)*$/.test(processIds)) {
+          return { ok: true, detail: `${appId} running on ${targetLabel(ctx)}` }
+        }
+        await sleep(2000)
+      }
+    } catch {
+      // The physical lease or transport can disappear after launch succeeds.
+      // Its raw Host/ADB error is private; durable verification gets only this
+      // bounded, structured result and follows the normal ChangeEngine path.
+      return androidProbeFailure(ctx, appId)
     }
     return { ok: false, detail: `${appId} installed but not running` }
   }
