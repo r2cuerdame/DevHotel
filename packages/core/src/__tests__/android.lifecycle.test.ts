@@ -61,6 +61,14 @@ describe('Android room lifecycle', () => {
       android: { device: 'Pixel 6', version: '15.0' }
     })
     orch.rooms.create(room)
+    orch.androidInstalls.record({
+      roomId: room.id,
+      target: { kind: 'emulator', targetId: room.id, deviceId: null },
+      applicationId: 'com.example.old',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z'
+    })
 
     await orch.startRoom(room.id, 'user')
 
@@ -72,6 +80,9 @@ describe('Android room lifecycle', () => {
     expect(createAt).toBeGreaterThan(removeAt)
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(true)
     expect(backend.calls.some((call) => call.startsWith('createService:'))).toBe(false)
+    expect(orch.androidInstalls.list(room.id, {
+      kind: 'emulator', targetId: room.id, deviceId: null
+    })).toEqual([])
     expect(gateway.status().routes).toEqual([{ domain: room.domain, roomId: room.id, https: false }])
 
     const callsAfterWake = [...backend.calls]

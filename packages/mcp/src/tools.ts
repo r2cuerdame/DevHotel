@@ -1,5 +1,17 @@
 import { z } from 'zod'
-import { zChangeId, zLeasePurpose, zPmKind, zQuickChange, zRoomId } from '@devhotel/shared'
+import {
+  zAndroidActivityName,
+  zAndroidApplicationId,
+  zAndroidCrashScenario,
+  zAndroidExtras,
+  zAndroidTargetSelector,
+  zAndroidTextMatch,
+  zChangeId,
+  zLeasePurpose,
+  zPmKind,
+  zQuickChange,
+  zRoomId
+} from '@devhotel/shared'
 import type { ControlClient } from './client'
 
 type ToolContent =
@@ -363,7 +375,14 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
             kind: 'android-run',
             ...(a.applicationId ? { applicationId: a.applicationId } : {})
           })
-          const content: ToolContent[] = [{ type: 'text', text: JSON.stringify(entry, null, 2) }]
+          let status: unknown = null
+          try {
+            status = await client.androidAutomationStatus(a.roomId)
+          } catch {
+            // A failed build or a target disconnect still returns the durable
+            // Change result; status is supplementary and never hides it.
+          }
+          const content: ToolContent[] = [{ type: 'text', text: JSON.stringify({ change: entry, android: status }, null, 2) }]
           try {
             content.push(await screenshotContent(client, a.roomId))
           } catch (err) {
@@ -374,6 +393,119 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
         }
       }
+    },
+    {
+      name: 'android_launch_app',
+      description:
+        'Launch an app previously installed by android_run on one exact Room target. Omit target for the attached physical phone when present, otherwise the Room emulator; explicit emulator/physical never falls back. Extras are typed, bounded values and no raw adb serial is accepted.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        activity: zAndroidActivityName.optional().describe('optional activity inside this application package'),
+        extras: zAndroidExtras.optional().describe('at most 16 string, boolean or int32 extras'),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidLaunchApp(roomId, input)
+      })
+    },
+    {
+      name: 'android_force_stop',
+      description:
+        'Force-stop a tracked app on one exact Room target. The app must have a current android_run install receipt for that target; arbitrary packages and raw serials are refused.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidForceStop(roomId, input)
+      })
+    },
+    {
+      name: 'android_wait_for_text',
+      description:
+        'Wait a bounded time for literal text in the foreground tracked app. UIAutomator XML stays internal; only sanitized nodes whose package exactly matches applicationId are returned.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        text: z.string().min(1).max(200),
+        match: zAndroidTextMatch.optional(),
+        timeoutMs: z.number().int().min(250).max(120_000).optional(),
+        pollIntervalMs: z.number().int().min(250).max(5_000).optional(),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidWaitForText(roomId, input)
+      })
+    },
+    {
+      name: 'android_tap_text',
+      description:
+        'Tap one unambiguous literal text node belonging to the foreground tracked app. Zero or multiple matches fail with stable structured errors; the physical lease is rechecked immediately before input.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        text: z.string().min(1).max(200),
+        match: zAndroidTextMatch.optional(),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidTapText(roomId, input)
+      })
+    },
+    {
+      name: 'android_dump_ui',
+      description:
+        'Return a bounded, sanitized UI hierarchy for the foreground tracked app. Cross-app nodes, arbitrary XML attributes and raw hierarchy files never cross the Room boundary.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        filter: z.string().max(200).optional().describe('literal filter over text, description, resource id and class'),
+        maxNodes: z.number().int().min(1).max(500).optional(),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidDumpUi(roomId, input)
+      })
+    },
+    {
+      name: 'android_logcat',
+      description:
+        'Read bounded logs for a tracked app only. DevHotel resolves and verifies an unshared package UID, clamps since to the tracked install time, redacts secrets, and never falls back to global logcat.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        since: z.string().datetime({ offset: true }).optional(),
+        filter: z.string().max(200).optional().describe('literal line filter'),
+        maxLines: z.number().int().min(1).max(500).optional(),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidLogcat(roomId, input)
+      })
+    },
+    {
+      name: 'android_run_crash_scenario',
+      description:
+        'Run the bounded am-crash scenario against a running tracked app, prove the original process IDs disappeared, and return package-UID-scoped redacted log evidence associated with runId.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        scenario: zAndroidCrashScenario,
+        runId: z.string().trim().min(1).max(200),
+        target: zAndroidTargetSelector.optional()
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...input } = a
+        return (await getClient()).androidRunCrashScenario(roomId, input)
+      })
     },
     {
       name: 'room_pull_file',

@@ -250,6 +250,30 @@ export const migrations: Migration[] = [
       );
       CREATE INDEX idx_android_events_at ON android_device_events(at DESC);
     `
+  },
+  {
+    // A package name alone is not an automation capability. Only the last
+    // successful DevHotel-managed install on one exact target owns a receipt;
+    // another Room installing the same package atomically replaces that owner.
+    version: 7,
+    sql: `
+      CREATE TABLE android_app_installs (
+        target_kind TEXT NOT NULL CHECK (target_kind IN ('emulator', 'physical')),
+        target_id TEXT NOT NULL,
+        lease_id TEXT CHECK (
+          (target_kind = 'emulator' AND lease_id IS NULL) OR
+          (target_kind = 'physical' AND lease_id IS NOT NULL)
+        ),
+        application_id TEXT NOT NULL,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        change_id TEXT NOT NULL,
+        apk_sha256 TEXT NOT NULL CHECK (length(apk_sha256) = 64),
+        installed_at TEXT NOT NULL,
+        PRIMARY KEY (target_kind, target_id, application_id)
+      );
+      CREATE INDEX idx_android_app_installs_room_target
+        ON android_app_installs(room_id, target_kind, target_id, application_id);
+    `
   }
 ]
 

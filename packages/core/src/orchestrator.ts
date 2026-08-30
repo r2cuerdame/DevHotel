@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
+  createReadStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,6 +17,23 @@ import { isAbsolute, join, relative } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
   Actor,
+  AndroidAutomationStatus,
+  AndroidCrashScenarioResult,
+  AndroidDumpUiInput,
+  AndroidForceStopInput,
+  AndroidForceStopResult,
+  AndroidForegroundInstallContext,
+  AndroidLaunchAppInput,
+  AndroidLaunchResult,
+  AndroidLogcatInput,
+  AndroidLogcatResult,
+  AndroidRunCrashScenarioInput,
+  AndroidTapTextInput,
+  AndroidTapTextResult,
+  AndroidTargetSelector,
+  AndroidUiDumpResult,
+  AndroidWaitForTextInput,
+  AndroidWaitForTextResult,
   BackupInfo,
   ChangeEntry,
   CheckReport,
@@ -41,10 +59,12 @@ import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResul
 import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
+import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
+import { AndroidAutomationSession } from './devices/androidAutomation'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
-import type { ExecResult, IsolationBackend, WebSpec } from './backend/types'
+import type { ExecOutputChunk, ExecResult, IsolationBackend, WebSpec } from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -191,6 +211,46 @@ function redactAdbResult(
   }
 }
 
+function hashFileSha256(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(path)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.once('error', reject)
+    stream.once('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+function emulatorApiLevel(version: string): number | null {
+  const major = Number.parseInt(version, 10)
+  const levels: Record<number, number> = { 11: 30, 12: 31, 13: 33, 14: 34, 15: 35 }
+  return levels[major] ?? null
+}
+
+function boundedTextCapture(maxBytes: number): {
+  push(chunk: ExecOutputChunk): void
+  text(): string
+  readonly exceeded: boolean
+} {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  let exceeded = false
+  return {
+    push(chunk) {
+      const data = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk)
+      const remaining = Math.max(0, maxBytes - bytes)
+      if (remaining > 0) {
+        const captured = data.subarray(0, remaining)
+        chunks.push(captured)
+        bytes += captured.byteLength
+      }
+      if (data.byteLength > remaining) exceeded = true
+    },
+    text: () => Buffer.concat(chunks, bytes).toString('utf8'),
+    get exceeded() { return exceeded }
+  }
+}
+
 export interface OrchestratorEvent {
   roomId: string
   kind: 'status' | 'change' | 'check' | 'deleted' | 'created'
@@ -245,6 +305,7 @@ export class RoomOrchestrator {
   readonly operationRecords: OperationsRepo
   readonly logs: LogHub
   readonly runs: RunOutputStore
+  readonly androidInstalls: AndroidAppInstallsRepo
   private readonly operations: OperationTracker
   private readonly pendingHostResyncConfirmations = new Map<string, PendingHostResyncConfirmation>()
   private readonly engine = new ChangeEngine()
@@ -284,6 +345,7 @@ export class RoomOrchestrator {
     this.operations = new OperationTracker(this.operationRecords)
     this.logs = new LogHub(opts.userData, opts.backend)
     this.runs = new RunOutputStore(opts.userData)
+    this.androidInstalls = androidAppInstallsRepo(opts.db)
     this.devices = new AndroidDeviceBroker({
       repo: androidDevicesRepo(opts.db),
       adb: opts.adb ?? new SpawnedAdbHost(),
@@ -1272,6 +1334,7 @@ export class RoomOrchestrator {
         this.olog(roomId, 'start emulator')
         report.begin('emulator-boot', 'Start the Room emulator')
         try {
+          this.clearAndroidEmulatorInstalls(roomId)
           await this.backend.removeEmulator(roomId)
           await this.backend.createEmulator(roomId, room.android)
           emulatorStarted = true
@@ -1668,6 +1731,222 @@ export class RoomOrchestrator {
   /** Reclaim phones from dead owners; the desktop app calls this on a timer. */
   reapAndroidDevices(): ReturnType<AndroidDeviceBroker['reap']> {
     return this.devices.reap()
+  }
+
+  androidAutomationStatus(
+    roomId: string,
+    target: AndroidTargetSelector = { kind: 'auto' }
+  ): Promise<AndroidAutomationStatus> {
+    return this.withRoomLock(roomId, () => this.androidAutomationStatusLocked(roomId, target))
+  }
+
+  /** Trusted Core composition point for a caller that already owns the Room lock. */
+  async androidAutomationStatusLocked(
+    roomId: string,
+    target: AndroidTargetSelector = { kind: 'auto' }
+  ): Promise<AndroidAutomationStatus> {
+    return (await this.openAndroidAutomationSessionLocked(roomId, target)).status()
+  }
+
+  /**
+   * Trusted lock-held composition for screenshot/report workflows. It resolves
+   * one exact session and returns only a tracked foreground receipt; raw serial
+   * and the captured physical lease ID stay inside Core. A workflow attaching
+   * metadata to already-captured evidence must instead open the session before
+   * capture and call `session.foregroundInstallContext()` afterwards, so a
+   * mid-capture physical lease replacement throws rather than becoming null.
+   */
+  async androidForegroundInstallReceiptLocked(
+    roomId: string,
+    target: AndroidTargetSelector = { kind: 'auto' }
+  ): Promise<AndroidForegroundInstallContext> {
+    return (await this.openAndroidAutomationSessionLocked(roomId, target)).foregroundInstallContext()
+  }
+
+  androidLaunchApp(roomId: string, input: AndroidLaunchAppInput): Promise<AndroidLaunchResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.launch(input.applicationId, input.activity, input.extras)
+    })
+  }
+
+  androidForceStop(roomId: string, input: AndroidForceStopInput): Promise<AndroidForceStopResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.forceStop(input.applicationId)
+    })
+  }
+
+  androidWaitForText(roomId: string, input: AndroidWaitForTextInput): Promise<AndroidWaitForTextResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.waitForText(input)
+    })
+  }
+
+  androidTapText(roomId: string, input: AndroidTapTextInput): Promise<AndroidTapTextResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.tapText(input)
+    })
+  }
+
+  androidDumpUi(roomId: string, input: AndroidDumpUiInput): Promise<AndroidUiDumpResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.dumpUi(input)
+    })
+  }
+
+  androidLogcat(roomId: string, input: AndroidLogcatInput): Promise<AndroidLogcatResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.logcat(input)
+    })
+  }
+
+  androidRunCrashScenario(
+    roomId: string,
+    input: AndroidRunCrashScenarioInput
+  ): Promise<AndroidCrashScenarioResult> {
+    return this.withRoomLock(roomId, async () => {
+      const session = await this.openAndroidAutomationSessionLocked(roomId, input.target ?? { kind: 'auto' })
+      return session.crashScenario(input)
+    })
+  }
+
+  /**
+   * Open one target while the caller already owns the Room lock. This method
+   * never reacquires that lock, captures one exact physical lease, and gives
+   * future internal workflows bounded app-scoped methods rather than raw adb.
+   */
+  async openAndroidAutomationSessionLocked(
+    roomId: string,
+    selector: AndroidTargetSelector
+  ): Promise<AndroidAutomationSession> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') {
+      throw new DevHotelError('ANDROID_ROOM_REQUIRED', 'Android automation is available only for Android Rooms.', {
+        recoveryHint: 'Choose an Android Room.', httpStatus: 409
+      })
+    }
+    const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+    if (!awake) {
+      throw new DevHotelError('ANDROID_ROOM_ASLEEP', 'Wake the Android Room before driving its target.', {
+        recoveryHint: 'Start the Room, wait for the target to become ready, and retry.', httpStatus: 409
+      })
+    }
+
+    const attached = this.devices.deviceForRoom(roomId)
+    const usePhysical = selector.kind === 'physical' || (selector.kind === 'auto' && attached !== null)
+    if (usePhysical) {
+      if (!attached) {
+        throw new DevHotelError('ANDROID_PHYSICAL_NOT_ATTACHED', 'This Room has no attached physical Android target.', {
+          recoveryHint: 'Attach a physical device lease, or explicitly select the Room emulator.', httpStatus: 409
+        })
+      }
+      if (selector.kind === 'physical' && selector.deviceId && selector.deviceId !== attached.id) {
+        throw new DevHotelError('ANDROID_TARGET_MISMATCH', 'The requested opaque device is not attached to this Room.', {
+          recoveryHint: 'Inspect the device broker and attach the intended device first.', httpStatus: 409
+        })
+      }
+      const captured = this.devices.authorizeInternalOperation(
+        roomId,
+        attached.id,
+        'opening the high-level Android automation session'
+      )
+      if (!captured.leaseId) {
+        throw new DevHotelError('ANDROID_PHYSICAL_NOT_LEASED', 'The selected physical Android target has no exclusive Room lease.', {
+          recoveryHint: 'Attach the physical device before running acceptance automation.', httpStatus: 409
+        })
+      }
+      const expectedLeaseId = captured.leaseId
+      const target = {
+        kind: 'physical' as const,
+        deviceId: captured.device.id,
+        nickname: captured.device.nickname,
+        model: captured.device.model,
+        androidVersion: captured.device.androidVersion,
+        apiLevel: captured.device.apiLevel
+      }
+      return new AndroidAutomationSession({
+        roomId,
+        target,
+        installTarget: {
+          kind: 'physical',
+          targetId: captured.device.id,
+          deviceId: captured.device.id,
+          leaseId: expectedLeaseId
+        },
+        installs: this.androidInstalls,
+        exec: async (args, opts) => {
+          const authorized = this.devices.authorizeInternalOperation(
+            roomId,
+            attached.id,
+            'running the high-level Android automation command',
+            expectedLeaseId
+          )
+          const result = await this.withDeviceHeartbeat(roomId, attached.id, expectedLeaseId, () =>
+            this.devices.hostAdb.exec(authorized.serial, args, {
+              timeoutMs: opts?.timeoutMs,
+              maxStdoutBytes: opts?.maxStdoutBytes,
+              maxStderrBytes: opts?.maxStderrBytes
+            })
+          )
+          return redactAdbResult(result, authorized.serial)
+        }
+      })
+    }
+
+    if ((await this.backend.emulatorState(roomId)) !== 'running') {
+      throw new DevHotelError('ANDROID_EMULATOR_NOT_RUNNING', 'The Room emulator is not running.', {
+        recoveryHint: 'Restart the Android Room and wait for its emulator container.', httpStatus: 409
+      })
+    }
+    const version = room.android?.version ?? EMULATOR_DEFAULT_VERSION
+    const target = {
+      kind: 'emulator' as const,
+      deviceId: null,
+      nickname: 'Room emulator',
+      model: room.android?.device ?? EMULATOR_DEFAULT_DEVICE,
+      androidVersion: version,
+      apiLevel: emulatorApiLevel(version)
+    }
+    return new AndroidAutomationSession({
+      roomId,
+      target,
+      installTarget: { kind: 'emulator', targetId: roomId, deviceId: null },
+      installs: this.androidInstalls,
+      exec: async (args, opts) => {
+        // OCI backends stream into bounded collectors so app-controlled UI or
+        // log output never becomes an unbounded host allocation.
+        const stdout = boundedTextCapture(opts?.maxStdoutBytes ?? 1024 * 1024)
+        const stderr = boundedTextCapture(opts?.maxStderrBytes ?? 64 * 1024)
+        let sawStdout = false
+        let sawStderr = false
+        const result = await this.backend.execInRoom(
+          roomId,
+          ['adb', '-s', EMULATOR_ADB_SERIAL, ...args],
+          {
+            timeoutMs: opts?.timeoutMs,
+            onStdout: (chunk) => { sawStdout = true; stdout.push(chunk) },
+            onStderr: (chunk) => { sawStderr = true; stderr.push(chunk) }
+          }
+        )
+        // Preserve compatibility with a backend that does not honour streaming.
+        if (!sawStdout && result.stdout) stdout.push(result.stdout)
+        if (!sawStderr && result.stderr) stderr.push(result.stderr)
+        const exceeded = stdout.exceeded || stderr.exceeded
+        const limitMessage = exceeded
+          ? '\nAndroid emulator command output exceeded its safety limit.'
+          : ''
+        return {
+          code: exceeded ? -1 : result.code,
+          stdout: stdout.text(),
+          stderr: `${stderr.text()}${limitMessage}`
+        }
+      }
+    })
   }
 
   /**
@@ -2984,6 +3263,25 @@ export class RoomOrchestrator {
       },
       syncRoute: () => this.syncRouteFor(roomId),
       clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
+      clearAndroidEmulatorInstalls: () => this.clearAndroidEmulatorInstalls(roomId),
+      recordAndroidInstall: async (applicationId, apkPath, changeId) => {
+        const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
+        await this.recordAndroidInstallLocked(
+          roomId,
+          physicalDevice
+            ? {
+                kind: 'physical',
+                targetId: physicalDevice.id,
+                deviceId: physicalDevice.id,
+                leaseId: expectedLeaseId!
+              }
+            : { kind: 'emulator', targetId: roomId, deviceId: null },
+          applicationId,
+          apkPath,
+          changeId,
+          expectedLeaseId
+        )
+      },
       physicalAndroidDevice:
         physicalDevice
           ? {
@@ -2995,6 +3293,59 @@ export class RoomOrchestrator {
               keepAlive: (run) => this.withDeviceHeartbeat(roomId, physicalDevice.id, capturePhysicalLease(), run, false)
             }
           : undefined
+    }
+  }
+
+  private clearAndroidEmulatorInstalls(roomId: string): void {
+    this.androidInstalls.clearTarget(roomId, { kind: 'emulator', targetId: roomId, deviceId: null })
+  }
+
+  private async recordAndroidInstallLocked(
+    roomId: string,
+    target: AndroidInstallTarget,
+    applicationId: string,
+    apkPath: string,
+    changeId: string,
+    expectedLeaseId: string | null
+  ): Promise<void> {
+    if (
+      !/^\/workspace\/[^\0]+\.apk$/i.test(apkPath) ||
+      apkPath.split('/').some((segment) => segment === '..')
+    ) {
+      throw new Error('Android install receipt received an unsafe APK path')
+    }
+    const stagingRoot = join(this.userData, 'tmp')
+    mkdirSync(stagingRoot, { recursive: true })
+    const stagingDir = mkdtempSync(join(stagingRoot, 'android-install-receipt-'))
+    const stagedApk = join(stagingDir, 'installed.apk')
+    try {
+      await this.backend.copyFromRoom(roomId, apkPath, stagedApk)
+      const staged = lstatSync(stagedApk)
+      if (!staged.isFile() || staged.isSymbolicLink() || staged.size <= 0 || staged.size > MAX_STAGED_APK_BYTES) {
+        throw new Error('Android install receipt refused an invalid or oversized APK')
+      }
+      const apkSha256 = await hashFileSha256(stagedApk)
+      if (target.kind === 'physical') {
+        if (!expectedLeaseId) throw new Error('Physical Android install receipt has no captured lease')
+        this.devices.authorizeInternalOperation(
+          roomId,
+          target.deviceId,
+          'recording the tracked Android install',
+          expectedLeaseId
+        )
+      } else if ((await this.backend.emulatorState(roomId)) !== 'running') {
+        throw new Error('The Room emulator disappeared before its install receipt was recorded')
+      }
+      this.androidInstalls.record({
+        roomId,
+        target,
+        applicationId,
+        changeId,
+        apkSha256,
+        installedAt: new Date().toISOString()
+      })
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true })
     }
   }
 

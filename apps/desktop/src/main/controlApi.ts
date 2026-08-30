@@ -4,6 +4,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from 'node:path'
 import {
   zAgentCloneBody,
+  zAndroidDumpUiBody,
+  zAndroidForceStopBody,
+  zAndroidLaunchAppBody,
+  zAndroidLogcatBody,
+  zAndroidRunCrashScenarioBody,
+  zAndroidTapTextBody,
+  zAndroidTargetSelector,
+  zAndroidWaitForTextBody,
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
@@ -26,7 +34,13 @@ import {
   DeviceLeaseError,
   type ControlInfo
 } from '@devhotel/shared'
-import { isDevHotelError, redactStructuredSecrets, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
+import {
+  DevHotelError,
+  isDevHotelError,
+  redactStructuredSecrets,
+  WorkspaceDriftError,
+  type RoomOrchestrator
+} from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /**
@@ -35,6 +49,8 @@ import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/
  * result can explicitly opt into a bounded wait.
  */
 const DEFAULT_START_WAIT_MS = 0
+const DEFAULT_BODY_LIMIT_BYTES = 24 * 1024 * 1024
+const ANDROID_AUTOMATION_BODY_LIMIT_BYTES = 64 * 1024
 
 /** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
 function parseWaitMs(raw: string | null): number {
@@ -67,7 +83,12 @@ export async function startControlApi(
         return
       }
       if (isDevHotelError(err)) {
-        sendJson(res, err.httpStatus, { error: err.message, code: err.code, recoveryHint: err.recoveryHint })
+        sendJson(res, err.httpStatus, {
+          error: err.message,
+          code: err.code,
+          recoveryHint: err.recoveryHint,
+          ...(err.evidence !== null ? { evidence: err.evidence } : {})
+        })
         return
       }
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) })
@@ -179,6 +200,58 @@ export async function startControlApi(
         }
         sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
         return
+      }
+      // High-level Android automation. Every body is strict and small, every
+      // package is checked against a target-scoped install receipt in Core.
+      if (safeRoomId && op === 'android') {
+        const action = parts[4]
+        if (action === 'status' && req.method === 'GET') {
+          const queryKeys = [...url.searchParams.keys()]
+          if (
+            queryKeys.some((key) => key !== 'target' && key !== 'deviceId') ||
+            url.searchParams.getAll('target').length > 1 ||
+            url.searchParams.getAll('deviceId').length > 1
+          ) {
+            throw new DevHotelError('INVALID_ANDROID_TARGET', 'Android status received an unsupported or repeated target field.', {
+              recoveryHint: 'Use only target=auto|emulator|physical and an optional opaque deviceId.',
+              httpStatus: 400
+            })
+          }
+          const kind = url.searchParams.get('target') ?? 'auto'
+          const deviceId = url.searchParams.get('deviceId') ?? undefined
+          const target = zAndroidTargetSelector.parse({
+            kind,
+            ...(deviceId ? { deviceId } : {})
+          })
+          sendJson(res, 200, await orch.androidAutomationStatus(safeRoomId, target))
+          return
+        }
+        if (req.method === 'POST') {
+          const body = await readBody(req, ANDROID_AUTOMATION_BODY_LIMIT_BYTES)
+          switch (action) {
+            case 'launch':
+              sendJson(res, 200, await orch.androidLaunchApp(safeRoomId, zAndroidLaunchAppBody.parse(body)))
+              return
+            case 'force-stop':
+              sendJson(res, 200, await orch.androidForceStop(safeRoomId, zAndroidForceStopBody.parse(body)))
+              return
+            case 'wait-for-text':
+              sendJson(res, 200, await orch.androidWaitForText(safeRoomId, zAndroidWaitForTextBody.parse(body)))
+              return
+            case 'tap-text':
+              sendJson(res, 200, await orch.androidTapText(safeRoomId, zAndroidTapTextBody.parse(body)))
+              return
+            case 'dump-ui':
+              sendJson(res, 200, await orch.androidDumpUi(safeRoomId, zAndroidDumpUiBody.parse(body)))
+              return
+            case 'logcat':
+              sendJson(res, 200, await orch.androidLogcat(safeRoomId, zAndroidLogcatBody.parse(body)))
+              return
+            case 'crash-scenario':
+              sendJson(res, 200, await orch.androidRunCrashScenario(safeRoomId, zAndroidRunCrashScenarioBody.parse(body)))
+              return
+          }
+        }
       }
       // /v1/rooms/:id/device/(attach|release|adb)
       if (safeRoomId && op === 'device' && req.method === 'POST') {
@@ -442,9 +515,27 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTES): Promise<unknown> {
+  const declared = Number(req.headers['content-length'])
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
+      recoveryHint: 'Send only the bounded fields accepted by this route.',
+      httpStatus: 413
+    })
+  }
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let bytes = 0
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    bytes += buffer.byteLength
+    if (bytes > maxBytes) {
+      throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
+        recoveryHint: 'Send only the bounded fields accepted by this route.',
+        httpStatus: 413
+      })
+    }
+    chunks.push(buffer)
+  }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw) return {}
   return JSON.parse(raw)

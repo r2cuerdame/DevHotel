@@ -260,7 +260,15 @@ export const CONTROL_ROUTES = {
   runChecks: { method: 'POST', path: '/v1/rooms/:id/checks' },
   applyChange: { method: 'POST', path: '/v1/rooms/:id/changes' },
   undoChange: { method: 'POST', path: '/v1/rooms/:id/undo' },
-  diagnostic: { method: 'GET', path: '/v1/rooms/:id/diagnostic' }
+  diagnostic: { method: 'GET', path: '/v1/rooms/:id/diagnostic' },
+  androidStatus: { method: 'GET', path: '/v1/rooms/:id/android/status' },
+  androidLaunch: { method: 'POST', path: '/v1/rooms/:id/android/launch' },
+  androidForceStop: { method: 'POST', path: '/v1/rooms/:id/android/force-stop' },
+  androidWaitForText: { method: 'POST', path: '/v1/rooms/:id/android/wait-for-text' },
+  androidTapText: { method: 'POST', path: '/v1/rooms/:id/android/tap-text' },
+  androidDumpUi: { method: 'POST', path: '/v1/rooms/:id/android/dump-ui' },
+  androidLogcat: { method: 'POST', path: '/v1/rooms/:id/android/logcat' },
+  androidCrashScenario: { method: 'POST', path: '/v1/rooms/:id/android/crash-scenario' }
 } as const
 
 /** Starting a Room answers with its operation; `waitMs` only chooses how long the call holds. */

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { applyMigrations, migrations } from '../store/migrations'
 
 describe('database migrations', () => {
-  it('upgrades an async-startup v5 database to Device Broker v6 without losing operations', () => {
+  it('upgrades an async-startup v5 database through install receipts v7 without losing operations', () => {
     const sqlite = new DatabaseSync(':memory:')
     try {
       for (const migration of migrations.filter(({ version }) => version <= 5)) {
@@ -35,7 +35,7 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
@@ -49,7 +49,8 @@ describe('database migrations', () => {
         'android_devices',
         'android_device_leases',
         'android_device_queue',
-        'android_device_events'
+        'android_device_events',
+        'android_app_installs'
       ]))
       const queueDedupe = sqlite
         .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_android_queue_dedupe'")
@@ -63,6 +64,15 @@ describe('database migrations', () => {
       ).toEqual({ bytes: 32 })
       const deviceColumns = sqlite.prepare('PRAGMA table_info(android_devices)').all() as { name: string; notnull: number }[]
       expect(deviceColumns.find(({ name }) => name === 'physical_identity')).toMatchObject({ notnull: 1 })
+      const installTable = sqlite
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'android_app_installs'")
+        .get() as { sql: string }
+      expect(installTable.sql.replace(/\s+/g, ' ')).toContain(
+        'PRIMARY KEY (target_kind, target_id, application_id)'
+      )
+      expect(installTable.sql.replace(/\s+/g, ' ')).toContain(
+        "target_kind = 'physical' AND lease_id IS NOT NULL"
+      )
     } finally {
       sqlite.close()
     }

@@ -38,12 +38,10 @@ room's Changes list. Host boundaries hold:
   journaled as `agent`, and retains the replaced workspace generation so a
   wrong sync stays recoverable. Moving a legacy Room into the Hotel remains
   user-only.
-- The Host's mouse, keyboard and foreground window are not on this API. UI
-  input belongs inside the Room — for an Android Room, `exec` an
-  `adb -s emulator-5554 shell input …` command against its own emulator, or
-  drive a leased physical phone through `POST /v1/rooms/:id/device/adb`, rather
-  than automating the Host desktop against the DevHotel preview window. See
-  [Host input isolation](./host-input-isolation.md).
+- The Host's mouse, keyboard and foreground window are not on this API. Android
+  UI input uses the tracked-app operations below; do not automate the Host
+  desktop against the DevHotel preview window. See [Host input
+  isolation](./host-input-isolation.md).
 
 ## Long operations
 
@@ -155,6 +153,45 @@ one-time code out of application state. Agents cannot provide an endpoint,
 port, token or pairing code. All JSON responses pass through the same
 structured secret-redaction boundary used by diagnostics, logs and device
 events.
+
+### Tracked Android automation
+
+An `applicationId` is not authority by itself. These routes accept only an app
+successfully installed by DevHotel's `android-run` on the exact Room target.
+The durable receipt contains the Room, opaque target identity, Change ID, APK
+SHA-256, and install time. Recreating an emulator clears its receipts; installing
+the same package on a shared phone transfers that exact target/package receipt
+to the last installing Room. Package disappearance is probed live and invalidates
+a stale receipt. Physical receipts are also fenced to the lease that performed
+the install, so releasing and reacquiring the same phone requires a fresh
+`android-run` before automation.
+
+`target` is `{ kind: 'auto' }` (the default), `{ kind: 'emulator' }`, or
+`{ kind: 'physical', deviceId? }`. Auto follows an attached physical proof target
+and otherwise uses the Room emulator. An explicit choice never falls back. Each
+physical command reauthorizes the lease ID captured when the operation began.
+Raw adb serials are intentionally neither accepted nor returned; a physical
+target is identified by its opaque broker `deviceId` and human nickname.
+
+Automation POST bodies are strict and capped at 64 KiB.
+
+| Method & path | Body / query | Result |
+|---|---|---|
+| `GET /v1/rooms/:id/android/status` | `?target=auto\|emulator\|physical&deviceId=` | safe target descriptor, live `installedApplicationIds`, tracked foreground app or `null`, and locale |
+| `POST /v1/rooms/:id/android/launch` | `{ applicationId, activity?, extras?, target? }` | resolved in-package component and bounded command evidence |
+| `POST /v1/rooms/:id/android/force-stop` | `{ applicationId, target? }` | bounded force-stop evidence |
+| `POST /v1/rooms/:id/android/wait-for-text` | `{ applicationId, text, match?, timeoutMs?, pollIntervalMs?, target? }` | one sanitized app-owned node, attempts and elapsed time |
+| `POST /v1/rooms/:id/android/tap-text` | `{ applicationId, text, match?, target? }` | the one unambiguous app-owned node and bounded input evidence |
+| `POST /v1/rooms/:id/android/dump-ui` | `{ applicationId, filter?, maxNodes?, target? }` | at most 500 sanitized nodes plus scan/truncation accounting |
+| `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines, clamped no earlier than the tracked install |
+| `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
+
+UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
+non-expanding parser, and discarded. Only nodes whose `package` exactly equals
+the tracked app cross the boundary. Taps require one match and recheck foreground
+ownership immediately before input. Logcat resolves an exact unshared UID and
+fails closed when `--uid` isolation is unavailable; it never reads global logs.
+
 ### Rooms
 
 | Method & path | Body / query | Result |

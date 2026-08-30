@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DeviceLeaseError } from '@devhotel/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { RoomOrchestrator } from '@devhotel/core'
+import { DevHotelError, type RoomOrchestrator } from '@devhotel/core'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -223,6 +223,95 @@ describe('agents reach the shared phone only through the broker', () => {
       const result = await call('/v1/rooms/room1abc/screenshot')
       expect(result.status).toBe(200)
       expect(result.body).toEqual({ png: encodedPng, source: 'adb' })
+    })
+  })
+})
+
+describe('agent Android automation routes', () => {
+  it('parses explicit opaque targets and forwards strict high-level operations', async () => {
+    const androidAutomationStatus = vi.fn(async () => ({ installedApplicationIds: ['com.example.app'] }))
+    const androidLaunchApp = vi.fn(async () => ({ applicationId: 'com.example.app', component: 'com.example.app/.Main' }))
+    const androidDumpUi = vi.fn(async () => ({ nodes: [] }))
+
+    await withApi(
+      { androidAutomationStatus, androidLaunchApp, androidDumpUi } as unknown as Partial<RoomOrchestrator>,
+      async (call) => {
+        const deviceId = `d${'a'.repeat(32)}`
+        const status = await call(`/v1/rooms/room1abc/android/status?target=physical&deviceId=${deviceId}`)
+        const launch = await call('/v1/rooms/room1abc/android/launch', {
+          method: 'POST',
+          body: JSON.stringify({
+            applicationId: 'com.example.app',
+            activity: '.MainActivity',
+            extras: { retries: 2 },
+            target: { kind: 'emulator' }
+          })
+        })
+        const dump = await call('/v1/rooms/room1abc/android/dump-ui', {
+          method: 'POST',
+          body: JSON.stringify({ applicationId: 'com.example.app', filter: 'Crash', maxNodes: 10 })
+        })
+
+        expect(status.status).toBe(200)
+        expect(androidAutomationStatus).toHaveBeenCalledWith('room1abc', { kind: 'physical', deviceId })
+        expect(launch.status).toBe(200)
+        expect(androidLaunchApp).toHaveBeenCalledWith('room1abc', {
+          applicationId: 'com.example.app', activity: '.MainActivity', extras: { retries: 2 }, target: { kind: 'emulator' }
+        })
+        expect(dump.status).toBe(200)
+        expect(androidDumpUi).toHaveBeenCalledWith('room1abc', {
+          applicationId: 'com.example.app', filter: 'Crash', maxNodes: 10
+        })
+      }
+    )
+  })
+
+  it('refuses raw serial fields and oversized automation bodies before Core', async () => {
+    const androidTapText = vi.fn()
+    const androidAutomationStatus = vi.fn()
+    await withApi({ androidTapText, androidAutomationStatus } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const serial = await call('/v1/rooms/room1abc/android/tap-text', {
+        method: 'POST',
+        body: JSON.stringify({ applicationId: 'com.example.app', text: 'Crash', serial: 'R5CT30ABCDE' })
+      })
+      const querySerial = await call('/v1/rooms/room1abc/android/status?target=physical&serial=R5CT30ABCDE')
+      const oversized = await call('/v1/rooms/room1abc/android/tap-text', {
+        method: 'POST',
+        body: JSON.stringify({ applicationId: 'com.example.app', text: 'x'.repeat(70_000) })
+      })
+
+      expect(serial.status).toBe(500)
+      expect(querySerial).toMatchObject({ status: 400, body: { code: 'INVALID_ANDROID_TARGET' } })
+      expect(oversized.status).toBe(413)
+      expect(oversized.body).toMatchObject({ code: 'REQUEST_BODY_TOO_LARGE' })
+      expect(androidTapText).not.toHaveBeenCalled()
+      expect(androidAutomationStatus).not.toHaveBeenCalled()
+    })
+  })
+
+  it('preserves bounded automation evidence in a structured Core error', async () => {
+    const androidForceStop = vi.fn(async () => {
+      throw new DevHotelError('ANDROID_FORCE_STOP_FAILED', 'The tracked app could not be stopped.', {
+        httpStatus: 409,
+        recoveryHint: 'Retry on the selected target.',
+        evidence: { code: 1, stdout: '', stderr: 'permission denied', truncated: false }
+      })
+    })
+
+    await withApi({ androidForceStop } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/android/force-stop', {
+        method: 'POST',
+        body: JSON.stringify({ applicationId: 'com.example.app' })
+      })
+
+      expect(result).toMatchObject({
+        status: 409,
+        body: {
+          code: 'ANDROID_FORCE_STOP_FAILED',
+          recoveryHint: 'Retry on the selected target.',
+          evidence: { code: 1, stderr: 'permission denied', truncated: false }
+        }
+      })
     })
   })
 })
