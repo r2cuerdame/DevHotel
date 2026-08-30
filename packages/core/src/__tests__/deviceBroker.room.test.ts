@@ -37,6 +37,22 @@ function installEvidenceResult(args: string[], state: { fence: string; apkSha256
   if (logical[1] === 'pm' && logical[2] === 'path') {
     return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
   }
+  if (logical[1] === 'sh' && logical[3]?.startsWith('dumpsys package "$1"')) {
+    return {
+      code: 0,
+      stdout: [
+        'Packages:',
+        '  Package [com.example.app] (abc123):',
+        '    userId=10123',
+        '    pkg=Package{abc123 com.example.app}',
+        `    codePath=${TEST_BASE_APK}`,
+        '',
+        logical.at(-1),
+        ''
+      ].join('\n'),
+      stderr: ''
+    }
+  }
   if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
   if (logical[1] === 'sha256sum') {
     return { code: 0, stdout: `${state.apkSha256 ?? TEST_APK_SHA}  ${TEST_BASE_APK}\n`, stderr: '' }
@@ -1016,6 +1032,47 @@ describe('Android automation targets the attached device without a hand-written 
 
     expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
     expect(entry.verify?.detail).toMatch(/bytes differ/)
+    expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
+  })
+
+  it('does not commit an emulator receipt when the package changes after log-fence proof', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
+    const installEvidence = { fence: '' }
+    let pathProbes = 0
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const androidArgs = roomAndroidArgs(cmd)
+      if (androidArgs) {
+        const logical = logicalAdbArgs(androidArgs)
+        if (logical[1] === 'pm' && logical[2] === 'path') {
+          pathProbes += 1
+          const path = pathProbes === 1 ? TEST_BASE_APK : '/data/app/replaced/base.apk'
+          return { code: 0, stdout: `package:${path}\n`, stderr: '' }
+        }
+        const evidence = installEvidenceResult(androidArgs, installEvidence)
+        if (evidence) return evidence
+      }
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
+    expect(entry.verify?.detail).toMatch(/package incarnation/)
+    expect(pathProbes).toBe(2)
     expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
   })
 

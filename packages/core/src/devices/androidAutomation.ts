@@ -31,12 +31,14 @@ const MAX_UI_TAG_BYTES = 32 * 1024
 const MAX_UI_ATTRIBUTE_BYTES = 4 * 1024
 const MAX_EVIDENCE_BYTES = 4 * 1024
 const MAX_LOGCAT_BYTES = 64 * 1024
+const MAX_PACKAGE_DUMP_BYTES = 1024 * 1024
 const MAX_TARGET_CLOCK_RTT_MS = 2_000
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_INTERVAL_MS = 500
 const TARGET_CLOCK_FORMAT = '+%s.%3N'
 const INSTALL_FENCE_TAG = 'DEVHOTEL_INSTALL_FENCE'
 const CRASH_FENCE_TAG = 'DEVHOTEL_CRASH_FENCE'
+const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$2"; exit "$status"`
 
 export interface AndroidAutomationExecOptions {
   timeoutMs?: number
@@ -99,6 +101,30 @@ function safeEvidence(result: ExecResult): AndroidCommandEvidence {
     stdout: stdout.text,
     stderr: stderr.text,
     truncated: stdout.truncated || stderr.truncated
+  }
+}
+
+function safeEvidenceWithoutStdout(result: ExecResult): AndroidCommandEvidence {
+  const evidence = safeEvidence(result)
+  return {
+    ...evidence,
+    stdout: '',
+    // The stdout was intentionally withheld because this probe can enumerate
+    // packages outside the tracked app. Make that omission explicit without
+    // disclosing any of the cross-app inventory.
+    truncated: evidence.truncated || result.stdout.length > 0
+  }
+}
+
+function safeEvidenceWithoutOutput(result: ExecResult): AndroidCommandEvidence {
+  const evidence = safeEvidence(result)
+  return {
+    ...evidence,
+    stdout: '',
+    stderr: '',
+    // Package-manager dumps can contain shared-user names and cross-app
+    // inventory on either stream. Preserve only bounded status metadata.
+    truncated: evidence.truncated || result.stdout.length > 0 || result.stderr.length > 0
   }
 }
 
@@ -189,6 +215,12 @@ interface InstalledPackageIdentity {
   evidence: AndroidCommandEvidence
 }
 
+interface VerifiedTrackedInstall {
+  receipt: AndroidInstallReceipt
+  apkSha256: string
+  packageIncarnation: string | null
+}
+
 function matchesText(node: AndroidUiNode, text: string, match: 'exact' | 'contains'): boolean {
   const values = [node.text, node.contentDescription]
   return match === 'exact'
@@ -269,15 +301,28 @@ export class AndroidAutomationSession {
   private async requireInstalled(
     applicationId: string,
     deadline?: AndroidAutomationDeadline
-  ): Promise<AndroidInstallReceipt> {
+  ): Promise<VerifiedTrackedInstall> {
     const receipt = this.receipt(applicationId)
+    const expected = {
+      receipt,
+      apkSha256: receipt.apkSha256,
+      packageIncarnation: this.opts.installs.packageIncarnation(
+        this.opts.roomId,
+        this.opts.installTarget,
+        applicationId
+      )
+    }
+    await this.assertInstalledPackageIdentity(applicationId, expected, deadline)
+    return expected
+  }
+
+  private async assertInstalledPackageIdentity(
+    applicationId: string,
+    expected: Pick<VerifiedTrackedInstall, 'apkSha256' | 'packageIncarnation'>,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<void> {
     const installed = await this.installedPackageIdentity(applicationId, deadline)
-    const expectedIncarnation = this.opts.installs.packageIncarnation(
-      this.opts.roomId,
-      this.opts.installTarget,
-      applicationId
-    )
-    if (installed.apkSha256 !== receipt.apkSha256 || installed.packageIncarnation !== expectedIncarnation) {
+    if (installed.apkSha256 !== expected.apkSha256 || installed.packageIncarnation !== expected.packageIncarnation) {
       this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
       throw automationError(
         'ANDROID_APP_REPLACED',
@@ -287,7 +332,6 @@ export class AndroidAutomationSession {
         installed.evidence
       )
     }
-    return receipt
   }
 
   private async installedPackageIdentity(
@@ -723,19 +767,100 @@ export class AndroidAutomationSession {
   }
 
   private async packageUid(applicationId: string): Promise<number> {
+    const completionFence = `devhotel-package-dump-${randomUUID()}`
+    let packageDump: ExecResult
+    try {
+      packageDump = await this.command(
+        [
+          'shell', 'sh', '-c', PACKAGE_DUMP_SCRIPT,
+          'devhotel-package-dump', applicationId, completionFence
+        ],
+        {
+          operation: 'Android package shared-UID declaration probe',
+          timeoutMs: 15_000,
+          stdoutLimit: MAX_PACKAGE_DUMP_BYTES,
+          outputLimitRecovery: 'Use an app with a bounded package-manager record and rerun android_run.'
+        }
+      )
+    } catch (error) {
+      if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_OUTPUT_LIMIT') throw error
+      throw automationError(
+        'ANDROID_LOGCAT_UNSUPPORTED',
+        'The selected Android target did not provide a bounded package shared-UID record.',
+        'Use Android 12 or newer with a bounded package-manager record; DevHotel will not infer UID isolation.',
+        409
+      )
+    }
+    const escaped = applicationId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const dumpLines = packageDump.stdout.split(/\n/).map((line) => line.replace(/\r$/, ''))
+    const completionIndexes = dumpLines
+      .map((line, index) => line === completionFence ? index : -1)
+      .filter((index) => index >= 0)
+    const lastContentIndex = dumpLines.reduce((last, line, index) => line ? index : last, -1)
+    const header = new RegExp(`^ {2}Package \\[${escaped}\\] \\([0-9a-fA-F]+\\):$`)
+    const headerIndexes = dumpLines
+      .map((line, index) => header.test(line) ? index : -1)
+      .filter((index) => index >= 0)
+    if (
+      packageDump.code !== 0 ||
+      Boolean(packageDump.stderr.trim()) ||
+      commandHitOutputLimit(packageDump) ||
+      completionIndexes.length !== 1 ||
+      completionIndexes[0] !== lastContentIndex ||
+      headerIndexes.length !== 1
+    ) {
+      throw automationError(
+        'ANDROID_LOGCAT_UNSUPPORTED',
+        'The selected Android target did not expose an exact package shared-UID record.',
+        'Use Android 12 or newer with package-manager dump support; DevHotel will not infer UID isolation.',
+        409,
+        safeEvidenceWithoutOutput(packageDump)
+      )
+    }
+    let fieldIndex = headerIndexes[0]! + 1
+    if (/^ {4}compat name=/.test(dumpLines[fieldIndex] ?? '')) fieldIndex += 1
+    const userIdField = /^ {4}userId=(\d+)$/.exec(dumpLines[fieldIndex] ?? '')
+    fieldIndex += 1
+    const hasSharedUser = /^ {4}sharedUser=\S/.test(dumpLines[fieldIndex] ?? '')
+    if (hasSharedUser) fieldIndex += 1
+    const hasStablePackageFields =
+      /^ {4}pkg=\S/.test(dumpLines[fieldIndex] ?? '') &&
+      /^ {4}codePath=\S/.test(dumpLines[fieldIndex + 1] ?? '')
+    if (!userIdField || !hasStablePackageFields) {
+      throw automationError(
+        'ANDROID_LOGCAT_UNSUPPORTED',
+        'The selected Android target returned an ambiguous package shared-UID record.',
+        'Use Android 12 or newer with the standard package-manager dump format; DevHotel will not infer UID isolation.',
+        409,
+        safeEvidenceWithoutOutput(packageDump)
+      )
+    }
+    // AOSP retains this scoped PackageSetting field even when the active
+    // SharedUserSetting currently has only one package. Rejecting the
+    // declaration itself prevents a same-signed companion from joining,
+    // logging, and leaving the UID between current-owner probes (an ABA).
+    if (hasSharedUser) {
+      throw automationError(
+        'ANDROID_LOGCAT_SHARED_UID',
+        `${applicationId} belongs to a declared shared UID on this target.`,
+        'Use an application with its own UID; DevHotel will not expose logs from a legacy shared-user group.',
+        409,
+        safeEvidenceWithoutOutput(packageDump)
+      )
+    }
+
     const uidResult = await this.command(
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', applicationId],
       { operation: 'Android package UID probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
     )
-    const escaped = applicationId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const match = new RegExp(`^package:${escaped}\\s+uid[:=](\\d+)$`, 'm').exec(uidResult.stdout)
-    if (uidResult.code !== 0 || !match) {
+    if (uidResult.code !== 0 || !match || match[1] !== userIdField[1]) {
       throw automationError(
         'ANDROID_LOGCAT_UNSUPPORTED',
         'The selected Android target did not expose an exact package UID.',
         'Use a target with package-manager UID filtering support.',
         409,
-        safeEvidence(uidResult)
+        safeEvidenceWithoutStdout(uidResult)
       )
     }
     const uid = Number.parseInt(match[1]!, 10)
@@ -753,7 +878,7 @@ export class AndroidAutomationSession {
         `${applicationId} cannot be isolated to a single package UID on this target.`,
         'Use an application UID that is not shared with another package; DevHotel will not fall back to global logcat.',
         409,
-        safeEvidence(owners)
+        safeEvidenceWithoutStdout(owners)
       )
     }
     return uid
@@ -762,53 +887,53 @@ export class AndroidAutomationSession {
   /** Trusted install-time proof. It never grants a receipt by itself. */
   async establishInstallEvidence(applicationId: string): Promise<AndroidInstallEvidence> {
     const identity = await this.installedPackageIdentity(applicationId)
-    if ((this.target.apiLevel ?? 0) < 31) {
-      return {
-        apkSha256: identity.apkSha256,
-        packageIncarnation: identity.packageIncarnation,
-        logFence: null
+    let provenLogFence: string | null = null
+    if ((this.target.apiLevel ?? 0) >= 31) {
+      let uid: number | null = null
+      try {
+        uid = await this.packageUid(applicationId)
+      } catch (error) {
+        if (
+          !(error instanceof DevHotelError) ||
+          (error.code !== 'ANDROID_LOGCAT_UNSUPPORTED' && error.code !== 'ANDROID_LOGCAT_SHARED_UID')
+        ) {
+          throw error
+        }
+      }
+      if (uid !== null) {
+        const candidate = `devhotel-install-${randomUUID()}`
+        const emitted = await this.command(
+          ['shell', 'run-as', applicationId, 'log', '-p', 'i', '-t', INSTALL_FENCE_TAG, candidate],
+          { operation: 'Android install log fence', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+        )
+        if (emitted.code === 0) {
+          let proof: ExecResult | null = null
+          try {
+            proof = await this.command(
+              ['logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`],
+              { operation: 'Android install log fence proof', timeoutMs: 30_000, stdoutLimit: 1024 * 1024 }
+            )
+          } catch (error) {
+            if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_OUTPUT_LIMIT') throw error
+          }
+          if (proof && proof.code === 0 && !commandHitOutputLimit(proof)) {
+            const occurrences = proof.stdout.split(/\r?\n/).filter((line) => line === candidate).length
+            if (occurrences === 1) provenLogFence = candidate
+          }
+        }
       }
     }
-    let uid: number
-    try {
-      uid = await this.packageUid(applicationId)
-    } catch (error) {
-      if (
-        error instanceof DevHotelError &&
-        (error.code === 'ANDROID_LOGCAT_UNSUPPORTED' || error.code === 'ANDROID_LOGCAT_SHARED_UID')
-      ) {
-        return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
-      }
-      throw error
-    }
-    const logFence = `devhotel-install-${randomUUID()}`
-    const emitted = await this.command(
-      ['shell', 'run-as', applicationId, 'log', '-p', 'i', '-t', INSTALL_FENCE_TAG, logFence],
-      { operation: 'Android install log fence', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
-    )
-    if (emitted.code !== 0) {
-      return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
-    }
-    let proof: ExecResult
-    try {
-      proof = await this.command(
-        ['logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`],
-        { operation: 'Android install log fence proof', timeoutMs: 30_000, stdoutLimit: 1024 * 1024 }
-      )
-    } catch (error) {
-      if (error instanceof DevHotelError && error.code === 'ANDROID_OUTPUT_LIMIT') {
-        return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
-      }
-      throw error
-    }
-    if (proof.code !== 0 || commandHitOutputLimit(proof)) {
-      return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
-    }
-    const occurrences = proof.stdout.split(/\r?\n/).filter((line) => line === logFence).length
+
+    // The marker and its readback are fallible target operations. A concurrent
+    // reinstall can otherwise seal the preflight bytes/incarnation together
+    // with a marker emitted by a different package incarnation. Re-probe after
+    // every proof attempt, including the non-log fallback, before a caller may
+    // commit the receipt.
+    await this.assertInstalledPackageIdentity(applicationId, identity)
     return {
       apkSha256: identity.apkSha256,
       packageIncarnation: identity.packageIncarnation,
-      logFence: occurrences === 1 ? logFence : null
+      logFence: provenLogFence
     }
   }
 
@@ -862,7 +987,8 @@ export class AndroidAutomationSession {
     input: AndroidLogcatInput,
     exactLogFence?: string
   ): Promise<AndroidLogcatResult> {
-    const receipt = await this.requireInstalled(input.applicationId)
+    const tracked = await this.requireInstalled(input.applicationId)
+    const receipt = tracked.receipt
     const requestedSince = input.since ? Date.parse(input.since) : Date.parse(receipt.installedAt)
     const sinceMs = Math.max(Number.isFinite(requestedSince) ? requestedSince : 0, Date.parse(receipt.installedAt))
     const since = new Date(sinceMs).toISOString()
@@ -937,6 +1063,10 @@ export class AndroidAutomationSession {
       lines.push(safe)
       bytes += size
     }
+    // Logd can retain an app-UID marker across a same-package reinstall. Seal
+    // the capture to the same package incarnation on both sides of the read so
+    // old authorization can never be used to return rows from a replacement.
+    await this.assertInstalledPackageIdentity(input.applicationId, tracked)
     return {
       target: this.target,
       applicationId: input.applicationId,

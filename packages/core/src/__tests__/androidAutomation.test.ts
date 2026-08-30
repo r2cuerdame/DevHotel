@@ -23,6 +23,13 @@ const PACKAGE_INCARNATION = createHash('sha256')
   .update(BASE_APK_STAT)
   .digest('hex')
 const INSTALL_LOG_FENCE = 'devhotel-install-11111111-2222-4333-8444-555555555555'
+const EXCLUSIVE_PACKAGE_DUMP = [
+  'Packages:',
+  `  Package [${APP_ID}] (abc123):`,
+  '    userId=10123',
+  `    pkg=Package{abc123 ${APP_ID}}`,
+  `    codePath=${BASE_APK_PATH}`
+].join('\n')
 
 function targetEpoch(epochMs: number): string {
   const seconds = Math.floor(epochMs / 1000)
@@ -171,6 +178,14 @@ describe('tracked Android automation session', () => {
         calls.push(args)
         timeouts.push(opts?.timeoutMs)
         const result = handler(args)
+        if (
+          args[1] === 'sh' &&
+          args[3]?.startsWith('dumpsys package "$1"') &&
+          result.code === 0 &&
+          !result.stdout.trim()
+        ) {
+          return { code: 0, stdout: `${EXCLUSIVE_PACKAGE_DUMP}\n\n${args.at(-1)}\n`, stderr: '' }
+        }
         if (args[1] === 'stat' && result.code === 0 && !/^\d+:\d+:\d+:-?\d+:-?\d+\r?\n?$/.test(result.stdout)) {
           return { code: 0, stdout: `${BASE_APK_STAT}\n`, stderr: '' }
         }
@@ -228,6 +243,61 @@ describe('tracked Android automation session', () => {
       packageIncarnation: PACKAGE_INCARNATION,
       logFence: null
     })
+  })
+
+  it('keeps non-log install evidence when the package dump is incomplete', async () => {
+    let pathProbes = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        pathProbes += 1
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return { code: 0, stdout: `${EXCLUSIVE_PACKAGE_DUMP}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.establishInstallEvidence(APP_ID)).resolves.toEqual({
+      apkSha256: 'a'.repeat(64),
+      packageIncarnation: PACKAGE_INCARNATION,
+      logFence: null
+    })
+    expect(pathProbes).toBe(2)
+    expect(calls.some((args) => args[1] === 'run-as' || args[0] === 'logcat')).toBe(false)
+  })
+
+  it('rejects install evidence when the package path changes during log-fence proof', async () => {
+    let pathProbes = 0
+    let emittedFence = ''
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        pathProbes += 1
+        const path = pathProbes === 1 ? BASE_APK_PATH : '/data/app/replaced/base.apk'
+        return { code: 0, stdout: `package:${path}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'run-as') {
+        emittedFence = args.at(-1)!
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'logcat') return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.establishInstallEvidence(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_APP_REPLACED'
+    })
+    expect(pathProbes).toBe(2)
+    expect(calls.findIndex((args) => args[0] === 'logcat')).toBeLessThan(
+      calls.map((args) => args[1] === 'pm' && args[2] === 'path').lastIndexOf(true)
+    )
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
   })
 
   it('gates authoritative log fencing on Android 12 without weakening non-log receipts', async () => {
@@ -468,6 +538,41 @@ describe('tracked Android automation session', () => {
     ])
   })
 
+  it('invalidates the receipt when the package incarnation changes during a log read', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let statProbes = 0
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') {
+        statProbes += 1
+        return { code: 0, stdout: `${statProbes <= 2 ? BASE_APK_STAT : replacementStat}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        return {
+          code: 0,
+          stdout: `1690000000.000 ${INSTALL_LOG_FENCE}\n1690000000.001 replacement row\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_APP_REPLACED'
+    })
+    expect(statProbes).toBe(4)
+    expect(calls.findIndex((args) => args[0] === 'logcat')).toBeLessThan(
+      calls.map((args) => args[1] === 'stat').lastIndexOf(true)
+    )
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
+  })
+
   it('preserves a fractional cutoff and applies the requested line cap after literal filtering', async () => {
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
@@ -629,6 +734,94 @@ describe('tracked Android automation session', () => {
     await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
       code: 'ANDROID_LOG_FENCE_UNSUPPORTED'
     })
+  })
+
+  it('rejects a declared legacy shared UID even while the app is its sole current owner', async () => {
+    const sharedUserName = 'com.private.legacy.shared'
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return {
+          code: 0,
+          stdout: [
+            'Packages:',
+            `  Package [${APP_ID}] (abc123):`,
+            '    userId=10123',
+            `    sharedUser=SharedUserSetting{def456 ${sharedUserName}/10123}`,
+            `    pkg=Package{abc123 ${APP_ID}}`,
+            `    codePath=${BASE_APK_PATH}`,
+            '',
+            args.at(-1),
+            ''
+          ].join('\n'),
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await session.logcat({ applicationId: APP_ID }).catch((error: unknown) => {
+      expect(error).toMatchObject({
+        code: 'ANDROID_LOGCAT_SHARED_UID',
+        evidence: { code: 0, stdout: '', stderr: '', truncated: true }
+      })
+      expect(JSON.stringify(error)).not.toContain(sharedUserName)
+    })
+    expect(calls.some((args) => args.includes('--uid'))).toBe(false)
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
+  })
+
+  it('fails log authority closed when the package dump completion cannot be proven', async () => {
+    const privateDiagnostic = 'sharedUser=com.private.legacy'
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return {
+          code: 0,
+          // A syntactically valid prefix is not authoritative without the
+          // random tail fence proving dumpsys and the wrapper both completed.
+          stdout: `${EXCLUSIVE_PACKAGE_DUMP}\n`,
+          stderr: privateDiagnostic
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_LOGCAT_UNSUPPORTED',
+      evidence: { code: 0, stdout: '', stderr: '', truncated: true }
+    })
+    await session.logcat({ applicationId: APP_ID }).catch((error: unknown) => {
+      expect(JSON.stringify(error)).not.toContain(privateDiagnostic)
+    })
+    expect(calls.some((args) => args.includes('--uid'))).toBe(false)
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
+  })
+
+  it('withholds other package IDs when a current shared-UID owner probe fails', async () => {
+    const otherPackage = 'com.private.other'
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        return {
+          code: 0,
+          stdout: `package:${APP_ID} uid:10123\npackage:${otherPackage} uid:10123\n`,
+          stderr: 'token=ghp_ABCDEFGHIJKLMNOPQRSTUVWX123456'
+        }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await session.logcat({ applicationId: APP_ID }).catch((error: unknown) => {
+      expect(error).toMatchObject({
+        code: 'ANDROID_LOGCAT_SHARED_UID',
+        evidence: { code: 0, stdout: '', stderr: 'token=•••', truncated: true }
+      })
+      expect(JSON.stringify(error)).not.toContain(otherPackage)
+    })
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
   })
 
   it('fails log and crash closed before UID/logcat access when an install has no authority fence', async () => {
