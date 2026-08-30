@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DeviceLeaseError } from '@devhotel/shared'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AndroidDeviceBroker, androidDevicesRepo, openDb } from '../index'
 import { FakeAdbHost } from './fakes'
@@ -35,6 +36,88 @@ function makeBroker(now = { value: Date.parse('2026-08-29T00:00:00.000Z') }) {
 }
 
 describe('Android device broker — exclusive lease over a shared USB phone', () => {
+  it('does not grant a cached-ready device while Host ADB is unavailable', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const deviceId = broker.listDevices()[0]!.id
+    adb.availability = { ok: false, detail: 'adb executable is unavailable' }
+    await broker.refreshInventory()
+
+    await expect(
+      broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    ).rejects.toMatchObject({ code: 'device-unhealthy' })
+    expect(() => broker.authorize('aaaa1111', deviceId, ['get-state'])).toThrow(DeviceLeaseError)
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('joins an in-flight inventory probe instead of leasing a cached-ready row', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    let finishDevices!: () => void
+    const devicesGate = new Promise<void>((resolve) => {
+      finishDevices = resolve
+    })
+    adb.devices = async () => {
+      await devicesGate
+      throw new Error('adb devices failed after availability passed')
+    }
+
+    const refresh = broker.refreshInventory()
+    let requestSettled = false
+    const request = broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a'
+    })
+    void request.then(
+      () => { requestSettled = true },
+      () => { requestSettled = true }
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(requestSettled).toBe(false)
+
+    finishDevices()
+    await refresh
+    await expect(request).rejects.toMatchObject({ code: 'device-unhealthy' })
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('does not promote a queued Room while Host ADB is unavailable', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const first = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    if (first.state !== 'granted') throw new Error('unreachable')
+
+    adb.availability = { ok: false, detail: 'adb executable is unavailable' }
+    await broker.refreshInventory()
+    const released = await broker.release(first.lease.id, 'done while adb was unavailable')
+
+    expect(released.promoted).toBeNull()
+    expect(broker.leaseForRoom('bbbb2222')).toBeNull()
+    expect(broker.listDevices()[0]!.queueDepth).toBe(1)
+
+    adb.availability = { ok: true, detail: 'fake adb 35.0.0' }
+    await broker.refreshInventory()
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ roomId: 'bbbb2222' })
+  })
+
+  it('preserves but does not re-grant an existing lease while its phone is unhealthy', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const first = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    if (first.state !== 'granted') throw new Error('unreachable')
+    adb.phones = [{ serial: 'R5CT30ABCDE', state: 'offline', model: 'SM_G991N', release: '14', sdk: '34' }]
+    await broker.refreshInventory()
+
+    await expect(
+      broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    ).rejects.toMatchObject({ code: 'device-unhealthy' })
+    expect(broker.leaseForRoom('aaaa1111')).toMatchObject({ id: first.lease.id, state: 'active' })
+  })
+
   it('grants the phone to the first Room and queues the second behind a visible owner', async () => {
     const { broker, db } = makeBroker()
     await broker.refreshInventory()

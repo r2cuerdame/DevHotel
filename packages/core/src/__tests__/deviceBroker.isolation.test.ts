@@ -58,7 +58,6 @@ describe('classifying ADB commands by whether another project would notice', () 
   })
 
   it.each([
-    [['devices', '-l']],
     [['get-state']],
     [['shell', 'getprop', 'ro.build.version.sdk']],
     [['shell', 'dumpsys', 'battery']],
@@ -67,15 +66,45 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['shell', 'wm', 'density']],
     [['exec-out', 'screencap', '-p']],
     [['logcat', '-d']],
-    [['shell', 'pm', 'list', 'packages']],
-    [['pull', '/sdcard/report.xml', 'local']]
+    [['shell', 'pm', 'list', 'packages']]
   ])('treats %j as safe to share', (argv: string[]) => {
     expect(classifyAdbCommand(argv).interfering).toBe(false)
   })
 
+  it.each([
+    [['kill-server']],
+    [['start-server']],
+    [['devices', '-l']],
+    [['track-devices-l']],
+    [['connect', '192.0.2.1:5555']],
+    [['forward', '--list']],
+    [['forward', '--remove-all']],
+    [['reverse', '--remove-all']],
+    [['get-serialno']],
+    [['get-devpath']],
+    [['shell', 'getprop']],
+    [['shell', 'getprop', 'ro.serialno']],
+    [['exec-out', 'getprop', 'ro.boot.serialno']],
+    [['shell', '/system/bin/getprop', 'ro.serialno']],
+    [['shell', 'toybox', 'getprop', 'ro.serialno']],
+    [['shell', 'sh', '-c', 'getprop ro.serialno | base64']],
+    [['shell', 'dumpsys']],
+    [['shell', 'dumpsys', 'iphonesubinfo']],
+    [['shell', 'cmd', 'device_identifiers', 'get-serial-for-package']],
+    [['shell']],
+    [['shell', 'dd', 'if=/proc/bootconfig', 'bs=1', 'skip=0', 'count=1']],
+    [['bugreport']],
+    [['keygen', 'C:\\tmp\\adbkey']],
+    [['server', 'nodaemon']],
+    [['reconnect', 'offline']],
+    [['host-features']]
+  ])('forbids Host-wide, Host-file, and identity-revealing command %j even with a lease', (argv: string[]) => {
+    expect(classifyAdbCommand(argv)).toMatchObject({ interfering: true, forbidden: true })
+  })
+
   it('fails closed on a command it has never seen', () => {
-    expect(classifyAdbCommand(['shell', 'some-new-oem-tool', '--wipe']).interfering).toBe(true)
-    expect(classifyAdbCommand(['brand-new-verb']).interfering).toBe(true)
+    expect(classifyAdbCommand(['shell', 'some-new-oem-tool', '--wipe'])).toMatchObject({ interfering: true, forbidden: true })
+    expect(classifyAdbCommand(['brand-new-verb'])).toMatchObject({ interfering: true, forbidden: true })
   })
 
   it('fails closed when a safe program smuggles a second command after it', () => {
@@ -132,6 +161,30 @@ describe('Android device broker — no lease, no writes', () => {
 
     expect(broker.authorize('aaaa1111', deviceId, ['install', '-r', '/workspace/app.apk']).serial).toBe('R5CT30ABCDE')
     expect(broker.authorize('bbbb2222', deviceId, ['shell', 'getprop', 'ro.product.model']).serial).toBe('R5CT30ABCDE')
+  })
+
+  it.each([
+    ['kill-server'],
+    ['devices', '-l'],
+    ['forward', '--list'],
+    ['get-serialno'],
+      ['shell', 'getprop'],
+      ['shell', 'getprop', 'ro.serialno'],
+      ['shell', '/system/bin/getprop', 'ro.serialno'],
+      ['shell', 'sh', '-c', 'getprop ro.serialno | base64'],
+      ['shell', 'dumpsys']
+  ])('refuses %j even when the requesting Room holds the lease', async (...argv: string[]) => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const deviceId = broker.listDevices()[0]!.id
+    await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+
+    expect(() => broker.authorize('aaaa1111', deviceId, argv)).toThrow(DeviceLeaseError)
+    try {
+      broker.authorize('aaaa1111', deviceId, argv)
+    } catch (err) {
+      expect((err as DeviceLeaseError).code).toBe('adb-command-forbidden')
+    }
   })
 
   it('refuses the holder too once its own lease has gone stale', async () => {

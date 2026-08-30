@@ -216,6 +216,7 @@ export type DeviceDenialCode =
   | 'lease-expired'
   | 'device-unknown'
   | 'device-unhealthy'
+  | 'adb-command-forbidden'
 
 export class DeviceLeaseError extends Error {
   constructor(

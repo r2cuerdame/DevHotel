@@ -112,16 +112,19 @@ whether they write files.
   `reboot`, `shell am`, `shell pm clear`, `shell input`, `shell monkey`,
   `shell settings`, `shell setprop`, `uiautomator`, instrumentation,
   `logcat -c`, …
-- **Shared** (no lease): a deliberately small read-only set such as `devices`,
-  `get-state`, `shell getprop`, exact query forms of `dumpsys` / `wm`,
+- **Shared** (no lease): a deliberately small read-only set such as
+  `get-state`, selected non-identifying `getprop` keys, exact query forms of `dumpsys` / `wm`,
   `shell pm list`, `exec-out screencap -p`, and `logcat -d`.
-- **Anything unrecognised fails closed.** A command DevHotel has never seen is
-  treated as interfering rather than allowed through, and a "safe" program that
-  smuggles a second command after `;`, `&&`, or `$( )` is refused too.
+- **Broker-only** (always refused): Host-wide server/connection/inventory verbs
+  such as `kill-server`, `start-server`, `connect`, `devices`, raw transport
+  queries such as `get-serialno`, and unapproved `getprop` keys.
+- **Anything unrecognised fails closed.** An unknown Host verb or shell program
+  is categorically refused rather than made safe by a lease, and a "safe"
+  program that smuggles a second command after `;`, `&&`, or `$( )` is refused too.
 
 A refusal is structured, not a generic error — `no-lease`,
 `lease-held-by-another-room`, `lease-expired`, `device-unhealthy`,
-`device-unknown` — and it names the current owner so the caller can explain
+`device-unknown`, `adb-command-forbidden` — and it names the current owner so the caller can explain
 itself.
 
 ## No hand-written serials
@@ -130,6 +133,8 @@ itself.
 point: the leased phone when one is attached, otherwise the Room's own
 emulator. Attaching a device changes what a Room's screenshots and automation
 drive, with nothing in the caller changing and no serial ever written by hand.
+Once attached, an offline/unauthorized phone or unavailable Host ADB fails that
+physical run; DevHotel never silently reports emulator results as physical proof.
 
 ## Observability
 
@@ -141,8 +146,9 @@ including grants, releases and stale recoveries.
 
 Devices are addressed publicly by a **nickname** and a short opaque device ID
 derived from the serial. Status, queue and attach responses do not return the
-raw hardware serial; only the Host broker retains it to execute an authorized
-ADB command.
+raw hardware serial; serial-returning commands are refused and any matching
+serial text in otherwise allowed ADB output is redacted. Only the Host broker
+retains it to execute an authorized ADB command.
 
 ## Surfaces
 

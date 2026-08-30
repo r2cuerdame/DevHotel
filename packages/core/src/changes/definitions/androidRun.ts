@@ -76,17 +76,15 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     const room = ctx.room()
     if (room.provider !== 'android') throw new Error('Only Android rooms can run Android apps')
     if (!ctx.isAwake()) throw new Error('Wake the room before running')
-    await assertLaunchersAreExecutable(ctx)
     if (ctx.physicalAndroidDevice) {
       const state = await ctx.physicalAndroidDevice.exec(['get-state'], { timeoutMs: 20_000 })
       if (state.code !== 0 || state.stdout.trim() !== 'device') {
         throw new Error(`${ctx.physicalAndroidDevice.nickname} is not ready: ${(state.stderr || state.stdout).trim() || `adb exited ${state.code}`}`)
       }
-      return
-    }
-    if ((await ctx.backend.emulatorState(room.id)) !== 'running') {
+    } else if ((await ctx.backend.emulatorState(room.id)) !== 'running') {
       throw new Error('The emulator is not running — restart the room')
     }
+    await assertLaunchersAreExecutable(ctx)
   },
   async apply(ctx, p, steps) {
     const apply = async (): Promise<void> => {

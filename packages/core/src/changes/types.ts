@@ -29,7 +29,7 @@ export interface ChangeCtx {
    * partition; absent in headless contexts, where there is no profile to clear.
    */
   clearBrowserData?: () => Promise<void>
-  /** Present only while this Android Room owns a healthy physical-device lease. */
+  /** Present while this Android Room owns a physical-device lease; exec fails closed when the target is unhealthy. */
   physicalAndroidDevice?: {
     nickname: string
     exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>

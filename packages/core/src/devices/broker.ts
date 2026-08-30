@@ -59,6 +59,10 @@ export class AndroidDeviceBroker {
   /** When a dead owner was first observed, so the grace period is real time. */
   private readonly deathObservedAt = new Map<string, number>()
   private lastAvailability: { ok: boolean; detail: string } = { ok: false, detail: 'not probed yet' }
+  /** A cached ready row is grantable only after the entire latest probe settled. */
+  private inventoryGrantable = false
+  /** Deduplicates refresh callers and lets a concurrent request join the probe. */
+  private inventoryRefresh: Promise<DeviceInventoryEntry[]> | null = null
 
   constructor(opts: DeviceBrokerOptions) {
     this.repo = opts.repo
@@ -77,14 +81,46 @@ export class AndroidDeviceBroker {
     return new Date(this.now()).toISOString()
   }
 
+  private assertHostAdbAvailable(): void {
+    if (this.lastAvailability.ok) return
+    throw new DeviceLeaseError(
+      'device-unhealthy',
+      `Host ADB is unavailable, so no physical device can be leased or driven: ${this.lastAvailability.detail}`
+    )
+  }
+
   /** Only USB/wireless phones are shared; emulators belong to one Room already. */
   private brokered(device: AndroidDevice): boolean {
     return device.connection !== 'emulator'
   }
 
   async refreshInventory(): Promise<DeviceInventoryEntry[]> {
-    this.lastAvailability = await this.adb.available()
-    if (!this.lastAvailability.ok) return this.listDevices()
+    if (this.inventoryRefresh) return this.inventoryRefresh
+    this.inventoryGrantable = false
+    const refresh = this.refreshInventoryOnce()
+    this.inventoryRefresh = refresh
+    try {
+      return await refresh
+    } catch (err) {
+      this.inventoryGrantable = false
+      this.lastAvailability = { ok: false, detail: err instanceof Error ? err.message : String(err) }
+      throw err
+    } finally {
+      if (this.inventoryRefresh === refresh) this.inventoryRefresh = null
+    }
+  }
+
+  private async refreshInventoryOnce(): Promise<DeviceInventoryEntry[]> {
+    let availability: { ok: boolean; detail: string }
+    try {
+      availability = await this.adb.available()
+    } catch (err) {
+      availability = { ok: false, detail: err instanceof Error ? err.message : String(err) }
+    }
+    if (!availability.ok) {
+      this.lastAvailability = availability
+      return this.listDevices()
+    }
 
     let lines: Awaited<ReturnType<AdbHost['devices']>>
     try {
@@ -150,6 +186,8 @@ export class AndroidDeviceBroker {
     // A request may have queued while its only candidate was offline or before
     // a crash interrupted promotion. Every healthy free phone gets a chance to
     // serve the durable queue; promote() is idempotent while a lease is active.
+    this.lastAvailability = availability
+    this.inventoryGrantable = true
     for (const device of this.repo.listDevices()) {
       if (device.health === 'ready' && this.brokered(device)) this.promote(device.id)
     }
@@ -239,6 +277,16 @@ export class AndroidDeviceBroker {
    */
   async requestDevice(rawRequest: DeviceRequest): Promise<DeviceRequestResult> {
     const request = zDeviceRequest.parse(rawRequest)
+    // Join an inventory probe that already owns the cached-health decision.
+    // There is no later await before the SQLite grant, so a new refresh cannot
+    // interleave after this fence and lease a stale row underneath us.
+    if (this.inventoryRefresh) await this.inventoryRefresh
+    // A persisted `ready` row is only a cache. Never grant or rejoin a lease
+    // until this process has proved that its Host ADB transport is available.
+    this.assertHostAdbAvailable()
+    if (!this.inventoryGrantable) {
+      throw new DeviceLeaseError('device-unhealthy', 'The physical-device inventory has not completed a healthy probe.')
+    }
     const at = this.at()
     const ttlMs = request.ttlMs ?? LEASE_DEFAULT_TTL_MS
     const maxDurationMs = request.maxDurationMs ?? LEASE_DEFAULT_MAX_DURATION_MS
@@ -246,6 +294,12 @@ export class AndroidDeviceBroker {
     const existingLease = this.repo.activeLeaseForRoom(request.roomId)
     if (existingLease) {
       const device = this.repo.getDevice(existingLease.deviceId)!
+      if (device.health !== 'ready') {
+        throw new DeviceLeaseError(
+          'device-unhealthy',
+          `${device.nickname} is still attached to Room ${request.roomId}, but it is ${device.health}.`
+        )
+      }
       if (this.matches(device, request.constraints)) {
         return { state: 'granted', lease: existingLease, device: this.publicDevice(device) }
       }
@@ -373,6 +427,7 @@ export class AndroidDeviceBroker {
 
   /** Give a just-freed phone to the best waiting request, if any. */
   private promote(deviceId: string): DeviceLease | null {
+    if (!this.lastAvailability.ok || !this.inventoryGrantable) return null
     const device = this.repo.getDevice(deviceId)
     if (!device || device.health !== 'ready' || this.repo.activeLease(deviceId)) return null
     const at = this.at()
@@ -508,11 +563,18 @@ export class AndroidDeviceBroker {
   authorize(roomId: string, deviceId: string, argv: string[]): { serial: string; device: AndroidDevice } {
     const device = this.repo.getDevice(deviceId)
     if (!device) throw new DeviceLeaseError('device-unknown', `unknown Android device: ${deviceId}`)
+    this.assertHostAdbAvailable()
     if (device.health !== 'ready') {
       throw new DeviceLeaseError('device-unhealthy', `${device.nickname} is ${device.health} and cannot accept ADB commands.`)
     }
 
     const classification = classifyAdbCommand(argv)
+    if (classification.forbidden) {
+      throw new DeviceLeaseError(
+        'adb-command-forbidden',
+        `${classification.reason} is owned by the Host Device Broker and is refused even with a device lease.`
+      )
+    }
     if (!this.brokered(device)) return { serial: device.serial, device }
     if (!classification.interfering) return { serial: device.serial, device }
 

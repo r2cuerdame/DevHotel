@@ -2,18 +2,43 @@
  * Which ADB operations may run without owning the phone.
  *
  * The split is not "read vs write" in the file sense — it is "would another
- * project notice". Reading `getprop` off a phone somebody else is testing is
- * harmless; installing an APK, clearing data, sending a key event or launching
- * an activity all reach into the run somebody else is watching. Anything this
- * classifier is not sure about is treated as interfering, so a command DevHotel
- * has never seen fails closed rather than colliding silently.
+ * project notice". Selected non-identifying properties are harmless; installing
+ * an APK, clearing data, sending a key event or launching an activity all reach
+ * into the run somebody else is watching. Host-wide and identity-revealing
+ * operations are forbidden even to a lease holder. Anything else this
+ * classifier is not sure about needs the exclusive device lease.
  */
 
 export interface AdbClassification {
   interfering: boolean
+  /** Host-wide or identity-revealing operations never become safe with a lease. */
+  forbidden?: boolean
   /** Human phrase naming the operation, used verbatim in refusal messages. */
   reason: string
 }
+
+/** Operations owned by the Host broker, never by a Room or its device lease. */
+const FORBIDDEN_VERBS = new Map<string, string>([
+  ['devices', 'listing raw Host ADB transports'],
+  ['track-devices', 'tracking raw Host ADB transports'],
+  ['track-devices-l', 'tracking raw Host ADB transports'],
+  ['get-serialno', 'reading the raw hardware serial'],
+  ['get-devpath', 'reading the Host transport path'],
+  ['start-server', 'starting the shared ADB server'],
+  ['kill-server', 'stopping the shared ADB server'],
+  ['connect', 'changing Host ADB connections'],
+  ['disconnect', 'changing Host ADB connections'],
+  ['pair', 'pairing a Host ADB connection'],
+  ['forward', 'changing or listing shared Host ADB forwards'],
+  ['reverse', 'changing shared Host ADB reverse forwards'],
+  ['push', 'reading a Host file for a device transfer'],
+  ['pull', 'writing a device file onto the Host'],
+  ['sync', 'reading Host files for device synchronization'],
+  ['restore', 'reading a Host backup'],
+  ['sideload', 'reading a Host package'],
+  ['bugreport', 'writing a device report onto the Host'],
+  ['keygen', 'writing an ADB key onto the Host']
+])
 
 /** Top-level adb verbs that always change the device or its app state. */
 const INTERFERING_VERBS = new Map<string, string>([
@@ -21,55 +46,51 @@ const INTERFERING_VERBS = new Map<string, string>([
   ['install-multiple', 'installing APKs'],
   ['install-multi-package', 'installing APKs'],
   ['uninstall', 'uninstalling an app'],
-  ['push', 'pushing a file to the device'],
-  ['sync', 'syncing files to the device'],
   ['reboot', 'rebooting the device'],
   ['root', 'restarting adbd as root'],
   ['unroot', 'restarting adbd'],
   ['remount', 'remounting device partitions'],
   ['disable-verity', 'changing device verity'],
   ['enable-verity', 'changing device verity'],
-  ['restore', 'restoring a device backup'],
   ['emu', 'sending an emulator console command'],
-  ['forward', 'claiming a device port forward'],
-  ['reverse', 'claiming a device reverse forward'],
   ['tcpip', 'switching the device transport'],
-  ['usb', 'switching the device transport'],
-  ['connect', 'changing device connections'],
-  ['disconnect', 'changing device connections'],
-  ['kill-server', 'stopping the shared adb server'],
-  ['pair', 'pairing the device']
+  ['usb', 'switching the device transport']
 ])
 
 /** Top-level adb verbs that only observe. */
 const SAFE_VERBS = new Set([
-  'devices',
   'get-state',
-  'get-serialno',
-  'get-devpath',
   'version',
   'features',
-  'start-server',
   'jdwp'
 ])
 
 /** `adb shell <cmd>` programs that only report. */
 const SAFE_SHELL_COMMANDS = new Set([
-  'getprop',
-  'cat',
-  'ls',
   'df',
   'ps',
+  'pidof',
   'id',
   'whoami',
   'uptime',
   'echo',
   'printf',
   'top',
-  'free',
-  'stat',
-  'md5sum',
-  'sha256sum'
+  'free'
+])
+
+/** Public, non-unique properties needed by health checks and Android builds. */
+const SAFE_GETPROP_KEYS = new Set([
+  'ro.build.version.release',
+  'ro.build.version.sdk',
+  'ro.product.manufacturer',
+  'ro.product.model',
+  'sys.boot_completed'
+])
+
+/** Commands whose read modes can bypass identity/output policy despite a lease. */
+const FORBIDDEN_SHELL_COMMANDS = new Map<string, string>([
+  ['dd', 'reading arbitrary protected device bytes with `dd`']
 ])
 
 /** `adb shell <cmd>` programs that always change something. */
@@ -88,7 +109,6 @@ const INTERFERING_SHELL_COMMANDS = new Map<string, string>([
   ['mv', 'moving files on the device'],
   ['mkdir', 'writing files on the device'],
   ['touch', 'writing files on the device'],
-  ['dd', 'writing to device storage'],
   ['chmod', 'changing device file modes'],
   ['chown', 'changing device file ownership'],
   ['kill', 'killing a process on the device'],
@@ -138,13 +158,19 @@ function classifyDumpsys(words: string[]): AdbClassification {
   // Keep the unauthenticated surface deliberately small. These exact forms are
   // observations; services such as `battery set`, `deviceidle force-idle`, and
   // vendor extensions are commands despite living behind `dumpsys`.
-  if (words.length === 1 || (service === 'battery' && words.length === 2)) {
-    return { interfering: false, reason: `\`dumpsys${service ? ` ${service}` : ''}\`` }
+  if (service === 'battery') {
+    return words.length === 2
+      ? { interfering: false, reason: '`dumpsys battery`' }
+      : { interfering: true, reason: 'changing battery state with `dumpsys battery`' }
   }
   if (service === 'package' && words.length <= 3 && words.every((word) => !word.startsWith('-'))) {
     return { interfering: false, reason: '`dumpsys package`' }
   }
-  return { interfering: true, reason: `the unrecognised \`dumpsys${service ? ` ${service}` : ''}\` operation` }
+  return {
+    interfering: true,
+    forbidden: true,
+    reason: service ? `reading the unapproved \`dumpsys ${service}\` service` : 'dumping every Android system service'
+  }
 }
 
 function classifyLogcat(words: string[]): AdbClassification {
@@ -157,18 +183,36 @@ function classifyLogcat(words: string[]): AdbClassification {
   return { interfering: true, reason: 'the unrecognised or mutating `logcat` operation' }
 }
 
+function classifyGetprop(words: string[]): AdbClassification {
+  const property = words[1]
+  if (words.length === 2 && property && SAFE_GETPROP_KEYS.has(property)) {
+    return { interfering: false, reason: `\`getprop ${property}\`` }
+  }
+  return {
+    interfering: true,
+    forbidden: true,
+    reason: property ? `reading the protected Android property \`${property}\`` : 'dumping protected Android properties'
+  }
+}
+
 function classifyShell(words: string[]): AdbClassification {
   const flagless = words.filter((word) => !word.startsWith('-'))
   const program = flagless[0]
-  if (!program) return { interfering: true, reason: 'running an interactive device shell' }
+  if (!program) {
+    return { interfering: true, forbidden: true, reason: 'running an interactive device shell' }
+  }
 
   if (words.some((word) => SHELL_CHAINING.test(word))) {
-    return { interfering: true, reason: 'running a compound device shell command' }
+    return { interfering: true, forbidden: true, reason: 'running a compound device shell command' }
   }
+
+  const forbidden = FORBIDDEN_SHELL_COMMANDS.get(program)
+  if (forbidden) return { interfering: true, forbidden: true, reason: forbidden }
 
   const interfering = INTERFERING_SHELL_COMMANDS.get(program)
   if (interfering) return { interfering: true, reason: interfering }
 
+  if (program === 'getprop') return classifyGetprop(words)
   if (program === 'wm') return classifyWm(words)
   if (program === 'dumpsys') return classifyDumpsys(words)
   if (program === 'screencap') {
@@ -190,11 +234,18 @@ function classifyShell(words: string[]): AdbClassification {
     if (program === 'cmd' && sub === 'package' && flagless[2] && SAFE_PM_SUBCOMMANDS.has(flagless[2])) {
       return { interfering: false, reason: `\`cmd package ${flagless[2]}\`` }
     }
+    if (program === 'cmd' && (sub === 'device_identifiers' || sub === 'phone')) {
+      return { interfering: true, forbidden: true, reason: `reading protected identifiers with \`cmd ${sub}\`` }
+    }
     return { interfering: true, reason: `\`${program}${sub ? ` ${sub}` : ''}\`` }
   }
 
   if (SAFE_SHELL_COMMANDS.has(program)) return { interfering: false, reason: `\`${program}\`` }
-  return { interfering: true, reason: `the unrecognised device command \`${program}\`` }
+  return {
+    interfering: true,
+    forbidden: true,
+    reason: `the unrecognised device command \`${program}\``
+  }
 }
 
 export function classifyAdbCommand(argv: string[]): AdbClassification {
@@ -202,20 +253,21 @@ export function classifyAdbCommand(argv: string[]): AdbClassification {
   const verb = rest[0]
   if (!verb) return { interfering: true, reason: 'an empty adb command' }
 
+  const forbidden = FORBIDDEN_VERBS.get(verb)
+  if (forbidden) return { interfering: true, forbidden: true, reason: forbidden }
+
   const interfering = INTERFERING_VERBS.get(verb)
   if (interfering) return { interfering: true, reason: interfering }
 
   if (verb === 'shell' || verb === 'exec-out') return classifyShell(rest.slice(1))
 
-  if (verb === 'pull') return { interfering: false, reason: '`adb pull`' }
-  if (verb === 'bugreport') {
-    return rest.length === 1
-      ? { interfering: false, reason: '`adb bugreport`' }
-      : { interfering: true, reason: 'writing a bugreport onto the Host' }
-  }
   if (verb === 'logcat') {
     return classifyLogcat(rest)
   }
   if (SAFE_VERBS.has(verb)) return { interfering: false, reason: `\`adb ${verb}\`` }
-  return { interfering: true, reason: `the unrecognised adb command \`${verb}\`` }
+  return {
+    interfering: true,
+    forbidden: true,
+    reason: `the unrecognised Host ADB command \`${verb}\``
+  }
 }

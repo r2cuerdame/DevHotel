@@ -138,6 +138,13 @@ function workerProcessLiveness(workerId: string): boolean | 'unknown' {
   }
 }
 
+function redactDeviceSerial(result: ExecResult, serial: string): ExecResult {
+  const escaped = serial.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const serialPattern = new RegExp(escaped, 'gi')
+  const redact = (value: string): string => value.replace(serialPattern, '[device-serial-redacted]')
+  return { ...result, stdout: redact(result.stdout), stderr: redact(result.stderr) }
+}
+
 export interface OrchestratorEvent {
   roomId: string
   kind: 'status' | 'change' | 'check' | 'deleted' | 'created'
@@ -1620,17 +1627,18 @@ export class RoomOrchestrator {
    * targets its own emulator. Attaching a device changes what `android-run` and
    * screenshots drive, with nothing else in the caller changing.
    */
-  async resolveAdbTarget(roomId: string): Promise<{ kind: 'physical' | 'emulator'; serial: string; deviceId: string | null; nickname: string }> {
+  async resolveAdbTarget(roomId: string): Promise<{ kind: 'physical' | 'emulator'; deviceId: string | null; nickname: string }> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') throw new Error('Only Android Rooms have an ADB target')
     const lease = this.devices.leaseForRoom(roomId)
     if (lease) {
-      const device = this.devices.deviceForRoom(roomId)
-      if (device && device.health === 'ready') {
-        return { kind: 'physical', serial: device.serial, deviceId: device.id, nickname: device.nickname }
-      }
+      // Keep an attached physical target sticky. An offline/unauthorized phone
+      // is an acceptance failure, never permission to silently use the Room
+      // emulator and report success against the wrong device.
+      const { device } = this.devices.authorize(roomId, lease.deviceId, ['get-state'])
+      return { kind: 'physical', deviceId: device.id, nickname: device.nickname }
     }
-    return { kind: 'emulator', serial: EMULATOR_ADB_SERIAL, deviceId: null, nickname: 'Room emulator' }
+    return { kind: 'emulator', deviceId: null, nickname: 'Room emulator' }
   }
 
   /**
@@ -1657,7 +1665,7 @@ export class RoomOrchestrator {
     if (verb.startsWith('-')) {
       throw new Error('ADB global and target-selector options are owned by the Device Broker and cannot be supplied by a Room')
     }
-    if (ADB_UNSAFE_HOST_FILE_VERBS.has(verb) || (verb === 'bugreport' && args.length > 1)) {
+    if (ADB_UNSAFE_HOST_FILE_VERBS.has(verb) || verb === 'bugreport') {
       throw new Error(`adb ${verb} exposes a Host filesystem path and is not available through the Device Broker`)
     }
     const target = opts.deviceId
@@ -1701,9 +1709,12 @@ export class RoomOrchestrator {
 
       // Re-check after staging: a short TTL may have expired while bytes moved.
       const authorized = this.devices.authorize(roomId, target.deviceId, executableArgs)
-      return await this.withDeviceHeartbeat(roomId, target.deviceId, () =>
+      const result = await this.withDeviceHeartbeat(roomId, target.deviceId, () =>
         this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs })
       )
+      // Defense in depth for read commands such as `cat`: even a vendor path
+      // that happens to echo the transport serial cannot pierce the opaque ID.
+      return redactDeviceSerial(result, authorized.serial)
     } finally {
       if (stagedDir) rmSync(stagedDir, { recursive: true, force: true })
     }
@@ -2814,7 +2825,7 @@ export class RoomOrchestrator {
       syncRoute: () => this.syncRouteFor(roomId),
       clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
       physicalAndroidDevice:
-        physicalDevice?.health === 'ready'
+        physicalDevice
           ? {
               nickname: physicalDevice.nickname,
               exec: (args, opts) => this.adbOnDeviceLocked(roomId, args, opts),

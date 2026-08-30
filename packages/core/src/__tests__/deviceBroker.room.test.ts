@@ -171,7 +171,9 @@ describe('Android automation targets the attached device without a hand-written 
     const { orch } = setup()
     await orch.refreshAndroidDevices()
 
-    expect(await orch.resolveAdbTarget('aaaa1111')).toMatchObject({ kind: 'emulator', serial: 'emulator-5554' })
+    const target = await orch.resolveAdbTarget('aaaa1111')
+    expect(target).toMatchObject({ kind: 'emulator', deviceId: null })
+    expect(target).not.toHaveProperty('serial')
   })
 
   it('resolves to the leased phone once one is attached', async () => {
@@ -179,7 +181,26 @@ describe('Android automation targets the attached device without a hand-written 
     await orch.refreshAndroidDevices()
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
 
-    expect(await orch.resolveAdbTarget('aaaa1111')).toMatchObject({ kind: 'physical', serial: 'R5CT30ABCDE', nickname: expect.any(String) })
+    const target = await orch.resolveAdbTarget('aaaa1111')
+    expect(target).toMatchObject({ kind: 'physical', deviceId: expect.any(String), nickname: expect.any(String) })
+    expect(target).not.toHaveProperty('serial')
+  })
+
+  it('fails an attached physical run when that phone becomes unhealthy instead of using the emulator', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    adb.phones = [{ serial: 'R5CT30ABCDE', state: 'offline', model: 'SM_G991N', release: '14', sdk: '34' }]
+    await orch.refreshAndroidDevices()
+    backend.execInRoomCalls = []
+
+    await expect(orch.resolveAdbTarget('aaaa1111')).rejects.toMatchObject({ code: 'device-unhealthy' })
+    await expect(orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')).rejects.toMatchObject({
+      code: 'device-unhealthy'
+    })
+    expect(adb.execs).toEqual([])
+    expect(backend.execInRoomCalls.some((call) => call.cmd.join(' ').includes('gradle assembleDebug'))).toBe(false)
   })
 
   it('stages Room APK bytes in a private Host temp before installing, then removes them', async () => {
@@ -219,7 +240,45 @@ describe('Android automation targets the attached device without a hand-written 
     await expect(orch.adbOnDevice('aaaa1111', ['-s', 'OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
     await expect(orch.adbOnDevice('aaaa1111', ['-sOTHER', 'get-state'])).rejects.toThrow(/target-selector/)
     await expect(orch.adbOnDevice('aaaa1111', ['--one-device=OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-d', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-e', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-t', '1', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['-Hlocalhost', 'get-state'])).rejects.toThrow(/target-selector/)
+    await expect(orch.adbOnDevice('aaaa1111', ['--exit-on-write-error', 'get-state'])).rejects.toThrow(/target-selector/)
     expect(adb.execs).toEqual([])
+  })
+
+  it('hard-denies Host-wide and serial queries for the lease holder, and redacts serial text from allowed output', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+
+    for (const args of [
+      ['kill-server'],
+      ['devices', '-l'],
+      ['forward', '--list'],
+      ['get-serialno'],
+      ['shell', 'getprop'],
+      ['shell', 'getprop', 'ro.serialno'],
+      ['exec-out', 'getprop', 'ro.boot.serialno'],
+      ['shell', '/system/bin/getprop', 'ro.serialno'],
+      ['shell', 'sh', '-c', 'getprop ro.serialno | base64'],
+      ['shell', 'dumpsys']
+    ]) {
+      await expect(orch.adbOnDevice('aaaa1111', args)).rejects.toMatchObject({ code: 'adb-command-forbidden' })
+    }
+    expect(adb.execs).toEqual([])
+
+    adb.execResultFor = () => ({
+      code: 1,
+      stdout: 'device R5CT30ABCDE reported a value\n',
+      stderr: 'transport r5ct30abcde failed\n'
+    })
+    const result = await orch.adbOnDevice('aaaa1111', ['get-state'])
+    expect(result.stdout).toContain('[device-serial-redacted]')
+    expect(result.stderr).toContain('[device-serial-redacted]')
+    expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/R5CT30ABCDE/i)
   })
 
   it('refuses an interfering ADB command from a Room with no lease, and never reaches the phone', async () => {
