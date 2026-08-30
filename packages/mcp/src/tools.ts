@@ -131,11 +131,46 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     },
     {
       name: 'start_room',
-      description: 'Start (wake) a room: its web server and services run again with preserved state.',
-      schema: { roomId: zRoomId },
+      description:
+        'Start (wake) a room: its web server and services run again with preserved state. Waking can outlast a tool ' +
+        'timeout, so this returns the wake as an operation: `status` is "running", "succeeded" or "failed", `stage` ' +
+        'says how far it got, and `error` carries the terminal failure. If it comes back "running", the Room is still ' +
+        'starting — poll check_operation with the returned id. Calling this again while a wake is running joins that ' +
+        'same wake, it never starts a second one.',
+      schema: {
+        roomId: zRoomId,
+        waitMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(600_000)
+          .optional()
+          .describe('how long DevHotel may hold this call waiting for the wake (default 10000; 0 returns at once)')
+      },
+      handler: wrap(async (a) => (await (await getClient()).startRoom(a.roomId, a.waitMs)).operation)
+    },
+    {
+      name: 'check_operation',
+      description:
+        'Check a long DevHotel operation (today: waking a Room) by id, or list a Room’s recent operations. Checking ' +
+        'never starts or repeats work. A "running" status means the operation is still in progress — your own earlier ' +
+        'timeout did not fail it.',
+      schema: {
+        operationId: z.string().uuid().optional().describe('operation id returned by start_room'),
+        roomId: zRoomId.optional().describe('list this Room’s recent operations instead'),
+        waitMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(600_000)
+          .optional()
+          .describe('with operationId: how long to wait for it to finish before answering (default 0)')
+      },
       handler: wrap(async (a) => {
-        await (await getClient()).startRoom(a.roomId)
-        return `Room ${a.roomId} started.`
+        const client = await getClient()
+        if (a.operationId) return (await client.getOperation(a.operationId, a.waitMs)).operation
+        if (a.roomId) return (await client.listRoomOperations(a.roomId)).operations
+        throw new Error('Pass operationId to check one operation, or roomId to list a Room’s recent operations.')
       })
     },
     {

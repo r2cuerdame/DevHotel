@@ -44,6 +44,67 @@ room's Changes list. Host boundaries hold:
   desktop against the DevHotel preview window. See
   [Host input isolation](./host-input-isolation.md).
 
+## Long operations
+
+Waking a Room can take longer than a client is willing to wait: an emulator
+image pull, fresh service containers, then up to 90 s of asking whether the
+site answers. So `POST /v1/rooms/:id/start` does not report an outcome — it
+reports an **operation**, and the operation is what carries the outcome.
+
+```json
+{
+  "operation": {
+    "id": "9d2a2c30-9c9a-4a2e-9b8b-0f6a2f1d5f01",
+    "kind": "room-start",
+    "roomId": "room1abc",
+    "actor": "agent",
+    "status": "running",
+    "stage": "container-start",
+    "stages": [
+      { "key": "preparing", "label": "Prepare the Room record", "status": "done",
+        "detail": null, "startedAt": "…", "endedAt": "…" },
+      { "key": "container-start", "label": "Start the Room containers", "status": "running",
+        "detail": null, "startedAt": "…", "endedAt": null }
+    ],
+    "error": null,
+    "startedAt": "…", "updatedAt": "…", "finishedAt": null
+  }
+}
+```
+
+- `status` is `running`, `succeeded` or `failed`. **`running` is an answer, not a
+  failure** — your call timing out says nothing about the wake, which is still
+  going. Come back with the ID.
+- `error` is `{ stage, message }` and is set only on `failed`.
+- Stage `status` is `running`, `done`, `failed`, or `skipped` — *skipped* means
+  the stage did not complete but deliberately did not stop the operation (the
+  Room was already awake; the emulator has no KVM). `detail` says which.
+- Stage order: Web `preparing → container-start → services-start → web-start →
+  verify → complete`; Android `preparing → container-start → emulator-boot →
+  web-start → verify → adb-ready → complete`; Windows `preparing → vm-start →
+  complete`.
+- `adb-ready` is a single question, not a wait: a fresh emulator is normally
+  still booting, which is reported as `skipped`. The Room is usable for builds
+  meanwhile, and `android-run` waits for the device itself.
+
+Operations are **idempotent to ask about and idempotent to start**. Reading one
+never starts work. Starting a Room whose wake is already running returns that
+same operation instead of queueing a second wake.
+
+The ID is durable: records live in the Room database, so it still answers after
+a reconnect. An operation left running by a killed app is reported `failed`
+("DevHotel restarted while this operation was running") at the next start rather
+than being polled forever.
+
+| Method & path | Body / query | Result |
+|---|---|---|
+| `POST /v1/rooms/:id/start` | `{ waitMs? }` — how long the call may hold before answering (default `10000`, max `600000`, `0` = answer at once) | `{ operation }` |
+| `GET /v1/operations/:operationId` | `?waitMs=` (default `0`) | `{ operation }`, `404` if unknown |
+| `GET /v1/rooms/:id/operations` | `?limit=` (default 20, max 200) | `{ operations }`, newest first |
+
+`waitMs` is a convenience, not a requirement: with `waitMs=0` on both calls you
+can drive the whole thing by polling.
+
 ## Endpoints
 
 ### Hotel
@@ -51,6 +112,7 @@ room's Changes list. Host boundaries hold:
 | Method & path | Result |
 |---|---|
 | `GET /v1/ping` | `{ version }` |
+| `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
 | `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }] }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
@@ -63,7 +125,8 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
 | `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. |
 | `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
-| `POST /v1/rooms/:id/start` · `/sleep` | | `204` |
+| `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
+| `POST /v1/rooms/:id/sleep` | | `204` |
 | `POST /v1/rooms/:id/restart-web` | | change entry |
 | `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
@@ -77,6 +140,7 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |
+| `GET /v1/rooms/:id/operations` | `?limit=` | `{ operations }` — this Room's recent long operations, newest first |
 | `GET /v1/rooms/:id/logs` | `?kind=web\|orchestrator` | `{ lines[] }` tail |
 | `GET /v1/rooms/:id/diagnostic` | | `{ text }` secret-redacted bundle |
 | `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | `{ png: base64, source }` — Android rooms; `screen` captures the display (FLAG_SECURE included) |

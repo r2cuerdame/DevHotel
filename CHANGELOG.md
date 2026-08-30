@@ -77,6 +77,18 @@ the command.
   retained run remains readable even when it alone exceeds the Room byte cap.
   Retained reads also use a fixed 4MiB scan budget per request.
 
+### Waking a Room is a trackable operation, so a client timeout stops meaning "failed"
+
+Reported by agents whose `start_room` timed out while the Room went on starting successfully: the call looked like a failure, and there was nothing to ask afterwards. Waking a Room takes as long as it takes — an emulator image pull, service containers, up to 90 s of waiting for the site to answer — and none of that fits inside a client's patience.
+
+- **`POST /v1/rooms/:id/start` now answers with the wake's operation** instead of a bare `204`: `{ operation: { id, status, stage, stages[], error, … } }`. `waitMs` (default 10 s, max 10 min) only chooses how long the call holds before answering — a quick wake still finishes inline, a slow one hands back a durable operation ID. A `running` status is a real answer, not an error.
+- **`GET /v1/operations/:id`** (optionally `?waitMs=`) and **`GET /v1/rooms/:id/operations`** answer afterwards. Checking never starts or repeats work, and the ID keeps working after the caller reconnects — records are stored in the Room database, and any left running by a killed app are failed at startup instead of being polled forever.
+- **Asking to start a Room whose wake is already running joins that wake.** A retry after your own timeout can no longer queue a second startup behind the first.
+- **Stages instead of a spinner.** A Web Room reports `preparing → container-start → services-start → web-start → verify → complete`; an Android Room reports `preparing → container-start → emulator-boot → web-start → verify → adb-ready → complete`; a Windows Room reports `preparing → vm-start → complete`. Each stage carries its own detail, and a stage that did not complete but deliberately did not stop the wake (an already-awake Room, an emulator without KVM) is marked `skipped` with the reason.
+- **A wake that did not bring the Room up is now reported as failed**, with the failing stage and the error text — previously the call returned successfully while the Room quietly went to `attention` or `broken`. The Room's own status behaviour is unchanged.
+- **Android Rooms stop claiming a phone that is still booting.** The wake asks adb once whether the device finished booting and records the answer; the Room is `ready` for builds either way, and `android-run` still waits for the device itself. The probe is a single bounded question, never a wait, so no Android wake got slower.
+- MCP: `start_room` returns the operation, and the new **`check_operation`** tool follows it by ID (or lists a Room's recent operations). Thirty tools now.
+
 ## 0.4.3 — 2026-08-16
 
 ### Reset Room — housekeeping without checking out

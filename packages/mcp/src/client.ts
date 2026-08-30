@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentCreateRoomInput, ControlInfo, QuickChange } from '@devhotel/shared'
+import type { AgentCreateRoomInput, ControlInfo, OperationRecord, QuickChange } from '@devhotel/shared'
 
 /** Bounded-output selection understood by the control API's exec and run reads. */
 export interface OutputSelection {
@@ -118,8 +118,24 @@ export class ControlClient {
   inspectRoom(roomId: string) {
     return this.req<unknown>('GET', `/v1/rooms/${encodeURIComponent(roomId)}`)
   }
-  startRoom(roomId: string) {
-    return this.req<void>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/start`)
+  /** Answers with the wake's operation record, running or finished. */
+  startRoom(roomId: string, waitMs?: number) {
+    return this.req<{ operation: OperationRecord }>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/start`,
+      waitMs === undefined ? {} : { waitMs }
+    )
+  }
+  getOperation(operationId: string, waitMs?: number) {
+    const query = waitMs === undefined ? '' : `?waitMs=${waitMs}`
+    return this.req<{ operation: OperationRecord }>('GET', `/v1/operations/${encodeURIComponent(operationId)}${query}`)
+  }
+  listRoomOperations(roomId: string, limit?: number) {
+    const query = limit === undefined ? '' : `?limit=${limit}`
+    return this.req<{ operations: OperationRecord[] }>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/operations${query}`
+    )
   }
   sleepRoom(roomId: string) {
     return this.req<void>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sleep`)
