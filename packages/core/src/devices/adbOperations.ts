@@ -32,6 +32,7 @@ const FORBIDDEN_VERBS = new Map<string, string>([
   ['pair', 'pairing a Host ADB connection'],
   ['tcpip', 'switching the shared device transport to TCP/IP'],
   ['usb', 'switching the shared device transport to USB'],
+  ['reboot', 'rebooting and disconnecting the shared device transport'],
   ['root', 'restarting shared adbd as root'],
   ['unroot', 'restarting shared adbd with different privileges'],
   ['remount', 'remounting shared device partitions'],
@@ -54,8 +55,7 @@ const INTERFERING_VERBS = new Map<string, string>([
   ['install', 'installing an APK'],
   ['install-multiple', 'installing APKs'],
   ['install-multi-package', 'installing APKs'],
-  ['uninstall', 'uninstalling an app'],
-  ['reboot', 'rebooting the device']
+  ['uninstall', 'uninstalling an app']
 ])
 
 /** Top-level adb verbs that only observe. */
@@ -91,7 +91,12 @@ const FORBIDDEN_SHELL_COMMANDS = new Map<string, string>([
   ['pidof', 'querying arbitrary app process state through raw ADB'],
   ['ps', 'listing cross-app processes through raw ADB'],
   ['printf', 'expanding arbitrary remote-shell data with `printf`'],
+  ['reboot', 'rebooting and disconnecting the shared device transport'],
   ['screencap', 'streaming binary screenshots through raw ADB'],
+  ['setprop', 'changing properties that can restart the shared device transport'],
+  ['start', 'restarting the shared Android runtime through raw ADB'],
+  ['stop', 'stopping the shared Android runtime through raw ADB'],
+  ['svc', 'changing shared device transports or services through raw ADB'],
   ['top', 'listing cross-app process activity through raw ADB'],
   ['uiautomator', 'reading or driving arbitrary UI hierarchy through raw ADB'],
   ['bmgr', 'reading or driving cross-app backup state through raw ADB']
@@ -102,11 +107,6 @@ const INTERFERING_SHELL_COMMANDS = new Map<string, string>([
   ['am', 'driving activities with `am`'],
   ['input', 'injecting input events'],
   ['monkey', 'running monkey'],
-  ['svc', 'changing device services'],
-  ['setprop', 'setting a system property'],
-  ['reboot', 'rebooting the device'],
-  ['stop', 'stopping the Android runtime'],
-  ['start', 'starting the Android runtime'],
   ['rm', 'deleting files on the device'],
   ['mv', 'moving files on the device'],
   ['mkdir', 'writing files on the device'],
