@@ -1,8 +1,10 @@
 import type { Translation } from './index'
 import { hotelServicesCommon } from './hotelServicesCommon'
+import { pairingCommon } from './pairingCommon'
 
 export const de: Translation = {
   ...hotelServicesCommon,
+  ...pairingCommon,
   'common.cancel': 'Abbrechen',
   'common.back': 'Zurück',
   'common.close': 'Schließen',

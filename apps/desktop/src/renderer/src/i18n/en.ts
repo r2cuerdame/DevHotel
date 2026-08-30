@@ -1,4 +1,7 @@
+import { pairingCommon } from './pairingCommon'
+
 export const en = {
+  ...pairingCommon,
   // Common actions
   'common.cancel': 'Cancel',
   'common.back': 'Back',
