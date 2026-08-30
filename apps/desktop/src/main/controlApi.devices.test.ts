@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DeviceLeaseError } from '@devhotel/shared'
+import { DeviceLeaseError, zRoomId } from '@devhotel/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DevHotelError, type RoomOrchestrator } from '@devhotel/core'
 import { startControlApi } from './controlApi'
@@ -280,12 +280,98 @@ describe('agent Android automation routes', () => {
         body: JSON.stringify({ applicationId: 'com.example.app', text: 'x'.repeat(70_000) })
       })
 
-      expect(serial.status).toBe(500)
+      expect(serial).toMatchObject({ status: 400, body: { code: 'INVALID_ANDROID_REQUEST' } })
       expect(querySerial).toMatchObject({ status: 400, body: { code: 'INVALID_ANDROID_TARGET' } })
       expect(oversized.status).toBe(413)
       expect(oversized.body).toMatchObject({ code: 'REQUEST_BODY_TOO_LARGE' })
       expect(androidTapText).not.toHaveBeenCalled()
       expect(androidAutomationStatus).not.toHaveBeenCalled()
+    })
+  })
+
+  it('returns sanitized 400s for invalid Android path, target and device selectors', async () => {
+    const androidAutomationStatus = vi.fn()
+    await withApi({ androidAutomationStatus } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const invalidRoom = await call('/v1/rooms/not-a-room/android/status')
+      const invalidTarget = await call('/v1/rooms/room1abc/android/status?target=tablet')
+      const invalidDevice = await call('/v1/rooms/room1abc/android/status?target=physical&deviceId=R5CT30ABCDE')
+
+      expect(invalidRoom).toMatchObject({ status: 400, body: { code: 'INVALID_ROOM_ID' } })
+      expect(invalidTarget).toMatchObject({ status: 400, body: { code: 'INVALID_ANDROID_TARGET' } })
+      expect(invalidDevice).toMatchObject({ status: 400, body: { code: 'INVALID_ANDROID_TARGET' } })
+      for (const result of [invalidRoom, invalidTarget, invalidDevice]) {
+        expect(JSON.stringify(result.body)).not.toMatch(/not-a-room|tablet|R5CT30ABCDE|issues/i)
+      }
+      expect(androidAutomationStatus).not.toHaveBeenCalled()
+    })
+  })
+
+  it.each([
+    ['launch', { applicationId: 'com.example.app', unknown: 'private-value' }],
+    ['force-stop', { applicationId: 'invalid' }],
+    ['wait-for-text', { applicationId: 'com.example.app', text: 'Crash', timeoutMs: 249 }],
+    ['tap-text', { applicationId: 'com.example.app', text: '' }],
+    ['dump-ui', { applicationId: 'com.example.app', maxNodes: 501 }],
+    ['logcat', { applicationId: 'com.example.app', maxLines: 0 }],
+    ['crash-scenario', { applicationId: 'com.example.app', scenario: 'am-crash', runId: '' }]
+  ])('returns a sanitized 400 before Core for an invalid %s body', async (action, body) => {
+    const orchestratorCalls = {
+      androidLaunchApp: vi.fn(),
+      androidForceStop: vi.fn(),
+      androidWaitForText: vi.fn(),
+      androidTapText: vi.fn(),
+      androidDumpUi: vi.fn(),
+      androidLogcat: vi.fn(),
+      androidRunCrashScenario: vi.fn()
+    }
+    await withApi(orchestratorCalls as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call(`/v1/rooms/room1abc/android/${action}`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      })
+
+      expect(result).toMatchObject({
+        status: 400,
+        body: {
+          code: 'INVALID_ANDROID_REQUEST',
+          error: 'Android automation request fields are invalid.'
+        }
+      })
+      expect(JSON.stringify(result.body)).not.toMatch(/private-value|issues/i)
+      expect(Object.values(orchestratorCalls).every((call) => call.mock.calls.length === 0)).toBe(true)
+    })
+  })
+
+  it('returns a sanitized 400 for malformed JSON without reclassifying internal exceptions', async () => {
+    const androidLaunchApp = vi.fn(async () => {
+      throw new TypeError('internal launch invariant')
+    })
+    const androidForceStop = vi.fn(async () => {
+      zRoomId.parse('internal-invalid-room')
+    })
+    await withApi({ androidLaunchApp, androidForceStop } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const malformed = await call('/v1/rooms/room1abc/android/launch', {
+        method: 'POST',
+        body: '{"applicationId":"secret-value"'
+      })
+      const internal = await call('/v1/rooms/room1abc/android/launch', {
+        method: 'POST',
+        body: JSON.stringify({ applicationId: 'com.example.app' })
+      })
+      const internalZod = await call('/v1/rooms/room1abc/android/force-stop', {
+        method: 'POST',
+        body: JSON.stringify({ applicationId: 'com.example.app' })
+      })
+
+      expect(malformed).toMatchObject({
+        status: 400,
+        body: { code: 'INVALID_JSON_BODY', error: 'Request body is not valid JSON.' }
+      })
+      expect(JSON.stringify(malformed.body)).not.toMatch(/secret-value|SyntaxError|position/i)
+      expect(internal).toMatchObject({ status: 500, body: { error: 'internal launch invariant' } })
+      expect(internalZod.status).toBe(500)
+      expect(androidLaunchApp).toHaveBeenCalledTimes(1)
+      expect(androidForceStop).toHaveBeenCalledTimes(1)
     })
   })
 

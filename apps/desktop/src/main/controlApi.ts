@@ -52,6 +52,34 @@ const DEFAULT_START_WAIT_MS = 0
 const DEFAULT_BODY_LIMIT_BYTES = 24 * 1024 * 1024
 const ANDROID_AUTOMATION_BODY_LIMIT_BYTES = 64 * 1024
 
+interface InputSchema<T> {
+  safeParse(input: unknown): { success: true; data: T } | { success: false }
+}
+
+function parseRequestInput<T>(
+  schema: InputSchema<T>,
+  input: unknown,
+  error: { code: string; message: string; recoveryHint: string }
+): T {
+  const parsed = schema.safeParse(input)
+  if (parsed.success) return parsed.data
+  // Route input is untrusted and Zod's issues can echo caller-controlled
+  // values. Convert only this explicit inbound boundary to a stable 400;
+  // validation errors thrown later by Core/backend code remain internal 500s.
+  throw new DevHotelError(error.code, error.message, {
+    recoveryHint: error.recoveryHint,
+    httpStatus: 400
+  })
+}
+
+function parseAndroidBody<T>(schema: InputSchema<T>, input: unknown): T {
+  return parseRequestInput(schema, input, {
+    code: 'INVALID_ANDROID_REQUEST',
+    message: 'Android automation request fields are invalid.',
+    recoveryHint: 'Use only the documented bounded Android operation fields and value formats.'
+  })
+}
+
 /** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
 function parseWaitMs(raw: string | null): number {
   if (raw === null) return 0
@@ -172,7 +200,13 @@ export async function startControlApi(
 
     if (parts[1] === 'rooms') {
       const roomId = parts[2]
-      const safeRoomId = roomId ? zRoomId.parse(roomId) : undefined
+      const safeRoomId = roomId
+        ? parseRequestInput(zRoomId, roomId, {
+            code: 'INVALID_ROOM_ID',
+            message: 'The Room ID in the request path is invalid.',
+            recoveryHint: 'Use the opaque Room ID returned by DevHotel.'
+          })
+        : undefined
       const op = parts[3]
 
       if (!roomId && req.method === 'GET') {
@@ -219,10 +253,15 @@ export async function startControlApi(
           }
           const kind = url.searchParams.get('target') ?? 'auto'
           const deviceId = url.searchParams.get('deviceId') ?? undefined
-          const target = zAndroidTargetSelector.parse({
-            kind,
-            ...(deviceId ? { deviceId } : {})
-          })
+          const target = parseRequestInput(
+            zAndroidTargetSelector,
+            { kind, ...(deviceId ? { deviceId } : {}) },
+            {
+              code: 'INVALID_ANDROID_TARGET',
+              message: 'Android status target fields are invalid.',
+              recoveryHint: 'Use target=auto|emulator|physical and an optional opaque deviceId.'
+            }
+          )
           sendJson(res, 200, await orch.androidAutomationStatus(safeRoomId, target))
           return
         }
@@ -230,25 +269,25 @@ export async function startControlApi(
           const body = await readBody(req, ANDROID_AUTOMATION_BODY_LIMIT_BYTES)
           switch (action) {
             case 'launch':
-              sendJson(res, 200, await orch.androidLaunchApp(safeRoomId, zAndroidLaunchAppBody.parse(body)))
+              sendJson(res, 200, await orch.androidLaunchApp(safeRoomId, parseAndroidBody(zAndroidLaunchAppBody, body)))
               return
             case 'force-stop':
-              sendJson(res, 200, await orch.androidForceStop(safeRoomId, zAndroidForceStopBody.parse(body)))
+              sendJson(res, 200, await orch.androidForceStop(safeRoomId, parseAndroidBody(zAndroidForceStopBody, body)))
               return
             case 'wait-for-text':
-              sendJson(res, 200, await orch.androidWaitForText(safeRoomId, zAndroidWaitForTextBody.parse(body)))
+              sendJson(res, 200, await orch.androidWaitForText(safeRoomId, parseAndroidBody(zAndroidWaitForTextBody, body)))
               return
             case 'tap-text':
-              sendJson(res, 200, await orch.androidTapText(safeRoomId, zAndroidTapTextBody.parse(body)))
+              sendJson(res, 200, await orch.androidTapText(safeRoomId, parseAndroidBody(zAndroidTapTextBody, body)))
               return
             case 'dump-ui':
-              sendJson(res, 200, await orch.androidDumpUi(safeRoomId, zAndroidDumpUiBody.parse(body)))
+              sendJson(res, 200, await orch.androidDumpUi(safeRoomId, parseAndroidBody(zAndroidDumpUiBody, body)))
               return
             case 'logcat':
-              sendJson(res, 200, await orch.androidLogcat(safeRoomId, zAndroidLogcatBody.parse(body)))
+              sendJson(res, 200, await orch.androidLogcat(safeRoomId, parseAndroidBody(zAndroidLogcatBody, body)))
               return
             case 'crash-scenario':
-              sendJson(res, 200, await orch.androidRunCrashScenario(safeRoomId, zAndroidRunCrashScenarioBody.parse(body)))
+              sendJson(res, 200, await orch.androidRunCrashScenario(safeRoomId, parseAndroidBody(zAndroidRunCrashScenarioBody, body)))
               return
           }
         }
@@ -538,5 +577,12 @@ async function readBody(req: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTE
   }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw) return {}
-  return JSON.parse(raw)
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new DevHotelError('INVALID_JSON_BODY', 'Request body is not valid JSON.', {
+      recoveryHint: 'Send one valid JSON value using UTF-8 encoding.',
+      httpStatus: 400
+    })
+  }
 }

@@ -982,7 +982,7 @@ describe('tracked Android automation session', () => {
       scenario: 'am-crash',
       runId: 'unsupported-fence'
     })).rejects.toMatchObject({ code: 'ANDROID_LOG_FENCE_UNSUPPORTED' })
-    expect(calls.some((args) => args[0] === 'logcat' || args[1] === 'pidof' || args[1] === 'run-as')).toBe(false)
+    expect(calls.some((args) => args[0] === 'logcat' || args[1] === 'pgrep' || args[1] === 'run-as')).toBe(false)
   })
 
   it('composes safe foreground metadata with its exact install receipt', async () => {
@@ -1112,7 +1112,9 @@ describe('tracked Android automation session', () => {
   it('does not misreport a pre-crash PID probe failure as an app that is not running', async () => {
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (args[1] === 'pidof') return { code: -1, stdout: '', stderr: 'transport lost' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pgrep') return { code: -1, stdout: '', stderr: 'transport lost' }
       return { code: 0, stdout: '', stderr: '' }
     })
 
@@ -1124,10 +1126,12 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args[1] === 'am' && args[2] === 'crash')).toBe(false)
   })
 
-  it('reports not-running only for an authoritative empty pidof result', async () => {
+  it('reports not-running only for an authoritative empty exact-UID pgrep result', async () => {
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (args[1] === 'pidof') return { code: 1, stdout: '', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pgrep') return { code: 1, stdout: '', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     })
 
@@ -1138,11 +1142,45 @@ describe('tracked Android automation session', () => {
     })).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_RUNNING' })
   })
 
+  it.each(['unreadable', 'malformed', 'duplicate', 'noisy-empty'] as const)(
+    'fails closed when the exact-UID process probe is %s',
+    async (failure) => {
+      const { calls, session } = setup((args) => {
+        if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+        if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+        if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+        if (args[1] === 'pgrep') {
+          return failure === 'unreadable'
+            ? { code: 2, stdout: '', stderr: 'permission denied' }
+            : failure === 'noisy-empty'
+              ? { code: 1, stdout: '', stderr: '\n' }
+            : failure === 'duplicate'
+              ? { code: 0, stdout: '1234\n1234\n', stderr: '' }
+              : { code: 0, stdout: 'not-a-pid\n', stderr: '' }
+        }
+        return { code: 0, stdout: '', stderr: '' }
+      })
+
+      await session.crashScenario({
+        applicationId: APP_ID,
+        scenario: 'am-crash',
+        runId: `pid-${failure}`
+      }).catch((error: unknown) => {
+        expect(error).toMatchObject({
+          code: 'ANDROID_PROCESS_PROBE_FAILED',
+          evidence: { stdout: '', stderr: '', truncated: true }
+        })
+        expect(JSON.stringify(error)).not.toMatch(/permission denied|not-a-pid|1234/)
+      })
+      expect(calls.some((args) => args[1] === 'sh' && args[3]?.includes('exec am crash'))).toBe(false)
+    }
+  )
+
   it('does not treat a post-crash PID probe failure as observed process death', async () => {
     let pidProbes = 0
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (args[1] === 'pidof') {
+      if (args[1] === 'pgrep') {
         pidProbes += 1
         return pidProbes === 1
           ? { code: 0, stdout: '1234\n', stderr: '' }
@@ -1171,7 +1209,7 @@ describe('tracked Android automation session', () => {
     let crashFence = ''
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (args[1] === 'pidof') {
+      if (args[1] === 'pgrep') {
         pidProbes += 1
         return pidProbes === 1
           ? { code: 0, stdout: '1234\n', stderr: '' }
@@ -1224,6 +1262,49 @@ describe('tracked Android automation session', () => {
       'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${secondaryUid}`
     ])
     expect(calls.some((args) => args[1] === 'date')).toBe(false)
+  })
+
+  it('scopes crash PID evidence to the exact Android user when the app runs for two users', async () => {
+    const secondaryUid = 1_010_123
+    let pidProbes = 0
+    let crashFence = ''
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') {
+        pidProbes += 1
+        return pidProbes === 1
+          ? { code: 0, stdout: '5678\n6789\n', stderr: '' }
+          : { code: 1, stdout: '', stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('exec am crash')) {
+        crashFence = args.at(-1)!
+        return { code: 0, stdout: 'Crash requested\n', stderr: '' }
+      }
+      if (args[0] === 'logcat') {
+        return { code: 0, stdout: `${crashFence}\nsecondary crash row\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { sleep: async () => {} }, target, SECONDARY_INSTALL_LOG_FENCE)
+
+    const result = await session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'two-users'
+    })
+
+    expect(result).toMatchObject({ observed: true, pidsBefore: [5678, 6789], pidsAfter: [] })
+    expect(JSON.stringify(result)).not.toContain('1234')
+    expect(calls.filter((args) => args[1] === 'pgrep')).toEqual([
+      ['shell', 'pgrep', '-u', String(secondaryUid)],
+      ['shell', 'pgrep', '-u', String(secondaryUid)]
+    ])
+    expect(calls.some((args) => args[1] === 'pidof')).toBe(false)
   })
 
   it('transfers one exact target/package receipt to the last installing Room', () => {

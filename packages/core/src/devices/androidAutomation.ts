@@ -42,6 +42,7 @@ const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$
 const ANDROID_PER_USER_RANGE = 100_000
 const ANDROID_FIRST_APPLICATION_ID = 10_000
 const ANDROID_LAST_APPLICATION_ID = 19_999
+const MAX_PACKAGE_PROCESSES = 1_024
 
 export interface AndroidAutomationExecOptions {
   timeoutMs?: number
@@ -1168,24 +1169,34 @@ export class AndroidAutomationSession {
     return this.readLogcat(input)
   }
 
-  private async pids(applicationId: string): Promise<number[]> {
+  private async pids(applicationId: string, authority: AndroidPackageAuthority): Promise<number[]> {
     const result = await this.command(
-      ['shell', 'pidof', applicationId],
+      ['shell', 'pgrep', '-u', String(authority.uid)],
       { operation: 'Android app process probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
     )
     const parsed = parsePids(result.stdout)
-    if (result.code === 0 && parsed.length > 0) return parsed
-    // Android toybox pidof reports an authoritative no-process result as exit
-    // 1 with no output. Transport failures and malformed output must never be
-    // collapsed into crash evidence.
-    if (result.code === 1 && !result.stdout.trim() && !result.stderr.trim()) return []
-    throw automationError(
-      'ANDROID_PROCESS_PROBE_FAILED',
-      `${applicationId} process state could not be established on this target.`,
-      'Restore target connectivity and retry; DevHotel will not infer a crash from a failed PID probe.',
-      409,
-      safeEvidence(result)
-    )
+    const tokens = result.stdout.trim() ? result.stdout.trim().split(/\s+/) : []
+    // Android 12+ toybox pgrep accepts a UID selector without a pattern. Exit
+    // 1 with empty streams is its authoritative no-match result. Exact EUID
+    // selection keeps both the main and remote app processes inside the
+    // already-proven package/user authority without exposing other users.
+    if (result.code === 1 && result.stdout.length === 0 && result.stderr.length === 0) return []
+    if (
+      result.code !== 0 ||
+      result.stderr.length > 0 ||
+      parsed.length === 0 ||
+      parsed.length !== tokens.length ||
+      parsed.length > MAX_PACKAGE_PROCESSES
+    ) {
+      throw automationError(
+        'ANDROID_PROCESS_PROBE_FAILED',
+        `${applicationId} process state could not be established on this target.`,
+        'Restore target connectivity and exact-user process visibility, then retry; DevHotel will not infer a crash from a failed PID probe.',
+        409,
+        safeEvidenceWithoutOutput(result)
+      )
+    }
+    return parsed
   }
 
   async crashScenario(input: AndroidRunCrashScenarioInput): Promise<AndroidCrashScenarioResult> {
@@ -1195,14 +1206,6 @@ export class AndroidAutomationSession {
     if ((this.target.apiLevel ?? 0) < 31 || !installAuthority) {
       throw this.logFenceError(input.applicationId)
     }
-    const pidsBefore = await this.pids(input.applicationId)
-    if (pidsBefore.length === 0) {
-      throw automationError(
-        'ANDROID_APP_NOT_RUNNING',
-        `${input.applicationId} has no running process to crash.`,
-        'Launch the tracked application before running the crash scenario.'
-      )
-    }
     const crashAuthority = await this.packageUid(input.applicationId)
     if (!samePackageAuthority(crashAuthority, installAuthority)) {
       throw automationError(
@@ -1210,6 +1213,14 @@ export class AndroidAutomationSession {
         'The active Android user no longer matches the tracked install log authority.',
         'Restore the Android user used by android_run or rerun android_run for the active user.',
         409
+      )
+    }
+    const pidsBefore = await this.pids(input.applicationId, crashAuthority)
+    if (pidsBefore.length === 0) {
+      throw automationError(
+        'ANDROID_APP_NOT_RUNNING',
+        `${input.applicationId} has no running process for the tracked Android user.`,
+        'Launch the tracked application for the active Android user before running the crash scenario.'
       )
     }
     const crashStartedAt = this.now()
@@ -1226,7 +1237,7 @@ export class AndroidAutomationSession {
     let pidsAfter = pidsBefore
     let observed = false
     for (let attempt = 0; attempt < 20; attempt++) {
-      pidsAfter = await this.pids(input.applicationId)
+      pidsAfter = await this.pids(input.applicationId, crashAuthority)
       if (pidsBefore.every((pid) => !pidsAfter.includes(pid))) {
         observed = true
         break
