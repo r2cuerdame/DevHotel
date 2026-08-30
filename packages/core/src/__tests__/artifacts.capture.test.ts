@@ -58,6 +58,9 @@ describe('Android screenshot artifact capture', () => {
       if (cmd[4] === 'pm' && cmd[5] === 'path') {
         return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       }
+      if (cmd[4] === 'sha256sum') {
+        return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
+      }
       if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
       }
