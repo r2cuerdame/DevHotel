@@ -183,6 +183,28 @@ describe('Room start as a trackable operation', () => {
     expect(backend.calls.filter((call) => call.startsWith('recreateAnchor:'))).toHaveLength(1)
   })
 
+  it('keeps waking the Room when an advisory progress save fails', async () => {
+    const { backend, orch, room } = await setup()
+    const save = orch.operationRecords.save.bind(orch.operationRecords)
+    let rejectProgressSave = true
+    orch.operationRecords.save = (record) => {
+      if (rejectProgressSave && record.status === 'running' && record.stages.length > 0) {
+        rejectProgressSave = false
+        throw new Error('SQLITE_IOERR: progress record could not be saved')
+      }
+      save(record)
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const finished = await orch.waitForOperation(started.id, 30_000)
+
+    expect(finished?.status).toBe('succeeded')
+    expect(backend.calls.filter((call) => call.startsWith('recreateAnchor:'))).toHaveLength(1)
+    expect(stage(finished!, 'preparing')?.warnings).toEqual([
+      'Progress tracking update failed: SQLITE_IOERR: progress record could not be saved'
+    ])
+  })
+
   it('records a terminal save failure and does not leave the dedupe key stale', async () => {
     const { orch, room } = await setup()
     const save = orch.operationRecords.save.bind(orch.operationRecords)

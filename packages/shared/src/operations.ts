@@ -38,6 +38,8 @@ export interface OperationStage {
   label: string
   status: OperationStageStatus
   detail: string | null
+  /** Advisory tracking failures that did not control or abort the Room work. */
+  warnings?: string[]
   startedAt: string
   endedAt: string | null
 }

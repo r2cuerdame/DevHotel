@@ -53,7 +53,10 @@ function nowIso(): string {
 function clone(record: OperationRecord): OperationRecord {
   return {
     ...record,
-    stages: record.stages.map((stage) => ({ ...stage })),
+    stages: record.stages.map((stage) => ({
+      ...stage,
+      ...(stage.warnings === undefined ? {} : { warnings: [...stage.warnings] })
+    })),
     error: record.error === null ? null : { ...record.error }
   }
 }
@@ -211,7 +214,19 @@ export class OperationTracker {
     }
     const touch = (): void => {
       record.updatedAt = nowIso()
-      this.persist(record)
+      try {
+        this.persist(record)
+      } catch (error) {
+        // Stage persistence is observability, never Room control flow. Keep
+        // driving the task and carry the warning in the in-memory snapshot;
+        // the next successful progress or terminal save makes it durable.
+        const stage = record.stages[record.stages.length - 1]
+        if (!stage) return
+        const warning = `Progress tracking update failed: ${messageOf(error)}`
+        if (!stage.warnings?.includes(warning)) {
+          stage.warnings = [...(stage.warnings ?? []), warning]
+        }
+      }
     }
     const report: OperationReporter = {
       begin: (stageKey, label) => {

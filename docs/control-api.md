@@ -79,6 +79,10 @@ reports an **operation**, and the operation is what carries the outcome.
 - Stage `status` is `running`, `done`, `failed`, or `skipped` — *skipped* means
   the stage did not complete but deliberately did not stop the operation (the
   Room was already awake; the emulator has no KVM). `detail` says which.
+- A stage can carry `warnings` when an advisory progress update could not be
+  persisted. The Room work continues and its terminal `status` still reports
+  the wake itself; the next successful progress or terminal write preserves
+  the warning for later polling.
 - Stage order: Web `preparing → container-start → services-start → web-start →
   verify → complete`; Android `preparing → container-start → emulator-boot →
   web-start → verify → adb-ready → complete`; Windows `preparing → vm-start →
