@@ -189,6 +189,9 @@ describe('Android automation schemas', () => {
     expect(zAndroidTapTextBody.safeParse({
       applicationId: 'com.example.app', text: 'Crash', serial: 'R5CT30ABCDE'
     }).success).toBe(false)
+    expect(zAndroidLaunchAppBody.safeParse({
+      applicationId: 'com.example.app', extras: { label: 'before\u0000after' }
+    }).success).toBe(false)
   })
 
   it('bounds log and crash inputs to literal, named scenarios', () => {

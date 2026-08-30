@@ -179,6 +179,18 @@ describe('tracked Android automation session', () => {
     expect(calls.at(-1)?.[2]).toBe('start')
   })
 
+  it('rejects a NUL string extra before invoking an Android launch command', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.launch(APP_ID, '.MainActivity', {
+      label: 'before\u0000after'
+    })).rejects.toMatchObject({ code: 'ANDROID_EXTRA_INVALID' })
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'start')).toBe(false)
+  })
+
   it('scopes a fully qualified activity from another Java namespace to the tracked app', async () => {
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }

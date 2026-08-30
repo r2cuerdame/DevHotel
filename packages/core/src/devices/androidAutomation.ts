@@ -116,7 +116,17 @@ function componentForActivity(applicationId: string, activity: string): string {
 function extrasArgv(extras: AndroidExtras | undefined): string[] {
   const args: string[] = []
   for (const [key, value] of Object.entries(extras ?? {})) {
-    if (typeof value === 'string') args.push('--es', key, value)
+    if (typeof value === 'string') {
+      if (value.includes('\u0000')) {
+        throw automationError(
+          'ANDROID_EXTRA_INVALID',
+          'Android string extras cannot contain a NUL byte.',
+          'Remove the NUL byte and retry with a text value that can be represented as a process argument.',
+          400
+        )
+      }
+      args.push('--es', key, value)
+    }
     else if (typeof value === 'boolean') args.push('--ez', key, String(value))
     else args.push('--ei', key, String(value))
   }

@@ -26,7 +26,7 @@ const zAndroidExtraKey = z
   .max(100)
   .regex(/^[A-Za-z_][A-Za-z0-9_.-]*$/, 'safe Android extra key')
 const zAndroidExtraValue = z.union([
-  z.string().max(1024),
+  z.string().max(1024).refine((value) => !value.includes('\u0000'), 'NUL-free string extra'),
   z.boolean(),
   z.number().int().min(-2_147_483_648).max(2_147_483_647)
 ])
