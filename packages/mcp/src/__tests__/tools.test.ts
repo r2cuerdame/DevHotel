@@ -31,6 +31,14 @@ beforeAll(async () => {
       if (req.url === '/v1/rooms/abc12345/diagnostic') {
         return void res.end(JSON.stringify({ text: 'DevHotel Diagnostic Bundle\n...' }))
       }
+      if (req.url === '/v1/rooms/abc12345/sync-from-host') {
+        res.writeHead(409, { 'content-type': 'application/json' })
+        return void res.end(JSON.stringify({
+          error: 'workspace_drift',
+          conflictReason: 'room-source-modified',
+          changedPaths: [{ path: 'app/src/main/java/App.kt', reason: 'modified' }]
+        }))
+      }
       res.writeHead(404).end('not found')
     })
   })
@@ -186,5 +194,12 @@ describe('makeTools', () => {
   it('errors surface as isError content, not throws', async () => {
     const res = await byName.inspect_room!.handler({ roomId: 'nope' })
     expect(res.isError).toBe(true)
+  })
+
+  it('surfaces exact Room drift details from the control API', async () => {
+    const res = await byName.sync_from_host!.handler({ roomId: 'abc12345' })
+    expect(res.isError).toBe(true)
+    expect(firstText(res)).toContain('"conflictReason":"room-source-modified"')
+    expect(firstText(res)).toContain('app/src/main/java/App.kt')
   })
 })

@@ -1,5 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import type { SourceType, WorkspaceMode } from '@devhotel/shared'
+import type { WorkspaceSnapshot } from '../workspaceDrift'
 
 export interface WebSpec {
   roomId: string
@@ -100,8 +101,12 @@ export interface IsolationBackend {
     workspaceVolumeRevision: number,
     log?: (line: string) => void
   ): Promise<void>
-  /** Content fingerprint excluding dependency/build caches and VCS internals. */
+  /** Transaction guard: excludes disposable build caches, retains Git control state, and prunes only Git objects. */
   fingerprintWorkspace(roomId: string, workspaceVolumeRevision: number, workspaceVolumeOverride?: string): Promise<string>
+  /** Path-addressable Host-sync source snapshot that filters generated output and VCS internals. */
+  snapshotWorkspace(roomId: string, workspaceVolumeRevision: number, workspaceVolumeOverride?: string): Promise<WorkspaceSnapshot>
+  /** Pre-R2C-8 fingerprint, used only to migrate a clean existing Room without accepting unknown drift. */
+  fingerprintWorkspaceLegacy(roomId: string, workspaceVolumeRevision: number): Promise<string>
   /**
    * Full immutable build-input digest. No workspace path is excluded; paths are
    * NUL-delimited and file type/metadata/content or symlink target are hashed.

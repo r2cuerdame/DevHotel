@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DevHotelError, type RoomOrchestrator } from '@devhotel/core'
+import { DevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -183,6 +183,46 @@ describe('agent control API host boundary', () => {
       const revoked = await fetch(url, { method: 'POST', headers })
       expect(revoked.status).toBe(403)
       expect(syncFromHost).not.toHaveBeenCalled()
+    } finally {
+      control.stop()
+    }
+  })
+
+  it('returns structured source drift without exposing the Host folder', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-drift-'))
+    roots.push(userData)
+    const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\private\\project' }
+    const syncFromHost = vi.fn(async () => {
+      throw new WorkspaceDriftError([{ path: 'app/src/main/java/App.kt', reason: 'modified' }])
+    })
+    const control = await startControlApi(
+      {
+        rooms: { get: () => room },
+        agentHostSyncAllowed: () => true,
+        syncFromHost
+      } as unknown as RoomOrchestrator,
+      userData,
+      'test'
+    )
+    try {
+      const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/sync-from-host`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${control.info.token}` }
+      })
+      const body = await response.json() as {
+        error: string
+        conflictReason: string
+        changedPaths: { path: string; reason: string }[]
+      }
+
+      expect(response.status).toBe(409)
+      expect(body).toEqual({
+        error: 'workspace_drift',
+        message: expect.stringContaining('App.kt'),
+        conflictReason: 'room-source-modified',
+        changedPaths: [{ path: 'app/src/main/java/App.kt', reason: 'modified' }]
+      })
+      expect(JSON.stringify(body)).not.toContain(room.sourceRef)
     } finally {
       control.stop()
     }
