@@ -68,8 +68,9 @@ apart from "broken".
 
 - FIFO by default, with an integer `priority` so an urgent release gate can go
   ahead of routine smoke runs.
-- One waiting entry per Room per device — a retrying agent rejoins its own
-  place instead of stacking duplicates ahead of everyone else.
+- One waiting entry per Room — an identical retry rejoins its own place, while
+  a changed request explicitly replaces the previous durable row instead of
+  leaving a stale request that can acquire another phone later.
 - A waiting request can be cancelled.
 - Waiters see the current owner, their position, and the reason.
 - With several phones connected, a request that names no specific device takes

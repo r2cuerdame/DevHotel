@@ -31,6 +31,8 @@ export interface DeviceBrokerOptions {
    * only a heartbeat gap *and* a dead owner does.
    */
   ownerLiveness?: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
+  /** Synchronous Room lifecycle fence used before a durable waiter is promoted. */
+  roomEligible?: (roomId: string) => boolean
   graceMs?: number
 }
 
@@ -63,6 +65,7 @@ export class AndroidDeviceBroker {
   private readonly adb: AdbHost
   private readonly now: () => number
   private readonly ownerLiveness: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
+  private readonly roomEligible: (roomId: string) => boolean
   private readonly graceMs: number
   /** When a dead owner was first observed, so the grace period is real time. */
   private readonly deathObservedAt = new Map<string, number>()
@@ -77,6 +80,7 @@ export class AndroidDeviceBroker {
     this.adb = opts.adb
     this.now = opts.now ?? (() => Date.now())
     this.ownerLiveness = opts.ownerLiveness ?? (() => 'unknown')
+    this.roomEligible = opts.roomEligible ?? (() => true)
     this.graceMs = opts.graceMs ?? LEASE_DEFAULT_GRACE_MS
   }
 
@@ -216,7 +220,7 @@ export class AndroidDeviceBroker {
 
   private describe(device: AndroidDevice): DeviceInventoryEntry {
     const lease = this.repo.activeLease(device.id)
-    const waiters = this.brokered(device) ? this.repo.waiting(device.id) : []
+    const waiters = this.brokered(device) ? this.matchingWaiters(device) : []
     return {
       ...this.publicDevice(device),
       brokered: this.brokered(device),
@@ -279,6 +283,59 @@ export class AndroidDeviceBroker {
     return true
   }
 
+  /** Unpinned queue rows are visible only on devices they can actually use. */
+  private matchingWaiters(device: AndroidDevice): DeviceQueueEntry[] {
+    return this.repo
+      .waiting(device.id)
+      .filter((entry) => this.roomEligible(entry.roomId) && this.matches(device, entry.constraints))
+  }
+
+  private sameQueuedRequest(
+    entry: DeviceQueueEntry,
+    request: DeviceRequest,
+    pinned: string | null,
+    ttlMs: number,
+    maxDurationMs: number
+  ): boolean {
+    const constraints = request.constraints ?? {}
+    return (
+      entry.deviceId === pinned &&
+      entry.project === request.project &&
+      entry.purpose === request.purpose &&
+      entry.workerId === request.workerId &&
+      entry.issueRef === (request.issueRef ?? null) &&
+      entry.runId === (request.runId ?? null) &&
+      entry.priority === (request.priority ?? 0) &&
+      entry.ttlMs === ttlMs &&
+      entry.maxDurationMs === maxDurationMs &&
+      entry.constraints.deviceId === constraints.deviceId &&
+      entry.constraints.nickname === constraints.nickname &&
+      entry.constraints.minApiLevel === constraints.minApiLevel &&
+      entry.constraints.connection === constraints.connection
+    )
+  }
+
+  private cancelRoomWaiters(roomId: string, at: string, reason: string, exceptId?: string): void {
+    const cancelled: DeviceQueueEntry[] = []
+    for (const entry of this.repo.waiting(null)) {
+      if (entry.roomId !== roomId || entry.id === exceptId) continue
+      cancelled.push(this.repo.resolveQueueEntry(entry.id, 'cancelled', at))
+    }
+    this.recordCancelledWaiters(cancelled, at, reason)
+  }
+
+  private recordCancelledWaiters(entries: DeviceQueueEntry[], at: string, reason: string): void {
+    for (const entry of entries) {
+      this.repo.recordEvent({
+        deviceId: entry.deviceId,
+        roomId: entry.roomId,
+        kind: 'cancelled',
+        detail: reason,
+        at
+      })
+    }
+  }
+
   /** Devices this request could ever run on, healthy or not. */
   private candidates(constraints: DeviceRequest['constraints']): AndroidDevice[] {
     return this.repo.listDevices().filter((device) => this.matches(device, constraints))
@@ -331,7 +388,7 @@ export class AndroidDeviceBroker {
 
     const free = candidates.find((device) => device.health === 'ready' && !this.repo.activeLease(device.id))
     if (free) {
-      const lease = this.repo.insertLease({
+      const grant = this.repo.grantLease({
         deviceId: free.id,
         roomId: request.roomId,
         project: request.project,
@@ -342,7 +399,12 @@ export class AndroidDeviceBroker {
         at,
         ttlMs,
         maxDurationMs
-      })
+      }, null)
+      this.recordCancelledWaiters(
+        grant.cancelledWaiters,
+        at,
+        'queued request superseded by an immediate device grant'
+      )
       this.repo.recordEvent({
         deviceId: free.id,
         roomId: request.roomId,
@@ -350,16 +412,22 @@ export class AndroidDeviceBroker {
         detail: `${request.project} took ${free.nickname} for ${request.purpose}`,
         at
       })
-      return { state: 'granted', lease, device: this.publicDevice(free) }
+      return { state: 'granted', lease: grant.lease, device: this.publicDevice(free) }
     }
 
     // Pin the queue to a specific device only when the request named one;
     // otherwise the entry stays free to be promoted by whichever phone frees up.
     const pinned = request.constraints?.deviceId ?? null
-    const existingEntry = this.repo.waitingForRoom(request.roomId, pinned)
-    const entry =
-      existingEntry ??
-      this.repo.enqueue({
+    const existingEntry = this.repo.waitingForRoom(request.roomId)
+    let entry: DeviceQueueEntry
+    if (existingEntry && this.sameQueuedRequest(existingEntry, request, pinned, ttlMs, maxDurationMs)) {
+      // Repair historical duplicate rows while preserving the idempotent token
+      // returned for the request the Room is already waiting on.
+      this.cancelRoomWaiters(request.roomId, at, 'duplicate queued request cancelled', existingEntry.id)
+      entry = existingEntry
+    } else {
+      if (existingEntry) this.cancelRoomWaiters(request.roomId, at, 'queued request replaced by a newer request')
+      entry = this.repo.enqueue({
         deviceId: pinned,
         roomId: request.roomId,
         project: request.project,
@@ -373,13 +441,12 @@ export class AndroidDeviceBroker {
         ttlMs,
         maxDurationMs
       })
-    if (!existingEntry) {
       this.repo.recordEvent({ deviceId: pinned, roomId: request.roomId, kind: 'queued', detail: `${request.project} is waiting for ${request.purpose}`, at })
     }
 
     const blocking = candidates.find((device) => this.repo.activeLease(device.id)) ?? candidates[0]!
     const holder = this.repo.activeLease(blocking.id)
-    const queue = this.repo.waiting(pinned ?? blocking.id)
+    const queue = this.matchingWaiters(blocking)
     const position = queue.findIndex((candidate) => candidate.id === entry.id) + 1
     return {
       state: 'queued',
@@ -458,10 +525,17 @@ export class AndroidDeviceBroker {
     if (!device || device.health !== 'ready' || this.repo.activeLease(deviceId)) return null
     const at = this.at()
     for (const entry of this.repo.waiting(deviceId)) {
+      if (this.repo.getQueueEntry(entry.id)?.state !== 'waiting') continue
+      if (!this.roomEligible(entry.roomId)) {
+        this.cancelRoomWaiters(entry.roomId, at, 'queued request cancelled because the Room is no longer eligible')
+        continue
+      }
       if (!this.matches(device, entry.constraints)) continue
-      if (this.repo.activeLeaseForRoom(entry.roomId)) continue
-      this.repo.resolveQueueEntry(entry.id, 'granted', at)
-      const lease = this.repo.insertLease({
+      if (this.repo.activeLeaseForRoom(entry.roomId)) {
+        this.cancelRoomWaiters(entry.roomId, at, 'stale queued request cancelled because the Room already owns a device')
+        continue
+      }
+      const grant = this.repo.grantLease({
         deviceId,
         roomId: entry.roomId,
         project: entry.project,
@@ -472,7 +546,12 @@ export class AndroidDeviceBroker {
         at,
         ttlMs: entry.ttlMs,
         maxDurationMs: entry.maxDurationMs
-      })
+      }, entry.id)
+      this.recordCancelledWaiters(
+        grant.cancelledWaiters,
+        at,
+        'duplicate queued request cancelled before promotion'
+      )
       this.repo.recordEvent({
         deviceId,
         roomId: entry.roomId,
@@ -480,7 +559,7 @@ export class AndroidDeviceBroker {
         detail: `${entry.project} was promoted from the queue onto ${device.nickname}`,
         at
       })
-      return lease
+      return grant.lease
     }
     return null
   }

@@ -168,6 +168,11 @@ export interface QueueInsert {
   maxDurationMs: number
 }
 
+export interface LeaseGrant {
+  lease: DeviceLease
+  cancelledWaiters: DeviceQueueEntry[]
+}
+
 export interface AndroidDevicesRepo {
   listDevices(): AndroidDevice[]
   getDevice(id: string): AndroidDevice | null
@@ -180,12 +185,13 @@ export interface AndroidDevicesRepo {
   latestLeaseForRoom(roomId: string): DeviceLease | null
   listActiveLeases(): DeviceLease[]
   getLease(id: string): DeviceLease | null
-  insertLease(input: LeaseInsert): DeviceLease
+  /** Atomically creates the lease and consumes this Room's durable queue rows. */
+  grantLease(input: LeaseInsert, queuedRequestId: string | null): LeaseGrant
   touchLease(id: string, heartbeatAt: string, activityAt: string | null): DeviceLease
   closeLease(id: string, state: 'released' | 'expired' | 'revoked', at: string, reason: string): DeviceLease
   acknowledgeRevokedLease(id: string, at: string, reason: string): DeviceLease
   waiting(deviceId: string | null): DeviceQueueEntry[]
-  waitingForRoom(roomId: string, deviceId: string | null): DeviceQueueEntry | null
+  waitingForRoom(roomId: string): DeviceQueueEntry | null
   getQueueEntry(id: string): DeviceQueueEntry | null
   enqueue(input: QueueInsert): DeviceQueueEntry
   resolveQueueEntry(id: string, state: 'granted' | 'cancelled', at: string): DeviceQueueEntry
@@ -271,31 +277,82 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
       const row = sqlite.prepare('SELECT * FROM android_device_leases WHERE id = ?').get(id) as unknown as LeaseRow | undefined
       return row ? toLease(row) : null
     },
-    insertLease(input) {
+    grantLease(input, queuedRequestId) {
       const id = randomUUID()
-      sqlite
-        .prepare(
-          `INSERT INTO android_device_leases
-             (id, device_id, room_id, project, issue_ref, run_id, worker_id, purpose, state,
-              acquired_at, heartbeat_at, activity_at, ttl_ms, max_duration_ms, released_at, release_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, NULL)`
-        )
-        .run(
-          id,
-          input.deviceId,
-          input.roomId,
-          input.project,
-          input.issueRef,
-          input.runId,
-          input.workerId,
-          input.purpose,
-          input.at,
-          input.at,
-          input.at,
-          input.ttlMs,
-          input.maxDurationMs
-        )
-      return repo.getLease(id)!
+      sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        if (queuedRequestId !== null) {
+          const chosen = sqlite
+            .prepare("SELECT * FROM android_device_queue WHERE id = ? AND state = 'waiting'")
+            .get(queuedRequestId) as unknown as QueueRow | undefined
+          if (!chosen) throw new Error(`no waiting queue entry: ${queuedRequestId}`)
+          if (chosen.room_id !== input.roomId) throw new Error('queued lease Room does not match the selected request')
+        }
+
+        const cancelledRows = (queuedRequestId === null
+          ? sqlite
+              .prepare("SELECT * FROM android_device_queue WHERE room_id = ? AND state = 'waiting' ORDER BY priority DESC, requested_at, rowid")
+              .all(input.roomId)
+          : sqlite
+              .prepare("SELECT * FROM android_device_queue WHERE room_id = ? AND state = 'waiting' AND id <> ? ORDER BY priority DESC, requested_at, rowid")
+              .all(input.roomId, queuedRequestId)) as unknown as QueueRow[]
+
+        // Insert first. If exclusivity or any other write fails, the surrounding
+        // transaction leaves every durable waiter in place for the next sweep.
+        sqlite
+          .prepare(
+            `INSERT INTO android_device_leases
+               (id, device_id, room_id, project, issue_ref, run_id, worker_id, purpose, state,
+                acquired_at, heartbeat_at, activity_at, ttl_ms, max_duration_ms, released_at, release_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, NULL)`
+          )
+          .run(
+            id,
+            input.deviceId,
+            input.roomId,
+            input.project,
+            input.issueRef,
+            input.runId,
+            input.workerId,
+            input.purpose,
+            input.at,
+            input.at,
+            input.at,
+            input.ttlMs,
+            input.maxDurationMs
+          )
+
+        if (queuedRequestId !== null) {
+          const granted = sqlite
+            .prepare("UPDATE android_device_queue SET state = 'granted', resolved_at = ? WHERE id = ? AND state = 'waiting'")
+            .run(input.at, queuedRequestId)
+          if (granted.changes !== 1) throw new Error(`no waiting queue entry: ${queuedRequestId}`)
+        }
+        for (const row of cancelledRows) {
+          const cancelled = sqlite
+            .prepare("UPDATE android_device_queue SET state = 'cancelled', resolved_at = ? WHERE id = ? AND state = 'waiting'")
+            .run(input.at, row.id)
+          if (cancelled.changes !== 1) throw new Error(`no waiting queue entry: ${row.id}`)
+        }
+        const leaseRow = sqlite.prepare('SELECT * FROM android_device_leases WHERE id = ?').get(id) as unknown as
+          | LeaseRow
+          | undefined
+        if (!leaseRow) throw new Error(`lease insert did not persist: ${id}`)
+        const lease = toLease(leaseRow)
+        sqlite.exec('COMMIT')
+
+        return {
+          lease,
+          cancelledWaiters: cancelledRows.map((row) => ({
+            ...toQueueEntry(row),
+            state: 'cancelled',
+            resolvedAt: input.at
+          }))
+        }
+      } catch (err) {
+        sqlite.exec('ROLLBACK')
+        throw err
+      }
     },
     touchLease(id, heartbeatAt, activityAt) {
       const changed = sqlite
@@ -343,10 +400,10 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
               .all(deviceId) as unknown as QueueRow[])
       return rows.map(toQueueEntry)
     },
-    waitingForRoom(roomId, deviceId) {
+    waitingForRoom(roomId) {
       const row = sqlite
-        .prepare("SELECT * FROM android_device_queue WHERE state = 'waiting' AND room_id = ? AND device_id IS ?")
-        .get(roomId, deviceId) as unknown as QueueRow | undefined
+        .prepare("SELECT * FROM android_device_queue WHERE state = 'waiting' AND room_id = ? ORDER BY priority DESC, requested_at, rowid LIMIT 1")
+        .get(roomId) as unknown as QueueRow | undefined
       return row ? toQueueEntry(row) : null
     },
     getQueueEntry(id) {

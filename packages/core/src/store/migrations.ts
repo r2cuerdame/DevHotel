@@ -227,10 +227,10 @@ export const migrations: Migration[] = [
         ttl_ms INTEGER NOT NULL,
         max_duration_ms INTEGER NOT NULL
       );
-      -- One waiting request per Room per device: a retrying agent rejoins its
-      -- own place in line instead of stacking duplicates ahead of everyone.
+      -- One waiting request per Room: a retrying agent rejoins an identical
+      -- request, while a changed request replaces the previous durable row.
       CREATE UNIQUE INDEX idx_android_queue_dedupe
-        ON android_device_queue(room_id, IFNULL(device_id, '')) WHERE state = 'waiting';
+        ON android_device_queue(room_id) WHERE state = 'waiting';
       CREATE INDEX idx_android_queue_order ON android_device_queue(state, priority DESC, requested_at);
       CREATE TABLE android_device_events (
         id TEXT PRIMARY KEY,

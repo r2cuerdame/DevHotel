@@ -108,6 +108,32 @@ describe('Rooms attach and release the shared phone', () => {
     expect(orch.inspectRoom('bbbb2222').device).toMatchObject({ project: 'MiracleKeyboard', purpose: 'keyboard' })
   })
 
+  it('cancels a crash-left waiter for a broken Room and promotes the next eligible Room', async () => {
+    const { orch } = setup()
+    orch.rooms.create(androidRoom('aaaa1111', 'Owner'))
+    orch.rooms.create(androidRoom('bbbb2222', 'BrokenWaiter'))
+    orch.rooms.create(androidRoom('cccc3333', 'LiveWaiter'))
+    await orch.refreshAndroidDevices()
+    const owner = await orch.attachAndroidDevice('aaaa1111', { purpose: 'smoke', workerId: 'worker-a' })
+    if (owner.state !== 'granted') throw new Error('unreachable')
+    await orch.attachAndroidDevice('bbbb2222', {
+      purpose: 'acceptance', workerId: 'worker-b', constraints: { deviceId: owner.device.id }
+    })
+    await orch.attachAndroidDevice('cccc3333', {
+      purpose: 'acceptance', workerId: 'worker-c', constraints: { deviceId: owner.device.id }
+    })
+    // Simulate a crash persisting the Room lifecycle before its queue cleanup.
+    orch.rooms.update('bbbb2222', { status: 'broken' })
+
+    await orch.releaseAndroidDevice('aaaa1111', 'owner finished')
+
+    expect(orch.devices.leaseForRoom('bbbb2222')).toBeNull()
+    expect(orch.devices.leaseForRoom('cccc3333')).toMatchObject({ project: 'LiveWaiter' })
+    expect(orch.androidDeviceStatus().recentEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'cancelled', roomId: 'bbbb2222' })
+    ]))
+  })
+
   it('gives the phone up when the Room is deleted', async () => {
     const { orch } = setup()
     orch.rooms.create(androidRoom('aaaa1111', 'AppDied'))

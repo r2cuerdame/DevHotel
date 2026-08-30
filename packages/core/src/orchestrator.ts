@@ -292,6 +292,10 @@ export class RoomOrchestrator {
         const room = this.rooms.get(lease.roomId)
         if (room === null || room.status === 'sleeping' || room.status === 'broken') return false
         return workerProcessLiveness(lease.workerId)
+      },
+      roomEligible: (roomId) => {
+        const room = this.rooms.get(roomId)
+        return room !== null && room.status !== 'sleeping' && room.status !== 'broken'
       }
     })
     registerQuickChanges(this.engine)

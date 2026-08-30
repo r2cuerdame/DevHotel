@@ -19,7 +19,10 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function makeBroker(now = { value: Date.parse('2026-08-29T00:00:00.000Z') }) {
+function makeBroker(
+  now = { value: Date.parse('2026-08-29T00:00:00.000Z') },
+  roomEligible: (roomId: string) => boolean = () => true
+) {
   const dir = mkdtempSync(join(tmpdir(), 'devhotel-devices-'))
   dirs.push(dir)
   const db = openDb(dir)
@@ -30,7 +33,8 @@ function makeBroker(now = { value: Date.parse('2026-08-29T00:00:00.000Z') }) {
   const broker = new AndroidDeviceBroker({
     repo: androidDevicesRepo(db),
     adb,
-    now: () => now.value
+    now: () => now.value,
+    roomEligible
   })
   return { broker, adb, db, now, dir }
 }
@@ -208,6 +212,41 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     expect(broker.listDevices().find((device) => device.id !== first.device.id)?.leaseOwner).toBeNull()
   })
 
+  it('counts and ranks unpinned waiters only on devices matching their constraints', async () => {
+    const { broker, adb } = makeBroker()
+    adb.phones = [
+      { serial: 'R5CT30USB01', state: 'device', model: 'Pixel_USB', release: '15', sdk: '35', usb: '1-4' },
+      { serial: '192.0.2.20:5555', state: 'device', model: 'Pixel_WiFi', release: '15', sdk: '35' }
+    ]
+    await broker.refreshInventory()
+    const usb = broker.listDevices().find((device) => device.connection === 'usb')!
+    const wireless = broker.listDevices().find((device) => device.connection === 'wireless')!
+    await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'UsbOwner', purpose: 'smoke', workerId: 'worker-a', constraints: { deviceId: usb.id }
+    })
+    await broker.requestDevice({
+      roomId: 'bbbb2222', project: 'WifiOwner', purpose: 'smoke', workerId: 'worker-b', constraints: { deviceId: wireless.id }
+    })
+
+    const usbWaiter = await broker.requestDevice({
+      roomId: 'cccc3333', project: 'UsbWaiter', purpose: 'acceptance', workerId: 'worker-c', constraints: { connection: 'usb' }
+    })
+    const wirelessWaiter = await broker.requestDevice({
+      roomId: 'dddd4444', project: 'WifiWaiter', purpose: 'acceptance', workerId: 'worker-d', constraints: { connection: 'wireless' }
+    })
+
+    expect(usbWaiter).toMatchObject({ state: 'queued', deviceId: null, position: 1 })
+    expect(wirelessWaiter).toMatchObject({ state: 'queued', deviceId: null, position: 1 })
+    expect(broker.listDevices().find((device) => device.id === usb.id)).toMatchObject({
+      queueDepth: 1,
+      waiters: [{ roomId: 'cccc3333', project: 'UsbWaiter' }]
+    })
+    expect(broker.listDevices().find((device) => device.id === wireless.id)).toMatchObject({
+      queueDepth: 1,
+      waiters: [{ roomId: 'dddd4444', project: 'WifiWaiter' }]
+    })
+  })
+
   it('hands the phone to the next queued Room when the owner releases it', async () => {
     const { broker, db } = makeBroker()
     await broker.refreshInventory()
@@ -222,6 +261,120 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     expect(released.promoted?.roomId).toBe('bbbb2222')
     expect(broker.listDevices()[0]).toMatchObject({ queueDepth: 1, leaseOwner: { roomId: 'bbbb2222' } })
     db.close()
+  })
+
+  it('keeps every durable waiter when an atomic queued grant cannot insert its lease', async () => {
+    const { broker, db } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'Owner', purpose: 'smoke', workerId: 'worker-a'
+    })
+    const queued = await broker.requestDevice({
+      roomId: 'bbbb2222', project: 'Waiter', purpose: 'acceptance', workerId: 'worker-b'
+    })
+    if (owner.state !== 'granted' || queued.state !== 'queued') throw new Error('unreachable')
+
+    // Model a pre-v6 duplicate row and make the lease write fail after the
+    // promotion transaction has selected both the chosen and sibling waiters.
+    db.sqlite.exec('DROP INDEX idx_android_queue_dedupe')
+    const repo = androidDevicesRepo(db)
+    const sibling = repo.enqueue({
+      deviceId: owner.device.id,
+      roomId: 'bbbb2222',
+      project: 'HistoricalDuplicate',
+      purpose: 'smoke',
+      workerId: 'worker-old',
+      issueRef: null,
+      runId: null,
+      constraints: { deviceId: owner.device.id },
+      priority: -1,
+      at: '2026-08-28T00:00:00.000Z',
+      ttlMs: 60_000,
+      maxDurationMs: 600_000
+    })
+    db.sqlite.exec(`
+      CREATE TRIGGER fail_waiter_lease_insert
+      BEFORE INSERT ON android_device_leases
+      WHEN NEW.room_id = 'bbbb2222'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated queued lease insert failure');
+      END;
+    `)
+
+    await expect(broker.release(owner.lease.id, 'owner finished')).rejects.toThrow(
+      /simulated queued lease insert failure/
+    )
+    expect(repo.activeLease(owner.device.id)).toBeNull()
+    expect(repo.getQueueEntry(queued.requestId)).toMatchObject({ state: 'waiting', resolvedAt: null })
+    expect(repo.getQueueEntry(sibling.id)).toMatchObject({ state: 'waiting', resolvedAt: null })
+
+    db.sqlite.exec('DROP TRIGGER fail_waiter_lease_insert')
+    await broker.refreshInventory()
+    const promoted = broker.leaseForRoom('bbbb2222')
+    expect(promoted).toMatchObject({ project: 'Waiter' })
+    expect(repo.getQueueEntry(queued.requestId)).toMatchObject({ state: 'granted' })
+    expect(repo.getQueueEntry(sibling.id)).toMatchObject({ state: 'cancelled' })
+
+    await broker.release(promoted!.id, 'waiter finished')
+    expect(repo.activeLease(owner.device.id)).toBeNull()
+    expect(repo.waiting(null).filter((entry) => entry.roomId === 'bbbb2222')).toHaveLength(0)
+  })
+
+  it('cancels an ineligible durable waiter and continues to the next live Room', async () => {
+    const eligibleRooms = new Set(['aaaa1111', 'bbbb2222', 'cccc3333'])
+    const now = { value: Date.parse('2026-08-29T00:00:00.000Z') }
+    const { broker, db } = makeBroker(now, (roomId) => eligibleRooms.has(roomId))
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'Owner', purpose: 'smoke', workerId: 'worker-a'
+    })
+    const stale = await broker.requestDevice({
+      roomId: 'bbbb2222', project: 'Gone', purpose: 'acceptance', workerId: 'worker-b'
+    })
+    await broker.requestDevice({
+      roomId: 'cccc3333', project: 'Live', purpose: 'acceptance', workerId: 'worker-c'
+    })
+    if (owner.state !== 'granted' || stale.state !== 'queued') throw new Error('unreachable')
+    eligibleRooms.delete('bbbb2222')
+
+    const released = await broker.release(owner.lease.id, 'owner finished')
+
+    expect(released.promoted?.roomId).toBe('cccc3333')
+    expect(broker.leaseForRoom('bbbb2222')).toBeNull()
+    expect(androidDevicesRepo(db).getQueueEntry(stale.requestId)).toMatchObject({ state: 'cancelled' })
+    expect(broker.status().recentEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'cancelled', roomId: 'bbbb2222' })
+    ]))
+  })
+
+  it('replaces a Room pending request and never auto-promotes a stale duplicate after release', async () => {
+    const { broker, db } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'Owner', purpose: 'smoke', workerId: 'worker-a'
+    })
+    if (owner.state !== 'granted') throw new Error('unreachable')
+    const first = await broker.requestDevice({
+      roomId: 'bbbb2222', project: 'Waiter', purpose: 'smoke', workerId: 'worker-b'
+    })
+    const replacement = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'Waiter',
+      purpose: 'acceptance',
+      workerId: 'worker-b',
+      constraints: { deviceId: owner.device.id }
+    })
+    if (first.state !== 'queued' || replacement.state !== 'queued') throw new Error('unreachable')
+
+    expect(replacement.requestId).not.toBe(first.requestId)
+    expect(androidDevicesRepo(db).getQueueEntry(first.requestId)).toMatchObject({ state: 'cancelled' })
+    expect(androidDevicesRepo(db).waiting(null).filter((entry) => entry.roomId === 'bbbb2222')).toHaveLength(1)
+
+    const firstRelease = await broker.release(owner.lease.id, 'owner finished')
+    expect(firstRelease.promoted?.roomId).toBe('bbbb2222')
+    const secondRelease = await broker.release(firstRelease.promoted!.id, 'waiter finished')
+    expect(secondRelease.promoted).toBeNull()
+    expect(androidDevicesRepo(db).waiting(null).filter((entry) => entry.roomId === 'bbbb2222')).toHaveLength(0)
   })
 
   it('keeps one waiting entry per Room instead of stacking duplicate requests', async () => {

@@ -50,6 +50,13 @@ describe('database migrations', () => {
         'android_device_queue',
         'android_device_events'
       ]))
+      const queueDedupe = sqlite
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_android_queue_dedupe'")
+        .get() as { sql: string }
+      expect(queueDedupe.sql.replace(/\s+/g, ' ')).toContain(
+        "ON android_device_queue(room_id) WHERE state = 'waiting'"
+      )
+      expect(queueDedupe.sql).not.toContain('IFNULL')
     } finally {
       sqlite.close()
     }
