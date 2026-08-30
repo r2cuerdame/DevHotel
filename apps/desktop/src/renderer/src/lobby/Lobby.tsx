@@ -4,6 +4,7 @@ import { RoomCard } from './RoomCard'
 import { NewRoomWizard } from './NewRoomWizard'
 import { SettingsModal } from './SettingsModal'
 import { HotelServicesModal } from './HotelServicesModal'
+import { AndroidPairingModal } from './AndroidPairingModal'
 
 export function Lobby(): React.JSX.Element {
   const rooms = useStore((s) => s.rooms)
@@ -12,6 +13,7 @@ export function Lobby(): React.JSX.Element {
   const t = useT()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [servicesOpen, setServicesOpen] = useState(false)
+  const [pairingOpen, setPairingOpen] = useState(false)
 
   return (
     <div className="lobby">
@@ -20,6 +22,7 @@ export function Lobby(): React.JSX.Element {
           Dev<b>Hotel</b>
         </span>
         <span className="spacer" />
+        <button className="btn pairing-entry" onClick={() => setPairingOpen(true)}>{t('pairing.entry')}</button>
         <button className="btn hotel-services-entry" onClick={() => setServicesOpen(true)}>{t('hotelServices.title')}</button>
         <button className="icon-btn" title={t('lobby.settings')} onClick={() => setSettingsOpen(true)}>
           ⚙
@@ -45,6 +48,7 @@ export function Lobby(): React.JSX.Element {
       {wizardOpen && <NewRoomWizard />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {servicesOpen && <HotelServicesModal onClose={() => setServicesOpen(false)} />}
+      {pairingOpen && <AndroidPairingModal onClose={() => setPairingOpen(false)} />}
     </div>
   )
 }

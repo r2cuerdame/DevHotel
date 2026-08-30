@@ -65,6 +65,7 @@ import {
   detectVmwareSetup,
   openOfficialVmwareDownload
 } from './vmwareSetup'
+import { AndroidPairingIpc } from './androidPairingIpc'
 
 export function registerIpc(opts: {
   win: BrowserWindow
@@ -141,6 +142,13 @@ export function registerIpc(opts: {
   const send = (channel: string, ...args: unknown[]): void => {
     if (!win.isDestroyed()) win.webContents.send(channel, ...args)
   }
+  const androidPairing = new AndroidPairingIpc(orch.devices, {
+    onPromptClosed: (event) => send(IPC.evAndroidPairingPromptClosed, event)
+  })
+  win.webContents.on('render-process-gone', () => androidPairing.dispose())
+  // Closing the main window hides it to the tray. Treat that as prompt
+  // dismissal so a hidden DOM cannot retain a code until the app is reopened.
+  win.on('hide', () => androidPairing.dispose())
 
   orch.onEvent((e) => {
     send(IPC.evRoomEvent, e)
@@ -396,6 +404,10 @@ export function registerIpc(opts: {
     // emulator, never a synthetic Host click on the preview. See androidInput.ts.
     return orch.execInRoom(safeRoomId, androidActionCommand(safeAction), { timeoutMs: 20_000 }, 'user')
   })
+  handle(IPC.androidPairingDiscover, () => androidPairing.discover())
+  handle(IPC.androidPairingBegin, (_event, input) => androidPairing.begin(input))
+  handle(IPC.androidPairingSubmit, (_event, input) => androidPairing.submit(input))
+  handle(IPC.androidPairingDismiss, (_event, input) => androidPairing.dismiss(input))
 
   handle(IPC.previewSetBounds, (_event, roomId, bounds) =>
     previews.attach(zRoomId.parse(roomId), zPreviewBounds.parse(bounds))

@@ -1,8 +1,10 @@
 import type { Translation } from './index'
 import { hotelServicesCommon } from './hotelServicesCommon'
+import { pairingCommon } from './pairingCommon'
 
 export const zhCN: Translation = {
   ...hotelServicesCommon,
+  ...pairingCommon,
   'common.cancel': '取消',
   'common.back': '返回',
   'common.close': '关闭',

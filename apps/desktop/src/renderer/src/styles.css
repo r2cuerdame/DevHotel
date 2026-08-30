@@ -1761,3 +1761,185 @@ code,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* ---------- trusted Android pairing ---------- */
+
+.pairing-entry {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+
+.android-pairing-modal {
+  width: 620px;
+}
+
+.android-pairing-head,
+.pairing-section-title,
+.pairing-prompt-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.android-pairing-head h2 {
+  margin: 4px 0 0;
+}
+
+.pairing-security-note,
+.pairing-one-shot,
+.pairing-expiry-block {
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pairing-security-note {
+  margin: 14px 0 18px;
+  color: var(--linen);
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 34%, var(--line));
+}
+
+.pairing-centered,
+.pairing-empty {
+  padding: 28px 12px;
+  color: var(--dim);
+  text-align: center;
+}
+
+.pairing-section-title {
+  margin-bottom: 9px;
+}
+
+.pairing-candidates {
+  display: grid;
+  gap: 8px;
+}
+
+.pairing-candidate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  color: var(--linen);
+  text-align: left;
+  background: var(--walnut-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.pairing-candidate:hover:not(:disabled) {
+  border-color: var(--brass);
+}
+
+.pairing-candidate span:first-child,
+.pairing-candidate small {
+  display: block;
+}
+
+.pairing-candidate small {
+  margin-top: 3px;
+  color: var(--dim);
+}
+
+.pairing-expiry {
+  flex: 0 0 auto;
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.pairing-consent,
+.pairing-code-panel {
+  padding: 16px;
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.pairing-consent h3,
+.pairing-code-panel h3,
+.pairing-result h3 {
+  margin: 0 0 8px;
+}
+
+.pairing-consent p,
+.pairing-code-panel p {
+  line-height: 1.5;
+}
+
+.pairing-one-shot {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  border-left: 2px solid var(--warn);
+}
+
+.pairing-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 16px 0 12px;
+  line-height: 1.45;
+}
+
+.pairing-check input {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+
+.pairing-expiry-block {
+  color: var(--warn);
+  text-align: center;
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--line));
+}
+
+.pairing-code-panel label {
+  display: block;
+  margin: 16px 0 6px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.pairing-code-input {
+  width: 100%;
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: 24px;
+  letter-spacing: 0.45em;
+  text-align: center;
+}
+
+.pairing-prompt-meta {
+  margin-top: 9px;
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.pairing-result {
+  padding: 18px;
+  text-align: center;
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+}
+
+.pairing-result[data-kind='success'] {
+  border-left-color: var(--ok);
+}
+
+.pairing-result[data-kind='error'] {
+  border-left-color: var(--bad);
+}
+
+.pairing-result-code {
+  display: inline-block;
+  margin: 8px 0;
+  padding: 4px 7px;
+  color: var(--dim);
+  background: var(--walnut-2);
+  border-radius: 4px;
+}

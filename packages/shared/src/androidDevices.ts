@@ -218,6 +218,103 @@ export interface DeviceBrokerStatus {
   recentEvents: DeviceEvent[]
 }
 
+/**
+ * Trusted-desktop-only pairing IPC. These contracts intentionally contain no
+ * address, port, service name or pairing code. Merely exporting the types does
+ * not expose a Control API or MCP operation.
+ */
+export type AndroidPairingUiCode =
+  | 'candidates-ready'
+  | 'pairing-unavailable'
+  | 'pairing-discovery-failed'
+  | 'candidate-unknown'
+  | 'candidate-stale'
+  | 'candidate-expired'
+  | 'candidate-consumed'
+  | 'capture-busy'
+  | 'capture-required'
+  | 'capture-ready'
+  | 'capture-cancelled'
+  | 'invalid-pairing-code'
+  | 'paired'
+  | 'pairing-failed'
+  | 'prompt-closed'
+
+export interface AndroidPairingUiEvidence {
+  kind: 'adb-pairing'
+  outcome: 'discovered' | 'capture-ready' | 'capture-cancelled' | 'paired' | 'failed'
+  code: AndroidPairingUiCode
+  at: string
+  candidateCount?: number
+}
+
+export interface AndroidPairingUiCandidate {
+  /** Process-local UUID; never an ADB endpoint or device identity. */
+  candidateId: string
+  generation: number
+  label: string
+  expiresAt: string
+}
+
+export interface AndroidPairingUiFailure {
+  ok: false
+  code: Exclude<AndroidPairingUiCode, 'candidates-ready' | 'capture-ready' | 'capture-cancelled' | 'paired'>
+  message: string
+  evidence: AndroidPairingUiEvidence
+}
+
+export type AndroidPairingUiDiscoveryResult =
+  | {
+      ok: true
+      code: 'candidates-ready'
+      generation: number
+      candidates: AndroidPairingUiCandidate[]
+      evidence: AndroidPairingUiEvidence
+    }
+  | AndroidPairingUiFailure
+
+export type AndroidPairingUiPromptResult =
+  | {
+      ok: true
+      code: 'capture-ready'
+      promptId: string
+      expiresAt: string
+      evidence: AndroidPairingUiEvidence
+    }
+  | AndroidPairingUiFailure
+
+export type AndroidPairingUiCompletionResult =
+  | { ok: true; code: 'paired'; evidence: AndroidPairingUiEvidence }
+  | AndroidPairingUiFailure
+
+export type AndroidPairingUiDismissResult =
+  | { ok: true; code: 'capture-cancelled'; evidence: AndroidPairingUiEvidence }
+  | AndroidPairingUiFailure
+
+export interface AndroidPairingPromptClosedEvent {
+  promptId: string
+  reason: 'expired' | 'dismissed'
+}
+
+export const zAndroidPairingCandidateRef = z
+  .object({
+    candidateId: z.string().uuid(),
+    generation: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
+  })
+  .strict()
+export type AndroidPairingCandidateRef = z.infer<typeof zAndroidPairingCandidateRef>
+
+export const zAndroidPairingPromptRef = z.object({ promptId: z.string().uuid() }).strict()
+export type AndroidPairingPromptRef = z.infer<typeof zAndroidPairingPromptRef>
+
+export const zAndroidPairingCodeSubmission = z
+  .object({
+    promptId: z.string().uuid(),
+    code: z.string().regex(/^\d{6}$/, 'exactly six digits')
+  })
+  .strict()
+export type AndroidPairingCodeSubmission = z.infer<typeof zAndroidPairingCodeSubmission>
+
 /** Structured reasons an ADB operation was refused, so callers can branch. */
 export type DeviceDenialCode =
   | 'no-lease'

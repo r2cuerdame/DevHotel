@@ -61,6 +61,10 @@ export const IPC = {
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
   androidAction: 'android:action',
+  androidPairingDiscover: 'android:pairing:discover',
+  androidPairingBegin: 'android:pairing:begin',
+  androidPairingSubmit: 'android:pairing:submit',
+  androidPairingDismiss: 'android:pairing:dismiss',
   previewSetBounds: 'preview:setBounds',
   previewSetVisible: 'preview:setVisible',
   previewDetach: 'preview:detach',
@@ -75,6 +79,7 @@ export const IPC = {
   evTermExit: 'ev:termExit',
   evPreviewState: 'ev:previewState',
   evPreviewDevTools: 'ev:previewDevTools',
+  evAndroidPairingPromptClosed: 'ev:androidPairingPromptClosed',
   evUpdate: 'ev:update'
 } as const
 
@@ -297,6 +302,13 @@ export interface IpcApi {
   android: {
     /** drive a phone control (navigation key or screen rotation) on the room's emulator */
     action(roomId: string, action: import('./control').AndroidAction): Promise<void>
+    /** Trusted desktop-only flow. No corresponding Control API or MCP methods exist. */
+    pairing: {
+      discover(): Promise<import('./androidDevices').AndroidPairingUiDiscoveryResult>
+      begin(input: import('./androidDevices').AndroidPairingCandidateRef): Promise<import('./androidDevices').AndroidPairingUiPromptResult>
+      submit(input: import('./androidDevices').AndroidPairingCodeSubmission): Promise<import('./androidDevices').AndroidPairingUiCompletionResult>
+      dismiss(input: import('./androidDevices').AndroidPairingPromptRef): Promise<import('./androidDevices').AndroidPairingUiDismissResult>
+    }
   }
   preview: {
     setBounds(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>

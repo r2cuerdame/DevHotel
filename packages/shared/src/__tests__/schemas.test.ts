@@ -15,6 +15,11 @@ import {
   zRunOutputQuery
 } from '../control'
 import { zGitHubToken, zHotelServiceAssignmentInput, zHotelServiceManifest } from '../hotelServices'
+import {
+  zAndroidPairingCandidateRef,
+  zAndroidPairingCodeSubmission,
+  zAndroidPairingPromptRef
+} from '../androidDevices'
 
 const serviceManifest = {
   schemaVersion: 1 as const,
@@ -71,6 +76,25 @@ describe('GitHub Hotel credential input', () => {
     expect(zGitHubToken.safeParse(`github_pat_${'a'.repeat(510)}`).success).toBe(false)
     expect(zGitHubToken.safeParse('github_pat_1234567890 secret').success).toBe(false)
     expect(zGitHubToken.safeParse('github-pat-123456789012345').success).toBe(false)
+  })
+})
+
+describe('trusted Android pairing IPC input', () => {
+  const candidateId = '11111111-2222-4333-8444-555555555555'
+  const promptId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+
+  it('accepts only opaque candidate and prompt capabilities', () => {
+    expect(zAndroidPairingCandidateRef.parse({ candidateId, generation: 2 })).toEqual({ candidateId, generation: 2 })
+    expect(zAndroidPairingPromptRef.parse({ promptId })).toEqual({ promptId })
+    expect(zAndroidPairingCandidateRef.safeParse({ candidateId, generation: 2, endpoint: '192.0.2.1:37117' }).success).toBe(false)
+    expect(zAndroidPairingCandidateRef.safeParse({ candidateId: '192.0.2.1:37117', generation: 2 }).success).toBe(false)
+  })
+
+  it('accepts an exact six-digit prompt-scoped code and rejects extra endpoint input', () => {
+    expect(zAndroidPairingCodeSubmission.parse({ promptId, code: '012345' })).toEqual({ promptId, code: '012345' })
+    expect(zAndroidPairingCodeSubmission.safeParse({ promptId, code: '12345' }).success).toBe(false)
+    expect(zAndroidPairingCodeSubmission.safeParse({ promptId, code: '12345a' }).success).toBe(false)
+    expect(zAndroidPairingCodeSubmission.safeParse({ promptId, code: '123456', endpoint: '192.0.2.1:37117' }).success).toBe(false)
   })
 })
 

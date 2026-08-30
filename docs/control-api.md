@@ -149,8 +149,10 @@ emulator cannot reproduce, then release it.
 
 There is deliberately no Control API or MCP pairing operation. Secure wireless
 pairing candidates and their private mDNS endpoints live only inside the Host
-broker for a future trusted desktop consent flow; agents cannot provide an
-endpoint, port, token or pairing code. All JSON responses pass through the same
+broker. Pairing is available solely through the trusted DevHotel desktop
+dialog, which requires prompt-specific explicit user consent and keeps the
+one-time code out of application state. Agents cannot provide an endpoint,
+port, token or pairing code. All JSON responses pass through the same
 structured secret-redaction boundary used by diagnostics, logs and device
 events.
 ### Rooms

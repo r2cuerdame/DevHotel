@@ -170,9 +170,9 @@ drive, with nothing in the caller changing and no serial ever written by hand.
 Once attached, an offline/unauthorized phone or unavailable Host ADB fails that
 physical run; DevHotel never silently reports emulator results as physical proof.
 
-## Secure wireless-pairing foundation
+## Secure wireless pairing with explicit desktop consent
 
-Pairing is Host-owned and is **not** an agent operation. Core can poll the
+Pairing is Host-owned and is **not** an agent operation. Core polls the
 Host's `_adb-tls-pairing._tcp` mDNS services, but it keeps every resolved
 address, port and service name in process memory. A trusted desktop flow sees
 only a random UUID candidate, a discovery generation, a generic label and a
@@ -188,6 +188,26 @@ discovered endpoint>`; it is never an argv value. Raw pairing stdout/stderr is
 discarded because ADB echoes transport details. The durable event is only the
 fixed fact that secure pairing succeeded or failed.
 
+The Lobby's **Pair Android device** dialog is the only pairing entry point. A
+user must select a currently advertised opaque candidate and check a fresh
+confirmation box before the broker creates a prompt-scoped UUID. The expiry
+countdown and single-use rule remain visible beside both the consent and code
+steps. The six-digit code lives only in an uncontrolled password input: the
+renderer reads it for one IPC invocation, clears the DOM immediately, and does
+not put it in React state, settings, history, or a diagnostic message. The IPC
+adapter copies an explicit allowlist of result fields and replaces every error
+with a fixed, secret-free code and message.
+
+Closing the dialog, clicking its backdrop, expiry, hiding the main window, or
+losing the renderer consumes the prompt, clears the broker's capture/redaction
+scope, and makes the opaque capability unusable. If `adb pair` is already in
+flight, the renderer input still clears immediately while the broker keeps its
+guard until that command settles (with the core TTL as the crash fallback), so
+dismissal cannot create an unguarded in-flight interval. A completed attempt is
+also single-use; retrying always starts with a newly discovered candidate and
+a new explicit confirmation. Success and failure evidence contains only the
+fixed outcome, fixed code, timestamp, and optional candidate count.
+
 While the trusted prompt is active, Android pixel capture fails closed: a
 pairing dialog or code cannot be made safe by text redaction. Text and
 structured values share one redactor at the log, device-event, diagnostic and
@@ -197,10 +217,11 @@ MCP output. A pairing attempt consumes its candidate immediately, but the
 capture guard remains held until the trusted prompt explicitly clears and
 dismisses its code field; expiry is the crash fallback.
 
-This foundation intentionally has no Control API route, MCP tool, or renderer
-UI yet. Agents cannot submit an endpoint or invoke pairing through raw ADB;
-`adb pair` remains a broker-only forbidden verb. A later trusted desktop UI can
-wire the internal candidate flow without widening the Room/Host boundary.
+There is intentionally no Control API route or MCP tool for this flow. Agents
+cannot discover candidates, submit an endpoint or code, or invoke pairing
+through raw ADB; `adb pair` remains a broker-only forbidden verb. The desktop
+IPC handlers accept calls only from DevHotel's trusted main frame and never
+widen the Room/Host boundary.
 
 ## Observability
 

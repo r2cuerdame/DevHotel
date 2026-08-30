@@ -76,7 +76,13 @@ const api: IpcApi = {
     cleanUninstall: () => ipcRenderer.invoke(IPC.cleanUninstall)
   },
   android: {
-    action: (roomId, action) => ipcRenderer.invoke(IPC.androidAction, roomId, action)
+    action: (roomId, action) => ipcRenderer.invoke(IPC.androidAction, roomId, action),
+    pairing: {
+      discover: () => ipcRenderer.invoke(IPC.androidPairingDiscover),
+      begin: (input) => ipcRenderer.invoke(IPC.androidPairingBegin, input),
+      submit: (input) => ipcRenderer.invoke(IPC.androidPairingSubmit, input),
+      dismiss: (input) => ipcRenderer.invoke(IPC.androidPairingDismiss, input)
+    }
   },
   preview: {
     setBounds: (roomId, bounds) => ipcRenderer.invoke(IPC.previewSetBounds, roomId, bounds),
