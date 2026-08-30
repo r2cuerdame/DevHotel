@@ -231,7 +231,7 @@ export async function startControlApi(
               const outcome = await orch.safeResyncFromHost(
                 safeRoomId,
                 'agent',
-                body.confirmDiscardRoomChanges
+                body.confirmationToken
               )
               sendJson(res, outcome.status === 'confirmation-required' ? 409 : 200, outcome)
             } catch (error) {

@@ -232,8 +232,9 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-safe-resync-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\private\\project' }
-    const safeResyncFromHost = vi.fn(async (_roomId: string, _actor: string, confirmed: boolean) =>
-      confirmed
+    const confirmationToken = '11111111-2222-4333-8444-555555555555'
+    const safeResyncFromHost = vi.fn(async (_roomId: string, _actor: string, token?: string) =>
+      token === confirmationToken
         ? {
             status: 'synced',
             before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
@@ -248,7 +249,7 @@ describe('agent control API host boundary', () => {
             status: 'confirmation-required',
             before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
             drift: { status: 'changed', changedPaths: [{ path: 'src/app.ts', reason: 'modified' }] },
-            confirmation: { required: true, provided: false },
+            confirmation: { required: true, provided: false, token: confirmationToken },
             recoveryGuidance: ['export or commit first']
           }
     )
@@ -270,9 +271,13 @@ describe('agent control API host boundary', () => {
       const preview = await fetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ confirmDiscardRoomChanges: false })
+        body: JSON.stringify({})
       })
-      const previewBody = await preview.json() as { status: string; drift: { changedPaths: { path: string }[] } }
+      const previewBody = await preview.json() as {
+        status: string
+        drift: { changedPaths: { path: string }[] }
+        confirmation: { token: string }
+      }
 
       expect(preview.status).toBe(409)
       expect(previewBody).toMatchObject({
@@ -284,15 +289,15 @@ describe('agent control API host boundary', () => {
       const confirmed = await fetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ confirmDiscardRoomChanges: true })
+        body: JSON.stringify({ confirmationToken: previewBody.confirmation.token })
       })
       expect(confirmed.status).toBe(200)
       await expect(confirmed.json()).resolves.toMatchObject({
         status: 'synced',
         retainedWorkspaceVolumeRevision: 1
       })
-      expect(safeResyncFromHost).toHaveBeenNthCalledWith(1, 'room1abc', 'agent', false)
-      expect(safeResyncFromHost).toHaveBeenNthCalledWith(2, 'room1abc', 'agent', true)
+      expect(safeResyncFromHost).toHaveBeenNthCalledWith(1, 'room1abc', 'agent', undefined)
+      expect(safeResyncFromHost).toHaveBeenNthCalledWith(2, 'room1abc', 'agent', confirmationToken)
     } finally {
       control.stop()
     }

@@ -144,7 +144,8 @@ export interface HostResyncConfirmationRequired {
   status: 'confirmation-required'
   before: HostResyncStateFacts
   drift: HostResyncDriftFacts
-  confirmation: { required: true; provided: false }
+  /** Opaque, single-use capability bound to this exact inspected snapshot. */
+  confirmation: { required: true; provided: false; token: string }
   recoveryGuidance: string[]
 }
 

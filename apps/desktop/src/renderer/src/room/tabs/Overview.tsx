@@ -69,16 +69,33 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
       try {
         const approvedHostPath = await api.app.pickFolder()
         if (!approvedHostPath) return
-        let outcome = await api.rooms.safeResyncFromHost(room.id, approvedHostPath, false)
-        if (outcome.status === 'confirmation-required') {
+        let outcome = await api.rooms.safeResyncFromHost(room.id, approvedHostPath)
+        while (outcome.status === 'confirmation-required') {
+          const quotePath = (path: string): string =>
+            JSON.stringify(
+              path.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+                `[U+${character.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}]`
+              )
+            )
+          const shownChanges = outcome.drift.changedPaths.slice(0, 50)
+          const omittedChanges = outcome.drift.changedPaths.length - shownChanges.length
           const paths = outcome.drift.changedPaths.length > 0
-            ? outcome.drift.changedPaths.map((change) => `${change.path} (${change.reason})`).join('\n')
-            : 'The previous path baseline is unavailable, so the exact changed paths cannot be proven.'
+            ? [
+                ...shownChanges.map((change) => `${quotePath(change.path)} (${change.reason})`),
+                ...(omittedChanges > 0 ? [`… and ${omittedChanges} more changed paths`] : [])
+              ].join('\n')
+            : outcome.drift.status === 'unknown'
+              ? 'The previous path baseline is unavailable, so the exact changed paths cannot be proven.'
+              : 'The Room snapshot changed after the previous confirmation. Review this fresh preview.'
           const confirmed = window.confirm(
             `${t('working.modifiedHint')}\n\n${paths}\n\n${outcome.recoveryGuidance.join('\n')}`
           )
           if (!confirmed) return
-          outcome = await api.rooms.safeResyncFromHost(room.id, approvedHostPath, true)
+          outcome = await api.rooms.safeResyncFromHost(
+            room.id,
+            approvedHostPath,
+            outcome.confirmation.token
+          )
         }
         if (outcome.status !== 'synced') return
         await Promise.all([refreshInspection(room.id), refreshRooms()])

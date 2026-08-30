@@ -179,7 +179,7 @@ export const zAgentCloneBody = z.object({
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 export const zSafeHostResyncBody = z.object({
-  confirmDiscardRoomChanges: z.boolean().optional().default(false)
+  confirmationToken: z.string().uuid().optional()
 }).strict()
 
 /** Phone controls the Android preview strip can drive on the emulator. */

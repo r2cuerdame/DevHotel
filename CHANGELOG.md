@@ -5,8 +5,8 @@
 ### Host resync is one guarded decision
 
 - The Working State card and new `safe_resync_from_host` MCP tool now perform drift inspection, explicit confirmation when needed, baseline acceptance, and Host import as one Room-locked operation. Users no longer have to infer a safe order from separate Reset baseline and Sync buttons.
-- A refused preview is read-only and returns exact Room-relative source changes, structured before facts, and recovery guidance. Old Rooms whose path baseline cannot be reconstructed fail closed as `unknown` rather than guessing that they are clean.
-- Confirmation is bound to the exact inspected workspace snapshot. DevHotel stages the Host import, pauses the live Room, rechecks the source generation, and discards the staged import if a terminal or process changed anything meanwhile.
+- A refused preview is read-only and returns exact Room-relative source changes, structured before facts, recovery guidance, and an opaque single-use confirmation token. Old Rooms whose path baseline cannot be reconstructed fail closed as `unknown` rather than guessing that they are clean.
+- Confirmation is bound to the exact inspected workspace snapshot. Stale, replayed, wrong-Room, or cross-actor tokens only produce a fresh preview. DevHotel stages the Host import, pauses the live Room, rechecks the source generation, and discards the staged import if a terminal, process, or queued file push changed anything meanwhile.
 - Successful resyncs return structured before/after revisions and name the replaced workspace generation retained for recovery. The lower-level baseline and sync endpoints remain available for compatibility.
 
 ### Your desktop stays yours while a Room's tests run

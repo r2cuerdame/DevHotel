@@ -223,7 +223,7 @@ export interface IpcApi {
     safeResyncFromHost(
       roomId: string,
       approvedHostPath: string,
-      confirmDiscardRoomChanges: boolean
+      confirmationToken?: string
     ): Promise<SafeHostResyncOutcome>
     moveIntoHotel(roomId: string, approvedHostPath: string): Promise<RoomRecord>
     /** accept the Room's current files as the Host sync baseline */

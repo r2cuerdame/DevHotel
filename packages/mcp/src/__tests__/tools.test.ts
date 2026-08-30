@@ -8,6 +8,7 @@ import { MCP_METADATA } from '../metadata'
 const TOKEN = 'test-token'
 const RUN_ID = '11111111-2222-3333-4444-555555555555'
 const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
+const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 const runningOperation = {
   id: OPERATION_ID,
   kind: 'room-start',
@@ -70,7 +71,7 @@ beforeAll(async () => {
         }))
       }
       if (req.url === '/v1/rooms/abc12345/safe-resync-from-host') {
-        if (JSON.parse(raw).confirmDiscardRoomChanges === true) {
+        if (JSON.parse(raw).confirmationToken === RESYNC_TOKEN) {
           return void res.end(JSON.stringify({
             status: 'synced',
             retainedWorkspaceVolumeRevision: 1,
@@ -84,6 +85,7 @@ beforeAll(async () => {
             status: 'changed',
             changedPaths: [{ path: 'src/app.ts', reason: 'modified' }]
           },
+          confirmation: { required: true, provided: false, token: RESYNC_TOKEN },
           recoveryGuidance: ['export or commit first']
         }))
       }
@@ -331,7 +333,7 @@ describe('makeTools', () => {
     expect(firstText(res)).toMatch(/operationId|roomId/)
   })
 
-  it('safe_resync_from_host refuses by default and forwards an explicit confirmation', async () => {
+  it('safe_resync_from_host forwards only the opaque token returned by its preview', async () => {
     const preview = await byName.safe_resync_from_host!.handler({ roomId: 'abc12345' })
     expect(preview.isError).toBe(true)
     expect(firstText(preview)).toContain('confirmation-required')
@@ -339,12 +341,12 @@ describe('makeTools', () => {
 
     const confirmed = await byName.safe_resync_from_host!.handler({
       roomId: 'abc12345',
-      confirmDiscardRoomChanges: true
+      confirmationToken: RESYNC_TOKEN
     })
     expect(confirmed.isError).toBeUndefined()
     expect(firstText(confirmed)).toContain('"status": "synced"')
     const requests = seen.filter((request) => request.url === '/v1/rooms/abc12345/safe-resync-from-host')
-    expect(requests.at(-2)?.body).toEqual({ confirmDiscardRoomChanges: false })
-    expect(requests.at(-1)?.body).toEqual({ confirmDiscardRoomChanges: true })
+    expect(requests.at(-2)?.body).toEqual({})
+    expect(requests.at(-1)?.body).toEqual({ confirmationToken: RESYNC_TOKEN })
   })
 })

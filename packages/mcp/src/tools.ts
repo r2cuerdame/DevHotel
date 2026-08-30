@@ -420,13 +420,13 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'safe_resync_from_host',
       description:
-        'Preferred Host resync operation. It inspects meaningful Room-side source drift, returns exact Room-relative changed paths without modifying anything when confirmation is required, and only then performs the baseline acceptance plus Host import as one guarded operation. Retry with confirmDiscardRoomChanges=true only after reviewing/exporting the reported changes. The replaced Room generation is retained for recovery.',
+        'Preferred Host resync operation. Call without a token to inspect meaningful Room-side source drift. If confirmation is required, review/export the exact Room-relative changes and repeat with the returned opaque confirmationToken. The token is single-use and bound to that exact snapshot; any intervening edit returns a fresh preview instead of discarding unseen work. The replaced Room generation is retained for recovery.',
       schema: {
         roomId: zRoomId,
-        confirmDiscardRoomChanges: z.boolean().optional().describe('default false; explicitly accept replacement of inspected Room-side source changes')
+        confirmationToken: z.string().uuid().optional().describe('single-use token returned by the immediately preceding confirmation-required preview')
       },
       handler: wrap(async (a) =>
-        (await getClient()).safeResyncFromHost(a.roomId, a.confirmDiscardRoomChanges ?? false)
+        (await getClient()).safeResyncFromHost(a.roomId, a.confirmationToken)
       )
     },
     {

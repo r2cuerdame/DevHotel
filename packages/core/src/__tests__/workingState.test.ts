@@ -292,7 +292,7 @@ describe('Room-owned working state', () => {
     backend.workspaceFingerprintValue = 'b'.repeat(64)
     backend.workspaceSnapshotEntries = [{ path: 'src/app.ts', kind: 'file', identity: 'room-edit' }]
 
-    const refused = await orch.safeResyncFromHost(room.id, 'agent', false)
+    const refused = await orch.safeResyncFromHost(room.id, 'agent')
 
     expect(refused).toMatchObject({
       status: 'confirmation-required',
@@ -302,12 +302,13 @@ describe('Room-owned working state', () => {
         baselineEvidence: 'path-snapshot',
         changedPaths: [{ path: 'src/app.ts', reason: 'modified' }]
       },
-      confirmation: { required: true, provided: false }
+      confirmation: { required: true, provided: false, token: expect.any(String) }
     })
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
     expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('old-source')
 
-    const completed = await orch.safeResyncFromHost(room.id, 'agent', true)
+    if (refused.status !== 'confirmation-required') throw new Error('expected a confirmation preview')
+    const completed = await orch.safeResyncFromHost(room.id, 'agent', refused.confirmation.token)
 
     expect(completed).toMatchObject({
       status: 'synced',
@@ -321,6 +322,170 @@ describe('Room-owned working state', () => {
     expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r2`)
     expect(orch.settings.get(retainedWorkspaceGenKey(room.id))).toBe('1')
     expect(orch.listChanges(room.id)[0]).toMatchObject({ kind: 'safe-resync-from-host', actor: 'agent' })
+
+    const importCount = backend.calls.filter((call) => call.startsWith('importHostFolder:')).length
+    const replay = await orch.safeResyncFromHost(room.id, 'agent', refused.confirmation.token)
+    expect(replay).toMatchObject({
+      status: 'confirmation-required',
+      drift: { status: 'clean' },
+      confirmation: { required: true, provided: false, token: expect.any(String) }
+    })
+    expect(backend.calls.filter((call) => call.startsWith('importHostFolder:'))).toHaveLength(importCount)
+  })
+
+  it('returns a fresh preview when Room source changes after the confirmation token was issued', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(
+      workspaceSyncBaseKey(room.id),
+      serializeWorkspaceSnapshot({
+        fingerprint: 'a'.repeat(64),
+        entries: [{ path: 'src/app.ts', kind: 'file', identity: 'baseline' }]
+      })
+    )
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    backend.workspaceSnapshotEntries = [
+      { path: 'src/app.ts', kind: 'file', identity: 'first-room-edit' }
+    ]
+
+    const preview = await orch.safeResyncFromHost(room.id, 'user')
+    if (preview.status !== 'confirmation-required') throw new Error('expected a confirmation preview')
+
+    backend.workspaceFingerprintValue = 'c'.repeat(64)
+    backend.workspaceSnapshotEntries = [
+      { path: 'src/app.ts', kind: 'file', identity: 'unseen-later-edit' }
+    ]
+    const refreshed = await orch.safeResyncFromHost(room.id, 'user', preview.confirmation.token)
+
+    expect(refreshed).toMatchObject({
+      status: 'confirmation-required',
+      drift: { changedPaths: [{ path: 'src/app.ts', reason: 'modified' }] },
+      confirmation: { required: true, provided: false, token: expect.any(String) }
+    })
+    if (refreshed.status !== 'confirmation-required') throw new Error('expected a refreshed preview')
+    expect(refreshed.confirmation.token).not.toBe(preview.confirmation.token)
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('does not persist a reconstructed path baseline while returning a confirmation preview', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 2,
+      stateRevision: 6,
+      syncStatus: 'modified',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(retainedWorkspaceGenKey(room.id), '1')
+    backend.snapshotWorkspace = async (_roomId, revision) =>
+      revision === 1
+        ? {
+            fingerprint: 'a'.repeat(64),
+            entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'retained-baseline' }]
+          }
+        : {
+            fingerprint: 'b'.repeat(64),
+            entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'current-room-edit' }]
+          }
+
+    const preview = await orch.safeResyncFromHost(room.id, 'user')
+
+    expect(preview).toMatchObject({
+      status: 'confirmation-required',
+      drift: {
+        status: 'changed',
+        baselineEvidence: 'path-snapshot',
+        changedPaths: [{ path: 'src/app.ts', reason: 'modified' }]
+      }
+    })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toBeNull()
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      stateRevision: 6,
+      workspaceVolumeRevision: 2,
+      syncStatus: 'modified'
+    })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('serializes file ingress with confirmation so a completed push must be previewed again', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(
+      workspaceSyncBaseKey(room.id),
+      serializeWorkspaceSnapshot({
+        fingerprint: 'a'.repeat(64),
+        entries: [{ path: 'src/app.ts', kind: 'file', identity: 'baseline' }]
+      })
+    )
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    backend.workspaceSnapshotEntries = [
+      { path: 'src/app.ts', kind: 'file', identity: 'previewed-room-edit' }
+    ]
+    const preview = await orch.safeResyncFromHost(room.id, 'user')
+    if (preview.status !== 'confirmation-required') throw new Error('expected a confirmation preview')
+
+    let releaseCopy!: () => void
+    let announceCopy!: () => void
+    const copyEntered = new Promise<void>((resolve) => { announceCopy = resolve })
+    const copyMayFinish = new Promise<void>((resolve) => { releaseCopy = resolve })
+    const copyIntoRoom = backend.copyIntoRoom.bind(backend)
+    backend.copyIntoRoom = async (...args) => {
+      announceCopy()
+      await copyMayFinish
+      await copyIntoRoom(...args)
+      backend.workspaceFingerprintValue = 'c'.repeat(64)
+      backend.workspaceSnapshotEntries = [
+        { path: 'src/app.ts', kind: 'file', identity: 'previewed-room-edit' },
+        { path: 'src/pushed.ts', kind: 'file', identity: 'queued-push' }
+      ]
+    }
+
+    const pushing = orch.pushRoomFile(room.id, '/workspace/src/pushed.ts', 'cHVzaGVk')
+    await copyEntered
+    let confirmationSettled = false
+    const confirming = orch.safeResyncFromHost(room.id, 'user', preview.confirmation.token).then((outcome) => {
+      confirmationSettled = true
+      return outcome
+    })
+    await Promise.resolve()
+
+    expect(confirmationSettled).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+
+    releaseCopy()
+    await pushing
+    const refreshed = await confirming
+    expect(refreshed).toMatchObject({
+      status: 'confirmation-required',
+      drift: {
+        changedPaths: [
+          { path: 'src/app.ts', reason: 'modified' },
+          { path: 'src/pushed.ts', reason: 'added' }
+        ]
+      }
+    })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
   })
 
   it('safe Host resync needs no destructive confirmation when inspection is clean', async () => {
@@ -375,7 +540,7 @@ describe('Room-owned working state', () => {
     expect(refused).toMatchObject({
       status: 'confirmation-required',
       drift: { status: 'unknown', baselineEvidence: 'unavailable', changedPaths: [] },
-      confirmation: { required: true, provided: false }
+      confirmation: { required: true, provided: false, token: expect.any(String) }
     })
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
   })
@@ -405,14 +570,18 @@ describe('Room-owned working state', () => {
       entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'later-terminal-edit' }]
     }
     orch.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(baseline))
-    let snapshotCalls = 0
-    backend.snapshotWorkspace = async () => {
-      snapshotCalls += 1
-      if (snapshotCalls === 3) return { fingerprint: 'd'.repeat(64), entries: [] }
-      return snapshotCalls <= 2 ? inspected : changedAgain
+    let roomSnapshotCalls = 0
+    backend.snapshotWorkspace = async (_roomId, revision) => {
+      if (revision === 2) return { fingerprint: 'd'.repeat(64), entries: [] }
+      roomSnapshotCalls += 1
+      return roomSnapshotCalls <= 3 ? inspected : changedAgain
     }
 
-    const error = await orch.safeResyncFromHost(room.id, 'user', true).catch((caught: unknown) => caught)
+    const preview = await orch.safeResyncFromHost(room.id, 'user')
+    if (preview.status !== 'confirmation-required') throw new Error('expected a confirmation preview')
+    const error = await orch
+      .safeResyncFromHost(room.id, 'user', preview.confirmation.token)
+      .catch((caught: unknown) => caught)
 
     expect(error).toBeInstanceOf(WorkspaceDriftError)
     expect((error as WorkspaceDriftError).changedPaths).toEqual([
@@ -427,6 +596,56 @@ describe('Room-owned working state', () => {
       syncStatus: 'modified'
     })
     expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('baseline')
+  })
+
+  it('restores runtime, metadata, baseline, and recovery pointer when final journal publication fails', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    const baseline = serializeWorkspaceSnapshot({
+      fingerprint: 'a'.repeat(64),
+      entries: [{ path: 'src/app.ts', kind: 'file', identity: 'baseline' }]
+    })
+    orch.settings.set(workspaceSyncBaseKey(room.id), baseline)
+    orch.settings.set(retainedWorkspaceGenKey(room.id), '7')
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    backend.workspaceSnapshotEntries = [
+      { path: 'src/app.ts', kind: 'file', identity: 'confirmed-room-edit' }
+    ]
+
+    const preview = await orch.safeResyncFromHost(room.id, 'user')
+    if (preview.status !== 'confirmation-required') throw new Error('expected a confirmation preview')
+    orch.changes.append = () => {
+      throw new Error('SQLITE_IOERR: journal publication failed')
+    }
+
+    const error = await orch
+      .safeResyncFromHost(room.id, 'user', preview.confirmation.token)
+      .catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('journal publication failed')
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toBe(baseline)
+    expect(orch.settings.get(retainedWorkspaceGenKey(room.id))).toBe('7')
+    expect(backend.lastWebSpec?.workspaceVolumeRevision).toBe(1)
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
   })
 
   it('refuses agent file transfer for legacy Host-bound rooms, whose workspace is the Host folder', async () => {
@@ -468,6 +687,9 @@ describe('Room-owned working state', () => {
       workspaceFingerprint: 'same-fingerprint'
     })
     orch.rooms.create(room)
+    // A malformed future pointer must never be interpreted as the generation
+    // that is about to become active and removed during best-effort cleanup.
+    orch.settings.set(retainedWorkspaceGenKey(room.id), '2junk')
     backend.workspaceFingerprintValue = 'same-fingerprint'
 
     const synced = await orch.syncFromHost(room.id, 'user')
