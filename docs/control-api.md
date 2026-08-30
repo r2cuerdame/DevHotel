@@ -170,6 +170,18 @@ last installing Room. Physical receipts are also fenced to the lease that
 performed the install, so releasing and reacquiring the same phone requires a
 fresh `android-run` before automation.
 
+Core also seals the active Android user privately at install time; numeric user
+IDs are never part of the public receipt or error contract. Status lists and
+foreground metadata include only receipts for the currently active user while
+preserving receipts owned by other users. A direct operation after a user
+switch fails with `ANDROID_APP_USER_CHANGED` without deleting the dormant
+receipt, so switching back can reactivate it. Legacy receipts without this
+private fence fail closed with `ANDROID_APP_USER_UNVERIFIED` and require a fresh
+`android-run`. Evidence-producing commands are followed by another exact-user,
+APK-byte and package-incarnation check before either success or bounded failure
+evidence is returned; the install receipt itself receives the same post-commit
+check while the Room target and physical lease remain captured.
+
 `target` is `{ kind: 'auto' }` (the default), `{ kind: 'emulator' }`, or
 `{ kind: 'physical', deviceId? }`. Auto follows an attached physical proof target
 and otherwise uses the Room emulator. An explicit choice never falls back. Each
@@ -194,7 +206,10 @@ UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals
 the tracked app cross the boundary. Taps require the same unique node and bounds
 across two consecutive dumps, then recheck foreground ownership immediately
-before input. On Android 12+ a successful tracked install emits a random marker
+before input. Android's input shell has no user selector, so the tap command
+performs an additional active-user guard in the same guest shell invocation and
+then applies the usual user/package postflight before reporting success. On
+Android 12+ a successful tracked install emits a random marker
 as the exact unshared app UID and proves that marker through bounded `--uid`
 logcat. Reads discard the marker and everything before it in logd sequence
 order. Crash evidence emits a fresh app-UID marker immediately before `am crash`

@@ -3402,8 +3402,18 @@ export class RoomOrchestrator {
         apkSha256,
         installedAt,
         packageIncarnation: evidence.packageIncarnation,
-        logFence: evidence.logFence
+        logFence: evidence.logFence,
+        installUserId: evidence.installUserId
       })
+      try {
+        // Close the evidence-return/SQLite-commit gap while the Room and exact
+        // physical lease remain captured. Later primitives still revalidate on
+        // every use because target-side package mutation cannot be locked out.
+        await session.confirmInstallEvidence(applicationId, evidence)
+      } catch (error) {
+        this.androidInstalls.remove(roomId, target, applicationId)
+        throw error
+      }
     } finally {
       rmSync(stagingDir, { recursive: true, force: true })
     }

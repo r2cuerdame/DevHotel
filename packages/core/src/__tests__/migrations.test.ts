@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { applyMigrations, migrations } from '../store/migrations'
 
 describe('database migrations', () => {
-  it('upgrades an async-startup v5 database through install receipts v7 without losing operations', () => {
+  it('upgrades an async-startup v5 database through user-bound install receipts v8 without losing operations', () => {
     const sqlite = new DatabaseSync(':memory:')
     try {
       for (const migration of migrations.filter(({ version }) => version <= 5)) {
@@ -35,7 +35,7 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
@@ -79,6 +79,8 @@ describe('database migrations', () => {
       }[]
       expect(installColumns.find(({ name }) => name === 'package_incarnation')).toMatchObject({ notnull: 1 })
       expect(installColumns.find(({ name }) => name === 'log_fence')).toMatchObject({ notnull: 0 })
+      expect(installColumns.find(({ name }) => name === 'install_user_id')).toMatchObject({ notnull: 0 })
+      expect(installTable.sql.replace(/\s+/g, ' ')).toContain('install_user_id BETWEEN 0 AND 21474')
     } finally {
       sqlite.close()
     }

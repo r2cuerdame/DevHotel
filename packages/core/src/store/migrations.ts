@@ -276,6 +276,18 @@ export const migrations: Migration[] = [
       CREATE INDEX idx_android_app_installs_room_target
         ON android_app_installs(room_id, target_kind, target_id, application_id);
     `
+  },
+  {
+    // Android APK paths and bytes are shared across users. Keep the active
+    // user that authorized the tracked install as private durable authority;
+    // legacy rows remain null and therefore fail closed until android_run.
+    version: 8,
+    sql: `
+      ALTER TABLE android_app_installs
+        ADD COLUMN install_user_id INTEGER CHECK (
+          install_user_id IS NULL OR install_user_id BETWEEN 0 AND 21474
+        );
+    `
   }
 ]
 

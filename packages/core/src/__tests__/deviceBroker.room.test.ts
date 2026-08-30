@@ -34,6 +34,9 @@ function roomAndroidArgs(command: string[]): string[] | null {
 
 function installEvidenceResult(args: string[], state: { fence: string; apkSha256?: string }): { code: number; stdout: string; stderr: string } | null {
   const logical = logicalAdbArgs(args)
+  if (logical[1] === 'am' && logical[2] === 'get-current-user') {
+    return { code: 0, stdout: '0\n', stderr: '' }
+  }
   if (logical[1] === 'pm' && logical[2] === 'path') {
     return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
   }
@@ -299,7 +302,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     adb.execs = []
     adb.execResultFor = (_serial, args) =>
@@ -316,7 +320,7 @@ describe('Android automation targets the attached device without a hand-written 
     const launch = adb.execs.find((call) => call.args[0] === 'shell' && call.args[1]?.includes("'am' 'start'"))
     expect(launch?.args).toEqual([
       'shell',
-      "'am' 'start' '-W' '--user' 'current' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
+      "'am' 'start' '-W' '--user' '0' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
     ])
     expect(launch?.args).toHaveLength(2)
   })
@@ -332,7 +336,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     backend.execInRoomCalls = []
     backend.execInRoomHandler = (_roomId, command) => {
@@ -355,7 +360,7 @@ describe('Android automation targets the attached device without a hand-written 
     )
     expect(launch?.cmd).toEqual([
       'adb', '-s', 'emulator-5554', 'shell',
-      "'am' 'start' '-W' '--user' 'current' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
+      "'am' 'start' '-W' '--user' '0' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
     ])
   })
 
@@ -442,7 +447,8 @@ describe('Android automation targets the attached device without a hand-written 
         apkSha256: 'a'.repeat(64),
         installedAt: '2026-08-31T00:00:00.000Z',
         packageIncarnation: TEST_PACKAGE_INCARNATION,
-        logFence: null
+        logFence: null,
+        installUserId: 0
       })
     }
     adb.execResultFor = (_serial, args) => args[0] === 'install'
@@ -710,7 +716,7 @@ describe('Android automation targets the attached device without a hand-written 
     expect(entry.verify?.detail).toMatch(/could not resolve launcher/)
     expect(adb.execs.some((call) => {
       const logical = logicalAdbArgs(call.args)
-      return logical[0] === 'shell' && logical[1] === 'am'
+      return logical[0] === 'shell' && logical[1] === 'am' && logical[2] === 'start'
     })).toBe(false)
   })
 
@@ -999,12 +1005,16 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: TEST_APK_SHA,
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     backend.execInRoomHandler = (_roomId, cmd) => {
       const androidArgs = roomAndroidArgs(cmd)
       if (androidArgs) {
         const logical = logicalAdbArgs(androidArgs)
+        if (logical[1] === 'am' && logical[2] === 'get-current-user') {
+          return { code: 0, stdout: '0\n', stderr: '' }
+        }
         if (logical[1] === 'pm' && logical[2] === 'path') return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
         if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
         if (logical[1] === 'sha256sum') return { code: 0, stdout: `${'b'.repeat(64)}  ${TEST_BASE_APK}\n`, stderr: '' }
@@ -1035,7 +1045,7 @@ describe('Android automation targets the attached device without a hand-written 
     expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
   })
 
-  it('does not commit an emulator receipt when the package changes after log-fence proof', async () => {
+  it('removes a just-committed emulator receipt when its package changes before commit postflight', async () => {
     const { orch, backend } = setup()
     backend.emulatorStateValue = 'running'
     const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
@@ -1047,7 +1057,7 @@ describe('Android automation targets the attached device without a hand-written 
         const logical = logicalAdbArgs(androidArgs)
         if (logical[1] === 'pm' && logical[2] === 'path') {
           pathProbes += 1
-          const path = pathProbes === 1 ? TEST_BASE_APK : '/data/app/replaced/base.apk'
+          const path = pathProbes < 3 ? TEST_BASE_APK : '/data/app/replaced/base.apk'
           return { code: 0, stdout: `package:${path}\n`, stderr: '' }
         }
         const evidence = installEvidenceResult(androidArgs, installEvidence)
@@ -1072,7 +1082,7 @@ describe('Android automation targets the attached device without a hand-written 
 
     expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
     expect(entry.verify?.detail).toMatch(/package incarnation/)
-    expect(pathProbes).toBe(2)
+    expect(pathProbes).toBe(3)
     expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
   })
 
@@ -1129,7 +1139,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     backend.execInRoomHandler = (_roomId, cmd) => {
       const logical = roomAndroidArgs(cmd)
@@ -1165,7 +1176,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     backend.execInRoomHandler = (_roomId, cmd, opts) => {
       const logical = roomAndroidArgs(cmd)
@@ -1205,7 +1217,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     let replaced = false
     adb.execResultFor = async (_serial, args) => {
@@ -1240,7 +1253,10 @@ describe('Android automation targets the attached device without a hand-written 
     const execOut = adb.execs.find((call) => call.args[0] === 'exec-out')
     expect(execOut?.args.slice(0, 3)).toEqual(['exec-out', 'sh', '-c'])
     expect(execOut?.args.length).toBeGreaterThan(5)
-    expect(adb.execs.some((call) => call.args[1] === 'input')).toBe(false)
+    expect(adb.execs.some((call) => {
+      const logical = logicalAdbArgs(call.args)
+      return logical[1] === 'sh' && logical[3]?.includes('exec input tap')
+    })).toBe(false)
   })
 
   it('does not reuse a physical install receipt after the phone is leased again', async () => {
@@ -1261,7 +1277,8 @@ describe('Android automation targets the attached device without a hand-written 
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
     await orch.releaseAndroidDevice('aaaa1111', 'rotate lease')
     const second = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-b' })

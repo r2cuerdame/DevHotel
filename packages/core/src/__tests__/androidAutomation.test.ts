@@ -36,6 +36,11 @@ function exclusivePackageDump(idField: 'userId' | 'appId'): string {
 
 const EXCLUSIVE_PACKAGE_DUMP = exclusivePackageDump('appId')
 
+function isGuardedTap(args: string[]): boolean {
+  return args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+    Boolean(args[3]?.includes('exec input tap'))
+}
+
 function targetEpoch(epochMs: number): string {
   const seconds = Math.floor(epochMs / 1000)
   return `${seconds}.${String(epochMs - (seconds * 1000)).padStart(3, '0')}`
@@ -153,6 +158,7 @@ describe('tracked Android automation session', () => {
     targetOverride: AndroidAutomationTarget = target,
     logFence: string | null = INSTALL_LOG_FENCE
   ) {
+    const installUserId = Number.parseInt(/^devhotel-install-u(\d+)-/.exec(logFence ?? '')?.[1] ?? '0', 10)
     const db = testDb()
     dbs.push(db)
     roomsRepo(db).create(makeRoom({
@@ -171,7 +177,8 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
-      logFence
+      logFence,
+      installUserId
     })
     const calls: string[][] = []
     const timeouts: Array<number | undefined> = []
@@ -184,6 +191,14 @@ describe('tracked Android automation session', () => {
         calls.push(args)
         timeouts.push(opts?.timeoutMs)
         const result = handler(args)
+        if (
+          args[1] === 'am' &&
+          args[2] === 'get-current-user' &&
+          result.code === 0 &&
+          !result.stdout.trim()
+        ) {
+          return { code: 0, stdout: `${installUserId}\n`, stderr: '' }
+        }
         if (
           args[1] === 'sh' &&
           args[3]?.startsWith('dumpsys package "$1"') &&
@@ -219,6 +234,7 @@ describe('tracked Android automation session', () => {
   }) => {
     let emittedFence = ''
     const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: `${userId}\n`, stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
         return {
@@ -241,6 +257,7 @@ describe('tracked Android automation session', () => {
     expect(evidence).toEqual({
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
+      installUserId: userId,
       logFence: emittedFence
     })
     expect(emittedFence).toMatch(new RegExp(`^devhotel-install-u${userId}-uid${uid}-[0-9a-f-]{36}$`))
@@ -253,30 +270,30 @@ describe('tracked Android automation session', () => {
     ])
   })
 
-  it('withholds an install log fence when the active Android user changes during proof', async () => {
-    let appUidProbes = 0
+  it('rejects install evidence when the active Android user changes during proof', async () => {
+    let markerRead = false
     let emittedFence = ''
     const { session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') {
+        return { code: 0, stdout: `${markerRead ? 10 : 0}\n`, stderr: '' }
+      }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'pm' && args.includes('--uid')) {
-        const requestedUid = args.at(-1)!
-        return { code: 0, stdout: `package:${APP_ID} uid:${requestedUid}\n`, stderr: '' }
-      }
-      if (args[1] === 'pm' && args[2] === 'list') {
-        appUidProbes += 1
-        const uid = appUidProbes === 1 ? 10123 : 1_010_123
-        return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
-      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'run-as') {
         emittedFence = args.at(-1)!
         return { code: 0, stdout: '', stderr: '' }
       }
-      if (args[0] === 'logcat') return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        markerRead = true
+        return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
+      }
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(session.establishInstallEvidence(APP_ID)).resolves.toMatchObject({ logFence: null })
-    expect(appUidProbes).toBe(2)
+    await expect(session.establishInstallEvidence(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_APP_USER_CHANGED'
+    })
   })
 
   it('keeps non-log install evidence when the bounded fence proof overflows', async () => {
@@ -292,6 +309,7 @@ describe('tracked Android automation session', () => {
     await expect(session.establishInstallEvidence(APP_ID)).resolves.toEqual({
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
+      installUserId: 0,
       logFence: null
     })
   })
@@ -312,6 +330,7 @@ describe('tracked Android automation session', () => {
     await expect(session.establishInstallEvidence(APP_ID)).resolves.toEqual({
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
+      installUserId: 0,
       logFence: null
     })
     expect(pathProbes).toBe(2)
@@ -344,6 +363,9 @@ describe('tracked Android automation session', () => {
     expect(calls.findIndex((args) => args[0] === 'logcat')).toBeLessThan(
       calls.map((args) => args[1] === 'pm' && args[2] === 'path').lastIndexOf(true)
     )
+    expect(calls.map((args) => args[1] === 'pm' && args.includes('--uid')).lastIndexOf(true)).toBeLessThan(
+      calls.map((args) => args[1] === 'pm' && args[2] === 'path').lastIndexOf(true)
+    )
     expect(installs.get(
       'aaaa1111',
       { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
@@ -360,6 +382,7 @@ describe('tracked Android automation session', () => {
     await expect(session.establishInstallEvidence(APP_ID)).resolves.toEqual({
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
+      installUserId: 0,
       logFence: null
     })
     expect(calls.some((args) => args[1] === 'run-as' || args[0] === 'logcat')).toBe(false)
@@ -367,6 +390,7 @@ describe('tracked Android automation session', () => {
 
   it('launches with typed argv and never constructs a shell command from extras', async () => {
     const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'stat') return { code: 0, stdout: `${BASE_APK_STAT}\n`, stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
@@ -377,15 +401,16 @@ describe('tracked Android automation session', () => {
     const result = await session.launch(APP_ID, undefined, { label: 'A $HOME; id', retries: 2, enabled: true })
 
     expect(result.component).toBe(`${APP_ID}/.MainActivity`)
-    expect(calls.at(-1)).toEqual([
-      'shell', 'am', 'start', '-W', '--user', 'current', '-n', `${APP_ID}/.MainActivity`,
+    expect(calls.find((args) => args[1] === 'am' && args[2] === 'start')).toEqual([
+      'shell', 'am', 'start', '-W', '--user', '0', '-n', `${APP_ID}/.MainActivity`,
       '--es', 'label', 'A $HOME; id', '--ei', 'retries', '2', '--ez', 'enabled', 'true'
     ])
-    expect(calls.at(-1)?.[2]).toBe('start')
+    expect(calls.find((args) => args[1] === 'am' && args[2] === 'start')?.[2]).toBe('start')
   })
 
   it('rejects a NUL string extra before invoking an Android launch command', async () => {
     const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     })
@@ -398,6 +423,7 @@ describe('tracked Android automation session', () => {
 
   it('scopes a fully qualified activity from another Java namespace to the tracked app', async () => {
     const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       return { code: 0, stdout: 'Status: ok\n', stderr: '' }
@@ -406,8 +432,8 @@ describe('tracked Android automation session', () => {
     const result = await session.launch(APP_ID, 'com.vendor.auth.LoginActivity')
 
     expect(result.component).toBe(`${APP_ID}/com.vendor.auth.LoginActivity`)
-    expect(calls.at(-1)).toEqual([
-      'shell', 'am', 'start', '-W', '--user', 'current', '-n',
+    expect(calls.find((args) => args[1] === 'am' && args[2] === 'start')).toEqual([
+      'shell', 'am', 'start', '-W', '--user', '0', '-n',
       `${APP_ID}/com.vendor.auth.LoginActivity`
     ])
   })
@@ -415,6 +441,7 @@ describe('tracked Android automation session', () => {
   it('returns only bounded redacted evidence when a launch command fails', async () => {
     const secret = `ghp_${'A'.repeat(24)}`
     const { session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'stat') return { code: 0, stdout: `${BASE_APK_STAT}\n`, stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
@@ -433,6 +460,69 @@ describe('tracked Android automation session', () => {
     await session.launch(APP_ID).catch((error: unknown) => {
       expect(JSON.stringify(error)).not.toContain(secret)
     })
+  })
+
+  it('prioritizes package replacement over launch failure evidence from the replacement', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { installs, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
+      if (args[1] === 'am' && args[2] === 'start') {
+        replaced = true
+        return { code: 1, stdout: 'replacement-private-output\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await session.launch(APP_ID).catch((error: unknown) => {
+      expect(error).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+      expect(JSON.stringify(error)).not.toContain('replacement-private-output')
+    })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
+  })
+
+  it('fails a successful force-stop closed when the package is replaced during the action', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'am' && args[2] === 'force-stop') {
+        replaced = true
+        return { code: 0, stdout: 'Force stopped\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+  })
+
+  it('withholds force-stop success when the active user changes during the action', async () => {
+    let switched = false
+    const { installs, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') {
+        return { code: 0, stdout: `${switched ? 10 : 0}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'am' && args[2] === 'force-stop') {
+        switched = true
+        return { code: 0, stdout: 'Force stopped\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_USER_CHANGED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
   })
 
   it('filters cross-app UI and refuses an ambiguous text tap before input', async () => {
@@ -458,7 +548,7 @@ describe('tracked Android automation session', () => {
     await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
       code: 'ANDROID_UI_TEXT_AMBIGUOUS'
     })
-    expect(calls.some((args) => args[1] === 'input')).toBe(false)
+    expect(calls.some(isGuardedTap)).toBe(false)
     expect(calls.some((args) => args[1] === 'rm')).toBe(true)
   })
 
@@ -485,7 +575,166 @@ describe('tracked Android automation session', () => {
       code: 'ANDROID_UI_TEXT_MOVED'
     })
     expect(hierarchy).toBe(2)
-    expect(calls.some((args) => args[1] === 'input')).toBe(false)
+    expect(calls.some(isGuardedTap)).toBe(false)
+  })
+
+  it('withholds a UI dump captured from a concurrently replaced package', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        replaced = true
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="replacement-private-ui" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let capturedError: unknown
+    try {
+      await session.dumpUi({ applicationId: APP_ID })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(JSON.stringify(capturedError)).not.toContain('replacement-private-ui')
+  })
+
+  it('withholds a UI dump when cleanup races a package replacement', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="private-ui" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'rm') replaced = true
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let capturedError: unknown
+    try {
+      await session.dumpUi({ applicationId: APP_ID })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(JSON.stringify(capturedError)).not.toContain('private-ui')
+  })
+
+  it('withholds tap success when the package is replaced during input', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        replaced = true
+        return { code: 0, stdout: 'Tapped\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
+      code: 'ANDROID_APP_REPLACED'
+    })
+  })
+
+  it('guards input with the sealed active user inside the same guest command', async () => {
+    let switched = false
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') {
+        return { code: 0, stdout: `${switched ? 10 : 0}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        switched = true
+        return { code: 71, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
+      code: 'ANDROID_APP_USER_CHANGED'
+    })
+    const tap = calls.find(isGuardedTap)
+    expect(tap?.slice(0, 5)).toEqual([
+      'shell', 'sh', '-c',
+      'current="$(am get-current-user)" || exit 70; [ "$current" = "$1" ] || exit 71; exec input tap "$2" "$3"',
+      'devhotel-tap'
+    ])
+    expect(tap?.slice(5)).toEqual(['0', '10', '10'])
+  })
+
+  it('withholds tap evidence when the package is replaced during the final foreground probe', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let tapRan = false
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        if (tapRan) replaced = true
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        tapRan = true
+        return { code: 0, stdout: 'private-tap-evidence\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let capturedError: unknown
+    try {
+      await session.tapText({ applicationId: APP_ID, text: 'Crash' })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(JSON.stringify(capturedError)).not.toContain('private-tap-evidence')
   })
 
   it('applies the text predicate before the cap and refuses a truncated candidate dump', async () => {
@@ -509,13 +758,13 @@ describe('tracked Android automation session', () => {
       code: 'ANDROID_UI_TEXT_AMBIGUOUS'
     })
     expect(hierarchyReads).toBe(1)
-    expect(calls.some((args) => args[1] === 'input')).toBe(false)
+    expect(calls.some(isGuardedTap)).toBe(false)
   })
 
   it('clamps every wait-for-text command to the remaining request deadline', async () => {
     let now = 1_000
     const { calls, session, timeouts } = setup((args) => {
-      if (args[1] !== 'stat') now += 80
+      if (args[1] !== 'stat') now += 30
       if (args[1] === 'pm' && args[2] === 'path') {
         return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       }
@@ -541,7 +790,11 @@ describe('tracked Android automation session', () => {
       pollIntervalMs: 250
     })).rejects.toMatchObject({ code: 'ANDROID_WAIT_TIMEOUT' })
 
-    expect(timeouts).toEqual([250, 170, 170, 90, 90, 10])
+    expect(timeouts[0]).toBe(250)
+    expect(timeouts.every((timeout, index) =>
+      timeout !== undefined && timeout > 0 && (index === 0 || timeout <= timeouts[index - 1]!)
+    )).toBe(true)
+    expect(timeouts.at(-1)).toBeLessThan(250)
     expect(calls.some((args) => args[1] === 'rm')).toBe(false)
     const trappedDump = calls.find((args) => args[0] === 'exec-out')
     expect(trappedDump?.[3]).toContain('trap cleanup 0 1 2 15')
@@ -583,12 +836,10 @@ describe('tracked Android automation session', () => {
       'logcat', '-d', '-v', 'epoch,UTC,printable', '--uid=10123'
     ])
     expect(calls.some((args) => args[1] === 'date')).toBe(false)
-    expect(calls.filter((args) => args[1] === 'pm' && args[2] === 'list')).toEqual([
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', APP_ID],
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', '10123'],
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', APP_ID],
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', '10123']
-    ])
+    const packageLists = calls.filter((args) => args[1] === 'pm' && args[2] === 'list')
+    expect(packageLists.length).toBeGreaterThanOrEqual(4)
+    expect(packageLists.every((args) => args[6] === '0')).toBe(true)
+    expect(packageLists.flat()).not.toContain('current')
   })
 
   it('preserves the full package UID for a secondary Android user', async () => {
@@ -616,46 +867,39 @@ describe('tracked Android automation session', () => {
     })
     expect(calls.find((args) => args[0] === 'logcat')).toContain(`--uid=${secondaryUid}`)
     expect(calls).toContainEqual([
-      'shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', String(secondaryUid)
+      'shell', 'pm', 'list', 'packages', '-U', '--user', '10', '--uid', String(secondaryUid)
     ])
   })
 
-  it('rejects a different active user before reading even if that user could replay the marker', async () => {
-    const secondaryUid = 1_010_123
-    const { calls, session } = setup((args) => {
+  it('rejects a different active user before reading even if the APK identity is globally identical', async () => {
+    const { calls, installs, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '10\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'pm' && args.includes('--uid')) {
-        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
-      }
-      if (args[1] === 'pm' && args[2] === 'list') {
-        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
-      }
-      if (args[0] === 'logcat') {
-        return { code: 0, stdout: `${INSTALL_LOG_FENCE}\nreplayed-user row\n`, stderr: '' }
-      }
       return { code: 0, stdout: '', stderr: '' }
     })
 
     await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
-      code: 'ANDROID_LOGCAT_USER_CHANGED'
+      code: 'ANDROID_APP_USER_CHANGED'
     })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
     expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
   })
 
   it('fails closed when the active Android user changes during a log capture', async () => {
-    let appUidProbes = 0
+    let logRead = false
     const { calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') {
+        return { code: 0, stdout: `${logRead ? 10 : 0}\n`, stderr: '' }
+      }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'pm' && args.includes('--uid')) {
-        const requestedUid = args.at(-1)!
-        return { code: 0, stdout: `package:${APP_ID} uid:${requestedUid}\n`, stderr: '' }
-      }
-      if (args[1] === 'pm' && args[2] === 'list') {
-        appUidProbes += 1
-        const uid = appUidProbes === 1 ? 10123 : 1_010_123
-        return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
-      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[0] === 'logcat') {
+        logRead = true
         return {
           code: 0,
           stdout: `1690000000.000 ${INSTALL_LOG_FENCE}\n1690000000.001 old-user row\n`,
@@ -666,9 +910,8 @@ describe('tracked Android automation session', () => {
     })
 
     await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
-      code: 'ANDROID_LOGCAT_USER_CHANGED'
+      code: 'ANDROID_APP_USER_CHANGED'
     })
-    expect(appUidProbes).toBe(2)
     expect(calls.some((args) => args[0] === 'logcat')).toBe(true)
   })
 
@@ -685,17 +928,22 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[0] === 'logcat') {
         return {
-          code: 0,
+          code: 1,
           stdout: `1690000000.000 ${INSTALL_LOG_FENCE}\n1690000000.001 replacement row\n`,
-          stderr: ''
+          stderr: 'replacement-private-log-error'
         }
       }
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
-      code: 'ANDROID_APP_REPLACED'
-    })
+    let capturedError: unknown
+    try {
+      await session.logcat({ applicationId: APP_ID })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(JSON.stringify(capturedError)).not.toContain('replacement-private-log-error')
     expect(statProbes).toBe(4)
     expect(calls.findIndex((args) => args[0] === 'logcat')).toBeLessThan(
       calls.map((args) => args[1] === 'stat').lastIndexOf(true)
@@ -705,6 +953,45 @@ describe('tracked Android automation session', () => {
       { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
       APP_ID
     )).toBeNull()
+  })
+
+  it('withholds log rows when replacement races the final UID authority probe', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let packageDumpProbes = 0
+    let replaced = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        packageDumpProbes += 1
+        if (packageDumpProbes === 3) replaced = true
+        return {
+          code: 0,
+          stdout: `${EXCLUSIVE_PACKAGE_DUMP}\n\n${args.at(-1)}\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        return {
+          code: 0,
+          stdout: `1690000000.000 ${INSTALL_LOG_FENCE}\n1690000000.001 replacement-private-row\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let capturedError: unknown
+    try {
+      await session.logcat({ applicationId: APP_ID })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(JSON.stringify(capturedError)).not.toContain('replacement-private-row')
+    expect(packageDumpProbes).toBe(3)
   })
 
   it('preserves a fractional cutoff and applies the requested line cap after literal filtering', async () => {
@@ -971,7 +1258,8 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
 
     await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
@@ -1012,8 +1300,97 @@ describe('tracked Android automation session', () => {
     expect(context.receipt).not.toHaveProperty('logFence')
   })
 
+  it('fails legacy receipts without user authority closed while preserving them for rerun', async () => {
+    const { db, installs, calls, session } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+    db.sqlite.prepare('UPDATE android_app_installs SET install_user_id = NULL').run()
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_APP_USER_UNVERIFIED'
+    })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
+    expect(calls.some((args) => args[1] === 'pm' || (args[1] === 'am' && args[2] === 'force-stop'))).toBe(false)
+  })
+
+  it('keeps other-user receipts durable while status returns only the active user context', async () => {
+    const otherApplicationId = 'com.example.other'
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop') return { code: 0, stdout: 'en-US\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    installs.record({
+      roomId: 'aaaa1111',
+      target: { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      applicationId: otherApplicationId,
+      changeId: '21111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: INSTALLED_AT,
+      packageIncarnation: PACKAGE_INCARNATION,
+      logFence: null,
+      installUserId: 10
+    })
+
+    await expect(session.status()).resolves.toMatchObject({
+      installedApplicationIds: [APP_ID],
+      foregroundApplicationId: APP_ID
+    })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      otherApplicationId
+    )).not.toBeNull()
+    expect(calls.some((args) => args[1] === 'pm' && args.at(-1) === otherApplicationId)).toBe(false)
+  })
+
+  it('withholds foreground install context when the package is replaced after metadata capture', async () => {
+    let foregroundCaptured = false
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    const { installs, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') {
+        return { code: 0, stdout: `${foregroundCaptured ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
+        foregroundCaptured = true
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop') return { code: 0, stdout: 'en-US\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.foregroundInstallContext()).rejects.toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
+  })
+
+  it('rejects direct primitives on another active user without deleting the original receipt', async () => {
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '10\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.launch(APP_ID, '.MainActivity')).rejects.toMatchObject({ code: 'ANDROID_APP_USER_CHANGED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
+    expect(calls.some((args) => args[1] === 'pm' || (args[1] === 'am' && args[2] === 'start'))).toBe(false)
+  })
+
   it('invalidates a stale receipt when the package is gone', async () => {
     const { installs, session } = setup((args) => {
+      if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: '', stderr: '' }
       return { code: 1, stdout: '', stderr: 'not installed' }
     })
@@ -1027,7 +1404,9 @@ describe('tracked Android automation session', () => {
   })
 
   it('preserves the receipt when package probes fail transiently', async () => {
-    const { installs, calls, session } = setup(() => ({ code: 1, stdout: '', stderr: 'transport lost' }))
+    const { installs, calls, session } = setup((args) => args[1] === 'am' && args[2] === 'get-current-user'
+      ? { code: 0, stdout: '0\n', stderr: '' }
+      : { code: 1, stdout: '', stderr: 'transport lost' })
 
     await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_PROBE_FAILED' })
     expect(installs.get(
@@ -1140,6 +1519,33 @@ describe('tracked Android automation session', () => {
       scenario: 'am-crash',
       runId: 'not-running'
     })).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_RUNNING' })
+  })
+
+  it('does not misclassify a replacement during an empty PID probe as not-running', async () => {
+    const replacementStat = '103:5252:123456:1788157200:1788157300'
+    let replaced = false
+    const { installs, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pgrep') {
+        replaced = true
+        return { code: 1, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'replacement-before-empty'
+    })).rejects.toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
   })
 
   it.each(['unreadable', 'malformed', 'duplicate', 'noisy-empty'] as const)(
@@ -1326,12 +1732,12 @@ describe('tracked Android automation session', () => {
     installs.record({
       roomId: 'aaaa1111', target: firstLease, applicationId: APP_ID,
       changeId: '21111111-2222-4333-8444-555555555555', apkSha256: 'b'.repeat(64), installedAt: INSTALLED_AT,
-      packageIncarnation: 'b'.repeat(64), logFence: null
+      packageIncarnation: 'b'.repeat(64), logFence: null, installUserId: 0
     })
     installs.record({
       roomId: 'bbbb2222', target: secondLease, applicationId: APP_ID,
       changeId: '31111111-2222-4333-8444-555555555555', apkSha256: 'c'.repeat(64), installedAt: INSTALLED_AT,
-      packageIncarnation: 'c'.repeat(64), logFence: null
+      packageIncarnation: 'c'.repeat(64), logFence: null, installUserId: 0
     })
 
     expect(installs.get('aaaa1111', firstLease, APP_ID)).toBeNull()

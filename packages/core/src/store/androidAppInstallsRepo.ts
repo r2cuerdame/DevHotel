@@ -16,6 +16,7 @@ interface AndroidInstallRow {
   installed_at: string
   package_incarnation: string
   log_fence: string | null
+  install_user_id: number | null
 }
 
 function receipt(row: AndroidInstallRow): AndroidInstallReceipt {
@@ -42,11 +43,13 @@ export interface AndroidAppInstallsRepo {
     installedAt: string
     packageIncarnation: string
     logFence: string | null
+    installUserId: number
   }): AndroidInstallReceipt
   get(roomId: string, target: AndroidInstallTarget, applicationId: string): AndroidInstallReceipt | null
   list(roomId: string, target: AndroidInstallTarget): AndroidInstallReceipt[]
   packageIncarnation(roomId: string, target: AndroidInstallTarget, applicationId: string): string | null
   logFence(roomId: string, target: AndroidInstallTarget, applicationId: string): string | null
+  installUserId(roomId: string, target: AndroidInstallTarget, applicationId: string): number | null
   remove(roomId: string, target: AndroidInstallTarget, applicationId: string): void
   invalidateTargetApplication(target: AndroidInstallTarget, applicationId: string): void
   invalidateTarget(target: Pick<AndroidInstallTarget, 'kind' | 'targetId'>): void
@@ -65,8 +68,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
       sqlite.prepare(
         `INSERT INTO android_app_installs (
            target_kind, target_id, lease_id, application_id, room_id, change_id, apk_sha256, installed_at,
-           package_incarnation, log_fence
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           package_incarnation, log_fence, install_user_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(target_kind, target_id, application_id) DO UPDATE SET
            lease_id = excluded.lease_id,
            room_id = excluded.room_id,
@@ -74,7 +77,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
            apk_sha256 = excluded.apk_sha256,
            installed_at = excluded.installed_at,
            package_incarnation = excluded.package_incarnation,
-           log_fence = excluded.log_fence`
+           log_fence = excluded.log_fence,
+           install_user_id = excluded.install_user_id`
       ).run(
         input.target.kind,
         input.target.targetId,
@@ -85,7 +89,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
         input.apkSha256,
         input.installedAt,
         input.packageIncarnation,
-        input.logFence
+        input.logFence,
+        input.installUserId
       )
       return this.get(input.roomId, input.target, input.applicationId)!
     },
@@ -116,6 +121,13 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
          WHERE room_id = ? AND target_kind = ? AND target_id = ? AND lease_id IS ? AND application_id = ?`
       ).get(roomId, ...targetParams(target), applicationId) as Pick<AndroidInstallRow, 'log_fence'> | undefined
       return row?.log_fence ?? null
+    },
+    installUserId(roomId, target, applicationId) {
+      const row = sqlite.prepare(
+        `SELECT install_user_id FROM android_app_installs
+         WHERE room_id = ? AND target_kind = ? AND target_id = ? AND lease_id IS ? AND application_id = ?`
+      ).get(roomId, ...targetParams(target), applicationId) as Pick<AndroidInstallRow, 'install_user_id'> | undefined
+      return row?.install_user_id ?? null
     },
     remove(roomId, target, applicationId) {
       sqlite.prepare(

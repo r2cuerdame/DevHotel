@@ -39,9 +39,11 @@ const TARGET_CLOCK_FORMAT = '+%s.%3N'
 const INSTALL_FENCE_TAG = 'DEVHOTEL_INSTALL_FENCE'
 const CRASH_FENCE_TAG = 'DEVHOTEL_CRASH_FENCE'
 const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$2"; exit "$status"`
+const GUARDED_TAP_SCRIPT = 'current="$(am get-current-user)" || exit 70; [ "$current" = "$1" ] || exit 71; exec input tap "$2" "$3"'
 const ANDROID_PER_USER_RANGE = 100_000
 const ANDROID_FIRST_APPLICATION_ID = 10_000
 const ANDROID_LAST_APPLICATION_ID = 19_999
+const ANDROID_MAX_USER_ID = 21_474
 const MAX_PACKAGE_PROCESSES = 1_024
 
 export interface AndroidAutomationExecOptions {
@@ -232,6 +234,8 @@ function commandHitOutputLimit(result: ExecResult): boolean {
 export interface AndroidInstallEvidence {
   apkSha256: string
   packageIncarnation: string
+  /** Private durable authority; never projected into AndroidInstallReceipt. */
+  installUserId: number
   /** Null means app-UID sequencing could not be proven; non-log primitives remain usable. */
   logFence: string | null
 }
@@ -246,10 +250,16 @@ interface VerifiedTrackedInstall {
   receipt: AndroidInstallReceipt
   apkSha256: string
   packageIncarnation: string | null
+  installUserId: number
 }
 
 interface AndroidPackageAuthority {
   uid: number
+  userId: number
+}
+
+interface AndroidForegroundPackage {
+  applicationId: string
   userId: number
 }
 
@@ -330,11 +340,63 @@ export class AndroidAutomationSession {
     return receipt
   }
 
+  private async currentUserId(deadline?: AndroidAutomationDeadline): Promise<number> {
+    const result = await this.command(
+      ['shell', 'am', 'get-current-user'],
+      { operation: 'Android active user probe', timeoutMs: 10_000, stdoutLimit: 256, deadline }
+    )
+    const match = /^(0|[1-9]\d{0,4})\r?\n?$/.exec(result.stdout)
+    const userId = match ? Number.parseInt(match[1]!, 10) : Number.NaN
+    if (
+      result.code !== 0 ||
+      result.stderr.length > 0 ||
+      !Number.isSafeInteger(userId) ||
+      userId < 0 ||
+      userId > ANDROID_MAX_USER_ID
+    ) {
+      throw automationError(
+        'ANDROID_APP_USER_UNVERIFIED',
+        'The selected Android target did not provide an exact active user ID.',
+        'Restore Android activity-manager connectivity and retry; DevHotel will not guess a user context.',
+        409,
+        safeEvidenceWithoutOutput(result)
+      )
+    }
+    return userId
+  }
+
+  private async assertActiveUser(
+    expectedUserId: number,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<void> {
+    const currentUserId = await this.currentUserId(deadline)
+    if (currentUserId === expectedUserId) return
+    throw automationError(
+      'ANDROID_APP_USER_CHANGED',
+      'The active Android user no longer matches this tracked install.',
+      'Switch back to the Android user active during android_run, or rerun android_run for the active user.',
+      409
+    )
+  }
+
   private async requireInstalled(
     applicationId: string,
     deadline?: AndroidAutomationDeadline
   ): Promise<VerifiedTrackedInstall> {
     const receipt = this.receipt(applicationId)
+    const installUserId = this.opts.installs.installUserId(
+      this.opts.roomId,
+      this.opts.installTarget,
+      applicationId
+    )
+    if (installUserId === null) {
+      throw automationError(
+        'ANDROID_APP_USER_UNVERIFIED',
+        `${applicationId} has no durable Android user authority in its tracked install receipt.`,
+        'Run android_run again to bind the tracked package to the active Android user.',
+        409
+      )
+    }
     const expected = {
       receipt,
       apkSha256: receipt.apkSha256,
@@ -342,18 +404,48 @@ export class AndroidAutomationSession {
         this.opts.roomId,
         this.opts.installTarget,
         applicationId
-      )
+      ),
+      installUserId
     }
-    await this.assertInstalledPackageIdentity(applicationId, expected, deadline)
+    await this.assertTrackedInstall(applicationId, expected, deadline)
     return expected
+  }
+
+  private async assertTrackedInstall(
+    applicationId: string,
+    expected: VerifiedTrackedInstall,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<void> {
+    await this.assertActiveUser(expected.installUserId, deadline)
+    await this.assertInstalledPackageIdentity(applicationId, expected, deadline)
+    await this.assertActiveUser(expected.installUserId, deadline)
+  }
+
+  private async runWithTrackedPostflight<T>(
+    applicationId: string,
+    expected: VerifiedTrackedInstall,
+    action: () => Promise<T>,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<T> {
+    let result: T
+    try {
+      result = await action()
+    } catch (error) {
+      // If the target action failed after taking effect, package/user
+      // authority still outranks its partial output or transport error.
+      await this.assertTrackedInstall(applicationId, expected, deadline)
+      throw error
+    }
+    await this.assertTrackedInstall(applicationId, expected, deadline)
+    return result
   }
 
   private async assertInstalledPackageIdentity(
     applicationId: string,
-    expected: Pick<VerifiedTrackedInstall, 'apkSha256' | 'packageIncarnation'>,
+    expected: Pick<VerifiedTrackedInstall, 'apkSha256' | 'packageIncarnation' | 'installUserId'>,
     deadline?: AndroidAutomationDeadline
   ): Promise<void> {
-    const installed = await this.installedPackageIdentity(applicationId, deadline)
+    const installed = await this.installedPackageIdentity(applicationId, expected.installUserId, deadline)
     if (installed.apkSha256 !== expected.apkSha256 || installed.packageIncarnation !== expected.packageIncarnation) {
       this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
       throw automationError(
@@ -368,10 +460,11 @@ export class AndroidAutomationSession {
 
   private async installedPackageIdentity(
     applicationId: string,
+    userId: number,
     deadline?: AndroidAutomationDeadline
   ): Promise<InstalledPackageIdentity> {
     const result = await this.command(
-      ['shell', 'pm', 'path', '--user', 'current', applicationId],
+      ['shell', 'pm', 'path', '--user', String(userId), applicationId],
       { operation: 'Android package probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline }
     )
     const paths = result.stdout
@@ -384,7 +477,7 @@ export class AndroidAutomationSession {
       // disappeared. Only a successful exact inventory may invalidate the
       // receipt after a failed path probe.
       const inventory = await this.command(
-        ['shell', 'pm', 'list', 'packages', '--user', 'current', applicationId],
+        ['shell', 'pm', 'list', 'packages', '--user', String(userId), applicationId],
         { operation: 'Android package inventory probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline }
       )
       const stillInstalled = inventory.code === 0 && inventory.stdout
@@ -475,22 +568,26 @@ export class AndroidAutomationSession {
     }
   }
 
-  private async foregroundPackage(deadline?: AndroidAutomationDeadline): Promise<string | null> {
+  private async foregroundPackage(deadline?: AndroidAutomationDeadline): Promise<AndroidForegroundPackage | null> {
     const result = await this.command(
       ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp' | head -c 2048"],
       { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048, deadline }
     )
     if (result.code !== 0) return null
-    const match = /\bu\d+\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\/[A-Za-z0-9_.$]+/.exec(result.stdout)
-    return match?.[1] ?? null
+    const match = /\bu(\d+)\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\/[A-Za-z0-9_.$]+/.exec(result.stdout)
+    if (!match) return null
+    const userId = Number.parseInt(match[1]!, 10)
+    if (!Number.isSafeInteger(userId) || userId < 0 || userId > ANDROID_MAX_USER_ID) return null
+    return { userId, applicationId: match[2]! }
   }
 
   private async requireForeground(
     applicationId: string,
+    userId: number,
     deadline?: AndroidAutomationDeadline
   ): Promise<void> {
     const foreground = await this.foregroundPackage(deadline)
-    if (foreground === applicationId) return
+    if (foreground?.applicationId === applicationId && foreground.userId === userId) return
     throw automationError(
       foreground
         ? 'ANDROID_APP_NOT_FOREGROUND'
@@ -503,11 +600,22 @@ export class AndroidAutomationSession {
   }
 
   async status(): Promise<AndroidAutomationStatus> {
+    const activeUserId = await this.currentUserId()
     const installedApplicationIds: string[] = []
+    const installed = new Map<string, VerifiedTrackedInstall>()
     for (const candidate of this.opts.installs.list(this.opts.roomId, this.opts.installTarget)) {
+      // A target may retain tracked apps from several Android users. Status is
+      // one active-screen snapshot: preserve other-user receipts, but never
+      // verify or project them into this user's installed/foreground context.
+      if (this.opts.installs.installUserId(
+        this.opts.roomId,
+        this.opts.installTarget,
+        candidate.applicationId
+      ) !== activeUserId) continue
       try {
-        await this.requireInstalled(candidate.applicationId)
+        const tracked = await this.requireInstalled(candidate.applicationId)
         installedApplicationIds.push(candidate.applicationId)
+        installed.set(candidate.applicationId, tracked)
       } catch (error) {
         if (
           !(error instanceof DevHotelError) ||
@@ -515,7 +623,6 @@ export class AndroidAutomationSession {
         ) throw error
       }
     }
-    const foreground = await this.foregroundPackage()
     const localeResult = await this.command(
       ['shell', 'getprop', 'persist.sys.locale'],
       { operation: 'Android locale probe', timeoutMs: 10_000, stdoutLimit: 256 }
@@ -523,10 +630,23 @@ export class AndroidAutomationSession {
     const locale = localeResult.code === 0 && /^[A-Za-z0-9_-]{2,35}$/.test(localeResult.stdout.trim())
       ? localeResult.stdout.trim()
       : null
+    const foreground = await this.foregroundPackage()
+    for (const [applicationId, tracked] of installed) {
+      await this.assertTrackedInstall(applicationId, tracked)
+    }
+    await this.assertActiveUser(activeUserId)
+    const foregroundTracked = foreground ? installed.get(foreground.applicationId) : undefined
+    const foregroundApplicationId = foreground && foregroundTracked?.installUserId === foreground.userId
+      ? foreground.applicationId
+      : null
+    if (foregroundApplicationId && foregroundTracked) {
+      await this.requireForeground(foregroundApplicationId, foregroundTracked.installUserId)
+      await this.assertTrackedInstall(foregroundApplicationId, foregroundTracked)
+    }
     return {
       target: this.target,
       installedApplicationIds,
-      foregroundApplicationId: foreground && installedApplicationIds.includes(foreground) ? foreground : null,
+      foregroundApplicationId,
       locale
     }
   }
@@ -534,13 +654,14 @@ export class AndroidAutomationSession {
   /** Safe metadata composition for lock-held artifact/acceptance workflows. */
   async foregroundInstallContext(): Promise<AndroidForegroundInstallContext> {
     const status = await this.status()
-    const receipt = status.foregroundApplicationId
-      ? this.opts.installs.get(
-          this.opts.roomId,
-          this.opts.installTarget,
-          status.foregroundApplicationId
-        )
+    const tracked = status.foregroundApplicationId
+      ? await this.requireInstalled(status.foregroundApplicationId)
       : null
+    if (tracked) {
+      await this.requireForeground(status.foregroundApplicationId!, tracked.installUserId)
+      await this.assertTrackedInstall(status.foregroundApplicationId!, tracked)
+    }
+    const receipt = tracked?.receipt ?? null
     return { status, receipt }
   }
 
@@ -549,17 +670,22 @@ export class AndroidAutomationSession {
     activity?: string,
     extras?: AndroidExtras
   ): Promise<AndroidLaunchResult> {
-    await this.requireInstalled(applicationId)
+    const tracked = await this.requireInstalled(applicationId)
     let component: string
     if (activity) {
       component = componentForActivity(applicationId, activity)
     } else {
-      const resolved = await this.command(
-        [
-          'shell', 'cmd', 'package', 'resolve-activity', '--brief', '--components',
-          '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', applicationId
-        ],
-        { operation: 'Android launcher resolution', timeoutMs: 20_000, stdoutLimit: 16 * 1024 }
+      const resolved = await this.runWithTrackedPostflight(
+        applicationId,
+        tracked,
+        () => this.command(
+          [
+            'shell', 'cmd', 'package', 'resolve-activity', '--brief', '--components',
+            '--user', String(tracked.installUserId),
+            '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', applicationId
+          ],
+          { operation: 'Android launcher resolution', timeoutMs: 20_000, stdoutLimit: 16 * 1024 }
+        )
       )
       const prefix = `${applicationId}/`
       component = resolved.stdout
@@ -576,9 +702,14 @@ export class AndroidAutomationSession {
         )
       }
     }
-    const result = await this.command(
-      ['shell', 'am', 'start', '-W', '--user', 'current', '-n', component, ...extrasArgv(extras)],
-      { operation: 'Android app launch', timeoutMs: 60_000, stdoutLimit: 64 * 1024 }
+    await this.assertTrackedInstall(applicationId, tracked)
+    const result = await this.runWithTrackedPostflight(
+      applicationId,
+      tracked,
+      () => this.command(
+        ['shell', 'am', 'start', '-W', '--user', String(tracked.installUserId), '-n', component, ...extrasArgv(extras)],
+        { operation: 'Android app launch', timeoutMs: 60_000, stdoutLimit: 64 * 1024 }
+      )
     )
     if (result.code !== 0) {
       throw automationError(
@@ -593,10 +724,14 @@ export class AndroidAutomationSession {
   }
 
   async forceStop(applicationId: string): Promise<AndroidForceStopResult> {
-    await this.requireInstalled(applicationId)
-    const result = await this.command(
-      ['shell', 'am', 'force-stop', '--user', 'current', applicationId],
-      { operation: 'Android force-stop', timeoutMs: 30_000, stdoutLimit: 16 * 1024 }
+    const tracked = await this.requireInstalled(applicationId)
+    const result = await this.runWithTrackedPostflight(
+      applicationId,
+      tracked,
+      () => this.command(
+        ['shell', 'am', 'force-stop', '--user', String(tracked.installUserId), applicationId],
+        { operation: 'Android force-stop', timeoutMs: 30_000, stdoutLimit: 16 * 1024 }
+      )
     )
     if (result.code !== 0) {
       throw automationError(
@@ -615,9 +750,10 @@ export class AndroidAutomationSession {
     opts: AndroidDumpOptions = {}
   ): Promise<AndroidUiDumpResult> {
     const { deadline } = opts
-    await this.requireInstalled(applicationId, deadline)
-    await this.requireForeground(applicationId, deadline)
+    const tracked = await this.requireInstalled(applicationId, deadline)
+    await this.requireForeground(applicationId, tracked.installUserId, deadline)
     const path = `/data/local/tmp/devhotel-ui-${randomUUID()}.xml`
+    let result!: AndroidUiDumpResult
     try {
       // The guest shell owns the temp file from creation through read. Its
       // trap still removes the file when the host-side deadline terminates adb,
@@ -632,10 +768,16 @@ export class AndroidAutomationSession {
         '[ "$status" -eq 0 ] || exit "$status"',
         `head -c ${MAX_UI_XML_BYTES + 1} "$path"`
       ].join('; ')
-      const read = await this.command(
-        ['exec-out', 'sh', '-c', dumpScript, 'devhotel-ui-dump', path],
-        { operation: 'Android UI dump and hierarchy read', timeoutMs: 60_000, stdoutLimit: MAX_UI_XML_BYTES + 1, deadline }
+      const read = await this.runWithTrackedPostflight(
+        applicationId,
+        tracked,
+        () => this.command(
+          ['exec-out', 'sh', '-c', dumpScript, 'devhotel-ui-dump', path],
+          { operation: 'Android UI dump and hierarchy read', timeoutMs: 60_000, stdoutLimit: MAX_UI_XML_BYTES + 1, deadline }
+        ),
+        deadline
       )
+      await this.requireForeground(applicationId, tracked.installUserId, deadline)
       if (read.code !== 0) {
         throw automationError(
           'ANDROID_UI_DUMP_FAILED',
@@ -658,7 +800,9 @@ export class AndroidAutomationSession {
         textMatch: opts.textMatch
       })
       if (deadline && this.now() >= deadline.at) throw waitTimeoutError(applicationId)
-      return { target: this.target, applicationId, ...parsed }
+      await this.assertTrackedInstall(applicationId, tracked, deadline)
+      await this.requireForeground(applicationId, tracked.installUserId, deadline)
+      result = { target: this.target, applicationId, ...parsed }
     } finally {
       const cleanupTimeoutMs = deadline
         ? Math.max(0, Math.min(10_000, deadline.at - this.now()))
@@ -671,6 +815,12 @@ export class AndroidAutomationSession {
         }).catch(() => undefined)
       }
     }
+    // The best-effort cleanup is still an awaited exact-target operation. Seal
+    // the captured result after it so a replacement during cleanup cannot be
+    // published as trusted UI from the old receipt.
+    await this.requireForeground(applicationId, tracked.installUserId, deadline)
+    await this.assertTrackedInstall(applicationId, tracked, deadline)
+    return result
   }
 
   dumpUi(input: AndroidDumpUiInput): Promise<AndroidUiDumpResult> {
@@ -781,11 +931,29 @@ export class AndroidAutomationSession {
       )
     }
     // A system dialog may still have appeared after the confirming hierarchy.
-    await this.requireForeground(input.applicationId)
-    const result = await this.command(
-      ['shell', 'input', 'tap', String(tapped.center.x), String(tapped.center.y)],
-      { operation: 'Android text tap', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+    const tracked = await this.requireInstalled(input.applicationId)
+    await this.requireForeground(input.applicationId, tracked.installUserId)
+    const result = await this.runWithTrackedPostflight(
+      input.applicationId,
+      tracked,
+      () => this.command(
+        // InputShellCommand has no Android-user selector. Keep the active-user
+        // check and input in one constant guest-side command, then retain the
+        // package/user postflight below. This is the narrowest available guard
+        // against a user switch in the host round trip without interpolating
+        // caller-controlled shell text.
+        [
+          'shell', 'sh', '-c', GUARDED_TAP_SCRIPT, 'devhotel-tap',
+          String(tracked.installUserId), String(tapped.center.x), String(tapped.center.y)
+        ],
+        { operation: 'Android text tap', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+      )
     )
+    await this.requireForeground(input.applicationId, tracked.installUserId)
+    // Foreground evidence can name the same applicationId after a concurrent
+    // reinstall. Keep exact package identity as the final awaited authority
+    // check before any tap result or command evidence crosses the boundary.
+    await this.assertTrackedInstall(input.applicationId, tracked)
     if (result.code !== 0) {
       throw automationError(
         'ANDROID_TAP_FAILED',
@@ -798,7 +966,7 @@ export class AndroidAutomationSession {
     return { target: this.target, applicationId: input.applicationId, tapped, evidence: safeEvidence(result) }
   }
 
-  private async packageUid(applicationId: string): Promise<AndroidPackageAuthority> {
+  private async packageUid(applicationId: string, userId: number): Promise<AndroidPackageAuthority> {
     const completionFence = `devhotel-package-dump-${randomUUID()}`
     let packageDump: ExecResult
     try {
@@ -886,7 +1054,7 @@ export class AndroidAutomationSession {
     }
 
     const uidResult = await this.command(
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', applicationId],
+      ['shell', 'pm', 'list', 'packages', '-U', '--user', String(userId), applicationId],
       { operation: 'Android package UID probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
     )
     const match = new RegExp(`^package:${escaped}\\s+uid[:=](\\d+)$`, 'm').exec(uidResult.stdout)
@@ -898,6 +1066,7 @@ export class AndroidAutomationSession {
       !Number.isSafeInteger(uid) ||
       appId < ANDROID_FIRST_APPLICATION_ID ||
       appId > ANDROID_LAST_APPLICATION_ID ||
+      Math.floor(uid / ANDROID_PER_USER_RANGE) !== userId ||
       String(appId) !== packageIdField[1]
     ) {
       throw automationError(
@@ -909,7 +1078,7 @@ export class AndroidAutomationSession {
       )
     }
     const owners = await this.command(
-      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', String(uid)],
+      ['shell', 'pm', 'list', 'packages', '-U', '--user', String(userId), '--uid', String(uid)],
       { operation: 'Android shared UID probe', timeoutMs: 15_000, stdoutLimit: 64 * 1024 }
     )
     const ownerLines = owners.stdout
@@ -934,17 +1103,18 @@ export class AndroidAutomationSession {
         safeEvidenceWithoutStdout(owners)
       )
     }
-    return { uid, userId: Math.floor(uid / ANDROID_PER_USER_RANGE) }
+    return { uid, userId }
   }
 
   /** Trusted install-time proof. It never grants a receipt by itself. */
   async establishInstallEvidence(applicationId: string): Promise<AndroidInstallEvidence> {
-    const identity = await this.installedPackageIdentity(applicationId)
+    const installUserId = await this.currentUserId()
+    const identity = await this.installedPackageIdentity(applicationId, installUserId)
     let provenLogFence: string | null = null
     let authority: AndroidPackageAuthority | null = null
     if ((this.target.apiLevel ?? 0) >= 31) {
       try {
-        authority = await this.packageUid(applicationId)
+        authority = await this.packageUid(applicationId, installUserId)
       } catch (error) {
         if (
           !(error instanceof DevHotelError) ||
@@ -980,15 +1150,12 @@ export class AndroidAutomationSession {
       }
     }
 
-    // The marker and its readback are fallible target operations. A concurrent
-    // reinstall can otherwise seal the preflight bytes/incarnation together
-    // with a marker emitted by a different package incarnation. Re-probe after
-    // every proof attempt, including the non-log fallback, before a caller may
-    // commit the receipt.
-    await this.assertInstalledPackageIdentity(applicationId, identity)
+    // The marker, readback and authority proof are fallible target operations.
+    // A concurrent reinstall can otherwise seal the preflight incarnation
+    // together with evidence from another package incarnation.
     if (provenLogFence && authority) {
       try {
-        const postflightAuthority = await this.packageUid(applicationId)
+        const postflightAuthority = await this.packageUid(applicationId, installUserId)
         if (!samePackageAuthority(postflightAuthority, authority)) provenLogFence = null
       } catch (error) {
         if (
@@ -998,11 +1165,43 @@ export class AndroidAutomationSession {
         provenLogFence = null
       }
     }
+    // Identity must be the final target-side proof after every UID/fence
+    // operation, not merely a check before the authority postflight.
+    await this.assertInstalledPackageIdentity(applicationId, { ...identity, installUserId })
+    await this.assertActiveUser(installUserId)
     return {
       apkSha256: identity.apkSha256,
       packageIncarnation: identity.packageIncarnation,
+      installUserId,
       logFence: provenLogFence
     }
+  }
+
+  /** Lock-held post-commit seal for the orchestrator's durable receipt write. */
+  async confirmInstallEvidence(
+    applicationId: string,
+    evidence: AndroidInstallEvidence
+  ): Promise<void> {
+    await this.assertActiveUser(evidence.installUserId)
+    if (evidence.logFence) {
+      const expectedAuthority = installLogFenceAuthority(evidence.logFence)
+      if (!expectedAuthority || expectedAuthority.userId !== evidence.installUserId) {
+        throw this.logFenceError(applicationId)
+      }
+      const currentAuthority = await this.packageUid(applicationId, evidence.installUserId)
+      if (!samePackageAuthority(currentAuthority, expectedAuthority)) {
+        throw automationError(
+          'ANDROID_LOGCAT_USER_CHANGED',
+          'The tracked Android package authority changed before install evidence was committed.',
+          'Retry android_run without concurrent package or Android-user changes.',
+          409
+        )
+      }
+    }
+    // Keep exact package identity last because the package-authority probes
+    // above are independently mutable target state.
+    await this.assertInstalledPackageIdentity(applicationId, evidence)
+    await this.assertActiveUser(evidence.installUserId)
   }
 
   private logFenceError(applicationId: string): DevHotelError {
@@ -1051,6 +1250,26 @@ export class AndroidAutomationSession {
     return targetCutoffMs
   }
 
+  private async assertLogAuthority(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    expected: AndroidPackageAuthority
+  ): Promise<void> {
+    const current = await this.packageUid(applicationId, tracked.installUserId)
+    if (!samePackageAuthority(current, expected)) {
+      throw automationError(
+        'ANDROID_LOGCAT_USER_CHANGED',
+        'The tracked Android package authority changed while evidence was being read.',
+        'Restore the Android user active during android_run and retry; DevHotel will not return cross-user evidence.',
+        409
+      )
+    }
+    // packageUid is itself a multi-command target probe. Re-seal exact bytes,
+    // incarnation and active user after it so a replacement during the UID
+    // proof cannot make same-UID rows authoritative.
+    await this.assertTrackedInstall(applicationId, tracked)
+  }
+
   private async readLogcat(
     input: AndroidLogcatInput,
     exactLogFence?: string,
@@ -1070,7 +1289,8 @@ export class AndroidAutomationSession {
     if (!logFence) throw this.logFenceError(input.applicationId)
     const sealedAuthority = exactAuthority ?? installLogFenceAuthority(logFence)
     if (!sealedAuthority) throw this.logFenceError(input.applicationId)
-    const authority = await this.packageUid(input.applicationId)
+    if (sealedAuthority.userId !== tracked.installUserId) throw this.logFenceError(input.applicationId)
+    const authority = await this.packageUid(input.applicationId, tracked.installUserId)
     if (!samePackageAuthority(authority, sealedAuthority)) {
       throw automationError(
         'ANDROID_LOGCAT_USER_CHANGED',
@@ -1082,17 +1302,22 @@ export class AndroidAutomationSession {
     const targetRequestedSince = !exactLogFence && input.since && sinceMs > Date.parse(receipt.installedAt)
       ? await this.targetCutoffForHostTime(sinceMs)
       : null
-    const result = await this.command(
-      [
-        'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${authority.uid}`
-      ],
-      {
-        operation: 'Android package logcat',
-        timeoutMs: 30_000,
-        stdoutLimit: 1024 * 1024,
-        outputLimitRecovery: 'Reduce app logging and rerun android_run to establish a fresh bounded log fence.'
-      }
+    const result = await this.runWithTrackedPostflight(
+      input.applicationId,
+      tracked,
+      () => this.command(
+        [
+          'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${authority.uid}`
+        ],
+        {
+          operation: 'Android package logcat',
+          timeoutMs: 30_000,
+          stdoutLimit: 1024 * 1024,
+          outputLimitRecovery: 'Reduce app logging and rerun android_run to establish a fresh bounded log fence.'
+        }
+      )
     )
+    await this.assertLogAuthority(input.applicationId, tracked, authority)
     if (commandHitOutputLimit(result)) {
       throw automationError(
         'ANDROID_OUTPUT_LIMIT',
@@ -1145,16 +1370,7 @@ export class AndroidAutomationSession {
     // Logd can retain an app-UID marker across a same-package reinstall. Seal
     // the capture to the same package incarnation on both sides of the read so
     // old authorization can never be used to return rows from a replacement.
-    await this.assertInstalledPackageIdentity(input.applicationId, tracked)
-    const postflightAuthority = await this.packageUid(input.applicationId)
-    if (!samePackageAuthority(postflightAuthority, authority)) {
-      throw automationError(
-        'ANDROID_LOGCAT_USER_CHANGED',
-        'The active Android user changed while package-scoped log evidence was being read.',
-        'Restore the original Android user and retry; DevHotel will not return evidence across user boundaries.',
-        409
-      )
-    }
+    await this.assertLogAuthority(input.applicationId, tracked, authority)
     return {
       target: this.target,
       applicationId: input.applicationId,
@@ -1200,13 +1416,17 @@ export class AndroidAutomationSession {
   }
 
   async crashScenario(input: AndroidRunCrashScenarioInput): Promise<AndroidCrashScenarioResult> {
-    await this.requireInstalled(input.applicationId)
+    const tracked = await this.requireInstalled(input.applicationId)
     const installFence = this.opts.installs.logFence(this.opts.roomId, this.opts.installTarget, input.applicationId)
     const installAuthority = installFence ? installLogFenceAuthority(installFence) : null
-    if ((this.target.apiLevel ?? 0) < 31 || !installAuthority) {
+    if (
+      (this.target.apiLevel ?? 0) < 31 ||
+      !installAuthority ||
+      installAuthority.userId !== tracked.installUserId
+    ) {
       throw this.logFenceError(input.applicationId)
     }
-    const crashAuthority = await this.packageUid(input.applicationId)
+    const crashAuthority = await this.packageUid(input.applicationId, tracked.installUserId)
     if (!samePackageAuthority(crashAuthority, installAuthority)) {
       throw automationError(
         'ANDROID_LOGCAT_USER_CHANGED',
@@ -1215,7 +1435,11 @@ export class AndroidAutomationSession {
         409
       )
     }
-    const pidsBefore = await this.pids(input.applicationId, crashAuthority)
+    const pidsBefore = await this.runWithTrackedPostflight(
+      input.applicationId,
+      tracked,
+      () => this.pids(input.applicationId, crashAuthority)
+    )
     if (pidsBefore.length === 0) {
       throw automationError(
         'ANDROID_APP_NOT_RUNNING',
@@ -1223,21 +1447,30 @@ export class AndroidAutomationSession {
         'Launch the tracked application for the active Android user before running the crash scenario.'
       )
     }
+    await this.assertTrackedInstall(input.applicationId, tracked)
     const crashStartedAt = this.now()
     const crashLogFence = `devhotel-crash-${randomUUID()}`
-    const crashResult = await this.command(
-      [
-        'shell', 'sh', '-c',
-        `run-as "$1" --user "$2" log -p i -t ${CRASH_FENCE_TAG} "$3" && exec am crash --user "$2" "$1"`,
-        'devhotel-crash', input.applicationId, String(crashAuthority.userId), crashLogFence
-      ],
-      { operation: 'Android crash scenario', timeoutMs: 30_000, stdoutLimit: 64 * 1024 }
+    const crashResult = await this.runWithTrackedPostflight(
+      input.applicationId,
+      tracked,
+      () => this.command(
+        [
+          'shell', 'sh', '-c',
+          `run-as "$1" --user "$2" log -p i -t ${CRASH_FENCE_TAG} "$3" && exec am crash --user "$2" "$1"`,
+          'devhotel-crash', input.applicationId, String(crashAuthority.userId), crashLogFence
+        ],
+        { operation: 'Android crash scenario', timeoutMs: 30_000, stdoutLimit: 64 * 1024 }
+      )
     )
     const result = crashResult
     let pidsAfter = pidsBefore
     let observed = false
     for (let attempt = 0; attempt < 20; attempt++) {
-      pidsAfter = await this.pids(input.applicationId, crashAuthority)
+      pidsAfter = await this.runWithTrackedPostflight(
+        input.applicationId,
+        tracked,
+        () => this.pids(input.applicationId, crashAuthority)
+      )
       if (pidsBefore.every((pid) => !pidsAfter.includes(pid))) {
         observed = true
         break

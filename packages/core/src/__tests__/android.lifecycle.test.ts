@@ -69,7 +69,8 @@ describe('Android room lifecycle', () => {
       apkSha256: 'a'.repeat(64),
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: '0'.repeat(64),
-      logFence: null
+      logFence: null,
+      installUserId: 0
     })
 
     await orch.startRoom(room.id, 'user')
