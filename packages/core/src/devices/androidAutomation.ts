@@ -50,6 +50,11 @@ export interface AndroidAutomationSessionOptions {
   sleep?: (ms: number) => Promise<void>
 }
 
+interface AndroidAutomationDeadline {
+  at: number
+  applicationId: string
+}
+
 function automationError(
   code: string,
   message: string,
@@ -58,6 +63,15 @@ function automationError(
   evidence?: AndroidCommandEvidence
 ): DevHotelError {
   return new DevHotelError(code, message, { recoveryHint, httpStatus, evidence })
+}
+
+function waitTimeoutError(applicationId: string): DevHotelError {
+  return automationError(
+    'ANDROID_WAIT_TIMEOUT',
+    `The requested text did not appear in ${applicationId} before the bounded timeout.`,
+    'Inspect android_dump_ui for the current app-scoped hierarchy and adjust the literal text or timeout.',
+    408
+  )
 }
 
 function byteTail(value: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -137,13 +151,34 @@ export class AndroidAutomationSession {
 
   private async command(
     args: string[],
-    opts: AndroidAutomationExecOptions & { stdoutLimit?: number; operation: string }
+    opts: AndroidAutomationExecOptions & {
+      deadline?: AndroidAutomationDeadline
+      stdoutLimit?: number
+      operation: string
+    }
   ): Promise<ExecResult> {
-    const result = await this.opts.exec(args, {
-      timeoutMs: opts.timeoutMs,
-      maxStdoutBytes: opts.maxStdoutBytes ?? opts.stdoutLimit,
-      maxStderrBytes: opts.maxStderrBytes ?? 64 * 1024
-    })
+    let timeoutMs = opts.timeoutMs
+    if (opts.deadline) {
+      const remainingMs = opts.deadline.at - this.now()
+      if (remainingMs <= 0) throw waitTimeoutError(opts.deadline.applicationId)
+      timeoutMs = Math.max(1, Math.min(timeoutMs ?? remainingMs, remainingMs))
+    }
+    let result: ExecResult
+    try {
+      result = await this.opts.exec(args, {
+        timeoutMs,
+        maxStdoutBytes: opts.maxStdoutBytes ?? opts.stdoutLimit,
+        maxStderrBytes: opts.maxStderrBytes ?? 64 * 1024
+      })
+    } catch (error) {
+      if (opts.deadline && this.now() >= opts.deadline.at) {
+        throw waitTimeoutError(opts.deadline.applicationId)
+      }
+      throw error
+    }
+    if (opts.deadline && this.now() >= opts.deadline.at) {
+      throw waitTimeoutError(opts.deadline.applicationId)
+    }
     if (opts.stdoutLimit !== undefined && Buffer.byteLength(result.stdout, 'utf8') > opts.stdoutLimit) {
       throw automationError(
         'ANDROID_OUTPUT_LIMIT',
@@ -166,12 +201,15 @@ export class AndroidAutomationSession {
     return receipt
   }
 
-  private async requireInstalled(applicationId: string): Promise<AndroidInstallReceipt> {
+  private async requireInstalled(
+    applicationId: string,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<AndroidInstallReceipt> {
     const receipt = this.receipt(applicationId)
     if (this.verifiedApkHashes.get(applicationId) === receipt.apkSha256) return receipt
     const result = await this.command(
       ['shell', 'pm', 'path', '--user', 'current', applicationId],
-      { operation: 'Android package probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+      { operation: 'Android package probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline }
     )
     const paths = result.stdout
       .split(/\r?\n/)
@@ -206,7 +244,7 @@ export class AndroidAutomationSession {
     }
     const hashed = await this.command(
       ['shell', 'sha256sum', baseApks[0]!],
-      { operation: 'Android installed APK identity probe', timeoutMs: 60_000, stdoutLimit: 8192 }
+      { operation: 'Android installed APK identity probe', timeoutMs: 60_000, stdoutLimit: 8192, deadline }
     )
     const installedSha256 = /^([a-fA-F0-9]{64})(?:\s|$)/.exec(hashed.stdout.trim())?.[1]?.toLowerCase()
     if (hashed.code !== 0 || !installedSha256) {
@@ -233,18 +271,21 @@ export class AndroidAutomationSession {
     return receipt
   }
 
-  private async foregroundPackage(): Promise<string | null> {
+  private async foregroundPackage(deadline?: AndroidAutomationDeadline): Promise<string | null> {
     const result = await this.command(
       ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp' | head -c 2048"],
-      { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048 }
+      { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048, deadline }
     )
     if (result.code !== 0) return null
     const match = /\bu\d+\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\/[A-Za-z0-9_.$]+/.exec(result.stdout)
     return match?.[1] ?? null
   }
 
-  private async requireForeground(applicationId: string): Promise<void> {
-    const foreground = await this.foregroundPackage()
+  private async requireForeground(
+    applicationId: string,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<void> {
+    const foreground = await this.foregroundPackage(deadline)
     if (foreground === applicationId) return
     throw automationError(
       foreground
@@ -365,14 +406,19 @@ export class AndroidAutomationSession {
     return { target: this.target, applicationId, evidence: safeEvidence(result) }
   }
 
-  private async dump(applicationId: string, filter?: string, maxNodes = 500): Promise<AndroidUiDumpResult> {
-    await this.requireInstalled(applicationId)
-    await this.requireForeground(applicationId)
+  private async dump(
+    applicationId: string,
+    filter?: string,
+    maxNodes = 500,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<AndroidUiDumpResult> {
+    await this.requireInstalled(applicationId, deadline)
+    await this.requireForeground(applicationId, deadline)
     const path = `/data/local/tmp/devhotel-ui-${randomUUID()}.xml`
     try {
       const dumped = await this.command(
         ['shell', 'uiautomator', 'dump', '--compressed', path],
-        { operation: 'Android UI dump', timeoutMs: 30_000, stdoutLimit: 16 * 1024 }
+        { operation: 'Android UI dump', timeoutMs: 30_000, stdoutLimit: 16 * 1024, deadline }
       )
       if (dumped.code !== 0) {
         throw automationError(
@@ -385,7 +431,7 @@ export class AndroidAutomationSession {
       }
       const read = await this.command(
         ['exec-out', 'sh', '-c', `head -c ${MAX_UI_XML_BYTES + 1} ${path}`],
-        { operation: 'Android UI hierarchy read', timeoutMs: 30_000, stdoutLimit: MAX_UI_XML_BYTES + 1 }
+        { operation: 'Android UI hierarchy read', timeoutMs: 30_000, stdoutLimit: MAX_UI_XML_BYTES + 1, deadline }
       )
       if (read.code !== 0) {
         throw automationError(
@@ -404,13 +450,19 @@ export class AndroidAutomationSession {
         )
       }
       const parsed = parseAndroidUiHierarchy(read.stdout, applicationId, { filter, maxNodes })
+      if (deadline && this.now() >= deadline.at) throw waitTimeoutError(applicationId)
       return { target: this.target, applicationId, ...parsed }
     } finally {
-      await this.opts.exec(['shell', 'rm', '-f', path], {
-        timeoutMs: 10_000,
-        maxStdoutBytes: 1024,
-        maxStderrBytes: 1024
-      }).catch(() => undefined)
+      const cleanupTimeoutMs = deadline
+        ? Math.max(0, Math.min(10_000, deadline.at - this.now()))
+        : 10_000
+      if (cleanupTimeoutMs > 0) {
+        await this.opts.exec(['shell', 'rm', '-f', path], {
+          timeoutMs: cleanupTimeoutMs,
+          maxStdoutBytes: 1024,
+          maxStderrBytes: 1024
+        }).catch(() => undefined)
+      }
     }
   }
 
@@ -420,12 +472,15 @@ export class AndroidAutomationSession {
 
   async waitForText(input: AndroidWaitForTextInput): Promise<AndroidWaitForTextResult> {
     const startedAt = this.now()
-    const deadline = startedAt + (input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS)
+    const deadline: AndroidAutomationDeadline = {
+      at: startedAt + (input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+      applicationId: input.applicationId
+    }
     const match = input.match ?? 'exact'
     let attempts = 0
     do {
       attempts += 1
-      const dumped = await this.dump(input.applicationId, input.text, 500)
+      const dumped = await this.dump(input.applicationId, input.text, 500, deadline)
       const matched = dumped.nodes.find((node) => matchesText(node, input.text, match))
       if (matched) {
         return {
@@ -436,15 +491,10 @@ export class AndroidAutomationSession {
           attempts
         }
       }
-      if (this.now() >= deadline) break
-      await this.pause(Math.min(input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS, Math.max(0, deadline - this.now())))
-    } while (this.now() <= deadline)
-    throw automationError(
-      'ANDROID_WAIT_TIMEOUT',
-      `The requested text did not appear in ${input.applicationId} before the bounded timeout.`,
-      'Inspect android_dump_ui for the current app-scoped hierarchy and adjust the literal text or timeout.',
-      408
-    )
+      if (this.now() >= deadline.at) break
+      await this.pause(Math.min(input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS, Math.max(0, deadline.at - this.now())))
+    } while (this.now() <= deadline.at)
+    throw waitTimeoutError(input.applicationId)
   }
 
   async tapText(input: AndroidTapTextInput): Promise<AndroidTapTextResult> {

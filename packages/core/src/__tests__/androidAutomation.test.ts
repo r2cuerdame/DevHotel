@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { AndroidAutomationTarget } from '@devhotel/shared'
-import { AndroidAutomationSession, parseAndroidUiHierarchy } from '../devices/androidAutomation'
+import {
+  AndroidAutomationSession,
+  parseAndroidUiHierarchy,
+  type AndroidAutomationSessionOptions
+} from '../devices/androidAutomation'
 import { androidAppInstallsRepo } from '../store/androidAppInstallsRepo'
 import { roomsRepo } from '../store/roomsRepo'
 import type { Db } from '../store/db'
@@ -87,7 +91,10 @@ describe('tracked Android automation session', () => {
     for (const db of dbs.splice(0)) db.close()
   })
 
-  function setup(handler: (args: string[]) => { code: number; stdout: string; stderr: string }) {
+  function setup(
+    handler: (args: string[]) => { code: number; stdout: string; stderr: string },
+    timing: Pick<AndroidAutomationSessionOptions, 'now' | 'sleep'> = {}
+  ) {
     const db = testDb()
     dbs.push(db)
     roomsRepo(db).create(makeRoom({
@@ -107,21 +114,24 @@ describe('tracked Android automation session', () => {
       installedAt: INSTALLED_AT
     })
     const calls: string[][] = []
+    const timeouts: Array<number | undefined> = []
     const session = new AndroidAutomationSession({
       roomId: 'aaaa1111',
       target,
       installTarget: { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
       installs,
-      exec: async (args) => {
+      exec: async (args, opts) => {
         calls.push(args)
+        timeouts.push(opts?.timeoutMs)
         const result = handler(args)
         if (args[1] === 'sha256sum' && result.code === 0 && !result.stdout && !result.stderr) {
           return { code: 0, stdout: `${'a'.repeat(64)}  ${args[2]}\n`, stderr: '' }
         }
         return result
-      }
+      },
+      ...timing
     })
-    return { db, installs, calls, session }
+    return { db, installs, calls, session, timeouts }
   }
 
   it('launches with typed argv and never constructs a shell command from extras', async () => {
@@ -215,6 +225,39 @@ describe('tracked Android automation session', () => {
     })
     expect(hierarchy).toBe(2)
     expect(calls.some((args) => args[1] === 'input')).toBe(false)
+  })
+
+  it('clamps every wait-for-text command to the remaining request deadline', async () => {
+    let now = 1_000
+    const { calls, session, timeouts } = setup((args) => {
+      now += 60
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      }
+      if (args[1] === 'sha256sum') {
+        return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[2] === '-c' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return { code: 0, stdout: `<hierarchy><node package="${APP_ID}" text="Other" bounds="[0,0][20,20]" /></hierarchy>`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, {
+      now: () => now,
+      sleep: async (ms) => { now += ms }
+    })
+
+    await expect(session.waitForText({
+      applicationId: APP_ID,
+      text: 'Ready',
+      timeoutMs: 250,
+      pollIntervalMs: 250
+    })).rejects.toMatchObject({ code: 'ANDROID_WAIT_TIMEOUT' })
+
+    expect(timeouts).toEqual([250, 190, 130, 70, 10])
+    expect(calls.some((args) => args[1] === 'rm')).toBe(false)
   })
 
   it('uses an exact unshared UID, clamps time to install, and redacts log secrets', async () => {
