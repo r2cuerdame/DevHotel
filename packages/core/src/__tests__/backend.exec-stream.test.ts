@@ -97,6 +97,19 @@ describe('runDocker output sinks', () => {
     expect(Buffer.concat(stderrChunks)).toHaveLength(0)
   })
 
+  it('rejects the operation when mandatory abort cleanup cannot prove completion', async () => {
+    await expect(runDocker([
+      '-e',
+      `process.stdout.write('overflow'); setTimeout(() => {}, 30000)`
+    ], {
+      timeoutMs: 30_000,
+      maxStdoutBytes: 4,
+      maxStderrBytes: 64,
+      onStdout: () => undefined,
+      onAbort: async () => { throw new Error('exact helper cleanup failed') }
+    })).rejects.toThrow(/exact helper cleanup failed/)
+  })
+
   it('refuses to combine chunk sinks with the file/line sinks', async () => {
     await expect(
       runDocker(['-e', ''], { onStdout: () => {}, outputFile: 'ignored.log' })

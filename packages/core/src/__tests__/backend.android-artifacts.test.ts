@@ -217,7 +217,8 @@ describe('OciCliBackend Android artifact export', () => {
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
-      State: { Status: 'running', Paused: paused }
+      State: { Status: 'running', Paused: paused },
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ids.anchor}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'inspect') {
@@ -281,7 +282,8 @@ describe('OciCliBackend Android artifact export', () => {
       Id: role === 'anchor' ? 'b'.repeat(64) : role === 'svc-emulator' ? 'c'.repeat(64) : 'a'.repeat(64),
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
-      State: { Status: 'running', Paused: paused }
+      State: { Status: 'running', Paused: paused },
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${'b'.repeat(64)}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'inspect') {
@@ -310,6 +312,33 @@ describe('OciCliBackend Android artifact export', () => {
     expect(Buffer.concat(chunks).toString('utf8')).toBe('abcd')
   })
 
+  it('refuses an emulator that is not bound to the exact owned anchor namespace', async () => {
+    const container = (name: string, role: string, id: string, networkMode?: string) => JSON.stringify([{
+      Id: id,
+      Name: `/${name}`,
+      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      State: { Status: 'running' },
+      ...(networkMode ? { HostConfig: { NetworkMode: networkMode } } : {})
+    }])
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect' && args[1] === anchorName(ROOM_ID)) {
+        return { code: 0, stdout: container(args[1], 'anchor', 'a'.repeat(64)), stderr: '' }
+      }
+      if (args[0] === 'inspect' && args[1] === emulatorName(ROOM_ID)) {
+        return {
+          code: 0,
+          stdout: container(args[1], 'svc-emulator', 'b'.repeat(64), `container:${'c'.repeat(64)}`),
+          stderr: ''
+        }
+      }
+      return ok
+    })
+
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact owned anchor network namespace/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'run')).toBe(false)
+  })
+
   it('aborted helper cleanup removes only the exact labeled container ID and ignores name reuse', async () => {
     const ownedIds = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), helper: 'c'.repeat(64) }
     let helperInspect: Record<string, unknown> | null = null
@@ -317,9 +346,14 @@ describe('OciCliBackend Android artifact export', () => {
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
-      State: { Status: 'running' }
+      State: { Status: 'running' },
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ownedIds.anchor}` } } : {})
     })
     mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'rm') {
+        helperInspect = null
+        return ok
+      }
       if (args[0] === 'inspect') {
         if (args[1] === anchorName(ROOM_ID)) {
           return { code: 0, stdout: JSON.stringify([roomContainer(args[1], 'anchor', ownedIds.anchor)]), stderr: '' }

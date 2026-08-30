@@ -1524,6 +1524,10 @@ export class OciCliBackend implements IsolationBackend {
     const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
     const emulator = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
     if (emulator.State?.Status !== 'running') throw new Error('Room emulator is not running under the execution fence')
+    const anchorId = exactContainerId(anchor, roomId)
+    if (emulator.HostConfig?.NetworkMode !== `container:${anchorId}`) {
+      throw new Error('Room emulator is not attached to the exact owned anchor network namespace')
+    }
     await this.ensureImage(ANDROID_IMAGE)
     const id = randomUUID()
     const name = jobName(roomId, id)
@@ -1550,7 +1554,7 @@ export class OciCliBackend implements IsolationBackend {
       '--name',
       name,
       '--network',
-      `container:${exactContainerId(anchor, roomId)}`,
+      `container:${anchorId}`,
       '--cap-drop',
       'ALL',
       '--security-opt',
@@ -1627,6 +1631,9 @@ export class OciCliBackend implements IsolationBackend {
     const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
     if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
       throw new Error('Could not clean up the exact aborted fenced Android helper')
+    }
+    if (await this.inspectContainer(id)) {
+      throw new Error('The exact aborted fenced Android helper still exists after cleanup')
     }
   }
 
@@ -2127,6 +2134,7 @@ interface DockerContainerInspect {
   Name?: string
   Config?: { Labels?: Record<string, string> | null } | null
   State?: { Status?: string; Paused?: boolean } | null
+  HostConfig?: { NetworkMode?: string } | null
 }
 
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {

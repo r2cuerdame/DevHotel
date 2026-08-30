@@ -191,9 +191,15 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
     const abort = (): void => {
       if (timer) clearTimeout(timer)
       child.kill('SIGKILL')
-      abortCleanup ??= opts.onAbort
-        ? Promise.resolve().then(opts.onAbort).catch(() => undefined)
-        : Promise.resolve()
+      if (!abortCleanup) {
+        abortCleanup = opts.onAbort
+          ? Promise.resolve().then(opts.onAbort)
+          : Promise.resolve()
+        // The child close event is what settles runDocker. Attach a handler now
+        // so a fast cleanup rejection is not reported as unhandled meanwhile;
+        // the original rejected promise is still propagated by finish/fail.
+        void abortCleanup.catch(() => undefined)
+      }
     }
 
     const fail = (err: Error): void => {
@@ -201,15 +207,19 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
       settled = true
       if (timer) clearTimeout(timer)
       abort()
-      void (abortCleanup ?? Promise.resolve()).then(() => reject(err))
+      void (abortCleanup ?? Promise.resolve()).then(
+        () => reject(err),
+        (cleanupError: unknown) => reject(new AggregateError([err, cleanupError], 'docker command and abort cleanup both failed'))
+      )
     }
 
     const finish = (): void => {
       if (settled || !childClosed || !outputFinished) return
       settled = true
-      void (abortCleanup ?? Promise.resolve()).then(() => {
-        resolve({ code: closeCode, stdout, stderr, ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}) })
-      })
+      void (abortCleanup ?? Promise.resolve()).then(
+        () => resolve({ code: closeCode, stdout, stderr, ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}) }),
+        reject
+      )
     }
 
     const feed = (rest: string, chunk: string): string => {
