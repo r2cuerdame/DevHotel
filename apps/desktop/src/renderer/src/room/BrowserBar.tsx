@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { IPC, type RuntimeRoomRecord } from '@devhotel/shared'
 import { api } from '../api'
+import { runtimeCapabilities } from './runtimeCapabilities'
 import { statusLabel, useStore, useT } from '../state/store'
 import { CloneRoomModal } from './CloneRoomModal'
 import { ResetRoomModal } from './ResetRoomModal'
@@ -58,7 +59,7 @@ export function BrowserBar({
     return () => onModalChange(false)
   }, [cloneOpen, menuOpen, onModalChange, renameOpen, resetOpen])
 
-  const running = room.runtimeStatus.state === 'running'
+  const { fullyRunning: running, hasLiveComponent } = runtimeCapabilities(room)
   const web = room.provider === 'web'
   const windows = room.provider === 'windows'
   // android rooms serve the emulator screen — their bar behaves like a site too
@@ -184,7 +185,7 @@ export function BrowserBar({
               }}
             />
             <div className="bar-menu-sep" />
-            {running && (
+            {hasLiveComponent && (
               <MenuItem
                 label={t('bar.sleep')}
                 onClick={() => {
