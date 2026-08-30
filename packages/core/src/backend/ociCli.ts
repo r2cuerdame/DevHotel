@@ -1525,7 +1525,14 @@ export class OciCliBackend implements IsolationBackend {
     const emulator = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
     if (emulator.State?.Status !== 'running') throw new Error('Room emulator is not running under the execution fence')
     const anchorId = exactContainerId(anchor, roomId)
-    if (emulator.HostConfig?.NetworkMode !== `container:${anchorId}`) {
+    const anchorSandboxId = anchor.NetworkSettings?.SandboxID?.trim() ?? ''
+    const emulatorSandboxId = emulator.NetworkSettings?.SandboxID?.trim() ?? ''
+    const networkMode = emulator.HostConfig?.NetworkMode ?? ''
+    if (
+      !/^[a-f0-9]{12,64}$/.test(anchorSandboxId) ||
+      emulatorSandboxId !== anchorSandboxId ||
+      (networkMode !== `container:${anchorName(roomId)}` && networkMode !== `container:${anchorId}`)
+    ) {
       throw new Error('Room emulator is not attached to the exact owned anchor network namespace')
     }
     await this.ensureImage(ANDROID_IMAGE)
@@ -2135,6 +2142,7 @@ interface DockerContainerInspect {
   Config?: { Labels?: Record<string, string> | null } | null
   State?: { Status?: string; Paused?: boolean } | null
   HostConfig?: { NetworkMode?: string } | null
+  NetworkSettings?: { SandboxID?: string; SandboxKey?: string } | null
 }
 
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {

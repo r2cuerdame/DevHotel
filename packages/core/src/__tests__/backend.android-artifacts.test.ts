@@ -211,14 +211,16 @@ describe('OciCliBackend Android artifact export', () => {
     const ids = {
       web: 'a'.repeat(64),
       anchor: 'b'.repeat(64),
-      emulator: 'c'.repeat(64)
+      emulator: 'c'.repeat(64),
+      sandbox: 'd'.repeat(64)
     }
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
       State: { Status: 'running', Paused: paused },
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ids.anchor}` } } : {})
+      ...(role === 'anchor' || role === 'svc-emulator' ? { NetworkSettings: { SandboxID: ids.sandbox } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'inspect') {
@@ -283,7 +285,8 @@ describe('OciCliBackend Android artifact export', () => {
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
       State: { Status: 'running', Paused: paused },
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${'b'.repeat(64)}` } } : {})
+      ...(role === 'anchor' || role === 'svc-emulator' ? { NetworkSettings: { SandboxID: 'd'.repeat(64) } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'inspect') {
@@ -312,22 +315,29 @@ describe('OciCliBackend Android artifact export', () => {
     expect(Buffer.concat(chunks).toString('utf8')).toBe('abcd')
   })
 
-  it('refuses an emulator that is not bound to the exact owned anchor namespace', async () => {
-    const container = (name: string, role: string, id: string, networkMode?: string) => JSON.stringify([{
+  it('accepts Moby name-form container mode but refuses a different network sandbox', async () => {
+    const container = (name: string, role: string, id: string, sandboxId: string, networkMode?: string) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
       State: { Status: 'running' },
+      NetworkSettings: { SandboxID: sandboxId },
       ...(networkMode ? { HostConfig: { NetworkMode: networkMode } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'inspect' && args[1] === anchorName(ROOM_ID)) {
-        return { code: 0, stdout: container(args[1], 'anchor', 'a'.repeat(64)), stderr: '' }
+        return { code: 0, stdout: container(args[1], 'anchor', 'a'.repeat(64), 'd'.repeat(64)), stderr: '' }
       }
       if (args[0] === 'inspect' && args[1] === emulatorName(ROOM_ID)) {
         return {
           code: 0,
-          stdout: container(args[1], 'svc-emulator', 'b'.repeat(64), `container:${'c'.repeat(64)}`),
+          stdout: container(
+            args[1],
+            'svc-emulator',
+            'b'.repeat(64),
+            'e'.repeat(64),
+            `container:${anchorName(ROOM_ID)}`
+          ),
           stderr: ''
         }
       }
@@ -341,13 +351,15 @@ describe('OciCliBackend Android artifact export', () => {
 
   it('aborted helper cleanup removes only the exact labeled container ID and ignores name reuse', async () => {
     const ownedIds = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), helper: 'c'.repeat(64) }
+    const sandboxId = 'd'.repeat(64)
     let helperInspect: Record<string, unknown> | null = null
     const roomContainer = (name: string, role: string, id: string) => ({
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
       State: { Status: 'running' },
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ownedIds.anchor}` } } : {})
+      ...(role === 'anchor' || role === 'svc-emulator' ? { NetworkSettings: { SandboxID: sandboxId } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
     })
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'rm') {
