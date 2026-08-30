@@ -140,7 +140,7 @@ describe('trusted Android pairing IPC', () => {
   it('fences replay and defers dismissal cleanup until an in-flight pair attempt settles', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(NOW)
-    const { ipc, pair, cancel } = setup()
+    const { ipc, pair, cancel, promptClosed } = setup(new Date(NOW + 1_000).toISOString())
     let finishPairing!: () => void
     pair.mockImplementation(async (_candidateId, _generation, _code) => {
       await new Promise<void>((resolve) => { finishPairing = resolve })
@@ -162,8 +162,12 @@ describe('trusted Android pairing IPC', () => {
     const prompt = ipc.begin({ candidateId: CANDIDATE_ID, generation: discovery.generation })
     if (!prompt.ok) throw new Error('unreachable')
 
+    await vi.advanceTimersByTimeAsync(900)
     const first = ipc.submit({ promptId: prompt.promptId, code: CODE })
     await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(promptClosed).not.toHaveBeenCalled()
+    expect(cancel).not.toHaveBeenCalled()
     await expect(ipc.submit({ promptId: prompt.promptId, code: CODE })).resolves.toMatchObject({
       ok: false,
       code: 'candidate-consumed'

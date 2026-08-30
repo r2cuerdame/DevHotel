@@ -229,6 +229,10 @@ export class AndroidPairingIpc {
     // Fence replay before the await, independently of the broker's own
     // consume-before-await guarantee.
     prompt.submitted = true
+    // Core consumes the candidate and starts a fresh operation TTL here. The
+    // original discovery deadline must no longer emit an `expired` event that
+    // could make the renderer discard this attempt's definitive result.
+    clearTimeout(prompt.timer)
 
     try {
       const result = await this.broker.pairCandidate(prompt.candidateId, prompt.generation, parsed.data.code)
