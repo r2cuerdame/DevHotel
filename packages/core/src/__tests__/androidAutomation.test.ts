@@ -282,10 +282,34 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args[1] === 'input')).toBe(false)
   })
 
+  it('applies the text predicate before the cap and refuses a truncated candidate dump', async () => {
+    const nodes = Array.from({ length: 501 }, (_, index) =>
+      `<node package="${APP_ID}" text="Crash" bounds="[${index},0][${index + 1},20]" />`
+    )
+    let hierarchyReads = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sh' && args[2] === '-c' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        hierarchyReads += 1
+        return { code: 0, stdout: `<hierarchy>${nodes.join('')}</hierarchy>`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
+      code: 'ANDROID_UI_TEXT_AMBIGUOUS'
+    })
+    expect(hierarchyReads).toBe(1)
+    expect(calls.some((args) => args[1] === 'input')).toBe(false)
+  })
+
   it('clamps every wait-for-text command to the remaining request deadline', async () => {
     let now = 1_000
     const { calls, session, timeouts } = setup((args) => {
-      now += 60
+      now += 80
       if (args[1] === 'pm' && args[2] === 'path') {
         return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       }
@@ -311,8 +335,12 @@ describe('tracked Android automation session', () => {
       pollIntervalMs: 250
     })).rejects.toMatchObject({ code: 'ANDROID_WAIT_TIMEOUT' })
 
-    expect(timeouts).toEqual([250, 190, 130, 70, 10])
+    expect(timeouts).toEqual([250, 170, 90, 10])
     expect(calls.some((args) => args[1] === 'rm')).toBe(false)
+    const trappedDump = calls.find((args) => args[0] === 'exec-out')
+    expect(trappedDump?.[3]).toContain('trap cleanup 0 1 2 15')
+    expect(trappedDump?.[3]).toContain('kill "$child"')
+    expect(trappedDump?.[5]).toMatch(/^\/data\/local\/tmp\/devhotel-ui-[a-f0-9-]+\.xml$/)
   })
 
   it('uses an exact unshared UID, clamps time to install, and redacts log secrets', async () => {
@@ -369,7 +397,10 @@ describe('tracked Android automation session', () => {
   })
 
   it('invalidates a stale receipt when the package is gone', async () => {
-    const { installs, session } = setup(() => ({ code: 1, stdout: '', stderr: 'not installed' }))
+    const { installs, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: '', stderr: '' }
+      return { code: 1, stdout: '', stderr: 'not installed' }
+    })
 
     await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_INSTALLED' })
     expect(installs.get(
@@ -377,6 +408,19 @@ describe('tracked Android automation session', () => {
       { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
       APP_ID
     )).toBeNull()
+  })
+
+  it('preserves the receipt when package probes fail transiently', async () => {
+    const { installs, calls, session } = setup(() => ({ code: 1, stdout: '', stderr: 'transport lost' }))
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_PROBE_FAILED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toMatchObject({ applicationId: APP_ID, apkSha256: 'a'.repeat(64) })
+    expect(calls.some((args) => args[1] === 'pm' && args[2] === 'list')).toBe(true)
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'force-stop')).toBe(false)
   })
 
   it('invalidates a receipt when the installed base APK bytes were replaced', async () => {
@@ -393,6 +437,79 @@ describe('tracked Android automation session', () => {
       APP_ID
     )).toBeNull()
     expect(calls.some((args) => args[1] === 'am' && args[2] === 'force-stop')).toBe(false)
+  })
+
+  it('preserves the receipt and refuses an unsealed split APK installation', async () => {
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return {
+          code: 0,
+          stdout: 'package:/data/app/base.apk\npackage:/data/app/split_config.en.apk\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_IDENTITY_UNVERIFIED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toMatchObject({ applicationId: APP_ID, apkSha256: 'a'.repeat(64) })
+    expect(calls.some((args) => args[1] === 'sha256sum')).toBe(false)
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'force-stop')).toBe(false)
+  })
+
+  it('does not misreport a pre-crash PID probe failure as an app that is not running', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pidof') return { code: -1, stdout: '', stderr: 'transport lost' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'pre-probe-failure'
+    })).rejects.toMatchObject({ code: 'ANDROID_PROCESS_PROBE_FAILED' })
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'crash')).toBe(false)
+  })
+
+  it('reports not-running only for an authoritative empty pidof result', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pidof') return { code: 1, stdout: '', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'not-running'
+    })).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_RUNNING' })
+  })
+
+  it('does not treat a post-crash PID probe failure as observed process death', async () => {
+    let pidProbes = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pidof') {
+        pidProbes += 1
+        return pidProbes === 1
+          ? { code: 0, stdout: '1234\n', stderr: '' }
+          : { code: -1, stdout: '', stderr: 'transport lost' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'post-probe-failure'
+    })).rejects.toMatchObject({ code: 'ANDROID_PROCESS_PROBE_FAILED' })
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'crash')).toBe(true)
+    expect(pidProbes).toBe(2)
   })
 
   it('transfers one exact target/package receipt to the last installing Room', () => {

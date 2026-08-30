@@ -55,6 +55,13 @@ interface AndroidAutomationDeadline {
   applicationId: string
 }
 
+interface AndroidDumpOptions {
+  filter?: string
+  maxNodes?: number
+  deadline?: AndroidAutomationDeadline
+  textMatch?: 'exact' | 'contains'
+}
+
 function automationError(
   code: string,
   message: string,
@@ -95,7 +102,10 @@ function parsePids(value: string): number[] {
   const trimmed = value.trim()
   if (!trimmed) return []
   if (!/^\d+(?:\s+\d+)*$/.test(trimmed)) return []
-  return [...new Set(trimmed.split(/\s+/).map((part) => Number.parseInt(part, 10)).filter(Number.isSafeInteger))]
+  return [...new Set(trimmed
+    .split(/\s+/)
+    .map((part) => Number.parseInt(part, 10))
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0))]
 }
 
 function componentForActivity(applicationId: string, activity: string): string {
@@ -229,6 +239,27 @@ export class AndroidAutomationSession {
       .map((line) => line.trim())
       .filter((line) => line.startsWith('package:'))
       .map((line) => line.slice('package:'.length))
+    if (result.code !== 0) {
+      // A timeout/transport failure is not evidence that an installed package
+      // disappeared. Only a successful exact inventory may invalidate the
+      // receipt after a failed path probe.
+      const inventory = await this.command(
+        ['shell', 'pm', 'list', 'packages', '--user', 'current', applicationId],
+        { operation: 'Android package inventory probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline }
+      )
+      const stillInstalled = inventory.code === 0 && inventory.stdout
+        .split(/\r?\n/)
+        .some((line) => line.trim() === `package:${applicationId}`)
+      if (inventory.code !== 0 || stillInstalled) {
+        throw automationError(
+          'ANDROID_APP_PROBE_FAILED',
+          `${applicationId} installation state could not be established on this target.`,
+          'Keep the existing install receipt, restore target connectivity, and retry.',
+          409,
+          safeEvidence(result)
+        )
+      }
+    }
     if (result.code !== 0 || paths.length === 0) {
       this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
       throw automationError(
@@ -246,11 +277,11 @@ export class AndroidAutomationSession {
       !/[\p{C}\p{Zl}\p{Zp}]/u.test(path) &&
       !path.split('/').some((segment) => segment === '.' || segment === '..')
     )
-    if (baseApks.length !== 1) {
+    if (paths.length !== 1 || baseApks.length !== 1) {
       throw automationError(
         'ANDROID_APP_IDENTITY_UNVERIFIED',
-        `${applicationId} did not expose one safe installed base APK path.`,
-        'Run android_run again on a supported Android target; DevHotel will not trust package name alone.',
+        `${applicationId} did not expose exactly one safe installed base APK and no split APKs.`,
+        'Run android_run again with one standalone APK; DevHotel will not trust an unsealed split installation.',
         409,
         safeEvidence(result)
       )
@@ -421,30 +452,29 @@ export class AndroidAutomationSession {
 
   private async dump(
     applicationId: string,
-    filter?: string,
-    maxNodes = 500,
-    deadline?: AndroidAutomationDeadline
+    opts: AndroidDumpOptions = {}
   ): Promise<AndroidUiDumpResult> {
+    const { deadline } = opts
     await this.requireInstalled(applicationId, deadline)
     await this.requireForeground(applicationId, deadline)
     const path = `/data/local/tmp/devhotel-ui-${randomUUID()}.xml`
     try {
-      const dumped = await this.command(
-        ['shell', 'uiautomator', 'dump', '--compressed', path],
-        { operation: 'Android UI dump', timeoutMs: 30_000, stdoutLimit: 16 * 1024, deadline }
-      )
-      if (dumped.code !== 0) {
-        throw automationError(
-          'ANDROID_UI_DUMP_FAILED',
-          'Android UIAutomator could not produce a hierarchy dump.',
-          'Ensure the app is unlocked and foreground, then retry.',
-          409,
-          safeEvidence(dumped)
-        )
-      }
+      // The guest shell owns the temp file from creation through read. Its
+      // trap still removes the file when the host-side deadline terminates adb,
+      // so bounded waits never depend on a post-deadline cleanup round trip.
+      const dumpScript = [
+        'path="$1"',
+        'child=',
+        'cleanup() { if [ -n "$child" ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; child=; fi; rm -f "$path"; }',
+        'trap cleanup 0 1 2 15',
+        'uiautomator dump --compressed "$path" >/dev/null 2>&1 & child=$!',
+        'wait "$child"; status=$?; child=',
+        '[ "$status" -eq 0 ] || exit "$status"',
+        `head -c ${MAX_UI_XML_BYTES + 1} "$path"`
+      ].join('; ')
       const read = await this.command(
-        ['exec-out', 'sh', '-c', `head -c ${MAX_UI_XML_BYTES + 1} ${path}`],
-        { operation: 'Android UI hierarchy read', timeoutMs: 30_000, stdoutLimit: MAX_UI_XML_BYTES + 1, deadline }
+        ['exec-out', 'sh', '-c', dumpScript, 'devhotel-ui-dump', path],
+        { operation: 'Android UI dump and hierarchy read', timeoutMs: 60_000, stdoutLimit: MAX_UI_XML_BYTES + 1, deadline }
       )
       if (read.code !== 0) {
         throw automationError(
@@ -462,7 +492,11 @@ export class AndroidAutomationSession {
           'Narrow the screen state or remove an unexpectedly large accessibility tree.'
         )
       }
-      const parsed = parseAndroidUiHierarchy(read.stdout, applicationId, { filter, maxNodes })
+      const parsed = parseAndroidUiHierarchy(read.stdout, applicationId, {
+        filter: opts.filter,
+        maxNodes: opts.maxNodes ?? 500,
+        textMatch: opts.textMatch
+      })
       if (deadline && this.now() >= deadline.at) throw waitTimeoutError(applicationId)
       return { target: this.target, applicationId, ...parsed }
     } finally {
@@ -480,7 +514,7 @@ export class AndroidAutomationSession {
   }
 
   dumpUi(input: AndroidDumpUiInput): Promise<AndroidUiDumpResult> {
-    return this.dump(input.applicationId, input.filter, input.maxNodes ?? 200)
+    return this.dump(input.applicationId, { filter: input.filter, maxNodes: input.maxNodes ?? 200 })
   }
 
   async waitForText(input: AndroidWaitForTextInput): Promise<AndroidWaitForTextResult> {
@@ -493,7 +527,12 @@ export class AndroidAutomationSession {
     let attempts = 0
     do {
       attempts += 1
-      const dumped = await this.dump(input.applicationId, input.text, 500, deadline)
+      const dumped = await this.dump(input.applicationId, {
+        filter: input.text,
+        maxNodes: 500,
+        deadline,
+        textMatch: match
+      })
       const matched = dumped.nodes.find((node) => matchesText(node, input.text, match))
       if (matched) {
         return {
@@ -512,7 +551,18 @@ export class AndroidAutomationSession {
 
   async tapText(input: AndroidTapTextInput): Promise<AndroidTapTextResult> {
     const match = input.match ?? 'exact'
-    const dumped = await this.dump(input.applicationId, input.text, 500)
+    const dumped = await this.dump(input.applicationId, {
+      filter: input.text,
+      maxNodes: 500,
+      textMatch: match
+    })
+    if (dumped.truncated) {
+      throw automationError(
+        'ANDROID_UI_TEXT_AMBIGUOUS',
+        'The bounded UI evidence was truncated before text uniqueness could be established.',
+        'Use a more specific text or simplify the screen before tapping.'
+      )
+    }
     const matches = dumped.nodes.filter((node) => matchesText(node, input.text, match))
     if (matches.length === 0) {
       throw automationError(
@@ -531,7 +581,18 @@ export class AndroidAutomationSession {
     const first = matches[0]!
     // Re-read immediately before input: foreground can remain the same while
     // an animation/list update moves the requested node under stale coordinates.
-    const confirmedDump = await this.dump(input.applicationId, input.text, 500)
+    const confirmedDump = await this.dump(input.applicationId, {
+      filter: input.text,
+      maxNodes: 500,
+      textMatch: match
+    })
+    if (confirmedDump.truncated) {
+      throw automationError(
+        'ANDROID_UI_TEXT_AMBIGUOUS',
+        'The confirming UI evidence was truncated before text uniqueness could be established.',
+        'Use a more specific text or simplify the screen before tapping.'
+      )
+    }
     const confirmedMatches = confirmedDump.nodes.filter((node) => matchesText(node, input.text, match))
     if (confirmedMatches.length !== 1) {
       throw automationError(
@@ -668,7 +729,19 @@ export class AndroidAutomationSession {
       ['shell', 'pidof', applicationId],
       { operation: 'Android app process probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
     )
-    return result.code === 0 ? parsePids(result.stdout) : []
+    const parsed = parsePids(result.stdout)
+    if (result.code === 0 && parsed.length > 0) return parsed
+    // Android toybox pidof reports an authoritative no-process result as exit
+    // 1 with no output. Transport failures and malformed output must never be
+    // collapsed into crash evidence.
+    if (result.code === 1 && !result.stdout.trim() && !result.stderr.trim()) return []
+    throw automationError(
+      'ANDROID_PROCESS_PROBE_FAILED',
+      `${applicationId} process state could not be established on this target.`,
+      'Restore target connectivity and retry; DevHotel will not infer a crash from a failed PID probe.',
+      409,
+      safeEvidence(result)
+    )
   }
 
   async crashScenario(input: AndroidRunCrashScenarioInput): Promise<AndroidCrashScenarioResult> {
@@ -724,6 +797,7 @@ interface ParsedUi {
 interface ParseUiOptions {
   filter?: string
   maxNodes?: number
+  textMatch?: 'exact' | 'contains'
 }
 
 function decodeXml(value: string): string {
@@ -882,8 +956,12 @@ export function parseAndroidUiHierarchy(
       }
     }
     if (opts.filter) {
-      const searchable = [node.text, node.contentDescription, node.resourceId, node.className].join('\n')
-      if (!literalIncludes(searchable, opts.filter)) continue
+      if (opts.textMatch) {
+        if (!matchesText(node, opts.filter, opts.textMatch)) continue
+      } else {
+        const searchable = [node.text, node.contentDescription, node.resourceId, node.className].join('\n')
+        if (!literalIncludes(searchable, opts.filter)) continue
+      }
     }
     matchedNodes += 1
     if (nodes.length < maxNodes) nodes.push(node)
