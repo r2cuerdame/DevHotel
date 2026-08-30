@@ -9,6 +9,7 @@ import type {
   RoomInspection,
   RoomPlan,
   RoomRecord,
+  RuntimeRoomRecord,
   RendererCreateRoomInput,
   RendererPlanRoomInput,
   UpdateStatusInfo
@@ -28,7 +29,7 @@ type View = { name: 'lobby' } | { name: 'room'; roomId: string }
 
 interface DhState {
   view: View
-  rooms: RoomRecord[]
+  rooms: RuntimeRoomRecord[]
   inspections: Record<string, RoomInspection>
   previews: Record<string, PreviewState>
   logs: Record<string, string[]>

@@ -2,7 +2,7 @@ import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
-import { FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
+import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
 
 describe('Room runtime status', () => {
   const dirs: string[] = []
@@ -73,6 +73,31 @@ describe('Room runtime status', () => {
     expect(first.runtimeStatus).toMatchObject({ state: 'running', recordedStatus: 'ready', main: 'running' })
     expect(second.runtimeStatus.state).toBe('running')
     expect(backend.calls.some((call) => /start|create|recreate/i.test(call))).toBe(false)
+  })
+
+  it('recreates a recorded-ready Room when Start is used to recover a dead runtime', async () => {
+    const { backend, orch } = setup()
+    const relay = await listeningPort()
+    backend.hostPort = relay.port
+    const room = makeRoom({ status: 'ready', hostPort: 45123 })
+    orch.rooms.create(room)
+    backend.webStateValue = 'missing'
+    const recreateAnchor = backend.recreateAnchor.bind(backend)
+    backend.recreateAnchor = async (spec) => {
+      const result = await recreateAnchor(spec)
+      backend.webStateValue = 'running'
+      return result
+    }
+
+    try {
+      await orch.startRoom(room.id, 'user')
+
+      expect(backend.calls).toContain(`recreateAnchor:${room.id}:${room.internalPort}`)
+      expect(backend.calls.some((call) => call.startsWith(`recreateWeb:${room.id}:`))).toBe(true)
+      expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: relay.port })
+    } finally {
+      relay.close()
+    }
   })
 
   it('reports an Android Room with one dead runtime component as degraded', async () => {

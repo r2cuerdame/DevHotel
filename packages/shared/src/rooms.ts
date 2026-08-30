@@ -114,6 +114,9 @@ export interface RoomRecord {
   thumbPath: string | null
 }
 
+/** A public Room record with a fresh, read-only runtime observation attached. */
+export type RuntimeRoomRecord = RoomRecord & { runtimeStatus: RoomRuntimeStatus }
+
 /** Which detection rule decided a value — shown in the Room Plan UI. */
 export interface Detected<T> {
   value: T

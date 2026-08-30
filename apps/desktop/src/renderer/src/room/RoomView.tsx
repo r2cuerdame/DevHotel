@@ -31,7 +31,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
   const roomAction = useStore((s) => s.roomAction)
   const toast = useStore((s) => s.toast)
   const t = useT()
-  const running = !!room && (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
+  const running = room?.runtimeStatus.state === 'running'
   const [configOpen, setConfigOpen] = useState(false)
   const [configTab, setConfigTab] = useState<ConfigTab>('overview')
   const [modalOpen, setModalOpen] = useState(false)

@@ -1,14 +1,19 @@
-import type { RoomRecord } from '@devhotel/shared'
+import type { RoomRecord, RoomRuntimeStatus } from '@devhotel/shared'
+
+type PreviewableRoom = Pick<RoomRecord, 'provider' | 'status'> & {
+  runtimeStatus?: Pick<RoomRuntimeStatus, 'state'>
+}
 
 export function roomPreviewPartition(roomId: string): string {
   return `persist:room-${roomId}`
 }
 
 /** Web rooms preview their site; Android rooms preview the relayed emulator screen. */
-export function isPreviewableRoom(room: Pick<RoomRecord, 'provider' | 'status'> | null | undefined): boolean {
+export function isPreviewableRoom(room: PreviewableRoom | null | undefined): boolean {
   return (
     (room?.provider === 'web' || room?.provider === 'android') &&
-    ['running', 'ready', 'attention'].includes(room.status)
+    ['running', 'ready', 'attention'].includes(room.status) &&
+    (room.runtimeStatus === undefined || room.runtimeStatus.state === 'running')
   )
 }
 

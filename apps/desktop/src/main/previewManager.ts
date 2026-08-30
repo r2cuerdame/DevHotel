@@ -56,6 +56,7 @@ export class PreviewManager {
   private previewLayout: PreviewLayout = { ...DEFAULT_LAYOUT, rightViewport: { ...DEFAULT_LAYOUT.rightViewport } }
   private pendingRightLoads = new PreviewSyncGuard()
   private visible = true
+  private attachAttempt = 0
 
   constructor(
     private readonly win: BrowserWindow,
@@ -74,8 +75,17 @@ export class PreviewManager {
     })
   }
 
-  attach(roomId: string, bounds: { x: number; y: number; width: number; height: number }): void {
-    const room = this.orch.rooms.get(roomId)
+  async attach(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void> {
+    const attempt = ++this.attachAttempt
+    let inspection: Awaited<ReturnType<RoomOrchestrator['inspectRoomRuntime']>>
+    try {
+      inspection = await this.orch.inspectRoomRuntime(roomId)
+    } catch {
+      if (attempt === this.attachAttempt && this.roomId) this.detach()
+      return
+    }
+    if (attempt !== this.attachAttempt) return
+    const room = { ...inspection.room, runtimeStatus: inspection.runtimeStatus }
     if (!isPreviewableRoom(room)) {
       // A forged/stale renderer attach must never leave another Room visible.
       if (this.roomId) this.detach()
@@ -207,6 +217,7 @@ export class PreviewManager {
   }
 
   detach(): void {
+    this.attachAttempt += 1
     const detachedRoomId = this.roomId
     if (this.thumbTimer) {
       clearInterval(this.thumbTimer)

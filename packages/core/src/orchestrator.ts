@@ -17,6 +17,7 @@ import type {
   RoomPlan,
   RoomRecord,
   RoomRuntimeStatus,
+  RuntimeRoomRecord,
   SourceType
 } from '@devhotel/shared'
 import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
@@ -300,14 +301,14 @@ export class RoomOrchestrator {
   }
 
   /** Public Room listing with live liveness overlaid; persisted records remain unchanged. */
-  async listRoomsRuntime(): Promise<(RoomRecord & { runtimeStatus: RoomRuntimeStatus })[]> {
+  async listRoomsRuntime(): Promise<RuntimeRoomRecord[]> {
     let backendAvailable = false
     try {
       backendAvailable = (await this.backend.health()).ok
     } catch {
       // Each OCI Room reports unknown below; Windows Rooms use their own provider probe.
     }
-    const rooms = [] as (RoomRecord & { runtimeStatus: RoomRuntimeStatus })[]
+    const rooms: RuntimeRoomRecord[] = []
     for (const room of this.rooms.list()) {
       const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
       rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
@@ -979,7 +980,11 @@ export class RoomOrchestrator {
       this.emit(roomId, 'status')
       return
     }
-    if (alreadyAwake && room.hostPort != null) return
+    if (alreadyAwake && room.hostPort != null) {
+      const runtimeStatus = await this.observeRuntimeStatus(room)
+      if (runtimeStatus.state === 'running') return
+      this.olog(roomId, `wake requested for stale runtime: ${runtimeStatus.detail}`)
+    }
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
