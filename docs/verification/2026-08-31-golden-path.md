@@ -1,6 +1,6 @@
 # Golden-path verification — 2026-08-31
 
-Target: GitHub #11 (R2C-238), exercised on Windows 11 against the locally installed DevHotel 0.4.3 control plane and Docker Desktop 29.2.1. Every Room action in this run used the loopback Control API, the same contract exposed by DevHotel MCP. No desktop, Host mouse/keyboard, Host ADB, or direct Docker command was used.
+Target: GitHub #11 (R2C-238), exercised on Windows 11 against the locally installed DevHotel 0.4.3 control plane and Docker Desktop 29.2.1. Every Room action in this run used the loopback Control API, the same contract exposed by DevHotel MCP. No desktop, Host mouse/keyboard, direct or unbrokered Host ADB, or direct Docker command was used. Physical-device operations used DevHotel's lease-fenced Host Device Broker internally.
 
 The fixtures intentionally cover both a reused Room and a newly provisioned Hotel-owned Room for Web and Android. Private device serials, pairing material, tokens, Host paths, and source contents are omitted.
 
@@ -119,7 +119,7 @@ The first physical capture after reinstall was a screen-off black frame and was 
 
 - Existing protected Rooms and applications were preserved; no Room was deleted or reset.
 - No Host source was rewritten, including the dirty ADisAD working tree and AppDied checkout.
-- No Host ADB command or direct Docker lifecycle command was used.
+- No direct or unbrokered Host ADB command or direct Docker lifecycle command was used.
 - Physical-device identifiers and all pairing/authorization material remain redacted.
 - The pre-existing differently signed AppDied and keyboard applications were never uninstalled, cleared, downgraded, or overwritten.
 - Long-output evidence records byte counts, page boundaries, and hashes rather than embedding retained content.
