@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { RoomOrchestrator } from '@devhotel/core'
+import type { OrchestratorEvent, RoomOrchestrator } from '@devhotel/core'
 import { PreviewManager } from './previewManager'
 
 const electronMocks = vi.hoisted(() => {
@@ -123,6 +123,44 @@ describe('PreviewManager runtime attachment', () => {
     expect(inspectRoomRuntime).toHaveBeenCalledTimes(1)
     expect(electronMocks.views[0]!.boundsCalls.at(-1)).toEqual(resizeAfterAttach)
 
+    manager.detach()
+  })
+
+  it('cancels a pending attachment when the Room stops before inspection resolves', async () => {
+    let finishInspection: ((value: unknown) => void) | undefined
+    const inspection = new Promise((resolve) => {
+      finishInspection = resolve
+    })
+    let emitEvent: ((event: OrchestratorEvent) => void) | undefined
+    const room = { id: 'room1abc', provider: 'web', status: 'ready' }
+    const orch = {
+      onEvent: (listener: (event: OrchestratorEvent) => void) => {
+        emitEvent = listener
+        return () => undefined
+      },
+      rooms: { get: () => room },
+      inspectRoomRuntime: () => inspection,
+      inspectRoom: () => ({ urls: { app: 'https://demo-dev.localhost/' } }),
+      setThumbnail: () => undefined
+    } as unknown as RoomOrchestrator
+    const win = {
+      contentView: { addChildView: () => undefined, removeChildView: () => undefined },
+      isDestroyed: () => false,
+      webContents: { send: () => undefined }
+    }
+    const manager = new PreviewManager(win as never, orch, 'C:\\devhotel-test')
+    const pendingAttach = manager.attach(room.id, { x: 10, y: 20, width: 800, height: 600 })
+
+    room.status = 'sleeping'
+    emitEvent?.({ roomId: room.id, kind: 'status' })
+    finishInspection?.({
+      room: { ...room, status: 'ready' },
+      runtimeStatus: { state: 'running' },
+      urls: { app: 'https://demo-dev.localhost/' }
+    })
+    await pendingAttach
+
+    expect(electronMocks.views).toHaveLength(0)
     manager.detach()
   })
 })

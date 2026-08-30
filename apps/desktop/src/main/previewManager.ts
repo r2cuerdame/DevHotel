@@ -68,10 +68,10 @@ export class PreviewManager {
   ) {
     orch.onEvent((e) => {
       if (e.kind === 'deleted') {
-        if (this.roomId === e.roomId) this.detach()
+        if (this.roomId === e.roomId || this.pendingRoomId === e.roomId) this.detach()
         void this.clearRoomData(e.roomId)
       }
-      if (e.kind === 'status' && this.roomId === e.roomId) {
+      if (e.kind === 'status' && (this.roomId === e.roomId || this.pendingRoomId === e.roomId)) {
         const room = orch.rooms.get(e.roomId)
         if (!isPreviewableRoom(room)) this.detach()
       }
