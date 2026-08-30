@@ -169,6 +169,18 @@ const ADB_INSTALL_VALUE_FLAGS = new Set([
 const MAX_STAGED_APK_BYTES = 512 * 1024 * 1024
 const MAX_STAGED_INSTALL_BYTES = 1024 * 1024 * 1024
 
+function posixRemoteArg(value: string): string {
+  if (value.includes('\0')) throw new Error('Android remote command arguments cannot contain NUL bytes')
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+/** adb shell concatenates its remaining argv into one remote shell command. */
+function protectAndroidRemoteCommand(args: string[]): string[] {
+  const verb = args[0]
+  if (verb !== 'shell' || args.length < 2) return args
+  return [verb, args.slice(1).map(posixRemoteArg).join(' ')]
+}
+
 function workerProcessLiveness(workerId: string): boolean | 'unknown' {
   const match = /^pid:(\d{1,10})$/.exec(workerId)
   if (!match) return 'unknown'
@@ -1886,8 +1898,9 @@ export class RoomOrchestrator {
             'running the high-level Android automation command',
             expectedLeaseId
           )
+          const executableArgs = protectAndroidRemoteCommand(args)
           const result = await this.withDeviceHeartbeat(roomId, attached.id, expectedLeaseId, () =>
-            this.devices.hostAdb.exec(authorized.serial, args, {
+            this.devices.hostAdb.exec(authorized.serial, executableArgs, {
               timeoutMs: opts?.timeoutMs,
               maxStdoutBytes: opts?.maxStdoutBytes,
               maxStderrBytes: opts?.maxStderrBytes
@@ -1926,7 +1939,7 @@ export class RoomOrchestrator {
         let sawStderr = false
         const result = await this.backend.execInRoom(
           roomId,
-          ['adb', '-s', EMULATOR_ADB_SERIAL, ...args],
+          ['adb', '-s', EMULATOR_ADB_SERIAL, ...protectAndroidRemoteCommand(args)],
           {
             timeoutMs: opts?.timeoutMs,
             onStdout: (chunk) => { sawStdout = true; stdout.push(chunk) },
@@ -2100,6 +2113,12 @@ export class RoomOrchestrator {
 
       // Re-check after staging: a short TTL may have expired while bytes moved.
       const authorized = authorize(executableArgs, capturedLeaseId)
+      // A raw install can replace one or several packages without producing a
+      // tracked receipt. Revoke every capability on this exact physical target
+      // before mutation, even when adb later reports an install failure.
+      if (ADB_INSTALL_VERBS.has(verb) && !internal) {
+        this.androidInstalls.invalidateTarget({ kind: 'physical', targetId: target.deviceId })
+      }
       const result = await this.withDeviceHeartbeat(roomId, target.deviceId, authorized.leaseId, () =>
         this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs }).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
@@ -3264,6 +3283,18 @@ export class RoomOrchestrator {
       syncRoute: () => this.syncRouteFor(roomId),
       clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
       clearAndroidEmulatorInstalls: () => this.clearAndroidEmulatorInstalls(roomId),
+      invalidateAndroidInstall: (applicationId) => {
+        const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
+        const target: AndroidInstallTarget = physicalDevice
+          ? {
+              kind: 'physical',
+              targetId: physicalDevice.id,
+              deviceId: physicalDevice.id,
+              leaseId: expectedLeaseId!
+            }
+          : { kind: 'emulator', targetId: roomId, deviceId: null }
+        this.androidInstalls.invalidateTargetApplication(target, applicationId)
+      },
       recordAndroidInstall: async (applicationId, apkPath, changeId) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
         await this.recordAndroidInstallLocked(
@@ -3314,6 +3345,9 @@ export class RoomOrchestrator {
     ) {
       throw new Error('Android install receipt received an unsafe APK path')
     }
+    // The install already succeeded. Remove any prior capability before the
+    // fallible copy/hash/fence work so a same-byte reinstall cannot retain it.
+    this.androidInstalls.invalidateTargetApplication(target, applicationId)
     const stagingRoot = join(this.userData, 'tmp')
     mkdirSync(stagingRoot, { recursive: true })
     const stagingDir = mkdtempSync(join(stagingRoot, 'android-install-receipt-'))
@@ -3336,13 +3370,39 @@ export class RoomOrchestrator {
       } else if ((await this.backend.emulatorState(roomId)) !== 'running') {
         throw new Error('The Room emulator disappeared before its install receipt was recorded')
       }
+      const session = await this.openAndroidAutomationSessionLocked(
+        roomId,
+        target.kind === 'physical'
+          ? { kind: 'physical', deviceId: target.deviceId }
+          : { kind: 'emulator' }
+      )
+      // This Host timestamp is the public lower bound. Capture it before the
+      // install marker so every sequence-fenced row is chronologically at or
+      // after the reported `since`, never in the gap before receipt commit.
+      const installedAt = new Date().toISOString()
+      const evidence = await session.establishInstallEvidence(applicationId)
+      if (evidence.apkSha256 !== apkSha256) {
+        throw new Error('The installed Android package bytes differ from the tracked Room APK')
+      }
+      if (target.kind === 'physical') {
+        this.devices.authorizeInternalOperation(
+          roomId,
+          target.deviceId,
+          'committing the tracked Android install evidence',
+          expectedLeaseId!
+        )
+      } else if ((await this.backend.emulatorState(roomId)) !== 'running') {
+        throw new Error('The Room emulator disappeared before its install evidence was committed')
+      }
       this.androidInstalls.record({
         roomId,
         target,
         applicationId,
         changeId,
         apkSha256,
-        installedAt: new Date().toISOString()
+        installedAt,
+        packageIncarnation: evidence.packageIncarnation,
+        logFence: evidence.logFence
       })
     } finally {
       rmSync(stagingDir, { recursive: true, force: true })

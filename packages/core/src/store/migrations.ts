@@ -269,6 +269,8 @@ export const migrations: Migration[] = [
         change_id TEXT NOT NULL,
         apk_sha256 TEXT NOT NULL CHECK (length(apk_sha256) = 64),
         installed_at TEXT NOT NULL,
+        package_incarnation TEXT NOT NULL CHECK (length(package_incarnation) = 64),
+        log_fence TEXT CHECK (log_fence IS NULL OR length(log_fence) BETWEEN 32 AND 200),
         PRIMARY KEY (target_kind, target_id, application_id)
       );
       CREATE INDEX idx_android_app_installs_room_target

@@ -203,6 +203,9 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       // multi-module apps (app + companion/crash-lab modules) install together
       for (const app of apps) {
         steps.push(`Install ${app.apkPath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
+        // Once package replacement starts, an old same-byte receipt must never
+        // survive a later install/proof failure.
+        ctx.invalidateAndroidInstall?.(app.appId)
         const install = await runAdb(ctx, ['install', '-r', app.apkPath], 180_000)
         if (install.code !== 0) {
           throw new Error(`adb install ${app.appId} failed: ${(install.stderr || install.stdout).slice(-300)}`)

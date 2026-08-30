@@ -38,6 +38,8 @@ export interface ChangeCtx {
   }
   /** Persist the app capability only after this tracked install succeeded. */
   recordAndroidInstall?: (applicationId: string, apkPath: string, changeId: string) => Promise<void>
+  /** Revoke any prior capability immediately before replacing package bytes. */
+  invalidateAndroidInstall?: (applicationId: string) => void
   /** Recreating a Room emulator invalidates every receipt for its old OS instance. */
   clearAndroidEmulatorInstalls?: () => void
 }

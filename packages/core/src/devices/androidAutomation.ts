@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type {
   AndroidAutomationStatus,
   AndroidAutomationTarget,
@@ -35,7 +35,8 @@ const MAX_TARGET_CLOCK_RTT_MS = 2_000
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_INTERVAL_MS = 500
 const TARGET_CLOCK_FORMAT = '+%s.%3N'
-const CRASH_CLOCK_PREFIX = 'DEVHOTEL_TARGET_EPOCH='
+const INSTALL_FENCE_TAG = 'DEVHOTEL_INSTALL_FENCE'
+const CRASH_FENCE_TAG = 'DEVHOTEL_CRASH_FENCE'
 
 export interface AndroidAutomationExecOptions {
   timeoutMs?: number
@@ -152,17 +153,40 @@ function literalIncludes(value: string, wanted: string, ignoreCase = false): boo
     : value.includes(wanted)
 }
 
-function epochSecondsWithMillis(epochMs: number): string {
-  const seconds = Math.floor(epochMs / 1000)
-  const millis = epochMs - (seconds * 1000)
-  return `${seconds}.${String(millis).padStart(3, '0')}`
-}
-
 function parseTargetEpochMillis(value: string): { epochMs: number; timestamp: string } | null {
   const match = /^(\d{10,11})\.(\d{3})\r?\n?$/.exec(value)
   if (!match) return null
   const epochMs = (Number.parseInt(match[1]!, 10) * 1000) + Number.parseInt(match[2]!, 10)
   return Number.isSafeInteger(epochMs) ? { epochMs, timestamp: `${match[1]}.${match[2]}` } : null
+}
+
+function packageIncarnation(path: string, stat: string): string {
+  return createHash('sha256').update('devhotel-android-package-incarnation\0').update(path).update('\0').update(stat).digest('hex')
+}
+
+function logEpochMillis(line: string): number | null {
+  const match = /^\s*(\d{10,11})\.(\d{3,9})\s/.exec(line)
+  if (!match) return null
+  const millis = Number.parseInt(match[2]!.slice(0, 3).padEnd(3, '0'), 10)
+  const value = (Number.parseInt(match[1]!, 10) * 1000) + millis
+  return Number.isSafeInteger(value) ? value : null
+}
+
+function commandHitOutputLimit(result: ExecResult): boolean {
+  return /(?:adb stdout exceeded the \d+-byte Host safety limit|Android emulator command output exceeded its safety limit\.)/i.test(result.stderr)
+}
+
+export interface AndroidInstallEvidence {
+  apkSha256: string
+  packageIncarnation: string
+  /** Null means app-UID sequencing could not be proven; non-log primitives remain usable. */
+  logFence: string | null
+}
+
+interface InstalledPackageIdentity {
+  apkSha256: string
+  packageIncarnation: string
+  evidence: AndroidCommandEvidence
 }
 
 function matchesText(node: AndroidUiNode, text: string, match: 'exact' | 'contains'): boolean {
@@ -180,7 +204,6 @@ export class AndroidAutomationSession {
   readonly target: AndroidAutomationTarget
   private readonly now: () => number
   private readonly pause: (ms: number) => Promise<void>
-  private readonly verifiedApkHashes = new Map<string, string>()
 
   constructor(private readonly opts: AndroidAutomationSessionOptions) {
     this.target = opts.target
@@ -248,7 +271,29 @@ export class AndroidAutomationSession {
     deadline?: AndroidAutomationDeadline
   ): Promise<AndroidInstallReceipt> {
     const receipt = this.receipt(applicationId)
-    if (this.verifiedApkHashes.get(applicationId) === receipt.apkSha256) return receipt
+    const installed = await this.installedPackageIdentity(applicationId, deadline)
+    const expectedIncarnation = this.opts.installs.packageIncarnation(
+      this.opts.roomId,
+      this.opts.installTarget,
+      applicationId
+    )
+    if (installed.apkSha256 !== receipt.apkSha256 || installed.packageIncarnation !== expectedIncarnation) {
+      this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
+      throw automationError(
+        'ANDROID_APP_REPLACED',
+        `${applicationId} no longer matches the exact package incarnation installed by this Room.`,
+        'Run android_run again to install and authorize the current APK instance.',
+        409,
+        installed.evidence
+      )
+    }
+    return receipt
+  }
+
+  private async installedPackageIdentity(
+    applicationId: string,
+    deadline?: AndroidAutomationDeadline
+  ): Promise<InstalledPackageIdentity> {
     const result = await this.command(
       ['shell', 'pm', 'path', '--user', 'current', applicationId],
       { operation: 'Android package probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline }
@@ -305,6 +350,24 @@ export class AndroidAutomationSession {
         safeEvidence(result)
       )
     }
+    const stat = async (): Promise<{ value: string; result: ExecResult }> => {
+      const probed = await this.command(
+        ['shell', 'stat', '-c', '%d:%i:%s:%Y:%Z', baseApks[0]!],
+        { operation: 'Android installed APK incarnation probe', timeoutMs: 15_000, stdoutLimit: 8192, deadline }
+      )
+      const value = probed.stdout.trim()
+      if (probed.code !== 0 || !/^\d+:\d+:\d+:-?\d+:-?\d+$/.test(value)) {
+        throw automationError(
+          'ANDROID_APP_IDENTITY_UNVERIFIED',
+          `${applicationId} installed package incarnation could not be verified.`,
+          'Use an Android target with exact stat support and rerun android_run.',
+          409,
+          safeEvidence(probed)
+        )
+      }
+      return { value, result: probed }
+    }
+    const before = await stat()
     const hashed = await this.command(
       ['shell', 'sha256sum', baseApks[0]!],
       { operation: 'Android installed APK identity probe', timeoutMs: 60_000, stdoutLimit: 8192, deadline }
@@ -319,19 +382,21 @@ export class AndroidAutomationSession {
         safeEvidence(hashed)
       )
     }
-    if (installedSha256 !== receipt.apkSha256) {
-      this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
-      this.verifiedApkHashes.delete(applicationId)
+    const after = await stat()
+    if (before.value !== after.value) {
       throw automationError(
-        'ANDROID_APP_REPLACED',
-        `${applicationId} no longer matches the APK installed by this Room.`,
-        'Run android_run again to install and authorize the current APK bytes.',
+        'ANDROID_APP_IDENTITY_UNVERIFIED',
+        `${applicationId} changed while its installed package identity was being verified.`,
+        'Stop concurrent package changes and retry android_run.',
         409,
-        safeEvidence(hashed)
+        safeEvidence(after.result)
       )
     }
-    this.verifiedApkHashes.set(applicationId, receipt.apkSha256)
-    return receipt
+    return {
+      apkSha256: installedSha256,
+      packageIncarnation: packageIncarnation(baseApks[0]!, before.value),
+      evidence: safeEvidence(hashed)
+    }
   }
 
   private async foregroundPackage(deadline?: AndroidAutomationDeadline): Promise<string | null> {
@@ -694,6 +759,68 @@ export class AndroidAutomationSession {
     return uid
   }
 
+  /** Trusted install-time proof. It never grants a receipt by itself. */
+  async establishInstallEvidence(applicationId: string): Promise<AndroidInstallEvidence> {
+    const identity = await this.installedPackageIdentity(applicationId)
+    if ((this.target.apiLevel ?? 0) < 31) {
+      return {
+        apkSha256: identity.apkSha256,
+        packageIncarnation: identity.packageIncarnation,
+        logFence: null
+      }
+    }
+    let uid: number
+    try {
+      uid = await this.packageUid(applicationId)
+    } catch (error) {
+      if (
+        error instanceof DevHotelError &&
+        (error.code === 'ANDROID_LOGCAT_UNSUPPORTED' || error.code === 'ANDROID_LOGCAT_SHARED_UID')
+      ) {
+        return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
+      }
+      throw error
+    }
+    const logFence = `devhotel-install-${randomUUID()}`
+    const emitted = await this.command(
+      ['shell', 'run-as', applicationId, 'log', '-p', 'i', '-t', INSTALL_FENCE_TAG, logFence],
+      { operation: 'Android install log fence', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+    )
+    if (emitted.code !== 0) {
+      return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
+    }
+    let proof: ExecResult
+    try {
+      proof = await this.command(
+        ['logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`],
+        { operation: 'Android install log fence proof', timeoutMs: 30_000, stdoutLimit: 1024 * 1024 }
+      )
+    } catch (error) {
+      if (error instanceof DevHotelError && error.code === 'ANDROID_OUTPUT_LIMIT') {
+        return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
+      }
+      throw error
+    }
+    if (proof.code !== 0 || commandHitOutputLimit(proof)) {
+      return { apkSha256: identity.apkSha256, packageIncarnation: identity.packageIncarnation, logFence: null }
+    }
+    const occurrences = proof.stdout.split(/\r?\n/).filter((line) => line === logFence).length
+    return {
+      apkSha256: identity.apkSha256,
+      packageIncarnation: identity.packageIncarnation,
+      logFence: occurrences === 1 ? logFence : null
+    }
+  }
+
+  private logFenceError(applicationId: string): DevHotelError {
+    return automationError(
+      'ANDROID_LOG_FENCE_UNSUPPORTED',
+      `Clock-independent log ordering is not available for ${applicationId} on this tracked install.`,
+      'Use Android 12 or newer with a debuggable app, then rerun android_run to establish a fresh app-UID log fence.',
+      409
+    )
+  }
+
   private targetClockError(result: ExecResult): DevHotelError {
     return automationError(
       'ANDROID_TARGET_CLOCK_UNVERIFIED',
@@ -704,7 +831,7 @@ export class AndroidAutomationSession {
     )
   }
 
-  private async targetCutoffForHostTime(hostCutoffMs: number): Promise<string> {
+  private async targetCutoffForHostTime(hostCutoffMs: number): Promise<number> {
     const hostBefore = this.now()
     const result = await this.command(
       ['shell', 'date', TARGET_CLOCK_FORMAT],
@@ -728,36 +855,44 @@ export class AndroidAutomationSession {
     // is omitted instead of admitting pre-fence evidence.
     const targetCutoffMs = hostCutoffMs + (target.epochMs - hostBefore)
     if (!Number.isSafeInteger(targetCutoffMs)) throw this.targetClockError(result)
-    return epochSecondsWithMillis(targetCutoffMs)
+    return targetCutoffMs
   }
 
   private async readLogcat(
     input: AndroidLogcatInput,
-    exactTargetSince?: string
+    exactLogFence?: string
   ): Promise<AndroidLogcatResult> {
     const receipt = await this.requireInstalled(input.applicationId)
-    const uid = await this.packageUid(input.applicationId)
     const requestedSince = input.since ? Date.parse(input.since) : Date.parse(receipt.installedAt)
     const sinceMs = Math.max(Number.isFinite(requestedSince) ? requestedSince : 0, Date.parse(receipt.installedAt))
     const since = new Date(sinceMs).toISOString()
-    const targetSince = exactTargetSince ?? await this.targetCutoffForHostTime(sinceMs)
+    if ((this.target.apiLevel ?? 0) < 31) throw this.logFenceError(input.applicationId)
+    const logFence = exactLogFence ?? this.opts.installs.logFence(
+      this.opts.roomId,
+      this.opts.installTarget,
+      input.applicationId
+    )
+    if (!logFence) throw this.logFenceError(input.applicationId)
+    const uid = await this.packageUid(input.applicationId)
+    const targetRequestedSince = !exactLogFence && input.since && sinceMs > Date.parse(receipt.installedAt)
+      ? await this.targetCutoffForHostTime(sinceMs)
+      : null
     const result = await this.command(
       [
-        'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${uid}`,
-        '-t', targetSince
+        'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${uid}`
       ],
       {
         operation: 'Android package logcat',
         timeoutMs: 30_000,
         stdoutLimit: 1024 * 1024,
-        outputLimitRecovery: 'Move since closer to the failure and retry so the bounded source window contains less log history.'
+        outputLimitRecovery: 'Reduce app logging and rerun android_run to establish a fresh bounded log fence.'
       }
     )
-    if (/(?:adb stdout exceeded the \d+-byte Host safety limit|Android emulator command output exceeded its safety limit\.)/i.test(result.stderr)) {
+    if (commandHitOutputLimit(result)) {
       throw automationError(
         'ANDROID_OUTPUT_LIMIT',
         'Android package logcat exceeded its 1048576-byte safety limit.',
-        'Move since closer to the failure and retry so the bounded source window contains less log history.'
+        'Reduce app logging and rerun android_run to establish a fresh bounded log fence.'
       )
     }
     if (result.code !== 0) {
@@ -770,9 +905,20 @@ export class AndroidAutomationSession {
       )
     }
     const source = result.stdout.split(/\r?\n/).filter(Boolean)
+    const fenceIndexes = source
+      .map((line, index) => line.includes(logFence) ? index : -1)
+      .filter((index) => index >= 0)
+    if (fenceIndexes.length !== 1) throw this.logFenceError(input.applicationId)
+    const fenced = source.slice(fenceIndexes[0]! + 1)
+    const timeScoped = targetRequestedSince === null
+      ? fenced
+      : fenced.filter((line) => {
+          const at = logEpochMillis(line)
+          return at !== null && at >= targetRequestedSince
+        })
     const filtered = input.filter
-      ? source.filter((line) => literalIncludes(line, input.filter!))
-      : source
+      ? timeScoped.filter((line) => literalIncludes(line, input.filter!))
+      : timeScoped
     const lines: string[] = []
     const maxLines = input.maxLines ?? 200
     let bytes = 0
@@ -796,7 +942,7 @@ export class AndroidAutomationSession {
       applicationId: input.applicationId,
       since,
       lines,
-      sourceLines: source.length,
+      sourceLines: timeScoped.length,
       truncated
     }
   }
@@ -827,6 +973,12 @@ export class AndroidAutomationSession {
 
   async crashScenario(input: AndroidRunCrashScenarioInput): Promise<AndroidCrashScenarioResult> {
     await this.requireInstalled(input.applicationId)
+    if (
+      (this.target.apiLevel ?? 0) < 31 ||
+      !this.opts.installs.logFence(this.opts.roomId, this.opts.installTarget, input.applicationId)
+    ) {
+      throw this.logFenceError(input.applicationId)
+    }
     const pidsBefore = await this.pids(input.applicationId)
     if (pidsBefore.length === 0) {
       throw automationError(
@@ -836,18 +988,16 @@ export class AndroidAutomationSession {
       )
     }
     const crashStartedAt = this.now()
+    const crashLogFence = `devhotel-crash-${randomUUID()}`
     const crashResult = await this.command(
       [
         'shell', 'sh', '-c',
-        `date '+${CRASH_CLOCK_PREFIX}${TARGET_CLOCK_FORMAT.slice(1)}' || exit $?; exec am crash --user current "$1"`,
-        'devhotel-crash', input.applicationId
+        `run-as "$1" log -p i -t ${CRASH_FENCE_TAG} "$2" && exec am crash --user current "$1"`,
+        'devhotel-crash', input.applicationId, crashLogFence
       ],
       { operation: 'Android crash scenario', timeoutMs: 30_000, stdoutLimit: 64 * 1024 }
     )
-    const clockLine = new RegExp(`^${CRASH_CLOCK_PREFIX}(\\d{10,11}\\.\\d{3})\\r?\\n`).exec(crashResult.stdout)
-    const targetCrashSince = clockLine ? parseTargetEpochMillis(`${clockLine[1]}\n`) : null
-    if (!clockLine || !targetCrashSince) throw this.targetClockError(crashResult)
-    const result = { ...crashResult, stdout: crashResult.stdout.slice(clockLine[0].length) }
+    const result = crashResult
     let pidsAfter = pidsBefore
     let observed = false
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -862,7 +1012,7 @@ export class AndroidAutomationSession {
       applicationId: input.applicationId,
       since: new Date(crashStartedAt).toISOString(),
       maxLines: 200
-    }, targetCrashSince.timestamp)
+    }, crashLogFence)
     return {
       target: this.target,
       applicationId: input.applicationId,

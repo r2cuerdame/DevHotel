@@ -158,15 +158,17 @@ events.
 
 An `applicationId` is not authority by itself. These routes accept only an app
 successfully installed by DevHotel's `android-run` on the exact Room target.
-The durable receipt contains the Room, opaque target identity, Change ID, APK
-SHA-256, and install time. Recreating an emulator clears its receipts; installing
-the same package on a shared phone transfers that exact target/package receipt
-to the last installing Room. Package disappearance is probed live and invalidates
-a stale receipt. The installed `base.apk` SHA-256 is compared with the receipt
-before each high-level session trusts it, so a same-name replacement also
-invalidates authority. Physical receipts are fenced to the lease that performed
-the install, so releasing and reacquiring the same phone requires a fresh
-`android-run` before automation.
+The public durable receipt contains the Room, opaque target identity, Change ID,
+APK SHA-256, and Host install time. Core additionally seals a private package
+incarnation from the one standalone `base.apk` path and target-side
+device/inode/size/time metadata. Before every high-level operation, the exact
+path, incarnation and bytes are re-probed; split APKs and same-byte reinstalls
+fail closed. Recreating an emulator clears its receipts, and every raw physical
+install revokes all receipts for that phone before adb runs. Installing the same
+package on a shared phone transfers that exact target/package receipt to the
+last installing Room. Physical receipts are also fenced to the lease that
+performed the install, so releasing and reacquiring the same phone requires a
+fresh `android-run` before automation.
 
 `target` is `{ kind: 'auto' }` (the default), `{ kind: 'emulator' }`, or
 `{ kind: 'physical', deviceId? }`. Auto follows an attached physical proof target
@@ -185,15 +187,22 @@ Automation POST bodies are strict and capped at 64 KiB.
 | `POST /v1/rooms/:id/android/wait-for-text` | `{ applicationId, text, match?, timeoutMs?, pollIntervalMs?, target? }` | one sanitized app-owned node, attempts and elapsed time |
 | `POST /v1/rooms/:id/android/tap-text` | `{ applicationId, text, match?, target? }` | the one unambiguous app-owned node and bounded input evidence |
 | `POST /v1/rooms/:id/android/dump-ui` | `{ applicationId, filter?, maxNodes?, target? }` | at most 500 sanitized nodes plus scan/truncation accounting |
-| `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines; Host-clock `since` is clamped no earlier than the tracked install, then translated through a bounded exact-target clock probe |
+| `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines after the tracked install's clock-independent app-UID fence; a later explicit Host-clock `since` is translated by a bounded exact-target clock probe |
 | `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
 
 UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals
 the tracked app cross the boundary. Taps require the same unique node and bounds
 across two consecutive dumps, then recheck foreground ownership immediately
-before input. Logcat resolves an exact unshared UID and
-fails closed when `--uid` isolation is unavailable; it never reads global logs.
+before input. On Android 12+ a successful tracked install emits a random marker
+as the exact unshared app UID and proves that marker through bounded `--uid`
+logcat. Reads discard the marker and everything before it in logd sequence
+order. Crash evidence emits a fresh app-UID marker immediately before `am crash`
+in one remote shell command. Missing, duplicate, pruned or oversized marker
+evidence fails closed; there is no target-clock fallback for the install/crash
+boundary and global logs are never read. Android 11 and older, shared UIDs, or
+apps without `run-as` support keep their non-log automation receipt but return
+`ANDROID_LOG_FENCE_UNSUPPORTED` for logcat and crash evidence.
 
 ### Rooms
 

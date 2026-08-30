@@ -73,6 +73,12 @@ describe('database migrations', () => {
       expect(installTable.sql.replace(/\s+/g, ' ')).toContain(
         "target_kind = 'physical' AND lease_id IS NOT NULL"
       )
+      const installColumns = sqlite.prepare('PRAGMA table_info(android_app_installs)').all() as {
+        name: string
+        notnull: number
+      }[]
+      expect(installColumns.find(({ name }) => name === 'package_incarnation')).toMatchObject({ notnull: 1 })
+      expect(installColumns.find(({ name }) => name === 'log_fence')).toMatchObject({ notnull: 0 })
     } finally {
       sqlite.close()
     }

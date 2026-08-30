@@ -1,9 +1,58 @@
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeAdbHost, FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
+
+const TEST_BASE_APK = '/data/app/base.apk'
+const TEST_BASE_STAT = '103:4242:123456:1788157200:1788157201'
+const TEST_APK_SHA = createHash('sha256').update('fake-room-file').digest('hex')
+const TEST_PACKAGE_INCARNATION = createHash('sha256')
+  .update('devhotel-android-package-incarnation\0')
+  .update(TEST_BASE_APK)
+  .update('\0')
+  .update(TEST_BASE_STAT)
+  .digest('hex')
+
+function logicalAdbArgs(args: string[]): string[] {
+  if (args[0] !== 'shell' || args.length !== 2 || !args[1]?.startsWith("'") || !args[1].endsWith("'")) return args
+  return [
+    'shell',
+    ...args[1]
+      .slice(1, -1)
+      .split("' '")
+      .map((value) => value.replaceAll("'\\''", "'"))
+  ]
+}
+
+function roomAndroidArgs(command: string[]): string[] | null {
+  if (command[0] !== 'adb' || command[1] !== '-s' || command.length < 4) return null
+  return logicalAdbArgs(command.slice(3))
+}
+
+function installEvidenceResult(args: string[], state: { fence: string; apkSha256?: string }): { code: number; stdout: string; stderr: string } | null {
+  const logical = logicalAdbArgs(args)
+  if (logical[1] === 'pm' && logical[2] === 'path') {
+    return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
+  }
+  if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
+  if (logical[1] === 'sha256sum') {
+    return { code: 0, stdout: `${state.apkSha256 ?? TEST_APK_SHA}  ${TEST_BASE_APK}\n`, stderr: '' }
+  }
+  if (logical[1] === 'pm' && logical[2] === 'list') {
+    return { code: 0, stdout: 'package:com.example.app uid:10123\n', stderr: '' }
+  }
+  if (logical[1] === 'run-as') {
+    state.fence = logical.at(-1) ?? ''
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  if (logical[0] === 'logcat' && logical.includes('raw,printable')) {
+    return { code: 0, stdout: `${state.fence}\n`, stderr: '' }
+  }
+  return null
+}
 
 describe('Rooms attach and release the shared phone', () => {
   const dirs: string[] = []
@@ -167,6 +216,7 @@ describe('Android automation targets the attached device without a hand-written 
   const dbs: Db[] = []
 
   afterEach(() => {
+    vi.useRealTimers()
     for (const db of dbs.splice(0)) db.close()
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
   })
@@ -216,6 +266,81 @@ describe('Android automation targets the attached device without a hand-written 
     const target = await orch.resolveAdbTarget('aaaa1111')
     expect(target).toMatchObject({ kind: 'physical', deviceId: expect.any(String), nickname: expect.any(String) })
     expect(target).not.toHaveProperty('serial')
+  })
+
+  it('quotes every physical adb-shell argument as one remote command without interpreting caller text', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: {
+        kind: 'physical', targetId: attached.device.id, deviceId: attached.device.id, leaseId: attached.lease.id
+      },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
+    })
+    adb.execs = []
+    adb.execResultFor = (_serial, args) =>
+      installEvidenceResult(args, { fence: '', apkSha256: 'a'.repeat(64) })
+    const hostile = "quote' $HOME; $(id)\nnext"
+
+    await orch.androidLaunchApp('aaaa1111', {
+      applicationId: 'com.example.app',
+      activity: '.MainActivity',
+      extras: { label: hostile },
+      target: { kind: 'physical', deviceId: attached.device.id }
+    })
+
+    const launch = adb.execs.find((call) => call.args[0] === 'shell' && call.args[1]?.includes("'am' 'start'"))
+    expect(launch?.args).toEqual([
+      'shell',
+      "'am' 'start' '-W' '--user' 'current' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
+    ])
+    expect(launch?.args).toHaveLength(2)
+  })
+
+  it('uses the same one-string shell quoting for the Room emulator executor', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target: { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
+    })
+    backend.execInRoomCalls = []
+    backend.execInRoomHandler = (_roomId, command) => {
+      const androidArgs = roomAndroidArgs(command)
+      if (!androidArgs) return { code: 0, stdout: '', stderr: '' }
+      return installEvidenceResult(androidArgs, { fence: '', apkSha256: 'a'.repeat(64) }) ??
+        { code: 0, stdout: 'Status: ok\n', stderr: '' }
+    }
+    const hostile = "quote' $HOME; $(id)\nnext"
+
+    await orch.androidLaunchApp('aaaa1111', {
+      applicationId: 'com.example.app',
+      activity: '.MainActivity',
+      extras: { label: hostile },
+      target: { kind: 'emulator' }
+    })
+
+    const launch = backend.execInRoomCalls.find((call) =>
+      call.cmd[0] === 'adb' && call.cmd[4]?.includes("'am' 'start'")
+    )
+    expect(launch?.cmd).toEqual([
+      'adb', '-s', 'emulator-5554', 'shell',
+      "'am' 'start' '-W' '--user' 'current' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
+    ])
   })
 
   it('fails an attached physical run when that phone becomes unhealthy instead of using the emulator', async () => {
@@ -276,6 +401,45 @@ describe('Android automation targets the attached device without a hand-written 
     expect(adb.execs).toEqual([{ serial: 'R5CT30ABCDE', args: ['install', '-r', stagedPath] }])
     expect(stagedPath).not.toBe('')
     expect(existsSync(stagedPath)).toBe(false)
+  })
+
+  it.each([
+    { label: 'succeeds', code: 0 },
+    { label: 'fails', code: 1 }
+  ])('revokes every exact-target receipt before a raw physical install $label', async ({ code }) => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    const target = {
+      kind: 'physical' as const,
+      targetId: attached.device.id,
+      deviceId: attached.device.id,
+      leaseId: attached.lease.id
+    }
+    for (const [index, applicationId] of ['com.example.app', 'com.example.companion'].entries()) {
+      orch.androidInstalls.record({
+        roomId: 'aaaa1111',
+        target,
+        applicationId,
+        changeId: `11111111-2222-4333-8444-55555555555${index}`,
+        apkSha256: 'a'.repeat(64),
+        installedAt: '2026-08-31T00:00:00.000Z',
+        packageIncarnation: TEST_PACKAGE_INCARNATION,
+        logFence: null
+      })
+    }
+    adb.execResultFor = (_serial, args) => args[0] === 'install'
+      ? { code, stdout: code === 0 ? 'Success\n' : '', stderr: code === 0 ? '' : 'Failure\n' }
+      : null
+
+    const result = await orch.adbOnDevice(
+      'aaaa1111',
+      ['install', '-r', '/workspace/app/build/outputs/apk/debug/app-debug.apk']
+    )
+
+    expect(result.code).toBe(code)
+    expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
   })
 
   it('maps private staging paths back to Room paths in every adb result', async () => {
@@ -463,11 +627,15 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
+    const installEvidence = { fence: '' }
     adb.execResultFor = (_serial, args) => {
-      if (args[0] === 'shell' && args[1] === 'cmd') {
+      const evidence = installEvidenceResult(args, installEvidence)
+      if (evidence) return evidence
+      const logical = logicalAdbArgs(args)
+      if (logical[0] === 'shell' && logical[1] === 'cmd') {
         return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
       }
-      return args[0] === 'shell' && args[1] === 'pidof' ? { code: 0, stdout: '1234\n', stderr: '' } : null
+      return logical[0] === 'shell' && logical[1] === 'pidof' ? { code: 0, stdout: '1234\n', stderr: '' } : null
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
@@ -484,10 +652,10 @@ describe('Android automation targets the attached device without a hand-written 
         apkSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
       })
     ])
-    expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state', 'install', 'shell', 'shell', 'shell'])
+    expect(installEvidence.fence).toMatch(/^devhotel-install-[0-9a-f-]{36}$/)
     expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/My 앱-$&-debug.APK')
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
-    expect(adb.execs.find((call) => call.args[1] === 'am')?.serial).toBe('R5CT30ABCDE')
+    expect(adb.execs.find((call) => logicalAdbArgs(call.args)[1] === 'am')?.serial).toBe('R5CT30ABCDE')
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
   })
 
@@ -510,16 +678,24 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
-    adb.execResultFor = (_serial, args) =>
-      args[0] === 'shell' && args[1] === 'cmd'
+    const installEvidence = { fence: '' }
+    adb.execResultFor = (_serial, args) => {
+      const evidence = installEvidenceResult(args, installEvidence)
+      if (evidence) return evidence
+      const logical = logicalAdbArgs(args)
+      return logical[0] === 'shell' && logical[1] === 'cmd'
         ? { code: 0, stdout: 'com.other.app/.MainActivity\n', stderr: '' }
         : null
+    }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
     expect(entry.verify?.detail).toMatch(/could not resolve launcher/)
-    expect(adb.execs.some((call) => call.args[0] === 'shell' && call.args[1] === 'am')).toBe(false)
+    expect(adb.execs.some((call) => {
+      const logical = logicalAdbArgs(call.args)
+      return logical[0] === 'shell' && logical[1] === 'am'
+    })).toBe(false)
   })
 
   it('durably records a safe failed verify when the physical PID probe loses its lease', async () => {
@@ -542,11 +718,15 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
+    const installEvidence = { fence: '' }
     adb.execResultFor = async (_serial, args) => {
-      if (args[0] === 'shell' && args[1] === 'cmd') {
+      const evidence = installEvidenceResult(args, installEvidence)
+      if (evidence) return evidence
+      const logical = logicalAdbArgs(args)
+      if (logical[0] === 'shell' && logical[1] === 'cmd') {
         return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
       }
-      if (args[0] === 'shell' && args[1] === 'pidof') {
+      if (logical[0] === 'shell' && logical[1] === 'pidof') {
         await orch.devices.release(attached.lease.id, 'simulated disconnect during physical verification')
         throw new Error('R5CT30ABCDE C:\\Users\\private\\adb.exe token=ghp_12345678901234567890')
       }
@@ -732,11 +912,23 @@ describe('Android automation targets the attached device without a hand-written 
 
   it('keeps android-run on the Room emulator by default', async () => {
     const { orch, adb, backend } = setup()
+    const installedAtBeforeFence = '2026-08-31T01:00:00.000Z'
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(installedAtBeforeFence)
     await orch.refreshAndroidDevices()
     adb.execs = []
     backend.emulatorStateValue = 'running'
     backend.execInRoomCalls = []
+    const installEvidence = { fence: '' }
     backend.execInRoomHandler = (_roomId, cmd) => {
+      const androidArgs = roomAndroidArgs(cmd)
+      if (androidArgs) {
+        if (logicalAdbArgs(androidArgs)[1] === 'run-as') {
+          vi.setSystemTime('2026-08-31T01:00:01.000Z')
+        }
+        const evidence = installEvidenceResult(androidArgs, installEvidence)
+        if (evidence) return evidence
+      }
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
         return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
@@ -757,11 +949,16 @@ describe('Android automation targets the attached device without a hand-written 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry.status).toBe('verified')
+    expect(installEvidence.fence).toMatch(/^devhotel-install-[0-9a-f-]{36}$/)
     expect(entry.verify?.detail).toMatch(/Room emulator/)
     expect(orch.androidInstalls.list('aaaa1111', {
       kind: 'emulator', targetId: 'aaaa1111', deviceId: null
     })).toEqual([
-      expect.objectContaining({ applicationId: 'com.example.app', changeId: entry.id })
+      expect.objectContaining({
+        applicationId: 'com.example.app',
+        changeId: entry.id,
+        installedAt: installedAtBeforeFence
+      })
     ])
     expect(adb.execs).toEqual([])
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('adb -s emulator-5554'))).toBe(true)
@@ -772,6 +969,93 @@ describe('Android automation targets the attached device without a hand-written 
           ?.includes("'install' '-r' '/workspace/app/build/outputs/apk/debug/My App'\\''s $&-debug.APK'")
       )
     ).toBe(true)
+  })
+
+  it('removes an old emulator receipt before tracked reinstall proof can fail', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
+    orch.androidInstalls.record({
+      roomId: 'aaaa1111',
+      target,
+      applicationId: 'com.example.app',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: TEST_APK_SHA,
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
+    })
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const androidArgs = roomAndroidArgs(cmd)
+      if (androidArgs) {
+        const logical = logicalAdbArgs(androidArgs)
+        if (logical[1] === 'pm' && logical[2] === 'path') return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
+        if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
+        if (logical[1] === 'sha256sum') return { code: 0, stdout: `${'b'.repeat(64)}  ${TEST_BASE_APK}\n`, stderr: '' }
+        if (logical[1] === 'pm' && logical[2] === 'list') {
+          return { code: 0, stdout: 'package:com.example.app uid:10123\n', stderr: '' }
+        }
+        if (logical[1] === 'run-as') return { code: 1, stdout: '', stderr: 'not debuggable' }
+      }
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
+    expect(entry.verify?.detail).toMatch(/bytes differ/)
+    expect(orch.androidInstalls.list('aaaa1111', target)).toEqual([])
+  })
+
+  it('records non-log automation authority when install fence proof output overflows', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
+    const installEvidence = { fence: '' }
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const androidArgs = roomAndroidArgs(cmd)
+      if (androidArgs) {
+        const evidence = installEvidenceResult(androidArgs, installEvidence)
+        if (evidence) {
+          return androidArgs[0] === 'logcat'
+            ? { code: 0, stdout: 'x'.repeat((1024 * 1024) + 1), stderr: '' }
+            : evidence
+        }
+      }
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.includes('resolve-activity')) return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
+      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
+      if (command.includes('pidof')) return { code: 0, stdout: '1234\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(orch.androidInstalls.list('aaaa1111', target)).toHaveLength(1)
+    expect(orch.androidInstalls.logFence('aaaa1111', target, 'com.example.app')).toBeNull()
   })
 
   it('uses an explicitly selected Room emulator even while a physical lease is attached', async () => {
@@ -786,15 +1070,19 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app',
       changeId: '11111111-2222-4333-8444-555555555555',
       apkSha256: 'a'.repeat(64),
-      installedAt: '2026-08-31T00:00:00.000Z'
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
     })
     backend.execInRoomHandler = (_roomId, cmd) => {
-      if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (cmd[4] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
-      if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
+      const logical = roomAndroidArgs(cmd)
+      if (!logical) return { code: 0, stdout: '', stderr: '' }
+      const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
+      if (identity) return identity
+      if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
       }
-      if (cmd[4] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
+      if (logical[1] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -818,16 +1106,20 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app',
       changeId: '11111111-2222-4333-8444-555555555555',
       apkSha256: 'a'.repeat(64),
-      installedAt: '2026-08-31T00:00:00.000Z'
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
     })
     backend.execInRoomHandler = (_roomId, cmd, opts) => {
-      if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (cmd[4] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
-      if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
+      const logical = roomAndroidArgs(cmd)
+      if (!logical) return { code: 0, stdout: '', stderr: '' }
+      const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
+      if (identity) return identity
+      if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
         opts?.onStdout?.(`mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n${'x'.repeat(3_000)}`)
         return { code: 0, stdout: '', stderr: '' }
       }
-      if (cmd[4] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
+      if (logical[1] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -854,17 +1146,20 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app',
       changeId: '11111111-2222-4333-8444-555555555555',
       apkSha256: 'a'.repeat(64),
-      installedAt: '2026-08-31T00:00:00.000Z'
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
     })
     let replaced = false
     adb.execResultFor = async (_serial, args) => {
-      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
-      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
-      if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
+      const logical = logicalAdbArgs(args)
+      const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
+      if (identity) return identity
+      if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
       }
-      if (args[1] === 'uiautomator') return { code: 0, stdout: 'UI hierarchy dumped\n', stderr: '' }
-      if (args[0] === 'exec-out') {
+      if (logical[1] === 'uiautomator') return { code: 0, stdout: 'UI hierarchy dumped\n', stderr: '' }
+      if (logical[0] === 'exec-out') {
         await orch.devices.release(attached.lease.id, 'replace after evidence')
         const next = await orch.devices.requestDevice({
           roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-b',
@@ -885,6 +1180,9 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app', text: 'Crash'
     })).rejects.toMatchObject({ code: 'lease-expired' })
     expect(replaced).toBe(true)
+    const execOut = adb.execs.find((call) => call.args[0] === 'exec-out')
+    expect(execOut?.args.slice(0, 3)).toEqual(['exec-out', 'sh', '-c'])
+    expect(execOut?.args.length).toBeGreaterThan(5)
     expect(adb.execs.some((call) => call.args[1] === 'input')).toBe(false)
   })
 
@@ -904,7 +1202,9 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app',
       changeId: '11111111-2222-4333-8444-555555555555',
       apkSha256: 'a'.repeat(64),
-      installedAt: '2026-08-31T00:00:00.000Z'
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: TEST_PACKAGE_INCARNATION,
+      logFence: null
     })
     await orch.releaseAndroidDevice('aaaa1111', 'rotate lease')
     const second = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-b' })
