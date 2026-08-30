@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { RoomRecord } from '@devhotel/shared'
+import type { RoomRecord, RuntimeRoomRecord } from '@devhotel/shared'
 import { statusLabel, useStore, useT } from '../../state/store'
 import { api } from '../../api'
 
@@ -24,7 +24,7 @@ function LatestBuild({ room }: { room: RoomRecord }): React.JSX.Element | null {
   )
 }
 
-export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHealth: () => void }): React.JSX.Element {
+export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; onShowHealth: () => void }): React.JSX.Element {
   const inspection = useStore((s) => s.inspections[room.id])
   const undoChange = useStore((s) => s.undoChange)
   const roomAction = useStore((s) => s.roomAction)
@@ -35,7 +35,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RoomRecord; onShowHe
   const busy = useStore((s) => s.busy[room.id])
   const t = useT()
   const url = inspection?.urls.app
-  const running = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+  const running = room.runtimeStatus.state === 'running'
   const android = room.provider === 'android'
   const windows = room.provider === 'windows'
   const [pending, setPending] = useState<string | null>(null)
