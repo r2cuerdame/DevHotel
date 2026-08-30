@@ -182,7 +182,7 @@ export class FakeBackend implements IsolationBackend {
     return this.workspaceFingerprintValue
   }
   workspaceSnapshotEntries: import('../workspaceDrift').WorkspaceSnapshotEntry[] = []
-  async snapshotWorkspace() {
+  async snapshotWorkspace(_roomId: string, _workspaceVolumeRevision: number) {
     return { fingerprint: this.workspaceFingerprintValue, entries: this.workspaceSnapshotEntries }
   }
   legacyWorkspaceFingerprintValue: string | null = null

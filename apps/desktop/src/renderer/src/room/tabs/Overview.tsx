@@ -50,27 +50,56 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
     }
   }
 
-  async function workingStateAction(kind: 'sync' | 'migrate'): Promise<void> {
-    await run(kind, async () => {
+  async function moveIntoHotel(): Promise<void> {
+    await run('migrate', async () => {
       try {
         const approvedHostPath = await api.app.pickFolder()
         if (!approvedHostPath) return
-        if (kind === 'sync') await api.rooms.syncFromHost(room.id, approvedHostPath)
-        else await api.rooms.moveIntoHotel(room.id, approvedHostPath)
+        await api.rooms.moveIntoHotel(room.id, approvedHostPath)
         await Promise.all([refreshInspection(room.id), refreshRooms()])
-        toast('success', kind === 'sync' ? t('working.synced') : t('working.roomOwned'))
+        toast('success', t('working.roomOwned'))
       } catch (err) {
         toast('error', err instanceof Error ? err.message : String(err))
       }
     })
   }
 
-  async function resetBaseline(): Promise<void> {
-    await run('baseline', async () => {
+  async function safeResyncFromHost(): Promise<void> {
+    await run('sync', async () => {
       try {
-        await api.rooms.resetSyncBaseline(room.id)
+        const approvedHostPath = await api.app.pickFolder()
+        if (!approvedHostPath) return
+        let outcome = await api.rooms.safeResyncFromHost(room.id, approvedHostPath)
+        while (outcome.status === 'confirmation-required') {
+          const quotePath = (path: string): string =>
+            JSON.stringify(
+              path.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+                `[U+${character.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}]`
+              )
+            )
+          const shownChanges = outcome.drift.changedPaths.slice(0, 50)
+          const omittedChanges = outcome.drift.changedPaths.length - shownChanges.length
+          const paths = outcome.drift.changedPaths.length > 0
+            ? [
+                ...shownChanges.map((change) => `${quotePath(change.path)} (${change.reason})`),
+                ...(omittedChanges > 0 ? [`… and ${omittedChanges} more changed paths`] : [])
+              ].join('\n')
+            : outcome.drift.status === 'unknown'
+              ? 'The previous path baseline is unavailable, so the exact changed paths cannot be proven.'
+              : 'The Room snapshot changed after the previous confirmation. Review this fresh preview.'
+          const confirmed = window.confirm(
+            `${t('working.modifiedHint')}\n\n${paths}\n\n${outcome.recoveryGuidance.join('\n')}`
+          )
+          if (!confirmed) return
+          outcome = await api.rooms.safeResyncFromHost(
+            room.id,
+            approvedHostPath,
+            outcome.confirmation.token
+          )
+        }
+        if (outcome.status !== 'synced') return
         await Promise.all([refreshInspection(room.id), refreshRooms()])
-        toast('success', t('working.baselineReset'))
+        toast('success', t('working.synced'))
       } catch (err) {
         toast('error', err instanceof Error ? err.message : String(err))
       }
@@ -203,7 +232,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
               </div>
             </span>
             {room.workspaceMode === 'legacy-host-bind' && room.hostSyncEnabled && (
-              <button className="btn primary" disabled={pending !== null} onClick={() => void workingStateAction('migrate')}>
+              <button className="btn primary" disabled={pending !== null} onClick={() => void moveIntoHotel()}>
                 {t('working.moveIntoHotel')}
               </button>
             )}
@@ -228,19 +257,14 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
                 {t('working.agentSync')}
               </label>
             )}
-            {room.workspaceMode === 'hotel' && room.hostSyncEnabled && room.syncStatus === 'modified' && (
-              <button className="btn" disabled={pending !== null} title={t('working.baselineHint')} onClick={() => void resetBaseline()}>
-                {pending === 'baseline' ? t('common.applying') : t('working.resetBaseline')}
-              </button>
-            )}
             {room.workspaceMode === 'hotel' && room.hostSyncEnabled && (
               <button
                 className="btn"
                 disabled={pending !== null}
                 title={room.syncStatus === 'modified' ? t('working.modifiedHint') : undefined}
-                onClick={() => void workingStateAction('sync')}
+                onClick={() => void safeResyncFromHost()}
               >
-                {t('working.syncFromHost')}
+                {pending === 'sync' ? t('common.applying') : t('working.syncFromHost')}
               </button>
             )}
           </div>

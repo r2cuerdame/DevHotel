@@ -15,6 +15,8 @@ const api: IpcApi = {
     rename: (roomId, nickname) => ipcRenderer.invoke(IPC.roomsRename, roomId, nickname),
     components: (roomId) => ipcRenderer.invoke(IPC.roomsComponents, roomId),
     syncFromHost: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsSyncFromHost, roomId, approvedHostPath),
+    safeResyncFromHost: (roomId, approvedHostPath, confirmationToken) =>
+      ipcRenderer.invoke(IPC.roomsSafeResyncFromHost, roomId, approvedHostPath, confirmationToken),
     moveIntoHotel: (roomId, approvedHostPath) => ipcRenderer.invoke(IPC.roomsMoveIntoHotel, roomId, approvedHostPath),
     resetSyncBaseline: (roomId) => ipcRenderer.invoke(IPC.roomsResetSyncBaseline, roomId),
     setAgentHostSync: (roomId, allowed) => ipcRenderer.invoke(IPC.roomsSetAgentHostSync, roomId, allowed),

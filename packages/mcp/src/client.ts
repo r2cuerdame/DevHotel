@@ -197,6 +197,11 @@ export class ControlClient {
   syncFromHost(roomId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sync-from-host`)
   }
+  safeResyncFromHost(roomId: string, confirmationToken?: string) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/safe-resync-from-host`, {
+      ...(confirmationToken === undefined ? {} : { confirmationToken })
+    })
+  }
   resetSyncBaseline(roomId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sync-baseline`)
   }

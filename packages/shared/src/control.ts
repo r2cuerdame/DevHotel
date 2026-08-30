@@ -178,6 +178,9 @@ export const zAgentCloneBody = z.object({
   services: z.enum(['copy', 'empty', 'exclude'])
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
+export const zSafeHostResyncBody = z.object({
+  confirmationToken: z.string().uuid().optional()
+}).strict()
 
 /** Phone controls the Android preview strip can drive on the emulator. */
 export const zAndroidAction = z.enum(['back', 'home', 'recents', 'rotate'])
@@ -250,6 +253,7 @@ export const CONTROL_ROUTES = {
   getOperation: { method: 'GET', path: '/v1/operations/:operationId' },
   listRoomOperations: { method: 'GET', path: '/v1/rooms/:id/operations' },
   sleepRoom: { method: 'POST', path: '/v1/rooms/:id/sleep' },
+  safeResyncFromHost: { method: 'POST', path: '/v1/rooms/:id/safe-resync-from-host' },
   execInRoom: { method: 'POST', path: '/v1/rooms/:id/exec' },
   listRuns: { method: 'GET', path: '/v1/rooms/:id/runs' },
   readRunOutput: { method: 'GET', path: '/v1/rooms/:id/runs/:runId/output' },

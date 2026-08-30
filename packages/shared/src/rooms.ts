@@ -117,6 +117,52 @@ export interface RoomRecord {
 /** A public Room record with a fresh, read-only runtime observation attached. */
 export type RuntimeRoomRecord = RoomRecord & { runtimeStatus: RoomRuntimeStatus }
 
+export type HostResyncPathChangeReason = 'added' | 'modified' | 'deleted'
+
+export interface HostResyncPathChange {
+  /** Room-relative only; Host absolute paths and file contents never cross the API boundary. */
+  path: string
+  reason: HostResyncPathChangeReason
+}
+
+export interface HostResyncStateFacts {
+  stateRevision: number
+  workspaceVolumeRevision: number
+  syncStatus: WorkspaceSyncStatus
+  workspaceFingerprint: string | null
+  lastSyncedAt: string | null
+}
+
+export interface HostResyncDriftFacts {
+  /** Unknown means an old fingerprint exists but no path-addressable baseline can prove which files changed. */
+  status: 'clean' | 'changed' | 'unknown'
+  baselineEvidence: 'path-snapshot' | 'current-fingerprint' | 'legacy-fingerprint' | 'unavailable'
+  changedPaths: HostResyncPathChange[]
+}
+
+export interface HostResyncConfirmationRequired {
+  status: 'confirmation-required'
+  before: HostResyncStateFacts
+  drift: HostResyncDriftFacts
+  /** Opaque, single-use capability bound to this exact inspected snapshot. */
+  confirmation: { required: true; provided: false; token: string }
+  recoveryGuidance: string[]
+}
+
+export interface HostResyncCompleted {
+  status: 'synced'
+  before: HostResyncStateFacts
+  after: HostResyncStateFacts
+  drift: HostResyncDriftFacts
+  confirmation: { required: boolean; provided: boolean }
+  baselineReset: true
+  retainedWorkspaceVolumeRevision: number
+  recoveryGuidance: string[]
+}
+
+/** Result of the inspect/refuse-or-confirm/reset/resync operation. */
+export type SafeHostResyncOutcome = HostResyncConfirmationRequired | HostResyncCompleted
+
 /** Which detection rule decided a value — shown in the Room Plan UI. */
 export interface Detected<T> {
   value: T

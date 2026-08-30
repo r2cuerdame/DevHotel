@@ -70,7 +70,8 @@ export function changesRepo(db: Db): ChangesRepo {
   const { sqlite } = db
   return {
     append(e) {
-      sqlite.exec('BEGIN')
+      const ownsTransaction = !sqlite.isTransaction
+      if (ownsTransaction) sqlite.exec('BEGIN')
       try {
         const row = sqlite
           .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM changes WHERE room_id = ?')
@@ -104,10 +105,10 @@ export function changesRepo(db: Db): ChangesRepo {
             e.createdAt,
             e.undoneAt,
           )
-        sqlite.exec('COMMIT')
+        if (ownsTransaction) sqlite.exec('COMMIT')
         return { ...e, seq }
       } catch (err) {
-        sqlite.exec('ROLLBACK')
+        if (ownsTransaction && sqlite.isTransaction) sqlite.exec('ROLLBACK')
         throw err
       }
     },

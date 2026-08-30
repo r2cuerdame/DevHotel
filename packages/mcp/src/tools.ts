@@ -418,16 +418,28 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       )
     },
     {
+      name: 'safe_resync_from_host',
+      description:
+        'Preferred Host resync operation. Call without a token to inspect meaningful Room-side source drift. If confirmation is required, review/export the exact Room-relative changes and repeat with the returned opaque confirmationToken. The token is single-use and bound to that exact snapshot; any intervening edit returns a fresh preview instead of discarding unseen work. The replaced Room generation is retained for recovery.',
+      schema: {
+        roomId: zRoomId,
+        confirmationToken: z.string().uuid().optional().describe('single-use token returned by the immediately preceding confirmation-required preview')
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).safeResyncFromHost(a.roomId, a.confirmationToken)
+      )
+    },
+    {
       name: 'reset_sync_baseline',
       description:
-        "Accept the room's current meaningful source files as the Host-sync baseline. Use after reviewing real source drift reported by sync_from_host; ordinary build outputs are ignored automatically. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",
+        "Low-level compatibility operation. Accept the room's current meaningful source files as the Host-sync baseline without syncing. Prefer safe_resync_from_host when the goal is to replace the Room from Host, because it keeps inspection, confirmation and publish under one guard.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).resetSyncBaseline(a.roomId))
     },
     {
       name: 'sync_from_host',
       description:
-        "Re-read the room's linked Host folder into the Room-owned working state. Runs under the room's inbound-sync grant (the human linked that folder when creating the room and can revoke agent sync per room), is journaled as the agent, and reads no other path — agents cannot choose paths. Build outputs are ignored; real Room source drift fails with conflictReason and exact changedPaths (see reset_sync_baseline). The generation it replaces is retained for recovery.",
+        "Low-level compatibility operation; prefer safe_resync_from_host so inspection, confirmation and publication stay under one guard. Re-read the room's linked Host folder into the Room-owned working state under its revocable inbound-sync grant. It is journaled as the agent and reads no other path — agents cannot choose paths. Build outputs are ignored; meaningful Room source drift is refused. The generation it replaces is retained for recovery.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).syncFromHost(a.roomId))
     },

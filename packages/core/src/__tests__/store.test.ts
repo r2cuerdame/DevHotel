@@ -245,6 +245,8 @@ describe('roomsRepo', () => {
     settings.set('depsGen:room-1:node22', '2')
     settings.set('depsGenMax:room-1:node22', '3')
     settings.set('workspaceGenMax:room-1', '4')
+    settings.set('workspaceSyncBase:room-1', 'snapshot')
+    settings.set('retainedWorkspaceGen:room-1', '3')
     settings.set('theme', 'dark')
     rooms.delete('room-1')
     expect(rooms.get('room-1')).toBeNull()
@@ -255,6 +257,8 @@ describe('roomsRepo', () => {
     expect(settings.get('depsGen:room-1:node22')).toBeNull()
     expect(settings.get('depsGenMax:room-1:node22')).toBeNull()
     expect(settings.get('workspaceGenMax:room-1')).toBeNull()
+    expect(settings.get('workspaceSyncBase:room-1')).toBeNull()
+    expect(settings.get('retainedWorkspaceGen:room-1')).toBeNull()
     expect(settings.get('theme')).toBe('dark')
   })
 
