@@ -761,6 +761,20 @@ describe('Screenshots follow the attached device', () => {
     expect(adb.execs[0]).toMatchObject({ serial: 'R5CT30ABCDE' })
   })
 
+  it('honors explicit screen mode through the Room display even when a phone is attached', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    const displayPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+
+    const shot = await orch.androidScreenshot('aaaa1111', 'screen')
+
+    expect(shot).toEqual({ source: 'screen', png: displayPng })
+    expect(backend.calls).toContain('captureEmulatorScreen:aaaa1111')
+    expect(adb.execs).toEqual([])
+  })
+
   it('redacts the private serial from a physical screenshot failure', async () => {
     const { orch, adb } = setup()
     await orch.refreshAndroidDevices()

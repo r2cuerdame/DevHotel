@@ -1877,10 +1877,10 @@ export class RoomOrchestrator {
     if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
     if (!awake) throw new Error('Wake the room before taking a screenshot')
-    // Follow whatever this Room is actually driving. With a phone attached the
-    // useful picture is the phone, and the caller never names a serial for it.
+    // Auto follows whatever this Room is driving. Explicit screen mode always
+    // captures the Room display so FLAG_SECURE surfaces remain visible there.
     const physicalDevice = this.devices.deviceForRoom(roomId)
-    if (physicalDevice) {
+    if (physicalDevice && mode === 'auto') {
       const args = ['exec-out', 'screencap', '-p']
       const authorized = this.devices.authorizeInternalOperation(roomId, physicalDevice.id, 'capturing the attached phone screen')
       const result = await this.withDeviceHeartbeat(roomId, physicalDevice.id, authorized.leaseId, () =>
