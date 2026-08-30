@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { DeviceLease } from '@devhotel/shared'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AndroidDeviceBroker, androidDevicesRepo, openDb } from '../index'
 import { FakeAdbHost } from './fakes'
@@ -22,7 +23,7 @@ function makeBroker(
   opts: {
     alive?: boolean | 'unknown'
     graceMs?: number
-    ownerLiveness?: () => Promise<boolean | 'unknown'> | boolean | 'unknown'
+    ownerLiveness?: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
   } = {}
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'devhotel-recovery-'))
@@ -168,6 +169,122 @@ describe('Android device broker — stale lease recovery', () => {
 
     expect((await sweeping).recovered).toHaveLength(0)
     expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('re-reads a later lease before max-duration reclaim after another owner probe awaits', async () => {
+    let finishProbe!: (alive: boolean) => void
+    let probeStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve
+    })
+    const probe = new Promise<boolean>((resolve) => {
+      finishProbe = resolve
+    })
+    const { broker, adb, now } = makeBroker({
+      ownerLiveness: (lease) => {
+        if (lease.roomId !== 'aaaa1111') return true
+        probeStarted()
+        return probe
+      }
+    })
+    adb.phones = [
+      { serial: 'R5CT30FIRST1', state: 'device', model: 'First_Probe', release: '14', sdk: '34', usb: '1-4' },
+      { serial: 'R5CT30SECOND', state: 'device', model: 'Second_Busy', release: '14', sdk: '34', usb: '1-5' }
+    ]
+    await broker.refreshInventory()
+    const firstDevice = broker.listDevices().find((device) => device.model === 'First Probe')!
+    const secondDevice = broker.listDevices().find((device) => device.model === 'Second Busy')!
+    const first = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'FirstOwner',
+      purpose: 'smoke',
+      workerId: 'worker-a',
+      constraints: { deviceId: firstDevice.id },
+      ttlMs: 5_000,
+      maxDurationMs: 600_000
+    })
+    now.value += 1
+    const second = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'SecondOwner',
+      purpose: 'acceptance',
+      workerId: 'worker-b',
+      constraints: { deviceId: secondDevice.id },
+      ttlMs: 5_000,
+      maxDurationMs: 60_000
+    })
+    if (first.state !== 'granted' || second.state !== 'granted') throw new Error('unreachable')
+
+    now.value += 60_001
+    // Keep its heartbeat fresh but leave activity old enough that the snapshot
+    // taken at sweep start would be eligible for max-duration reclaim.
+    broker.heartbeat(second.lease.id)
+    const sweeping = broker.reap()
+    await started
+    // This must fence the stale activity snapshot while the first Room's
+    // liveness probe is still pending.
+    broker.heartbeat(second.lease.id, { busy: true })
+    finishProbe(true)
+
+    const swept = await sweeping
+    expect(swept.recovered.find((entry) => entry.lease.id === second.lease.id)).toBeUndefined()
+    expect(swept.warnings.find((event) => event.deviceId === secondDevice.id)?.kind).toBe('max-duration-warning')
+    expect(broker.leaseForRoom('bbbb2222')?.id).toBe(second.lease.id)
+  })
+
+  it('skips a later lease explicitly released while another owner probe awaits', async () => {
+    let finishProbe!: (alive: boolean) => void
+    let probeStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve
+    })
+    const probe = new Promise<boolean>((resolve) => {
+      finishProbe = resolve
+    })
+    const { broker, adb, now } = makeBroker({
+      ownerLiveness: (lease) => {
+        if (lease.roomId !== 'aaaa1111') return true
+        probeStarted()
+        return probe
+      }
+    })
+    adb.phones = [
+      { serial: 'R5CT30FIRST2', state: 'device', model: 'First_Probe', release: '14', sdk: '34', usb: '1-4' },
+      { serial: 'R5CT30THIRD1', state: 'device', model: 'Second_Released', release: '14', sdk: '34', usb: '1-5' }
+    ]
+    await broker.refreshInventory()
+    const firstDevice = broker.listDevices().find((device) => device.model === 'First Probe')!
+    const secondDevice = broker.listDevices().find((device) => device.model === 'Second Released')!
+    const first = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'FirstOwner',
+      purpose: 'smoke',
+      workerId: 'worker-a',
+      constraints: { deviceId: firstDevice.id },
+      ttlMs: 5_000,
+      maxDurationMs: 600_000
+    })
+    now.value += 1
+    const second = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'SecondOwner',
+      purpose: 'acceptance',
+      workerId: 'worker-b',
+      constraints: { deviceId: secondDevice.id },
+      ttlMs: 5_000,
+      maxDurationMs: 60_000
+    })
+    if (first.state !== 'granted' || second.state !== 'granted') throw new Error('unreachable')
+
+    now.value += 60_001
+    broker.heartbeat(second.lease.id)
+    const sweeping = broker.reap()
+    await started
+    await broker.release(second.lease.id, 'finished while another Room was probed')
+    finishProbe(true)
+
+    await expect(sweeping).resolves.toMatchObject({ recovered: [] })
+    expect(broker.leaseForRoom('bbbb2222')).toBeNull()
   })
 
   it('does not cut off a long instrumentation run that is still reporting activity', async () => {

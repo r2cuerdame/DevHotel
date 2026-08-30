@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { isIP } from 'node:net'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { AndroidDevice, DeviceConnection, DeviceHealth } from '@devhotel/shared'
@@ -48,10 +49,41 @@ export interface AdbHost {
   execBinary(serial: string, args: string[], opts?: AdbExecOptions): Promise<AdbBinaryResult>
 }
 
-export function connectionForSerial(serial: string): DeviceConnection {
+function isTcpPort(raw: string): boolean {
+  const port = Number(raw)
+  return Number.isInteger(port) && port >= 1 && port <= 65_535
+}
+
+function isDnsHost(raw: string): boolean {
+  if (raw.length === 0 || raw.length > 253) return false
+  return raw.split('.').every((label) =>
+    label.length >= 1 &&
+    label.length <= 63 &&
+    /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)
+  )
+}
+
+export function connectionForSerial(serial: string, usbLocation: string | null = null): DeviceConnection {
   if (/^emulator-\d+$/.test(serial)) return 'emulator'
-  // adb reports network-attached devices as host:port.
-  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(serial) || /^[A-Za-z0-9.-]+:\d+$/.test(serial)) return 'wireless'
+  // `adb devices -l` supplies this field only for a USB transport. Prefer the
+  // transport metadata over serial-shape heuristics (USB serials are opaque).
+  if (usbLocation) return 'usb'
+  // Android Wireless Debugging uses a DNS-SD service name instead of a
+  // host:port on current platform-tools. Only the connect service is a device;
+  // the similarly named pairing service must never enter inventory.
+  if (/^.+\._adb-tls-connect\._tcp(?:\.local)?\.?$/i.test(serial)) return 'wireless'
+
+  const bracketedIpv6 = /^\[([0-9A-Fa-f:.]+)(?:%([A-Za-z0-9._~-]+))?\]:(\d{1,5})$/.exec(serial)
+  if (bracketedIpv6 && isIP(bracketedIpv6[1]!) === 6 && isTcpPort(bracketedIpv6[3]!)) return 'wireless'
+
+  // Legacy network-attached devices are reported as IPv4-or-DNS host:port.
+  // Requiring exactly one syntactically valid host and a bounded TCP port
+  // avoids broadening the classifier to arbitrary colon-bearing serials.
+  const hostEndpoint = /^([^:]+):(\d{1,5})$/.exec(serial)
+  if (hostEndpoint && isTcpPort(hostEndpoint[2]!)) {
+    const host = hostEndpoint[1]!
+    if (isIP(host) === 4 || isDnsHost(host)) return 'wireless'
+  }
   return 'usb'
 }
 

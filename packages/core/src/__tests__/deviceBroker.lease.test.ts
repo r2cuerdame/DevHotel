@@ -247,6 +247,38 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     })
   })
 
+  it('enforces wireless constraints for modern ADB TLS DNS-SD serials', async () => {
+    const { broker, adb } = makeBroker()
+    adb.phones = [{
+      serial: 'adb-0W071F0A021046-xyZ._adb-tls-connect._tcp.local.',
+      state: 'device',
+      model: 'Pixel_Wireless',
+      release: '15',
+      sdk: '35'
+    }]
+    await broker.refreshInventory()
+    const device = broker.listDevices()[0]!
+    expect(device).toMatchObject({ connection: 'wireless', health: 'ready' })
+
+    await expect(broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'UsbOnly',
+      purpose: 'smoke',
+      workerId: 'worker-a',
+      constraints: { connection: 'usb' }
+    })).rejects.toMatchObject({ code: 'device-unknown' })
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+
+    const granted = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'WirelessOnly',
+      purpose: 'acceptance',
+      workerId: 'worker-b',
+      constraints: { connection: 'wireless' }
+    })
+    expect(granted).toMatchObject({ state: 'granted', device: { id: device.id, connection: 'wireless' } })
+  })
+
   it('hands the phone to the next queued Room when the owner releases it', async () => {
     const { broker, db } = makeBroker()
     await broker.refreshInventory()

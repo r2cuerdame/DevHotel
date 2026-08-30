@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { resolveAdbExecutable, SpawnedAdbHost } from '../devices/adbHost'
+import { connectionForSerial, resolveAdbExecutable, SpawnedAdbHost } from '../devices/adbHost'
 
 const dirs: string[] = []
 afterEach(() => {
@@ -57,6 +57,43 @@ describe('Host adb discovery', () => {
       })
     ).toBe(expected)
     expect(checked.filter((candidate) => candidate === expected)).toHaveLength(1)
+  })
+})
+
+describe('Host adb transport classification', () => {
+  it.each([
+    '192.0.2.20:5555',
+    'pixel.example:5555',
+    'adb-0W071F0A021046._adb-tls-connect._tcp',
+    'adb-0W071F0A021046._adb-tls-connect._tcp.local',
+    'adb-0W071F0A021046._ADB-TLS-CONNECT._TCP.LOCAL.',
+    '[fe80::1]:5555',
+    '[fe80::1%wlan0]:5555',
+    '[2001:db8::192.0.2.1%3]:37123'
+  ])('classifies %s as wireless', (serial) => {
+    expect(connectionForSerial(serial)).toBe('wireless')
+  })
+
+  it.each([
+    'R5CT30ABCDE',
+    'adb-0W071F0A021046._adb-tls-pairing._tcp',
+    'adb-0W071F0A021046._adb-tls-connect._udp',
+    'adb-0W071F0A021046._adb-tls-connect._tcp.local.example',
+    '._adb-tls-connect._tcp',
+    'fe80::1:5555',
+    '[fe80::1%bad zone]:5555',
+    '[not-ip%wlan0]:5555',
+    '[fe80::1]:0',
+    '[fe80::1]:65536',
+    '192.0.2.20:0',
+    '192.0.2.20:65536'
+  ])('does not classify %s as wireless', (serial) => {
+    expect(connectionForSerial(serial)).toBe('usb')
+  })
+
+  it('prefers explicit USB transport metadata over an opaque colon-bearing serial', () => {
+    expect(connectionForSerial('USB:12345', '1-4')).toBe('usb')
+    expect(connectionForSerial('emulator-5554', '1-4')).toBe('emulator')
   })
 })
 

@@ -150,7 +150,7 @@ export class AndroidDeviceBroker {
       // a short digest can collide, so no serial-derived material is exposed.
       const known = this.repo.getDeviceBySerial(line.serial)
       const id = known?.id ?? `d${randomUUID().replaceAll('-', '')}`
-      const connection = connectionForSerial(line.serial)
+      const connection = connectionForSerial(line.serial, line.usb)
       const health = healthForState(line.state)
       // Properties need an authorized device; an unauthorized phone still
       // belongs in the inventory so the user can see why it is unusable.
@@ -580,10 +580,16 @@ export class AndroidDeviceBroker {
     const now = this.now()
     const at = this.at()
     const result: ReapResult = { recovered: [], warnings: [] }
-    for (const lease of this.repo.listActiveLeases()) {
+    for (const snapshot of this.repo.listActiveLeases()) {
+      // Another lease's liveness probe can await for an arbitrary amount of
+      // time. Fence every later snapshot before acting on it so a heartbeat or
+      // release that wins during that await is never mistaken for stale state.
+      let lease = this.repo.getLease(snapshot.id)
+      if (!lease || lease.state !== 'active') {
+        this.deathObservedAt.delete(snapshot.id)
+        continue
+      }
       const heartbeatAgeMs = now - Date.parse(lease.heartbeatAt)
-      const leaseAgeMs = now - Date.parse(lease.acquiredAt)
-      const activityAgeMs = now - Date.parse(lease.activityAt)
 
       if (heartbeatAgeMs > lease.ttlMs) {
         const live = await this.ownerLiveness(lease)
@@ -599,13 +605,14 @@ export class AndroidDeviceBroker {
           this.deathObservedAt.delete(lease.id)
           continue
         }
+        lease = current
         if (live !== true) {
           const firstSeen = this.deathObservedAt.get(lease.id) ?? now
           this.deathObservedAt.set(lease.id, firstSeen)
           if (now - firstSeen >= this.graceMs) {
             const reason = live === false
-              ? `owner gone: no heartbeat for ${Math.round(heartbeatAgeMs / 1000)}s and the Room or worker is not running`
-              : `owner silent: no heartbeat for ${Math.round(heartbeatAgeMs / 1000)}s and worker liveness is unavailable`
+              ? `owner gone: no heartbeat for ${Math.round((now - Date.parse(lease.heartbeatAt)) / 1000)}s and the Room or worker is not running`
+              : `owner silent: no heartbeat for ${Math.round((now - Date.parse(lease.heartbeatAt)) / 1000)}s and worker liveness is unavailable`
             result.recovered.push({ ...(await this.close(lease, 'expired', reason)), reason })
             continue
           }
@@ -613,6 +620,18 @@ export class AndroidDeviceBroker {
           this.deathObservedAt.delete(lease.id)
         }
       }
+
+      // Re-read immediately before all max-duration decisions. In particular,
+      // the current Room can report busy activity or explicitly release while
+      // an earlier Room's async liveness probe is still in flight.
+      const current = this.repo.getLease(snapshot.id)
+      if (!current || current.state !== 'active') {
+        this.deathObservedAt.delete(snapshot.id)
+        continue
+      }
+      lease = current
+      const leaseAgeMs = now - Date.parse(lease.acquiredAt)
+      const activityAgeMs = now - Date.parse(lease.activityAt)
 
       if (leaseAgeMs > lease.maxDurationMs) {
         // Still reporting real device work? Warn instead of cutting an
