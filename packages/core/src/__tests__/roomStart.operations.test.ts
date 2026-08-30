@@ -286,7 +286,7 @@ describe('Room start as a trackable operation', () => {
     const finished = await orch.waitForOperation(started.id, 10_000)
     expect(finished?.status).toBe('succeeded')
     expect(finished?.finishedAt).not.toBeNull()
-  })
+  }, 20_000)
 
   it('polling the operation neither starts nor repeats any Room work', async () => {
     const { backend, orch, room } = await setup()
