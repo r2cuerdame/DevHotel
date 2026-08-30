@@ -388,8 +388,14 @@ export function buildOneShotArgs(spec: WebSpec, cmd: string, jobId: string): str
     ...envArgs(spec),
     '-w',
     '/workspace',
+    // A Room image may own a long-running ENTRYPOINT (the Android image starts
+    // its emulator stack there). Passing `sh ...` after the image only changes
+    // CMD, so the entrypoint can run our command and then keep the one-shot
+    // container alive until DevHotel's timeout. Override it explicitly: the
+    // requested shell program is the whole lifecycle of this job.
+    '--entrypoint',
+    '/bin/sh',
     imageFor(spec),
-    'sh',
     '-lc',
     wrapStartCommand(cmd),
   ]

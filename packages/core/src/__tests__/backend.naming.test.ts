@@ -243,7 +243,21 @@ describe('buildOneShotArgs', () => {
     expect(oneShot).toContain(jobName('r1', jobId))
     expect(oneShot.flatMap((arg, i) => arg === '-l' ? [oneShot[i + 1]] : [])).toContain('devhotel.role=job')
     expect(oneShot).not.toContain('devhotel.role=web')
-    expect(oneShot.slice(-3)).toEqual(['sh', '-lc', wrapStartCommand('npm install')])
+    const entrypoint = oneShot.indexOf('--entrypoint')
+    expect(oneShot.slice(entrypoint, entrypoint + 3)).toEqual(['--entrypoint', '/bin/sh', 'node:22-bookworm'])
+    expect(oneShot.slice(-2)).toEqual(['-lc', wrapStartCommand('npm install')])
+  })
+
+  it('overrides image entrypoints so a completed one-shot cannot remain alive behind an image supervisor', () => {
+    const oneShot = buildOneShotArgs(spec({ imageOverride: 'budtmo/docker-android:emulator_14.0' }), 'printf done', jobId)
+    const image = oneShot.indexOf('budtmo/docker-android:emulator_14.0')
+    expect(oneShot.slice(image - 2, image + 3)).toEqual([
+      '--entrypoint',
+      '/bin/sh',
+      'budtmo/docker-android:emulator_14.0',
+      '-lc',
+      wrapStartCommand('printf done'),
+    ])
   })
 
   it('preserves compound shell programs behind a PID-1 inner shell', () => {
