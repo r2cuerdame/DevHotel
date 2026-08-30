@@ -67,7 +67,9 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/restart-web` | | change entry |
 | `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
-| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? }` | `{ code, stdout, stderr }` — buffered until exit; redirect long output to a file. A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
+| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs?, output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
+| `GET /v1/rooms/:id/runs` | | `{ runs[] }` — commands running now, plus finished runs whose full output the Room still holds |
+| `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&encoding=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
 | `POST /v1/rooms/:id/checks` | | 15-step check report (includes `line-endings`) |
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
@@ -90,6 +92,90 @@ rejected, as is any entry whose parent directory resolves outside the linked
 folder through a symlink. Included generated paths participate in the baseline
 and are copied during linked-folder import. A real conflict response has the shape
 `{ error: "workspace_drift", message, conflictReason: "room-source-modified", changedPaths: [{ path, reason }] }`.
+
+## Command output
+
+`exec` answers with a **bounded** view of the command's output — never a silent
+truncation, and never the whole of a 400MB logcat inlined into one response.
+
+`output` on the request selects what comes back inline. Every field is optional:
+
+| field | meaning |
+|---|---|
+| `maxBytes` | inline budget **per stream** (default `64000`, min `256`, max `4000000`) |
+| `maxLines` | inline budget per stream, in lines |
+| `mode` | `tail` (default) or `head` — which end to keep when it does not fit |
+| `include` | keep only lines containing this literal UTF-8 substring |
+| `exclude` | drop lines containing this literal UTF-8 substring |
+| `ignoreCase` | match ASCII letters in `include`/`exclude` case-insensitively |
+
+Filters are literal strings of at most 200 characters. Regex metacharacters
+have no special meaning. Matching uses a streaming, non-backtracking algorithm
+whose memory is bounded by the filter length, so an Agent cannot stall the
+Electron main thread with a catastrophic regular expression.
+
+Returned text preserves the selected raw line terminators exactly, including
+CRLF, a final newline, and newline-only output. Byte counts describe the raw
+bytes selected, not a newline-normalized reconstruction.
+
+`output` on the response reports what happened:
+
+```json
+{
+  "code": 1,
+  "stdout": "…last 64000 bytes…",
+  "stderr": "…",
+  "output": {
+    "runId": "9f2c…",
+    "retained": true,
+    "stdout": { "bytes": 41235904, "lines": 380112, "returnedBytes": 63988,
+                "returnedLines": 611, "truncated": true, "filtered": false, "retained": true },
+    "stderr": { "bytes": 0, "lines": 0, "returnedBytes": 0, "returnedLines": 0,
+                "truncated": false, "filtered": false, "retained": false },
+    "notes": ["stdout: returned 63988 of 41235904 bytes (611 of 380112 lines); complete raw output retained as run 9f2c… — read it with read_run_output"]
+  }
+}
+```
+
+Whenever the response could not carry everything — truncated, or narrowed by a
+filter — the **complete raw output is retained under the Room** and read back
+by run id. When the response did carry everything, nothing is retained and
+`runId` refers to a run that is already gone: there is nothing left to fetch.
+
+Retention lives in Hotel storage beside the Room's logs and artifacts, is
+deleted with the Room, and is bounded — a Room keeps its most recent 20
+retained runs, up to 256MB. The just-finished run named by an exec response is
+never immediately pruned; if that single run exceeds 256MB it remains readable
+and all older retained runs are evicted.
+
+### Reading a run
+
+`GET /v1/rooms/:id/runs/:runId/output` takes the same selection fields plus
+`stream` (`stdout` | `stderr`, default `stdout`), `offsetBytes`, and `encoding`
+(`utf8` | `base64`, default `utf8`). It returns the window plus `bytes` (size
+of the retained stream), `nextOffset`, `eof`, `scannedBytes`, `scannedLines`
+and the same truncation flags. Base64 reads leave `text` empty and return the
+selected bytes in `contentBase64`, so arbitrary non-UTF-8 output is recoverable
+exactly.
+
+- **Page through everything**: reads default to `mode=head`; pass each
+  response's `nextOffset` back as `offsetBytes` until `eof` is true. Decode and
+  concatenate `contentBase64` pages when byte-for-byte recovery is required.
+- **Search it**: pass `include`; `nextOffset` resumes after the last returned
+  line, so paging stays exact even when the filter skipped the lines between.
+  Filtered reads are head-paged and deliberately reject a single logical line
+  over 4MiB; page that stream without `include`/`exclude` instead.
+
+Each synchronous read scans at most 4MiB forward. A filtered continuation may
+also inspect at most 4MiB backward to find and re-evaluate its line boundary.
+This fixed work bound protects Electron's main thread; a response can therefore
+return no matching text with `eof=false` and a larger `nextOffset`, which the
+caller should continue paging normally.
+
+Reading takes no Room lock, so a run is readable **while it is still running** —
+`GET /v1/rooms/:id/runs` lists active runs with the bytes and lines they have
+produced so far, which is how a caller tells "hung" from "busy" and how a
+dropped connection is picked back up.
 
 ## MCP registration note
 

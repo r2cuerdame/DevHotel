@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
+import type { ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type { WindowsVmLifecycle } from '../orchestrator'
@@ -114,8 +114,16 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`deleteRoomPod:${roomId}`)
     return { reclaimedBytes: 1024 }
   }
-  async execInRoom(_roomId: string, cmd: string[], _opts?: { timeoutMs?: number }): Promise<ExecResult> {
-    return this.execHandler?.(cmd) ?? this.execResult
+  /** Chunks to emit instead of `execResult`, so streaming callers can be tested. */
+  execChunks: { stdout?: string[]; stderr?: string[] } | null = null
+  async execInRoom(_roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
+    const result = this.execHandler?.(cmd) ?? this.execResult
+    if (!opts?.onStdout && !opts?.onStderr) return result
+    const stdout = this.execChunks?.stdout ?? (result.stdout ? [result.stdout] : [])
+    const stderr = this.execChunks?.stderr ?? (result.stderr ? [result.stderr] : [])
+    for (const chunk of stdout) opts.onStdout?.(chunk)
+    for (const chunk of stderr) opts.onStderr?.(chunk)
+    return { code: result.code, stdout: '', stderr: '' }
   }
   async spawnInteractiveExec(): Promise<ChildProcessWithoutNullStreams> {
     throw new Error('interactive process streaming is not available in FakeBackend')

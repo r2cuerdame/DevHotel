@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import path from 'node:path'
-import type { ExecResult } from './types'
+import type { ExecOutputChunk, ExecResult } from './types'
 
 export interface RunDockerOpts {
   timeoutMs?: number
@@ -11,6 +11,14 @@ export interface RunDockerOpts {
   inputFile?: string
   /** Stream docker stdout to this host file without loading it into JS memory. */
   outputFile?: string
+  /**
+   * Receive stdout as it arrives. When set, stdout is NOT accumulated into the
+   * result, so a caller that bounds or retains the stream itself never pays for
+   * a gigabyte of log in JS memory.
+   */
+  onStdout?: (chunk: ExecOutputChunk) => void
+  /** Same contract as onStdout, for stderr. */
+  onStderr?: (chunk: ExecOutputChunk) => void
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -146,6 +154,9 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
   if (opts.outputFile && opts.onLine) {
     return Promise.reject(new Error('runDocker accepts either outputFile or onLine, not both'))
   }
+  if ((opts.onStdout || opts.onStderr) && (opts.outputFile || opts.onLine)) {
+    return Promise.reject(new Error('runDocker accepts either chunk sinks or outputFile/onLine, not both'))
+  }
   return new Promise((resolve, reject) => {
     const child = spawnDockerProcess(args)
     let stdout = ''
@@ -191,19 +202,29 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
         finish()
       })
       child.stdout.pipe(output)
-    } else {
+    } else if (!opts.onStdout) {
       child.stdout.setEncoding('utf8')
     }
-    child.stderr.setEncoding('utf8')
+    if (!opts.onStderr) child.stderr.setEncoding('utf8')
     if (!opts.outputFile) {
-      child.stdout.on('data', (chunk: string) => {
-        stdout += chunk
-        outRest = feed(outRest, chunk)
+      child.stdout.on('data', (chunk: string | Buffer) => {
+        if (opts.onStdout) {
+          opts.onStdout(chunk)
+          return
+        }
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+        stdout += text
+        outRest = feed(outRest, text)
       })
     }
-    child.stderr.on('data', (chunk: string) => {
-      stderr += chunk
-      errRest = feed(errRest, chunk)
+    child.stderr.on('data', (chunk: string | Buffer) => {
+      if (opts.onStderr) {
+        opts.onStderr(chunk)
+        return
+      }
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+      stderr += text
+      errRest = feed(errRest, text)
     })
 
     const timer = setTimeout(() => {
@@ -229,7 +250,13 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
         if (outRest.length > 0) opts.onLine(outRest)
         if (errRest.length > 0) opts.onLine(errRest)
       }
-      if (timedOut) stderr += `\ndocker ${args[0] ?? ''} timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`
+      if (timedOut) {
+        // The timeout notice is the one line a caller must never lose, so it
+        // follows the same path the rest of stderr took.
+        const notice = `\ndocker ${args[0] ?? ''} timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`
+        if (opts.onStderr) opts.onStderr(notice)
+        else stderr += notice
+      }
       closeCode = code ?? -1
       childClosed = true
       finish()

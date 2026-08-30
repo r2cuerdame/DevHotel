@@ -43,6 +43,20 @@ export interface ExecResult {
   stderr: string
 }
 
+export type ExecOutputChunk = string | Uint8Array
+
+export interface ExecOpts {
+  timeoutMs?: number
+  /**
+   * Receive stdout as it is produced. A backend that honours this must not also
+   * accumulate the stream into `ExecResult.stdout` — that is the whole point:
+   * the caller bounds and retains the output itself.
+   */
+  onStdout?: (chunk: ExecOutputChunk) => void
+  /** Same contract as onStdout, for stderr. */
+  onStderr?: (chunk: ExecOutputChunk) => void
+}
+
 export interface ManagedNetwork {
   roomId: string
   name: string
@@ -73,7 +87,7 @@ export interface IsolationBackend {
   recreateWeb(spec: WebSpec): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
   deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }>
-  execInRoom(roomId: string, cmd: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
+  execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult>
   /** Spawn an interactive command only after engine and exact web-container ownership validation. */
   spawnInteractiveExec(roomId: string, cmd: string[]): Promise<ChildProcessWithoutNullStreams>
   /** Follow web logs only after engine and exact web-container ownership validation. */

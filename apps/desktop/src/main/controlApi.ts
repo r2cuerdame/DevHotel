@@ -10,6 +10,8 @@ import {
   zExecBody,
   zLogKind,
   zRoomId,
+  zRunId,
+  zRunOutputQuery,
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
@@ -176,7 +178,11 @@ export async function startControlApi(
           }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs }, 'agent'))
+            sendJson(
+              res,
+              200,
+              await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs, output: body.output }, 'agent')
+            )
             return
           }
           case 'checks':
@@ -207,6 +213,21 @@ export async function startControlApi(
         }
         sendJson(res, 200, await orch.pushRoomFile(safeRoomId, body.path, body.contentBase64))
         return
+      }
+      if (safeRoomId && op === 'runs' && req.method === 'GET') {
+        // /v1/rooms/:id/runs and /v1/rooms/:id/runs/:runId/output — reading a
+        // run never takes the Room lock, so a long command stays readable while
+        // it is still producing output.
+        if (!parts[4]) {
+          sendJson(res, 200, { runs: orch.listRuns(safeRoomId) })
+          return
+        }
+        if (parts[5] === 'output') {
+          const runId = zRunId.parse(parts[4])
+          const query = zRunOutputQuery.parse(Object.fromEntries(url.searchParams))
+          sendJson(res, 200, orch.readRunOutput(safeRoomId, runId, query))
+          return
+        }
       }
       if (safeRoomId && req.method === 'GET') {
         switch (op) {
