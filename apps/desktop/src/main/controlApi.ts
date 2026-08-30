@@ -9,14 +9,32 @@ import {
   zAgentCreateRoomInput,
   zExecBody,
   zLogKind,
+  zOperationId,
+  zOperationWaitMs,
   zRoomId,
   zRunId,
   zRunOutputQuery,
+  zRoomOperationsLimit,
+  zStartRoomBody,
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
 import { isDevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
+
+/**
+ * Return the durable ID immediately by default. A caller cannot safely assume
+ * its own deadline is longer than ours; clients that want an inline terminal
+ * result can explicitly opt into a bounded wait.
+ */
+const DEFAULT_START_WAIT_MS = 0
+
+/** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
+function parseWaitMs(raw: string | null): number {
+  if (raw === null) return 0
+  const parsed = zOperationWaitMs.safeParse(Number(raw))
+  return parsed.success ? parsed.data : 0
+}
 
 /** Hotel Services reachable by agents; populated after app startup wiring. */
 export interface HotelServicesRef {
@@ -68,6 +86,20 @@ export async function startControlApi(
       return
     }
 
+    // Long operations are addressable on their own so a caller that timed out,
+    // reconnected, or restarted can still finish the story it started.
+    if (parts[1] === 'operations' && parts[2] && !parts[3] && req.method === 'GET') {
+      const operationId = zOperationId.parse(parts[2])
+      const waitMs = parseWaitMs(url.searchParams.get('waitMs'))
+      const operation = waitMs > 0 ? await orch.waitForOperation(operationId, waitMs) : orch.getOperation(operationId)
+      if (!operation) {
+        sendJson(res, 404, { error: 'operation not found' })
+        return
+      }
+      sendJson(res, 200, { operation })
+      return
+    }
+
     if (parts[1] === 'hotel' && parts[2] === 'github') {
       if (!hotel.github) {
         sendJson(res, 503, { error: 'Hotel services are still starting' })
@@ -116,10 +148,18 @@ export async function startControlApi(
       }
       if (safeRoomId && op && req.method === 'POST') {
         switch (op) {
-          case 'start':
-            await orch.startRoom(safeRoomId, 'agent')
-            res.writeHead(204).end()
+          case 'start': {
+            // Waking a Room outlives most client timeouts, so the answer is the
+            // operation itself. `waitMs` only decides how long this call holds
+            // before returning it: a `running` operation is a real answer, and
+            // asking again joins the same wake instead of starting another.
+            const body = zStartRoomBody.parse(await readBody(req))
+            const started = orch.startRoomOperation(safeRoomId, 'agent')
+            const waitMs = body.waitMs ?? DEFAULT_START_WAIT_MS
+            const operation = waitMs > 0 ? await orch.waitForOperation(started.id, waitMs) : started
+            sendJson(res, 200, { operation: operation ?? started })
             return
+          }
           case 'sleep':
             await orch.sleepRoom(safeRoomId, 'agent')
             res.writeHead(204).end()
@@ -243,6 +283,12 @@ export async function startControlApi(
           case 'logs': {
             const kind = zLogKind.parse(url.searchParams.get('kind') ?? 'web')
             sendJson(res, 200, { lines: orch.logs.tail(safeRoomId, kind) })
+            return
+          }
+          case 'operations': {
+            const raw = url.searchParams.get('limit')
+            const limit = raw === null ? undefined : zRoomOperationsLimit.parse(Number(raw))
+            sendJson(res, 200, { operations: orch.listOperations(safeRoomId, limit) })
             return
           }
           case 'screenshot': {

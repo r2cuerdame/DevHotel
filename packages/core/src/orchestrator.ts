@@ -11,6 +11,7 @@ import type {
   CheckStatus,
   CloneRoomInput,
   CreateRoomInput,
+  OperationRecord,
   ProviderKind,
   QuickChange,
   RoomInspection,
@@ -55,6 +56,8 @@ import {
   type StreamReport
 } from './runOutput'
 import { writeManifest } from './manifest'
+import { OperationTracker, type OperationReporter } from './operations'
+import { operationsRepo, type OperationsRepo } from './store/operationsRepo'
 import { reconcile, type ReconcileResult } from './reconcile'
 import type { Db } from './store/db'
 import { changesRepo, type ChangesRepo } from './store/changesRepo'
@@ -101,6 +104,16 @@ const ANDROID_CHANGE_KINDS = new Set([
 
 const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'android-run'])
 
+/**
+ * The adb readiness probe is deliberately a single bounded question, not a
+ * wait. A wake recreates the emulator, and a cold Android image needs minutes
+ * to finish booting — blocking the wake on that would slow every Android wake
+ * to no purpose, since the Room is already usable for builds and `android-run`
+ * waits for the device itself. What the caller gains is the honest answer that
+ * the phone is not usable yet, which a `ready` Room status does not say.
+ */
+const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
+
 export interface OrchestratorEvent {
   roomId: string
   kind: 'status' | 'change' | 'check' | 'deleted' | 'created'
@@ -143,12 +156,16 @@ export class RoomOrchestrator {
   readonly changes: ChangesRepo
   readonly checks: ChecksRepo
   readonly settings: SettingsRepo
+  readonly operationRecords: OperationsRepo
   readonly logs: LogHub
   readonly runs: RunOutputStore
+  private readonly operations: OperationTracker
   private readonly engine = new ChangeEngine()
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
   private readonly activeMutations = new Set<Promise<unknown>>()
+  private readonly deletingRooms = new Set<string>()
+  private readonly materializingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
@@ -170,12 +187,20 @@ export class RoomOrchestrator {
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
     this.settings = settingsRepo(opts.db)
+    this.operationRecords = operationsRepo(opts.db)
+    // Progress is a pull surface on purpose: a per-stage push would refresh
+    // every renderer view and rebuild the tray several times per wake.
+    this.operations = new OperationTracker(this.operationRecords)
     this.logs = new LogHub(opts.userData, opts.backend)
     this.runs = new RunOutputStore(opts.userData)
     registerQuickChanges(this.engine)
   }
 
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
+    // This is the only recovery step that must precede every fallible startup
+    // dependency. The desktop still exposes its control API when init fails;
+    // callers must never keep polling work that died with the prior process.
+    this.markInterruptedOperations()
     await this.gateway.start()
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
@@ -185,6 +210,17 @@ export class RoomOrchestrator {
     await this.reconcileWindowsRooms()
     await this.markInterruptedChanges()
     return { backendOk: health.ok, reconciled }
+  }
+
+  /**
+   * Operations recorded as running belonged to the previous process. Nothing is
+   * driving them now, so a caller polling one must be told it ended rather than
+   * be left waiting on work that no longer exists.
+   */
+  private markInterruptedOperations(): void {
+    for (const operation of this.operations.recoverInterrupted()) {
+      this.olog(operation.roomId, `interrupted ${operation.kind} operation ${operation.id} was ended by an app restart`)
+    }
   }
 
   private async markInterruptedChanges(): Promise<void> {
@@ -270,7 +306,7 @@ export class RoomOrchestrator {
   /** Serializes lifecycle mutations per room — concurrent UI/MCP calls queue instead of interleaving docker operations. */
   private withRoomLock<T>(roomId: string, fn: () => Promise<T>, admittedBeforeGate = false): Promise<T> {
     if (this.mutationGate !== 'open' && !admittedBeforeGate) {
-      return Promise.reject(new Error('DevHotel is shutting down or removing its data; no new room changes can start'))
+      return Promise.reject(this.mutationGateError())
     }
     const prev = this.roomOps.get(roomId) ?? Promise.resolve()
     const next = prev.catch(() => undefined).then(fn)
@@ -281,12 +317,19 @@ export class RoomOrchestrator {
     return next
   }
 
+  private mutationGateError(): Error {
+    return new Error('DevHotel is shutting down or removing its data; no new room changes can start')
+  }
+
   /**
    * Reserve a newly-created Room ID while another Room's operation is still
-   * materializing it. Public target operations queue behind this barrier, and
-   * global shutdown/delete-all drains it through roomOps like any other lock.
+   * materializing it. Ordinary target mutations queue behind this barrier;
+   * durable starts are rejected until release because rollback can delete the
+   * target. Global shutdown/delete-all drains it through roomOps like any other
+   * lock.
    */
   private reserveRoomBarrier(roomId: string): () => void {
+    this.materializingRooms.add(roomId)
     const previous = this.roomOps.get(roomId) ?? Promise.resolve()
     let release!: () => void
     const held = new Promise<void>((resolve) => {
@@ -298,6 +341,7 @@ export class RoomOrchestrator {
     return () => {
       if (released) return
       released = true
+      this.materializingRooms.delete(roomId)
       release()
     }
   }
@@ -990,18 +1034,83 @@ export class RoomOrchestrator {
     }
   }
 
-  startRoom(roomId: string, actor: Actor): Promise<void> {
-    return this.withRoomLock(roomId, () => this.startRoomLocked(roomId, actor))
+  /**
+   * Waking a Room is long enough that the caller's own timeout is the usual
+   * reason a start "fails". Callers who need to survive that use
+   * {@link startRoomOperation} and poll the returned operation; this awaits the
+   * same single operation and keeps its original contract — it resolves once
+   * the wake settled, and a wake that could not bring the Room up leaves the
+   * Room marked `broken`/`attention` rather than rejecting.
+   */
+  async startRoom(roomId: string, actor: Actor): Promise<void> {
+    await this.beginRoomStart(roomId, actor).completion
   }
 
-  private async startRoomLocked(roomId: string, _actor: Actor): Promise<void> {
+  /**
+   * Start (or join) the Room's wake and return its durable operation record
+   * immediately. Repeat calls while a wake is running return that same record
+   * instead of queueing a second wake.
+   */
+  startRoomOperation(roomId: string, actor: Actor): OperationRecord {
+    return this.beginRoomStart(roomId, actor).record
+  }
+
+  private beginRoomStart(roomId: string, actor: Actor): { record: OperationRecord; completion: Promise<void> } {
+    // OperationTracker persists before it publishes. Reject before that
+    // boundary when global or per-Room deletion already owns the lifecycle, so
+    // cleanup cannot be followed by a terminal write that resurrects an orphan
+    // operation row.
+    if (this.mutationGate !== 'open') throw this.mutationGateError()
+    if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
+    // Fail an unknown Room before an operation exists: there is nothing to poll.
+    this.mustGet(roomId)
+    // A clone publishes its preparing ownership row before the target exists.
+    // Other lifecycle calls may safely queue behind that target's barrier, but
+    // a start operation must not publish yet: clone rollback can delete the row
+    // before queued work runs, leaving the operation as an orphan afterwards.
+    if (this.materializingRooms.has(roomId)) {
+      throw new Error(`Room ${roomId} is still being created and cannot be started`)
+    }
+    const handle = this.operations.run('room-start', roomId, actor, (report) =>
+      this.withRoomLock(roomId, () => this.startRoomLocked(roomId, actor, report))
+    )
+    // The lifecycle lock's task resolves just before OperationTracker stores its
+    // terminal snapshot. Make later delete/drain work wait for that publication
+    // too, otherwise it could remove the Room and then lose a race to the final
+    // operation INSERT.
+    if (handle.newlyStarted) this.roomOps.set(roomId, handle.completion.catch(() => undefined))
+    return handle
+  }
+
+  /** The Room's recent operations, newest first. */
+  listOperations(roomId: string, limit?: number): OperationRecord[] {
+    return this.operations.listForRoom(roomId, limit)
+  }
+
+  getOperation(operationId: string): OperationRecord | null {
+    return this.operations.get(operationId)
+  }
+
+  /**
+   * Wait up to `timeoutMs` for an operation to finish. Running out of time is
+   * not an error: the record comes back with `status: 'running'`.
+   */
+  waitForOperation(operationId: string, timeoutMs: number): Promise<OperationRecord | null> {
+    return this.operations.wait(operationId, timeoutMs)
+  }
+
+  private async startRoomLocked(roomId: string, _actor: Actor, report: OperationReporter): Promise<void> {
     const room = this.mustGet(roomId)
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
+    report.begin('preparing', 'Prepare the Room record')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
       if (alreadyAwake) {
         try {
-          if ((await windowsVm.state(roomId)) === 'running') return
+          if ((await windowsVm.state(roomId)) === 'running') {
+            report.skip('Room was already awake')
+            return
+          }
         } catch (error) {
           this.olog(
             roomId,
@@ -1012,6 +1121,7 @@ export class RoomOrchestrator {
       this.rooms.update(roomId, { status: 'preparing', hostPort: null })
       this.emit(roomId, 'status')
       this.olog(roomId, 'wake Windows VM')
+      report.begin('vm-start', 'Start the Windows VM')
       try {
         await windowsVm.start(roomId)
         if ((await windowsVm.state(roomId)) !== 'running') throw new Error('VMware did not report the Windows Room as running')
@@ -1019,6 +1129,7 @@ export class RoomOrchestrator {
       } catch (error) {
         this.olog(roomId, `wake failed: ${error instanceof Error ? error.message : String(error)}`)
         this.rooms.update(roomId, { status: 'broken', hostPort: null })
+        report.fail('wake failed', error)
       }
       await writeManifest(this.userData, this.mustGet(roomId))
       this.emit(roomId, 'status')
@@ -1026,7 +1137,10 @@ export class RoomOrchestrator {
     }
     if (alreadyAwake && room.hostPort != null) {
       const runtimeStatus = await this.observeRuntimeStatus(room)
-      if (runtimeStatus.state === 'running') return
+      if (runtimeStatus.state === 'running') {
+        report.skip('Room was already awake')
+        return
+      }
       this.olog(roomId, `wake requested for stale runtime: ${runtimeStatus.detail}`)
     }
     this.rooms.update(roomId, { status: 'preparing' })
@@ -1039,44 +1153,92 @@ export class RoomOrchestrator {
         // rooms created before the emulator screen existed relayed nothing
         this.rooms.update(roomId, { internalPort: 6080 })
       }
+      report.begin('container-start', 'Start the Room containers')
       const { hostPort } = await this.backend.recreateAnchor({
         roomId,
         internalPort: this.mustGet(roomId).internalPort
       })
       this.rooms.update(roomId, { hostPort, status: 'running' })
+      let emulatorStarted = false
       if (room.provider === 'android') {
         // the emulator joins the fresh anchor's netns, so it is recreated with it
         this.olog(roomId, 'start emulator')
+        report.begin('emulator-boot', 'Start the Room emulator')
         try {
           await this.backend.removeEmulator(roomId)
           await this.backend.createEmulator(roomId, room.android)
+          emulatorStarted = true
+          report.detail('emulator container started')
         } catch (err) {
           // No KVM or a failed image pull must not brick the room — it can
           // still build APKs; checks surface the missing emulator screen.
-          this.olog(roomId, `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`)
+          const detail = `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`
+          this.olog(roomId, detail)
+          report.skip(detail)
         }
       } else {
+        report.begin('services-start', 'Start the Room services')
         // services join the anchor's netns, so a fresh anchor needs fresh service containers
-        for (const [svc, cfg] of Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]) {
+        const services = Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]
+        if (services.length === 0) report.skip('this Room has no Room Services')
+        for (const [svc, cfg] of services) {
           this.olog(roomId, `start service ${svc} ${cfg.version}`)
           await this.backend.removeService(roomId, svc, { volume: false })
           await this.backend.createService(roomId, svc, cfg.version)
         }
       }
+      report.begin('web-start', 'Start the Room web process')
       await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
+      report.begin('verify', 'Verify the Room answers')
       const verify = await verifyWebUp(this.ctxFor(roomId), { timeoutMs: 90_000 })
       this.rooms.update(roomId, {
         status: verify.ok ? 'ready' : 'attention',
         lastUsedAt: new Date().toISOString()
       })
       this.olog(roomId, `wake: ${verify.detail}`)
+      report.detail(verify.detail)
+      if (!verify.ok) {
+        // The Room is left in `attention`, exactly as before — but the caller
+        // now gets a terminal answer instead of a call that merely returned.
+        report.fail(verify.detail)
+        this.emit(roomId, 'status')
+        return
+      }
+      if (emulatorStarted) await this.reportEmulatorReady(roomId, report)
     } catch (err) {
       this.olog(roomId, `wake failed: ${err instanceof Error ? err.message : String(err)}`)
       this.rooms.update(roomId, { status: 'broken' })
+      report.fail('wake failed', err)
     }
     this.emit(roomId, 'status')
+  }
+
+  /**
+   * Ask once whether the freshly started emulator already answers adb. Never
+   * fatal: a Room whose phone is still booting is a working build Room.
+   */
+  private async reportEmulatorReady(roomId: string, report: OperationReporter): Promise<void> {
+    report.begin('adb-ready', 'Check whether the emulator answers adb')
+    let detail = ''
+    try {
+      const probe = await this.backend.execInRoom(
+        roomId,
+        ['sh', '-lc', `adb -s ${EMULATOR_ADB_SERIAL} shell getprop sys.boot_completed 2>/dev/null`],
+        { timeoutMs: EMULATOR_ADB_PROBE_TIMEOUT_MS }
+      )
+      if (probe.stdout.trim() === '1') {
+        report.detail(`emulator ${EMULATOR_ADB_SERIAL} answers adb and finished booting`)
+        return
+      }
+    } catch (err) {
+      detail = ` (${err instanceof Error ? err.message : String(err)})`
+    }
+    report.skip(
+      `emulator ${EMULATOR_ADB_SERIAL} is still booting${detail}; the Room is usable for builds now, ` +
+        'and android-run waits for the device before installing'
+    )
   }
 
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
@@ -1175,7 +1337,19 @@ export class RoomOrchestrator {
   }
 
   deleteRoom(roomId: string, actor: Actor): Promise<{ reclaimedBytes: number }> {
-    return this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+    if (this.deletingRooms.has(roomId)) {
+      return Promise.reject(new Error(`Room ${roomId} is already being deleted`))
+    }
+    // Reserve deletion synchronously. A concurrent start must fail before it
+    // creates its durable operation record, not queue behind deletion and write
+    // a terminal orphan after the Room row is gone.
+    this.deletingRooms.add(roomId)
+    const task = this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+    void task.then(
+      () => this.deletingRooms.delete(roomId),
+      () => this.deletingRooms.delete(roomId)
+    )
+    return task
   }
 
   /**
@@ -1227,6 +1401,7 @@ export class RoomOrchestrator {
       const windowsVm = this.mustWindowsVm()
       const { reclaimedBytes } = await windowsVm.delete(roomId)
       this.rooms.delete(roomId)
+      this.operations.forgetRoom(roomId)
       rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
       this.emit(roomId, 'deleted')
       return { reclaimedBytes }
@@ -1235,6 +1410,7 @@ export class RoomOrchestrator {
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
+    this.operations.forgetRoom(roomId)
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
     return { reclaimedBytes }

@@ -9,6 +9,13 @@ export const zProviderKind = z.enum(['web', 'android', 'windows'])
 export const zServiceKind = z.enum(['postgres', 'redis'])
 export const zRoomId = z.string().regex(/^[a-z0-9]{8}$/, 'valid Room ID')
 export const zChangeId = z.string().uuid()
+export const zOperationId = z.string().uuid()
+/**
+ * How long the server may hold one call open waiting for a long operation.
+ * Bounded so a client's own timeout is always the shorter one — the caller
+ * gets an answer (`status: 'running'`) rather than a dropped connection.
+ */
+export const zOperationWaitMs = z.number().int().min(0).max(600_000)
 export const zTermId = z.string().uuid()
 export const zNickname = z.string().trim().min(1).max(60)
 export const zLocalDomain = z.string().regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$/)
@@ -240,6 +247,8 @@ export const CONTROL_ROUTES = {
   createRoom: { method: 'POST', path: '/v1/rooms' },
   inspectRoom: { method: 'GET', path: '/v1/rooms/:id' },
   startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
+  getOperation: { method: 'GET', path: '/v1/operations/:operationId' },
+  listRoomOperations: { method: 'GET', path: '/v1/rooms/:id/operations' },
   sleepRoom: { method: 'POST', path: '/v1/rooms/:id/sleep' },
   execInRoom: { method: 'POST', path: '/v1/rooms/:id/exec' },
   listRuns: { method: 'GET', path: '/v1/rooms/:id/runs' },
@@ -250,6 +259,9 @@ export const CONTROL_ROUTES = {
   diagnostic: { method: 'GET', path: '/v1/rooms/:id/diagnostic' }
 } as const
 
+/** Starting a Room answers with its operation; `waitMs` only chooses how long the call holds. */
+export const zStartRoomBody = z.object({ waitMs: zOperationWaitMs.optional() }).strict()
+export const zRoomOperationsLimit = z.number().int().min(1).max(200)
 export const zApplyChangeBody = z.object({ change: zQuickChange }).strict()
 export const zUndoChangeBody = z.object({ changeId: zChangeId }).strict()
 /**
