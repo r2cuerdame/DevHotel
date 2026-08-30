@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
@@ -59,7 +59,10 @@ describe('Rooms attach and release the shared phone', () => {
     expect(result.state).toBe('granted')
     if (result.state !== 'granted') throw new Error('unreachable')
     expect(result.device).not.toHaveProperty('serial')
-    expect(orch.inspectRoom('aaaa1111').device).toMatchObject({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance' })
+    const inspection = orch.inspectRoom('aaaa1111')
+    expect(inspection.device).toMatchObject({ deviceId: result.device.id, project: 'AppDied', purpose: 'acceptance' })
+    expect(JSON.stringify(inspection)).not.toContain(result.lease.id)
+    expect(JSON.stringify(inspection)).not.toContain('worker-a')
   })
 
   it('queues the second Room and tells it who is holding the phone', async () => {
@@ -81,6 +84,9 @@ describe('Rooms attach and release the shared phone', () => {
     if (second.state !== 'queued') throw new Error('unreachable')
     expect(second.owner?.project).toBe('AppDied')
     expect(second.position).toBe(1)
+    const publicStatus = JSON.stringify(orch.androidDeviceStatus())
+    expect(publicStatus).not.toContain(first.lease.id)
+    expect(publicStatus).not.toContain(second.requestId)
   })
 
   it('gives the phone up when the Room goes to sleep', async () => {
@@ -99,7 +105,7 @@ describe('Rooms attach and release the shared phone', () => {
     await orch.sleepRoom('aaaa1111', 'user')
 
     expect(orch.inspectRoom('aaaa1111').device).toBeNull()
-    expect(orch.inspectRoom('bbbb2222').device).toMatchObject({ roomId: 'bbbb2222' })
+    expect(orch.inspectRoom('bbbb2222').device).toMatchObject({ project: 'MiracleKeyboard', purpose: 'keyboard' })
   })
 
   it('gives the phone up when the Room is deleted', async () => {
@@ -203,6 +209,25 @@ describe('Android automation targets the attached device without a hand-written 
     expect(backend.execInRoomCalls.some((call) => call.cmd.join(' ').includes('gradle assembleDebug'))).toBe(false)
   })
 
+  it('keeps a disconnected physical proof target sticky until explicit release', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.phones = []
+    await orch.refreshAndroidDevices()
+    backend.execInRoomCalls = []
+
+    expect(orch.inspectRoom('aaaa1111').device).toBeNull()
+    await expect(orch.resolveAdbTarget('aaaa1111')).rejects.toMatchObject({ code: 'device-unhealthy' })
+    await expect(orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')).rejects.toMatchObject({
+      code: 'device-unhealthy'
+    })
+    expect(backend.execInRoomCalls.some((call) => call.cmd.join(' ').includes('gradle assembleDebug'))).toBe(false)
+
+    await orch.releaseAndroidDevice('aaaa1111', 'switch back to emulator explicitly')
+    await expect(orch.resolveAdbTarget('aaaa1111')).resolves.toMatchObject({ kind: 'emulator', deviceId: null })
+  })
+
   it('stages Room APK bytes in a private Host temp before installing, then removes them', async () => {
     const { orch, adb, backend, userData } = setup()
     await orch.refreshAndroidDevices()
@@ -227,6 +252,76 @@ describe('Android automation targets the attached device without a hand-written 
     expect(existsSync(stagedPath)).toBe(false)
   })
 
+  it('maps private staging paths back to Room paths in every adb result', async () => {
+    const { orch, adb, userData } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execResultFor = (_serial, args) => {
+      const privatePath = args.at(-1)!
+      return {
+        code: 1,
+        stdout: `failed to inspect ${privatePath.replaceAll('\\', '/')}\n`,
+        stderr: `adb: failed to stat ${privatePath}\n`
+      }
+    }
+
+    const roomPath = '/workspace/app/build/outputs/apk/debug/broken.apk'
+    const result = await orch.adbOnDevice('aaaa1111', ['install', '-r', roomPath])
+
+    expect(result.stdout).toContain(roomPath)
+    expect(result.stderr).toContain(roomPath)
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(userData)
+    expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/device-adb-/)
+  })
+
+  it('rejects a staged APK link before Host adb can dereference it', async () => {
+    const { orch, adb, backend, userData } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    const outside = join(userData, 'outside-staging-target')
+    mkdirSync(outside)
+    backend.copyFromRoomHook = (_roomId, _roomPath, hostPath) => {
+      symlinkSync(outside, hostPath, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install', '-r', '/workspace/app/build/outputs/apk/debug/app-debug.apk'])
+    ).rejects.toThrow(/non-regular|escaped/)
+
+    expect(adb.execs).toEqual([])
+    expect(existsSync(outside)).toBe(true)
+  })
+
+  it('fences a staged install to the exact lease captured before copying bytes', async () => {
+    const { orch, adb, backend, userData } = setup()
+    await orch.refreshAndroidDevices()
+    const first = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (first.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    backend.copyFromRoomHook = async () => {
+      backend.copyFromRoomHook = null
+      await orch.devices.release(first.lease.id, 'replace lease during staging')
+      const replacement = await orch.devices.requestDevice({
+        roomId: 'aaaa1111',
+        project: 'AppDied',
+        purpose: 'acceptance',
+        workerId: 'worker-b',
+        constraints: { deviceId: first.lease.deviceId }
+      })
+      expect(replacement.state).toBe('granted')
+      if (replacement.state === 'granted') expect(replacement.lease.id).not.toBe(first.lease.id)
+    }
+
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install', '-r', '/workspace/app/build/outputs/apk/debug/app-debug.apk'])
+    ).rejects.toMatchObject({ code: 'lease-expired' })
+
+    expect(adb.execs).toEqual([])
+    const tmpEntries = existsSync(join(userData, 'tmp')) ? readdirSync(join(userData, 'tmp')) : []
+    expect(tmpEntries).toEqual([])
+  })
+
   it('rejects Host APK paths and every leading ADB target-selector form', async () => {
     const { orch, adb } = setup()
     await orch.refreshAndroidDevices()
@@ -237,6 +332,15 @@ describe('Android automation targets the attached device without a hand-written 
     await expect(
       orch.adbOnDevice('aaaa1111', ['install-multiple', '/workspace/app.apk', '/tmp/secret-without-extension'])
     ).rejects.toThrow(/Host/)
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install-multiple', '/workspace/app.apk', '..\\payload.bin'])
+    ).rejects.toThrow(/relative|Host/)
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install-multiple', '/workspace/app.apk', 'payload.bin'])
+    ).rejects.toThrow(/relative|Host/)
+    await expect(
+      orch.adbOnDevice('aaaa1111', ['install', '-r', '--local-agent', 'payload.bin', '/workspace/app.apk'])
+    ).rejects.toThrow(/approved flags|Host/)
     await expect(orch.adbOnDevice('aaaa1111', ['-s', 'OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
     await expect(orch.adbOnDevice('aaaa1111', ['-sOTHER', 'get-state'])).rejects.toThrow(/target-selector/)
     await expect(orch.adbOnDevice('aaaa1111', ['--one-device=OTHER', 'get-state'])).rejects.toThrow(/target-selector/)
@@ -264,7 +368,16 @@ describe('Android automation targets the attached device without a hand-written 
       ['exec-out', 'getprop', 'ro.boot.serialno'],
       ['shell', '/system/bin/getprop', 'ro.serialno'],
       ['shell', 'sh', '-c', 'getprop ro.serialno | base64'],
-      ['shell', 'dumpsys']
+      ['shell', 'dumpsys'],
+      ['shell', 'dumpsys', 'package', 'com.example.app'],
+      ['shell', 'pm', 'list', 'packages'],
+      ['shell', 'ps', '-A'],
+      ['shell', 'pidof', 'com.example.app'],
+      ['logcat'],
+      ['logcat', '-d'],
+      ['exec-out', 'screencap', '-p'],
+      ['jdwp'],
+      ['tcpip', '5555']
     ]) {
       await expect(orch.adbOnDevice('aaaa1111', args)).rejects.toMatchObject({ code: 'adb-command-forbidden' })
     }
@@ -329,6 +442,118 @@ describe('Android automation targets the attached device without a hand-written 
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
     expect(adb.execs.find((call) => call.args[1] === 'am')?.serial).toBe('R5CT30ABCDE')
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
+  })
+
+  it.each([
+    {
+      name: 'applicationId shell metacharacters',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app;getprop.ro.serialno', elements: [{ outputFile: 'app-debug.apk' }] },
+      expected: /Invalid Android applicationId/
+    },
+    {
+      name: 'APK filename traversal',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '../../secret.apk' }] },
+      expected: /unsafe APK filename/
+    },
+    {
+      name: 'metadata path shell injection',
+      findOutput: "/workspace/app/build/outputs/apk/debug/output-metadata.json';getprop ro.serialno;'\n",
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] },
+      expected: /unsafe output-metadata path/
+    }
+  ])('fails closed on $name before a physical adb install', async ({ findOutput, metadata, expected }) => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) return { code: 0, stdout: findOutput, stderr: '' }
+      if (command.startsWith('cat ')) return { code: 0, stdout: JSON.stringify(metadata), stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toMatch(expected)
+    expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state'])
+  })
+
+  it('rejects an invalid requested applicationId before inserting it into physical adb argv', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith('cat ')) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange(
+      'aaaa1111',
+      { kind: 'android-run', applicationId: 'com.example.app;getprop.ro.serialno' },
+      'user'
+    )
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toMatch(/Invalid Android applicationId/)
+    expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state'])
+  })
+
+  it('keeps android-run fenced to its preflight lease across a long build', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    const first = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (first.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    let replaced = false
+    backend.execInRoomHandler = async (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('cd /workspace') && !replaced) {
+        replaced = true
+        await orch.devices.release(first.lease.id, 'replace lease during build')
+        const next = await orch.devices.requestDevice({
+          roomId: 'aaaa1111',
+          project: 'AppDied',
+          purpose: 'acceptance',
+          workerId: 'worker-b',
+          constraints: { deviceId: first.lease.deviceId }
+        })
+        expect(next.state).toBe('granted')
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(replaced).toBe(true)
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toMatch(/lease changed/)
+    expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
   })
 
   it('keeps android-run on the Room emulator by default', async () => {
@@ -429,5 +654,26 @@ describe('Screenshots follow the attached device', () => {
     expect(shot).toMatchObject({ source: 'adb', png: png.toString('base64') })
     // The phone answered, not the Room's own emulator, whose stdout differs.
     expect(adb.execs[0]).toMatchObject({ serial: 'R5CT30ABCDE' })
+  })
+
+  it('redacts the private serial from a physical screenshot failure', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execBinaryResultFor = () => ({
+      code: 1,
+      stdout: Buffer.alloc(0),
+      stderr: "error: device 'R5CT30ABCDE' not found",
+      outputLimitExceeded: false
+    })
+
+    let message = ''
+    try {
+      await orch.androidScreenshot('aaaa1111')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(message).toContain('[device-serial-redacted]')
+    expect(message).not.toContain('R5CT30ABCDE')
   })
 })

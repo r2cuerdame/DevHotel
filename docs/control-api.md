@@ -136,7 +136,7 @@ are not brokered and never enter this queue.
 | `POST /v1/devices/cancel` | `{ requestId }` | leave the queue |
 | `POST /v1/rooms/:id/device/attach` | `{ purpose, workerId, issueRef?, runId?, priority?, ttlMs?, maxDurationMs?, constraints? }` | `{ state: 'granted', lease, device }` or `{ state: 'queued', requestId, position, owner, reason }`. `project` is taken from the Room and is rejected in the body. |
 | `POST /v1/rooms/:id/device/release` | `{ reason? }` | the closed lease; promotes the next queued Room. Nothing is uninstalled or cleared. |
-| `POST /v1/rooms/:id/device/adb` | `{ args: string[], timeoutMs? }` | `{ code, stdout, stderr }` — argv without `adb` or any global target selector; the broker picks this Room's leased device. Install inputs must be `/workspace/*.apk` paths, whose bytes are staged in private Host temp files. State-changing commands need a live lease and are otherwise refused with HTTP 409 plus a structured broker code. |
+| `POST /v1/rooms/:id/device/adb` | `{ args: string[], timeoutMs? }` | `{ code, stdout, stderr }` — bounded raw argv without `adb` or any global target selector; the broker picks this Room's leased device. Install inputs must be `/workspace/*.apk` paths. Bytes are staged as canonical regular files in private Host temp storage (512 MiB/APK, 1 GiB/install), and returned text maps the private path back to its Room path. State-changing commands need the exact still-active lease captured at authorization. Cross-app/large-output reads (`logcat`, `dumpsys`, `exec-out`, app/process listings, raw screen capture) are always refused; use high-level screenshot/tracked-app operations. |
 
 Use `pid:<OS process id>` for `workerId` when the caller can provide it, so the
 broker can distinguish a live worker from a dead one directly. Other stable
@@ -152,7 +152,7 @@ emulator cannot reproduce, then release it.
 |---|---|---|
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
-| `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. |
+| `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
 | `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
 | `POST /v1/rooms/:id/sleep` | | `204` |

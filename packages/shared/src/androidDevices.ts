@@ -19,7 +19,7 @@ export const zAdbSerial = z
   .min(1)
   .max(128)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/, 'valid adb serial')
-export const zDeviceId = z.string().regex(/^d[a-f0-9]{11}$/, 'valid device ID')
+export const zDeviceId = z.string().regex(/^d[a-f0-9]{32}$/, 'valid opaque device ID')
 export const zDeviceNickname = z.string().trim().min(1).max(60).regex(/^[^\p{C}]+$/u, 'printable nickname')
 
 /** How the device is attached. Only `usb` and `wireless` are brokered. */
@@ -121,6 +121,15 @@ export interface DeviceLease {
   releaseReason: string | null
 }
 
+/** Non-capability lease facts safe for Room inspection and UI surfaces. */
+export interface RoomDeviceLeaseSummary {
+  deviceId: string
+  project: string
+  purpose: LeasePurpose
+  state: LeaseState
+  acquiredAt: string
+}
+
 export interface DeviceQueueEntry {
   id: string
   deviceId: string | null
@@ -163,7 +172,6 @@ export interface DeviceEvent {
 
 /** Who currently holds the phone, in the form a waiting project needs to see. */
 export interface DeviceLeaseOwner {
-  leaseId: string
   roomId: string
   project: string
   purpose: LeasePurpose
@@ -175,7 +183,6 @@ export interface DeviceLeaseOwner {
 }
 
 export interface DeviceWaiter {
-  requestId: string
   roomId: string
   project: string
   purpose: LeasePurpose

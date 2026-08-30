@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -60,13 +61,10 @@ describe('classifying ADB commands by whether another project would notice', () 
   it.each([
     [['get-state']],
     [['shell', 'getprop', 'ro.build.version.sdk']],
-    [['shell', 'dumpsys', 'battery']],
-    [['shell', 'dumpsys', 'package', 'com.example.app']],
     [['shell', 'wm', 'size']],
     [['shell', 'wm', 'density']],
-    [['exec-out', 'screencap', '-p']],
-    [['logcat', '-d']],
-    [['shell', 'pm', 'list', 'packages']]
+    [['shell', 'uptime']],
+    [['shell', 'free']]
   ])('treats %j as safe to share', (argv: string[]) => {
     expect(classifyAdbCommand(argv).interfering).toBe(false)
   })
@@ -77,11 +75,16 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['devices', '-l']],
     [['track-devices-l']],
     [['connect', '192.0.2.1:5555']],
+    [['tcpip', '5555']],
+    [['usb']],
+    [['root']],
+    [['remount']],
     [['forward', '--list']],
     [['forward', '--remove-all']],
     [['reverse', '--remove-all']],
     [['get-serialno']],
     [['get-devpath']],
+    [['version']],
     [['shell', 'getprop']],
     [['shell', 'getprop', 'ro.serialno']],
     [['exec-out', 'getprop', 'ro.boot.serialno']],
@@ -89,7 +92,40 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['shell', 'toybox', 'getprop', 'ro.serialno']],
     [['shell', 'sh', '-c', 'getprop ro.serialno | base64']],
     [['shell', 'dumpsys']],
+    [['shell', 'dumpsys', 'battery']],
+    [['shell', 'dumpsys', 'package', 'com.example.app']],
     [['shell', 'dumpsys', 'iphonesubinfo']],
+    [['shell', 'wm', 'dump-visible-window-views']],
+    [['shell', 'wm', 'size', '1080x2400']],
+    [['shell', 'screenrecord', '-']],
+    [['shell', 'pm', 'list', 'packages']],
+    [['shell', 'pm', 'path', 'com.example.app']],
+    [['shell', 'pm', '--user', '0', 'list', 'packages']],
+    [['shell', 'cmd', 'package', 'resolve-activity', '--brief', 'com.example.app']],
+    [['shell', 'settings', 'get', 'secure', 'android_id']],
+    [['shell', 'settings', 'list', 'secure']],
+    [['shell', 'content', 'query', '--uri', 'content://contacts/phones']],
+    [['shell', 'ime', 'list', '-a']],
+    [['shell', 'device_config', 'list']],
+    [['shell', 'am', 'get-current-user']],
+    [['shell', 'appops', 'get', 'com.example.app']],
+    [['shell', 'ps', '-A']],
+    [['shell', 'pidof', 'com.example.app']],
+    [['shell', 'top', '-n', '1']],
+    [['shell', 'echo', '$ANDROID_ID']],
+    [['shell', 'printf', '%s', '$ANDROID_ID']],
+    [['shell', 'wm', 'size', '$ANDROID_ID']],
+    [['shell', 'am', 'start', '-n', '$ANDROID_ID']],
+    [['shell', 'rm', '/sdcard/*']],
+    [['shell', 'df', '/data/*']],
+    [['shell', 'id', 'shell']],
+    [['shell', 'free', '-h']],
+    [['shell', 'date', '+%s']],
+    [['shell', 'logcat', '-d']],
+    [['logcat']],
+    [['logcat', '-d']],
+    [['jdwp']],
+    [['exec-out', 'screencap', '-p']],
     [['shell', 'cmd', 'device_identifiers', 'get-serial-for-package']],
     [['shell']],
     [['shell', 'dd', 'if=/proc/bootconfig', 'bs=1', 'skip=0', 'count=1']],
@@ -97,7 +133,8 @@ describe('classifying ADB commands by whether another project would notice', () 
     [['keygen', 'C:\\tmp\\adbkey']],
     [['server', 'nodaemon']],
     [['reconnect', 'offline']],
-    [['host-features']]
+    [['host-features']],
+    [['get-state', 'extra']]
   ])('forbids Host-wide, Host-file, and identity-revealing command %j even with a lease', (argv: string[]) => {
     expect(classifyAdbCommand(argv)).toMatchObject({ interfering: true, forbidden: true })
   })
@@ -115,9 +152,40 @@ describe('classifying ADB commands by whether another project would notice', () 
     expect(classifyAdbCommand(['shell', 'getprop\rpm clear com.example.app']).interfering).toBe(true)
   })
 
-  it('looks past the serial selector so `-s` cannot hide the verb', () => {
-    expect(classifyAdbCommand(['-s', 'R5CT30ABCDE', 'install', 'app.apk']).interfering).toBe(true)
-    expect(classifyAdbCommand(['-s', 'R5CT30ABCDE', 'get-state']).interfering).toBe(false)
+  it('forbids split and attached global selectors that could override the broker target', () => {
+    for (const argv of [
+      ['-s', 'R5CT30ABCDE', 'get-state'],
+      ['-sR5CT30ABCDE', 'get-state'],
+      ['-t', '7', 'get-state'],
+      ['--one-device=R5CT30ABCDE', 'get-state'],
+      ['-H', 'attacker.example', 'get-state']
+    ]) {
+      expect(classifyAdbCommand(argv)).toMatchObject({ interfering: true, forbidden: true })
+    }
+  })
+})
+
+describe('opaque persisted device IDs', () => {
+  it('never derives the public ID from the private serial and keeps it across refreshes', async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const first = broker.listDevices()[0]!.id
+    const predictable = `d${createHash('sha256').update('R5CT30ABCDE').digest('hex').slice(0, 11)}`
+
+    expect(first).toMatch(/^d[a-f0-9]{32}$/)
+    expect(first).not.toBe(predictable)
+
+    await broker.refreshInventory()
+    expect(broker.listDevices()[0]!.id).toBe(first)
+  })
+
+  it('assigns distinct opaque IDs to distinct serials', async () => {
+    const { broker } = makeBroker([
+      { serial: '192.0.2.10:5555', state: 'device' },
+      { serial: '192.0.2.11:5555', state: 'device' }
+    ])
+    await broker.refreshInventory()
+    expect(new Set(broker.listDevices().map(({ id }) => id)).size).toBe(2)
   })
 })
 
@@ -172,7 +240,25 @@ describe('Android device broker — no lease, no writes', () => {
       ['shell', 'getprop', 'ro.serialno'],
       ['shell', '/system/bin/getprop', 'ro.serialno'],
       ['shell', 'sh', '-c', 'getprop ro.serialno | base64'],
-      ['shell', 'dumpsys']
+      ['shell', 'dumpsys'],
+      ['shell', 'dumpsys', 'package', 'com.example.app'],
+      ['shell', 'wm', 'dump-visible-window-views'],
+      ['shell', 'screenrecord', '-'],
+      ['shell', 'pm', 'list', 'packages'],
+      ['shell', 'settings', 'get', 'secure', 'android_id'],
+      ['shell', 'content', 'query', '--uri', 'content://contacts/phones'],
+      ['shell', 'am', 'get-current-user'],
+      ['shell', 'appops', 'get', 'com.example.app'],
+      ['shell', 'ps', '-A'],
+      ['shell', 'pidof', 'com.example.app'],
+      ['shell', 'echo', '$ANDROID_ID'],
+      ['shell', 'df', '/data/*'],
+      ['logcat', '-d'],
+      ['exec-out', 'screencap', '-p'],
+      ['jdwp'],
+      ['tcpip', '5555'],
+      ['version'],
+      ['root']
   ])('refuses %j even when the requesting Room holds the lease', async (...argv: string[]) => {
     const { broker } = makeBroker()
     await broker.refreshInventory()

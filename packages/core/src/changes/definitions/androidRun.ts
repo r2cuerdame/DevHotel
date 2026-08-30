@@ -5,10 +5,62 @@ import { sleep } from '../types'
 
 const BUILD_TIMEOUT_MS = 15 * 60_000
 const ADB = `adb -s ${EMULATOR_ADB_SERIAL}`
+const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
 
 interface BuiltApp {
   appId: string
   apkPath: string
+}
+
+function assertApplicationId(value: string, source: 'build metadata' | 'request'): string {
+  if (
+    value.length === 0 ||
+    value.length > MAX_ANDROID_APPLICATION_ID_LENGTH ||
+    !/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value)
+  ) {
+    throw new Error(`Invalid Android applicationId in ${source}`)
+  }
+  return value
+}
+
+function assertMetadataPath(metaPath: string): string {
+  const prefix = '/workspace/'
+  const suffix = '/build/outputs/apk/debug/output-metadata.json'
+  const segments = metaPath.slice(prefix.length).split('/')
+  if (
+    metaPath.length > 4096 ||
+    !metaPath.startsWith(prefix) ||
+    !metaPath.endsWith(suffix) ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..' || !/^[A-Za-z0-9._+@ -]+$/.test(segment))
+  ) {
+    throw new Error('Android build returned an unsafe output-metadata path')
+  }
+  return metaPath
+}
+
+function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
+  let metadata: unknown
+  try {
+    metadata = JSON.parse(stdout)
+  } catch {
+    throw new Error('Android build returned invalid output metadata')
+  }
+  if (!metadata || typeof metadata !== 'object') throw new Error('Android build returned invalid output metadata')
+  const record = metadata as { applicationId?: unknown; elements?: unknown }
+  const element = Array.isArray(record.elements)
+    ? record.elements.find((candidate): candidate is { outputFile: string } =>
+        Boolean(candidate && typeof candidate === 'object' && typeof (candidate as { outputFile?: unknown }).outputFile === 'string')
+      )
+    : null
+  if (typeof record.applicationId !== 'string' || !element) {
+    throw new Error('Android build output metadata is missing its applicationId or APK')
+  }
+  const appId = assertApplicationId(record.applicationId, 'build metadata')
+  const outputFile = element.outputFile
+  if (outputFile.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9._+-]*\.apk$/i.test(outputFile)) {
+    throw new Error('Android build output metadata contains an unsafe APK filename')
+  }
+  return { appId, apkPath: metaPath.replace(/output-metadata\.json$/, outputFile) }
 }
 
 /** Every module's debug APK, resolved strictly from its own output-metadata.json. */
@@ -19,11 +71,11 @@ async function builtApps(ctx: ChangeCtx): Promise<BuiltApp[]> {
     { timeoutMs: 30_000 }
   )
   const apps: BuiltApp[] = []
-  for (const metaPath of list.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
-    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat '${metaPath}'`], { timeoutMs: 30_000 })
-    const appId = /"applicationId"\s*:\s*"([^"]+)"/.exec(meta.stdout)?.[1]
-    const outputFile = /"outputFile"\s*:\s*"([^"]+)"/.exec(meta.stdout)?.[1]
-    if (appId && outputFile) apps.push({ appId, apkPath: metaPath.replace(/output-metadata\.json$/, outputFile) })
+  for (const discoveredPath of list.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+    const metaPath = assertMetadataPath(discoveredPath)
+    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat ${shellQuote(metaPath)}`], { timeoutMs: 30_000 })
+    if (meta.code !== 0) throw new Error('Android build output metadata could not be read')
+    apps.push(builtAppFromMetadata(metaPath, meta.stdout))
   }
   return apps
 }
@@ -34,9 +86,10 @@ function pickTarget(apps: BuiltApp[], applicationId?: string): BuiltApp {
     if (!first) throw new Error('no debug APK metadata produced by the build')
     return first
   }
-  const target = apps.find((app) => app.appId === applicationId)
+  const requestedId = assertApplicationId(applicationId, 'request')
+  const target = apps.find((app) => app.appId === requestedId)
   if (!target) {
-    throw new Error(`applicationId ${applicationId} not among built modules: ${apps.map((app) => app.appId).join(', ') || 'none'}`)
+    throw new Error(`Requested applicationId is not among built modules: ${apps.map((app) => app.appId).join(', ') || 'none'}`)
   }
   return target
 }

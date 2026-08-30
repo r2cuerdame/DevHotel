@@ -100,7 +100,9 @@ merely busy must not lose it.
   reclaim — a long `connectedAndroidTest` or a stuck OS dialog is real work.
   A lease that overran with no device activity is reclaimed.
 - Unplugging the phone revokes the lease immediately, and **replugging never
-  restores the old owner** — the queue decides who gets it next.
+  restores the old owner** — the queue decides who gets it next. The former
+  Room keeps a sticky failed-physical target until it explicitly releases, so
+  an acceptance run cannot silently fall back to its emulator after unplug.
 - Every reclaim promotes the next queued Room automatically.
 
 ## ADB isolation — no lease, no writes
@@ -108,19 +110,26 @@ merely busy must not lose it.
 Commands are classified by *whether another project would notice*, not by
 whether they write files.
 
-- **Interfering** (needs a live lease): `install`, `uninstall`, `push`,
-  `reboot`, `shell am`, `shell pm clear`, `shell input`, `shell monkey`,
-  `shell settings`, `shell setprop`, `uiautomator`, instrumentation,
-  `logcat -c`, …
-- **Shared** (no lease): a deliberately small read-only set such as
-  `get-state`, selected non-identifying `getprop` keys, exact query forms of `dumpsys` / `wm`,
-  `shell pm list`, `exec-out screencap -p`, and `logcat -d`.
+- **Interfering** (needs a live lease): `install`, `uninstall`, `reboot`,
+  approved mutating `shell am` / `shell pm` / `shell settings` subcommands,
+  `shell input`, `shell monkey`, and `shell setprop`.
+- **Shared** (no lease): a deliberately small bounded set such as `get-state`,
+  selected non-identifying `getprop` keys, and exact `wm size` / `wm density`
+  queries.
 - **Broker-only** (always refused): Host-wide server/connection/inventory verbs
   such as `kill-server`, `start-server`, `connect`, `devices`, raw transport
-  queries such as `get-serialno`, and unapproved `getprop` keys.
+  queries such as `get-serialno`, unapproved `getprop` keys, caller-supplied
+  target selectors, Host-path reads such as `push` / `pull`, Host SDK path
+  disclosure through `adb version`, and cross-app or large-output reads
+  including `logcat`, `dumpsys`, `exec-out`, `pm list/path/dump`, `ps`, `top`,
+  `jdwp`, raw `screenrecord`, and `wm` modes other than the two exact queries. Screen
+  capture and tracked-app checks are available only through their high-level
+  operations, which build the argv internally.
 - **Anything unrecognised fails closed.** An unknown Host verb or shell program
   is categorically refused rather than made safe by a lease, and a "safe"
-  program that smuggles a second command after `;`, `&&`, or `$( )` is refused too.
+  program that smuggles a second command, remote expansion, or glob after `;`,
+  `&&`, `$( )`, `$VAR`, or `*` is refused too. Shared commands accept only
+  their documented exact arity.
 
 A refusal is structured, not a generic error — `no-lease`,
 `lease-held-by-another-room`, `lease-expired`, `device-unhealthy`,
@@ -144,11 +153,14 @@ connection type, current owner (project, Room, purpose, lease age, last
 heartbeat), queue depth with the waiting projects, and a recent event history
 including grants, releases and stale recoveries.
 
-Devices are addressed publicly by a **nickname** and a short opaque device ID
-derived from the serial. Status, queue and attach responses do not return the
-raw hardware serial; serial-returning commands are refused and any matching
-serial text in otherwise allowed ADB output is redacted. Only the Host broker
-retains it to execute an authorized ADB command.
+Devices are addressed publicly by a **nickname** and a persisted random opaque
+device ID that contains no serial-derived material. Status, queue and attach
+responses do not return the raw hardware serial or the private heartbeat/cancel
+capability IDs of other Rooms; serial-returning commands are refused and any
+matching serial text in otherwise allowed ADB output or screenshot errors is
+redacted. Only the Host broker retains the serial to execute an authorized ADB
+command. Host ADB output is byte-capped and a process that crosses the cap is
+terminated with an explicit error rather than buffered into the desktop process.
 
 ## Surfaces
 
@@ -177,6 +189,8 @@ that died will never call anything again.
   (`/device/adb`), not from inside the Room container: a USB phone is on the
   Host's bus, not in the Room's network namespace. APK paths are accepted only
   under `/workspace`; DevHotel copies their bytes into a private Host temp,
-  rechecks the lease, installs from that temp, and removes it afterwards.
+  rejects links/non-regular/escaped/empty/oversized staging objects (512 MiB
+  per APK, 1 GiB per install), rechecks the exact lease, maps any echoed temp
+  path back to its Room path, installs, and removes the temp afterwards.
   `android-run` targets the Room emulator by default and automatically follows
   an exclusive physical-device attachment for the final proof.

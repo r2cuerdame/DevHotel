@@ -238,6 +238,35 @@ describe('Android device broker — stale lease recovery', () => {
     expect(broker.leaseForRoom('aaaa1111')).toBeNull()
   })
 
+  it('finishes lease revocation after a crash persisted disconnect health first', async () => {
+    const { broker, adb, db, now } = makeBroker({ alive: true })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a'
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+
+    // Simulate process death in the narrow window after markHealth() committed
+    // but before the active lease was revoked.
+    const repo = androidDevicesRepo(db)
+    repo.markHealth(granted.device.id, 'disconnected', new Date(now.value).toISOString())
+    expect(repo.activeLease(granted.device.id)?.id).toBe(granted.lease.id)
+    adb.phones = []
+
+    await broker.refreshInventory()
+
+    expect(repo.activeLease(granted.device.id)).toBeNull()
+    expect(repo.latestLeaseForRoom('aaaa1111')).toMatchObject({
+      id: granted.lease.id,
+      state: 'revoked',
+      releaseReason: 'device disconnected'
+    })
+    expect(broker.deviceForRoom('aaaa1111')).toMatchObject({ id: granted.device.id, health: 'disconnected' })
+  })
+
   it('promotes queued work when an offline device becomes ready', async () => {
     const { broker, adb } = makeBroker({ alive: true })
     adb.phones = [{ serial: 'R5CT30ABCDE', state: 'offline', model: 'SM_G991N', release: '14', sdk: '34' }]

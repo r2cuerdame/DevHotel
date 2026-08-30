@@ -25,7 +25,7 @@ beforeAll(async () => {
             detail: 'adb 35.0.0',
             devices: [
               {
-                id: 'd0123456789a',
+                id: 'd0123456789abcdef0123456789abcdef',
                 nickname: 'Pixel-USB-01',
                 connection: 'usb',
                 health: 'ready',

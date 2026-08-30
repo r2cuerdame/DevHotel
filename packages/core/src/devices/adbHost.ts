@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -24,6 +23,16 @@ export interface AdbBinaryResult {
   code: number
   stdout: Buffer
   stderr: string
+  /** True only when the Host safety cap terminated the adb process. */
+  outputLimitExceeded: boolean
+}
+
+export interface AdbExecOptions {
+  timeoutMs?: number
+  /** Internal/test override. Public callers never choose the Host buffer cap. */
+  maxStdoutBytes?: number
+  /** Internal/test override. Public callers never choose the Host buffer cap. */
+  maxStderrBytes?: number
 }
 
 /**
@@ -34,18 +43,9 @@ export interface AdbBinaryResult {
 export interface AdbHost {
   available(): Promise<AdbHostAvailability>
   devices(): Promise<AdbDeviceLine[]>
-  exec(serial: string, args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
+  exec(serial: string, args: string[], opts?: AdbExecOptions): Promise<ExecResult>
   /** Binary-safe variant for commands such as `exec-out screencap -p`. */
-  execBinary(serial: string, args: string[], opts?: { timeoutMs?: number }): Promise<AdbBinaryResult>
-}
-
-/**
- * A phone's adb serial is stable but is also a hardware identifier a user may
- * not want echoed into logs and issue comments. The broker's public ID is a
- * short digest of it: stable across reconnects, meaningless off this machine.
- */
-export function deviceIdForSerial(serial: string): string {
-  return `d${createHash('sha256').update(serial).digest('hex').slice(0, 11)}`
+  execBinary(serial: string, args: string[], opts?: AdbExecOptions): Promise<AdbBinaryResult>
 }
 
 export function connectionForSerial(serial: string): DeviceConnection {
@@ -141,72 +141,158 @@ export function resolveAdbExecutable(opts: ResolveAdbOptions = {}): string {
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000
+const DEFAULT_TEXT_STDOUT_LIMIT_BYTES = 1024 * 1024
+const DEFAULT_BINARY_STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
+const DEFAULT_STDERR_LIMIT_BYTES = 256 * 1024
 
-function runBinary(executable: string, args: string[], timeoutMs: number): Promise<AdbBinaryResult> {
+interface RunBinaryOptions {
+  timeoutMs: number
+  maxStdoutBytes: number
+  maxStderrBytes: number
+}
+
+function runBinary(executable: string, args: string[], opts: RunBinaryOptions): Promise<AdbBinaryResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { windowsHide: true })
     const stdout: Buffer[] = []
-    let stderr = ''
+    const stderr: Buffer[] = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let outputLimit: { stream: 'stdout' | 'stderr'; limit: number } | null = null
     let timedOut = false
-    child.stderr.setEncoding('utf8')
+
+    const stopForLimit = (stream: 'stdout' | 'stderr', limit: number): void => {
+      if (outputLimit) return
+      outputLimit = { stream, limit }
+      child.kill('SIGKILL')
+    }
     child.stdout.on('data', (chunk: Buffer) => {
-      stdout.push(chunk)
+      const remaining = Math.max(0, opts.maxStdoutBytes - stdoutBytes)
+      if (remaining > 0) {
+        const captured = chunk.subarray(0, remaining)
+        stdout.push(captured)
+        stdoutBytes += captured.length
+      }
+      if (chunk.length > remaining) stopForLimit('stdout', opts.maxStdoutBytes)
     })
-    child.stderr.on('data', (chunk: string) => {
-      stderr += chunk
+    child.stderr.on('data', (chunk: Buffer) => {
+      const remaining = Math.max(0, opts.maxStderrBytes - stderrBytes)
+      if (remaining > 0) {
+        const captured = chunk.subarray(0, remaining)
+        stderr.push(captured)
+        stderrBytes += captured.length
+      }
+      if (chunk.length > remaining) stopForLimit('stderr', opts.maxStderrBytes)
     })
     const timer = setTimeout(() => {
       timedOut = true
       child.kill('SIGKILL')
-    }, timeoutMs)
-    child.on('error', (err) => {
+    }, opts.timeoutMs)
+    child.on('error', () => {
       clearTimeout(timer)
-      reject(err)
+      reject(new Error('Host ADB process could not be launched; inspect Host diagnostics locally'))
     })
     child.on('close', (code) => {
       clearTimeout(timer)
-      if (timedOut) stderr += `\nadb ${args[0] ?? ''} timed out after ${timeoutMs}ms`
-      resolve({ code: code ?? -1, stdout: Buffer.concat(stdout), stderr })
+      let stderrText = Buffer.concat(stderr, stderrBytes).toString('utf8')
+      if (timedOut) stderrText += `\nadb ${args[0] ?? ''} timed out after ${opts.timeoutMs}ms`
+      if (outputLimit) {
+        stderrText += `\nadb ${outputLimit.stream} exceeded the ${outputLimit.limit}-byte Host safety limit; process terminated`
+      }
+      resolve({
+        code: outputLimit ? -1 : (code ?? -1),
+        stdout: Buffer.concat(stdout, stdoutBytes),
+        stderr: stderrText,
+        outputLimitExceeded: outputLimit !== null
+      })
     })
   })
 }
 
-async function run(executable: string, args: string[], timeoutMs: number): Promise<ExecResult> {
-  const result = await runBinary(executable, args, timeoutMs)
+async function run(executable: string, args: string[], opts: AdbExecOptions = {}): Promise<ExecResult> {
+  const result = await runBinary(executable, args, {
+    timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    maxStdoutBytes: opts.maxStdoutBytes ?? DEFAULT_TEXT_STDOUT_LIMIT_BYTES,
+    maxStderrBytes: opts.maxStderrBytes ?? DEFAULT_STDERR_LIMIT_BYTES
+  })
   return { code: result.code, stdout: result.stdout.toString('utf8'), stderr: result.stderr }
+}
+
+export interface SpawnedAdbHostOptions {
+  executable?: string
+  /** Prefix used by tests/wrappers before adb argv; empty in production. */
+  prefixArgs?: string[]
+  textStdoutLimitBytes?: number
+  binaryStdoutLimitBytes?: number
+  stderrLimitBytes?: number
 }
 
 /** The real Host adb. Every call names an explicit serial — never a default device. */
 export class SpawnedAdbHost implements AdbHost {
-  constructor(private readonly executable: string = resolveAdbExecutable()) {}
+  private readonly executable: string
+  private readonly prefixArgs: string[]
+  private readonly textStdoutLimitBytes: number
+  private readonly binaryStdoutLimitBytes: number
+  private readonly stderrLimitBytes: number
+
+  constructor(input: string | SpawnedAdbHostOptions = resolveAdbExecutable()) {
+    const opts = typeof input === 'string' ? { executable: input } : input
+    this.executable = opts.executable ?? resolveAdbExecutable()
+    this.prefixArgs = opts.prefixArgs ?? []
+    this.textStdoutLimitBytes = opts.textStdoutLimitBytes ?? DEFAULT_TEXT_STDOUT_LIMIT_BYTES
+    this.binaryStdoutLimitBytes = opts.binaryStdoutLimitBytes ?? DEFAULT_BINARY_STDOUT_LIMIT_BYTES
+    this.stderrLimitBytes = opts.stderrLimitBytes ?? DEFAULT_STDERR_LIMIT_BYTES
+  }
+
+  private argv(args: string[]): string[] {
+    return [...this.prefixArgs, ...args]
+  }
 
   async available(): Promise<AdbHostAvailability> {
     try {
-      const result = await run(this.executable, ['version'], 15_000)
+      const result = await run(this.executable, this.argv(['version']), {
+        timeoutMs: 15_000,
+        maxStdoutBytes: this.textStdoutLimitBytes,
+        maxStderrBytes: this.stderrLimitBytes
+      })
       if (result.code !== 0) {
-        return { ok: false, detail: `adb exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(0, 200)}` }
+        return { ok: false, detail: `Host ADB probe failed with exit code ${result.code}; inspect Host diagnostics locally` }
       }
       return { ok: true, detail: result.stdout.split(/\r?\n/)[0]?.trim() || 'adb available' }
-    } catch (err) {
+    } catch {
       return {
         ok: false,
-        detail: `no usable adb (${err instanceof Error ? err.message : String(err)}). Set DEVHOTEL_ADB_PATH or install platform-tools.`
+        detail: 'No usable Host ADB could be launched. Set DEVHOTEL_ADB_PATH or install platform-tools.'
       }
     }
   }
 
   async devices(): Promise<AdbDeviceLine[]> {
-    const result = await run(this.executable, ['devices', '-l'], 20_000)
-    if (result.code !== 0) throw new Error(`adb devices failed (${result.code}): ${(result.stderr || result.stdout).trim().slice(0, 200)}`)
+    const result = await run(this.executable, this.argv(['devices', '-l']), {
+      timeoutMs: 20_000,
+      maxStdoutBytes: this.textStdoutLimitBytes,
+      maxStderrBytes: this.stderrLimitBytes
+    })
+    // A failing `adb devices` can echo raw transport serials. Inventory errors
+    // become public broker status, so only the exit fact crosses this boundary.
+    if (result.code !== 0) throw new Error(`adb devices failed with exit code ${result.code}; inspect Host diagnostics locally`)
     return parseAdbDevices(result.stdout)
   }
 
-  exec(serial: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
-    return run(this.executable, ['-s', serial, ...args], opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  exec(serial: string, args: string[], opts: AdbExecOptions = {}): Promise<ExecResult> {
+    return run(this.executable, this.argv(['-s', serial, ...args]), {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxStdoutBytes: Math.min(opts.maxStdoutBytes ?? this.textStdoutLimitBytes, this.textStdoutLimitBytes),
+      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes)
+    })
   }
 
-  execBinary(serial: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<AdbBinaryResult> {
-    return runBinary(this.executable, ['-s', serial, ...args], opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  execBinary(serial: string, args: string[], opts: AdbExecOptions = {}): Promise<AdbBinaryResult> {
+    return runBinary(this.executable, this.argv(['-s', serial, ...args]), {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxStdoutBytes: Math.min(opts.maxStdoutBytes ?? this.binaryStdoutLimitBytes, this.binaryStdoutLimitBytes),
+      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes)
+    })
   }
 }
 

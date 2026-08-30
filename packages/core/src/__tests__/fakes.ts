@@ -69,6 +69,7 @@ export class FakeBackend implements IsolationBackend {
   execHandler: ((cmd: string[]) => ExecResult) | null = null
   oneShotHandler: ((spec: WebSpec, cmd: string) => ExecResult) | null = null
   execInRoomHandler: ((roomId: string, cmd: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
+  copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
   relayTokenValue = ''
   lastWebSpec: WebSpec | null = null
@@ -285,10 +286,11 @@ export class FakeBackend implements IsolationBackend {
   async copyIntoRoom(_roomId: string, _hostPath: string, containerPath: string) {
     this.calls.push(`copyIntoRoom:${containerPath}`)
   }
-  async copyFromRoom(_roomId: string, containerPath: string, hostPath: string) {
+  async copyFromRoom(roomId: string, containerPath: string, hostPath: string) {
     this.calls.push(`copyFromRoom:${containerPath}`)
-    const { writeFileSync } = await import('node:fs')
-    writeFileSync(hostPath, 'fake-room-file')
+    await this.copyFromRoomHook?.(roomId, containerPath, hostPath)
+    const { existsSync, writeFileSync } = await import('node:fs')
+    if (!existsSync(hostPath)) writeFileSync(hostPath, 'fake-room-file')
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   async createEmulator(
@@ -449,6 +451,9 @@ export class FakeAdbHost implements AdbHost {
   screencapPng = Buffer.alloc(0)
   execHook: ((serial: string, args: string[]) => void) | null = null
   execResultFor: ((serial: string, args: string[]) => Promise<ExecResult | null> | ExecResult | null) | null = null
+  execBinaryResultFor:
+    | ((serial: string, args: string[]) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
+    | null = null
 
   constructor(public phones: FakePhone[] = []) {}
 
@@ -488,9 +493,11 @@ export class FakeAdbHost implements AdbHost {
 
   async execBinary(serial: string, args: string[]): Promise<AdbBinaryResult> {
     this.execs.push({ serial, args })
+    const custom = await this.execBinaryResultFor?.(serial, args)
+    if (custom) return custom
     if (args[0] === 'exec-out' && args[1] === 'screencap') {
-      return { code: 0, stdout: this.screencapPng, stderr: '' }
+      return { code: 0, stdout: this.screencapPng, stderr: '', outputLimitExceeded: false }
     }
-    return { code: 0, stdout: Buffer.alloc(0), stderr: '' }
+    return { code: 0, stdout: Buffer.alloc(0), stderr: '', outputLimitExceeded: false }
   }
 }

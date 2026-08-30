@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   DeviceLeaseError,
   LEASE_DEFAULT_GRACE_MS,
@@ -18,7 +19,7 @@ import {
 } from '@devhotel/shared'
 import type { AndroidDevicesRepo } from '../store/androidDevicesRepo'
 import { classifyAdbCommand } from './adbOperations'
-import { connectionForSerial, defaultNickname, deviceIdForSerial, healthForState, readDeviceProps, type AdbHost } from './adbHost'
+import { connectionForSerial, defaultNickname, healthForState, readDeviceProps, type AdbHost } from './adbHost'
 
 export interface DeviceBrokerOptions {
   repo: AndroidDevicesRepo
@@ -37,6 +38,13 @@ export interface DeviceBrokerOptions {
 export interface ReapResult {
   recovered: { lease: DeviceLease; reason: string; promoted: DeviceLease | null }[]
   warnings: DeviceEvent[]
+}
+
+export interface AuthorizedAdbTarget {
+  serial: string
+  device: AndroidDevice
+  /** Null only for a deliberately shared read that did not need a lease. */
+  leaseId: string | null
 }
 
 const MAX_DURATION_WARN_RATIO = 0.8
@@ -133,11 +141,13 @@ export class AndroidDeviceBroker {
     const at = this.at()
     const seen = new Set<string>()
     for (const line of lines) {
-      const id = deviceIdForSerial(line.serial)
-      seen.add(id)
+      // The public ID is random and persisted with the private serial. A digest
+      // of an IP:port wireless serial can be reversed by dictionary search and
+      // a short digest can collide, so no serial-derived material is exposed.
+      const known = this.repo.getDeviceBySerial(line.serial)
+      const id = known?.id ?? `d${randomUUID().replaceAll('-', '')}`
       const connection = connectionForSerial(line.serial)
       const health = healthForState(line.state)
-      const known = this.repo.getDevice(id)
       // Properties need an authorized device; an unauthorized phone still
       // belongs in the inventory so the user can see why it is unusable.
       const props =
@@ -145,7 +155,7 @@ export class AndroidDeviceBroker {
           ? await readDeviceProps(this.adb, line.serial)
           : { androidVersion: known?.androidVersion ?? null, apiLevel: known?.apiLevel ?? null, model: known?.model ?? null }
       const model = props.model ?? line.model ?? known?.model ?? null
-      this.repo.upsertDevice({
+      const persisted = this.repo.upsertDevice({
         id,
         serial: line.serial,
         nickname: known?.nickname ?? defaultNickname(model, connection, this.repo.listDevices()),
@@ -156,20 +166,26 @@ export class AndroidDeviceBroker {
         health,
         seenAt: at
       })
+      // A second broker process may have won the unique-serial insert with a
+      // different random ID. Always continue from the row SQLite retained.
+      seen.add(persisted.id)
       if (!known) {
-        this.repo.recordEvent({ deviceId: id, roomId: null, kind: 'discovered', detail: `${model ?? 'Android device'} (${connection})`, at })
+        this.repo.recordEvent({ deviceId: persisted.id, roomId: null, kind: 'discovered', detail: `${model ?? 'Android device'} (${connection})`, at })
       } else if (known.health !== 'ready' && health === 'ready') {
-        this.repo.recordEvent({ deviceId: id, roomId: null, kind: 'reconnected', detail: `back as ${health}`, at })
+        this.repo.recordEvent({ deviceId: persisted.id, roomId: null, kind: 'reconnected', detail: `back as ${health}`, at })
       }
     }
 
     for (const device of this.repo.listDevices()) {
-      if (seen.has(device.id) || device.health === 'disconnected') continue
-      this.repo.markHealth(device.id, 'disconnected', at)
-      this.repo.recordEvent({ deviceId: device.id, roomId: null, kind: 'disconnected', detail: `${device.nickname} left the bus`, at })
+      if (seen.has(device.id)) continue
+      if (device.health !== 'disconnected') {
+        this.repo.markHealth(device.id, 'disconnected', at)
+        this.repo.recordEvent({ deviceId: device.id, roomId: null, kind: 'disconnected', detail: `${device.nickname} left the bus`, at })
+      }
       // A phone that unplugs cannot keep serving its owner, and a reconnect
-      // must never resurrect that owner: drop the lease now and let the queue
-      // decide who gets the device when it comes back.
+      // must never resurrect that owner. Closing is deliberately retried even
+      // when health was already persisted as disconnected: a process can die
+      // between the health update and lease revocation.
       const lease = this.repo.activeLease(device.id)
       if (lease) {
         this.repo.closeLease(lease.id, 'revoked', at, 'device disconnected')
@@ -227,7 +243,6 @@ export class AndroidDeviceBroker {
   private owner(lease: DeviceLease): DeviceLeaseOwner {
     const now = this.now()
     return {
-      leaseId: lease.id,
       roomId: lease.roomId,
       project: lease.project,
       purpose: lease.purpose,
@@ -241,7 +256,6 @@ export class AndroidDeviceBroker {
 
   private waiter(entry: DeviceQueueEntry): DeviceWaiter {
     return {
-      requestId: entry.id,
       roomId: entry.roomId,
       project: entry.project,
       purpose: entry.purpose,
@@ -400,7 +414,19 @@ export class AndroidDeviceBroker {
     for (const entry of this.repo.waiting(null)) {
       if (entry.roomId === roomId) this.repo.resolveQueueEntry(entry.id, 'cancelled', this.at())
     }
-    if (!lease) return null
+    if (!lease) {
+      // Disconnect revokes exclusivity immediately, but the Room must retain a
+      // sticky failed-physical target until it explicitly releases. Otherwise
+      // the next android-run could silently fall back to its emulator.
+      const latest = this.repo.latestLeaseForRoom(roomId)
+      if (latest?.state === 'revoked' && latest.releaseReason === 'device disconnected') {
+        const at = this.at()
+        const acknowledged = this.repo.acknowledgeRevokedLease(latest.id, at, `device disconnect acknowledged: ${reason}`)
+        this.repo.recordEvent({ deviceId: latest.deviceId, roomId, kind: 'released', detail: reason, at })
+        return { lease: acknowledged, promoted: null }
+      }
+      return null
+    }
     return this.close(lease, 'released', reason)
   }
 
@@ -551,7 +577,11 @@ export class AndroidDeviceBroker {
 
   /** Internal target lookup; public status intentionally does not choose a serial. */
   deviceForRoom(roomId: string): AndroidDevice | null {
-    const lease = this.repo.activeLeaseForRoom(roomId)
+    const active = this.repo.activeLeaseForRoom(roomId)
+    const latest = active ?? this.repo.latestLeaseForRoom(roomId)
+    const lease = latest?.state === 'active' || (latest?.state === 'revoked' && latest.releaseReason === 'device disconnected')
+      ? latest
+      : null
     return lease ? this.repo.getDevice(lease.deviceId) : null
   }
 
@@ -560,13 +590,8 @@ export class AndroidDeviceBroker {
    * only for the Room that holds a live lease on it; everything else gets a
    * structured refusal instead of a silent collision.
    */
-  authorize(roomId: string, deviceId: string, argv: string[]): { serial: string; device: AndroidDevice } {
-    const device = this.repo.getDevice(deviceId)
-    if (!device) throw new DeviceLeaseError('device-unknown', `unknown Android device: ${deviceId}`)
-    this.assertHostAdbAvailable()
-    if (device.health !== 'ready') {
-      throw new DeviceLeaseError('device-unhealthy', `${device.nickname} is ${device.health} and cannot accept ADB commands.`)
-    }
+  authorize(roomId: string, deviceId: string, argv: string[], expectedLeaseId?: string | null): AuthorizedAdbTarget {
+    const device = this.readyDevice(deviceId)
 
     const classification = classifyAdbCommand(argv)
     if (classification.forbidden) {
@@ -575,26 +600,74 @@ export class AndroidDeviceBroker {
         `${classification.reason} is owned by the Host Device Broker and is refused even with a device lease.`
       )
     }
-    if (!this.brokered(device)) return { serial: device.serial, device }
-    if (!classification.interfering) return { serial: device.serial, device }
+    if (!this.brokered(device)) return { serial: device.serial, device, leaseId: null }
+    if (!classification.interfering) return { serial: device.serial, device, leaseId: null }
 
-    const lease = this.repo.activeLease(deviceId)
+    return this.authorizeLeaseHolder(roomId, device, classification.reason, expectedLeaseId)
+  }
+
+  /**
+   * Lease gate for a high-level primitive whose argv was assembled inside Core.
+   * Generic callers cannot select this path; it is what lets android-run and
+   * androidScreenshot use narrowly tracked app/screenshot reads while the raw
+   * ADB surface refuses process lists, dumps and binary streams altogether.
+   */
+  authorizeInternalOperation(
+    roomId: string,
+    deviceId: string,
+    reason: string,
+    expectedLeaseId?: string | null
+  ): AuthorizedAdbTarget {
+    const device = this.readyDevice(deviceId)
+    if (!this.brokered(device)) return { serial: device.serial, device, leaseId: null }
+    return this.authorizeLeaseHolder(roomId, device, reason, expectedLeaseId)
+  }
+
+  private readyDevice(deviceId: string): AndroidDevice {
+    const device = this.repo.getDevice(deviceId)
+    if (!device) throw new DeviceLeaseError('device-unknown', `unknown Android device: ${deviceId}`)
+    this.assertHostAdbAvailable()
+    if (device.health !== 'ready') {
+      throw new DeviceLeaseError('device-unhealthy', `${device.nickname} is ${device.health} and cannot accept ADB commands.`)
+    }
+    return device
+  }
+
+  private authorizeLeaseHolder(
+    roomId: string,
+    device: AndroidDevice,
+    reason: string,
+    expectedLeaseId?: string | null
+  ): AuthorizedAdbTarget {
+    const lease = this.repo.activeLease(device.id)
     if (!lease) {
+      if (expectedLeaseId) {
+        throw new DeviceLeaseError(
+          'lease-expired',
+          `The device lease captured for this operation is no longer active before ${reason}.`
+        )
+      }
       throw new DeviceLeaseError(
         'no-lease',
-        `${classification.reason} needs a device lease. Attach ${device.nickname} to Room ${roomId} first.`
+        `${reason} needs a device lease. Attach ${device.nickname} to Room ${roomId} first.`
       )
     }
     if (lease.roomId !== roomId) {
       throw new DeviceLeaseError(
         'lease-held-by-another-room',
-        `${device.nickname} is leased by ${lease.project} (Room ${lease.roomId}) for ${lease.purpose}. ${classification.reason} is refused.`
+        `${device.nickname} is leased by ${lease.project} (Room ${lease.roomId}) for ${lease.purpose}. ${reason} is refused.`
+      )
+    }
+    if (expectedLeaseId && lease.id !== expectedLeaseId) {
+      throw new DeviceLeaseError(
+        'lease-expired',
+        `The device lease changed while this operation was preparing ${reason}; retry under the new lease.`
       )
     }
     if (this.now() - Date.parse(lease.heartbeatAt) > lease.ttlMs) {
-      throw new DeviceLeaseError('lease-expired', `The lease on ${device.nickname} went stale — heartbeat it or take it again before ${classification.reason}.`)
+      throw new DeviceLeaseError('lease-expired', `The lease on ${device.nickname} went stale — heartbeat it or take it again before ${reason}.`)
     }
-    return { serial: device.serial, device }
+    return { serial: device.serial, device, leaseId: lease.id }
   }
 
   status(): DeviceBrokerStatus {

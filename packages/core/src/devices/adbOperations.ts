@@ -24,11 +24,20 @@ const FORBIDDEN_VERBS = new Map<string, string>([
   ['track-devices-l', 'tracking raw Host ADB transports'],
   ['get-serialno', 'reading the raw hardware serial'],
   ['get-devpath', 'reading the Host transport path'],
+  ['version', 'reading the Host ADB SDK installation path'],
   ['start-server', 'starting the shared ADB server'],
   ['kill-server', 'stopping the shared ADB server'],
   ['connect', 'changing Host ADB connections'],
   ['disconnect', 'changing Host ADB connections'],
   ['pair', 'pairing a Host ADB connection'],
+  ['tcpip', 'switching the shared device transport to TCP/IP'],
+  ['usb', 'switching the shared device transport to USB'],
+  ['root', 'restarting shared adbd as root'],
+  ['unroot', 'restarting shared adbd with different privileges'],
+  ['remount', 'remounting shared device partitions'],
+  ['disable-verity', 'changing shared device verity'],
+  ['enable-verity', 'changing shared device verity'],
+  ['emu', 'sending a Host-owned emulator console command'],
   ['forward', 'changing or listing shared Host ADB forwards'],
   ['reverse', 'changing shared Host ADB reverse forwards'],
   ['push', 'reading a Host file for a device transfer'],
@@ -46,36 +55,21 @@ const INTERFERING_VERBS = new Map<string, string>([
   ['install-multiple', 'installing APKs'],
   ['install-multi-package', 'installing APKs'],
   ['uninstall', 'uninstalling an app'],
-  ['reboot', 'rebooting the device'],
-  ['root', 'restarting adbd as root'],
-  ['unroot', 'restarting adbd'],
-  ['remount', 'remounting device partitions'],
-  ['disable-verity', 'changing device verity'],
-  ['enable-verity', 'changing device verity'],
-  ['emu', 'sending an emulator console command'],
-  ['tcpip', 'switching the device transport'],
-  ['usb', 'switching the device transport']
+  ['reboot', 'rebooting the device']
 ])
 
 /** Top-level adb verbs that only observe. */
 const SAFE_VERBS = new Set([
   'get-state',
-  'version',
-  'features',
-  'jdwp'
+  'features'
 ])
 
 /** `adb shell <cmd>` programs that only report. */
 const SAFE_SHELL_COMMANDS = new Set([
   'df',
-  'ps',
-  'pidof',
   'id',
   'whoami',
   'uptime',
-  'echo',
-  'printf',
-  'top',
   'free'
 ])
 
@@ -90,7 +84,17 @@ const SAFE_GETPROP_KEYS = new Set([
 
 /** Commands whose read modes can bypass identity/output policy despite a lease. */
 const FORBIDDEN_SHELL_COMMANDS = new Map<string, string>([
-  ['dd', 'reading arbitrary protected device bytes with `dd`']
+  ['dd', 'reading arbitrary protected device bytes with `dd`'],
+  ['dumpsys', 'dumping cross-app Android service state through raw ADB'],
+  ['echo', 'expanding arbitrary remote-shell data with `echo`'],
+  ['logcat', 'reading the shared device log through raw ADB'],
+  ['pidof', 'querying arbitrary app process state through raw ADB'],
+  ['ps', 'listing cross-app processes through raw ADB'],
+  ['printf', 'expanding arbitrary remote-shell data with `printf`'],
+  ['screencap', 'streaming binary screenshots through raw ADB'],
+  ['top', 'listing cross-app process activity through raw ADB'],
+  ['uiautomator', 'reading or driving arbitrary UI hierarchy through raw ADB'],
+  ['bmgr', 'reading or driving cross-app backup state through raw ADB']
 ])
 
 /** `adb shell <cmd>` programs that always change something. */
@@ -99,8 +103,6 @@ const INTERFERING_SHELL_COMMANDS = new Map<string, string>([
   ['input', 'injecting input events'],
   ['monkey', 'running monkey'],
   ['svc', 'changing device services'],
-  ['settings', 'changing device settings'],
-  ['content', 'writing through a content provider'],
   ['setprop', 'setting a system property'],
   ['reboot', 'rebooting the device'],
   ['stop', 'stopping the Android runtime'],
@@ -113,35 +115,43 @@ const INTERFERING_SHELL_COMMANDS = new Map<string, string>([
   ['chown', 'changing device file ownership'],
   ['kill', 'killing a process on the device'],
   ['killall', 'killing processes on the device'],
-  ['bmgr', 'driving the backup manager'],
-  ['ime', 'changing the input method'],
-  ['locksettings', 'changing lock settings'],
-  ['device_config', 'changing device config'],
-  ['uiautomator', 'driving UI automation']
+  ['locksettings', 'changing lock settings']
 ])
 
-/** `pm` and `cmd` subcommands split further: `pm list` observes, `pm clear` does not. */
-const SAFE_PM_SUBCOMMANDS = new Set(['list', 'path', 'dump', 'get-install-location', 'has-feature'])
+/** App-discovery reads belong to tracked high-level operations, never raw ADB. */
+const PM_APP_READ_SUBCOMMANDS = new Set([
+  'dump',
+  'get-install-location',
+  'has-feature',
+  'list',
+  'path',
+  'query-activities',
+  'query-receivers',
+  'query-services',
+  'resolve-activity'
+])
 
-function stripGlobalFlags(argv: string[]): string[] {
-  const rest = [...argv]
-  while (rest.length > 0) {
-    const head = rest[0]!
-    if (head === '-s' || head === '-t' || head === '-H' || head === '-P' || head === '-L') {
-      rest.splice(0, 2)
-      continue
-    }
-    if (head === '-d' || head === '-e' || head === '-a') {
-      rest.shift()
-      continue
-    }
-    break
-  }
-  return rest
-}
+const PM_MUTATING_SUBCOMMANDS = new Set([
+  'clear', 'default-state', 'disable', 'disable-until-used', 'disable-user', 'enable',
+  'grant', 'hide', 'reset-permissions', 'revoke', 'set-install-location', 'suspend',
+  'trim-caches', 'unhide', 'unsuspend'
+])
+const AM_MUTATING_SUBCOMMANDS = new Set([
+  'broadcast', 'clear-debug-app', 'force-stop', 'hang', 'idle-maintenance', 'instrument',
+  'kill', 'kill-all', 'profile', 'restart', 'screen-compat', 'set-debug-app', 'set-watch-heap',
+  'start', 'start-activity', 'start-foreground-service', 'startservice', 'stopservice'
+])
+const SETTINGS_MUTATING_SUBCOMMANDS = new Set(['put', 'delete', 'reset'])
+const CONTENT_MUTATING_SUBCOMMANDS = new Set(['insert', 'update', 'delete'])
+const IME_MUTATING_SUBCOMMANDS = new Set(['set', 'enable', 'disable', 'reset'])
+const DEVICE_CONFIG_MUTATING_SUBCOMMANDS = new Set(['put', 'delete', 'reset'])
+const APPOPS_MUTATING_SUBCOMMANDS = new Set(['set', 'reset'])
 
-/** Tokens that let one shell word smuggle a second command past the check. */
-const SHELL_CHAINING = /[;&|<>]|\$\(|`|[\r\n]/
+/** A caller-supplied selector could override the serial inserted by the Host. */
+const TARGETING_GLOBAL_FLAGS = new Set(['-s', '-t', '-d', '-e', '-a', '-H', '-P', '-L', '--one-device'])
+
+/** Shell expansion/chaining tokens are never accepted from raw argv. */
+const SHELL_META = /[;&|<>$`*?[\]{}~]|[\r\n]/
 
 function classifyWm(words: string[]): AdbClassification {
   const subcommand = words[1]
@@ -150,37 +160,11 @@ function classifyWm(words: string[]): AdbClassification {
   if ((subcommand === 'size' || subcommand === 'density') && words.length === 2) {
     return { interfering: false, reason: `\`wm ${subcommand}\`` }
   }
-  return { interfering: true, reason: `changing display state with \`wm${subcommand ? ` ${subcommand}` : ''}\`` }
-}
-
-function classifyDumpsys(words: string[]): AdbClassification {
-  const service = words[1]
-  // Keep the unauthenticated surface deliberately small. These exact forms are
-  // observations; services such as `battery set`, `deviceidle force-idle`, and
-  // vendor extensions are commands despite living behind `dumpsys`.
-  if (service === 'battery') {
-    return words.length === 2
-      ? { interfering: false, reason: '`dumpsys battery`' }
-      : { interfering: true, reason: 'changing battery state with `dumpsys battery`' }
-  }
-  if (service === 'package' && words.length <= 3 && words.every((word) => !word.startsWith('-'))) {
-    return { interfering: false, reason: '`dumpsys package`' }
-  }
   return {
     interfering: true,
     forbidden: true,
-    reason: service ? `reading the unapproved \`dumpsys ${service}\` service` : 'dumping every Android system service'
+    reason: `running the unapproved or cross-app \`wm${subcommand ? ` ${subcommand}` : ''}\` operation`
   }
-}
-
-function classifyLogcat(words: string[]): AdbClassification {
-  // A tiny read-only surface is easier to keep honest than mirroring logcat's
-  // evolving option parser. In particular -c, -G, -P and -f mutate shared
-  // buffers or device storage; unfamiliar variants therefore need a lease.
-  if (words.length === 1 || (words.length === 2 && (words[1] === '-d' || words[1] === '--dump'))) {
-    return { interfering: false, reason: '`logcat`' }
-  }
-  return { interfering: true, reason: 'the unrecognised or mutating `logcat` operation' }
 }
 
 function classifyGetprop(words: string[]): AdbClassification {
@@ -195,6 +179,24 @@ function classifyGetprop(words: string[]): AdbClassification {
   }
 }
 
+function classifyMutatingSubcommand(
+  program: string,
+  words: string[],
+  allowed: ReadonlySet<string>
+): AdbClassification {
+  const subcommand = words[1]
+  if (subcommand && allowed.has(subcommand)) {
+    return { interfering: true, reason: `\`${program} ${subcommand}\`` }
+  }
+  return {
+    interfering: true,
+    forbidden: true,
+    reason: subcommand
+      ? `running the unapproved or read-capable \`${program} ${subcommand}\` operation`
+      : `running \`${program}\` without an approved mutating subcommand`
+  }
+}
+
 function classifyShell(words: string[]): AdbClassification {
   const flagless = words.filter((word) => !word.startsWith('-'))
   const program = flagless[0]
@@ -202,45 +204,53 @@ function classifyShell(words: string[]): AdbClassification {
     return { interfering: true, forbidden: true, reason: 'running an interactive device shell' }
   }
 
-  if (words.some((word) => SHELL_CHAINING.test(word))) {
-    return { interfering: true, forbidden: true, reason: 'running a compound device shell command' }
+  if (words.some((word) => SHELL_META.test(word))) {
+    return { interfering: true, forbidden: true, reason: 'using shell expansion or compound device commands' }
   }
 
   const forbidden = FORBIDDEN_SHELL_COMMANDS.get(program)
   if (forbidden) return { interfering: true, forbidden: true, reason: forbidden }
+
+  if (program === 'am') return classifyMutatingSubcommand(program, words, AM_MUTATING_SUBCOMMANDS)
+  if (program === 'settings') return classifyMutatingSubcommand(program, words, SETTINGS_MUTATING_SUBCOMMANDS)
+  if (program === 'content') return classifyMutatingSubcommand(program, words, CONTENT_MUTATING_SUBCOMMANDS)
+  if (program === 'ime') return classifyMutatingSubcommand(program, words, IME_MUTATING_SUBCOMMANDS)
+  if (program === 'device_config') return classifyMutatingSubcommand(program, words, DEVICE_CONFIG_MUTATING_SUBCOMMANDS)
 
   const interfering = INTERFERING_SHELL_COMMANDS.get(program)
   if (interfering) return { interfering: true, reason: interfering }
 
   if (program === 'getprop') return classifyGetprop(words)
   if (program === 'wm') return classifyWm(words)
-  if (program === 'dumpsys') return classifyDumpsys(words)
-  if (program === 'screencap') {
-    return words.length === 1 || (words.length === 2 && words[1] === '-p')
-      ? { interfering: false, reason: '`screencap`' }
-      : { interfering: true, reason: 'writing a screenshot onto device storage' }
+  if (program === 'screenrecord') {
+    return { interfering: true, forbidden: true, reason: 'streaming the shared screen through raw ADB' }
   }
-  if (program === 'screenrecord') return { interfering: true, reason: 'recording the shared screen' }
-  if (program === 'logcat') return classifyLogcat(words)
   if (program === 'date') {
     return words.length === 1
       ? { interfering: false, reason: '`date`' }
-      : { interfering: true, reason: 'changing or invoking an unrecognised `date` operation' }
+      : { interfering: true, forbidden: true, reason: 'changing or invoking an unapproved `date` operation' }
   }
 
   if (program === 'pm' || program === 'cmd' || program === 'appops') {
-    const sub = flagless[1]
-    if (program === 'pm' && sub && SAFE_PM_SUBCOMMANDS.has(sub)) return { interfering: false, reason: `\`pm ${sub}\`` }
-    if (program === 'cmd' && sub === 'package' && flagless[2] && SAFE_PM_SUBCOMMANDS.has(flagless[2])) {
-      return { interfering: false, reason: `\`cmd package ${flagless[2]}\`` }
+    const trailing = flagless.slice(1)
+    const readSub = trailing.find((word) => PM_APP_READ_SUBCOMMANDS.has(word))
+    if (program === 'pm' && readSub) {
+      return { interfering: true, forbidden: true, reason: `reading arbitrary app state with \`pm ${readSub}\`` }
     }
-    if (program === 'cmd' && (sub === 'device_identifiers' || sub === 'phone')) {
-      return { interfering: true, forbidden: true, reason: `reading protected identifiers with \`cmd ${sub}\`` }
+    if (program === 'pm') {
+      return classifyMutatingSubcommand(program, words, PM_MUTATING_SUBCOMMANDS)
     }
-    return { interfering: true, reason: `\`${program}${sub ? ` ${sub}` : ''}\`` }
+    if (program === 'cmd') {
+      return { interfering: true, forbidden: true, reason: 'reading or driving Android services through raw `cmd`' }
+    }
+    return classifyMutatingSubcommand(program, words, APPOPS_MUTATING_SUBCOMMANDS)
   }
 
-  if (SAFE_SHELL_COMMANDS.has(program)) return { interfering: false, reason: `\`${program}\`` }
+  if (SAFE_SHELL_COMMANDS.has(program)) {
+    return words.length === 1
+      ? { interfering: false, reason: `\`${program}\`` }
+      : { interfering: true, forbidden: true, reason: `passing unapproved arguments to \`${program}\`` }
+  }
   return {
     interfering: true,
     forbidden: true,
@@ -249,7 +259,18 @@ function classifyShell(words: string[]): AdbClassification {
 }
 
 export function classifyAdbCommand(argv: string[]): AdbClassification {
-  const rest = stripGlobalFlags(argv.filter((arg) => arg.length > 0))
+  const rest = argv.filter((arg) => arg.length > 0)
+  const leading = rest[0]
+  if (
+    leading &&
+    (TARGETING_GLOBAL_FLAGS.has(leading) || leading.startsWith('--one-device=') || /^-[stHPL].+/.test(leading))
+  ) {
+    return {
+      interfering: true,
+      forbidden: true,
+      reason: 'overriding the Host-selected ADB transport or server'
+    }
+  }
   const verb = rest[0]
   if (!verb) return { interfering: true, reason: 'an empty adb command' }
 
@@ -259,12 +280,26 @@ export function classifyAdbCommand(argv: string[]): AdbClassification {
   const interfering = INTERFERING_VERBS.get(verb)
   if (interfering) return { interfering: true, reason: interfering }
 
-  if (verb === 'shell' || verb === 'exec-out') return classifyShell(rest.slice(1))
+  if (verb === 'exec-out') {
+    return {
+      interfering: true,
+      forbidden: true,
+      reason: 'streaming unbounded or binary device output through raw `exec-out`'
+    }
+  }
+  if (verb === 'shell') return classifyShell(rest.slice(1))
 
   if (verb === 'logcat') {
-    return classifyLogcat(rest)
+    return { interfering: true, forbidden: true, reason: 'reading the shared device log through raw ADB' }
   }
-  if (SAFE_VERBS.has(verb)) return { interfering: false, reason: `\`adb ${verb}\`` }
+  if (verb === 'jdwp') {
+    return { interfering: true, forbidden: true, reason: 'listing cross-app debuggable processes through raw ADB' }
+  }
+  if (SAFE_VERBS.has(verb)) {
+    return rest.length === 1
+      ? { interfering: false, reason: `\`adb ${verb}\`` }
+      : { interfering: true, forbidden: true, reason: `passing unapproved arguments to \`adb ${verb}\`` }
+  }
   return {
     interfering: true,
     forbidden: true,

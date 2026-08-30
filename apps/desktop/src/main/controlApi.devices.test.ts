@@ -41,7 +41,7 @@ describe('agents reach the shared phone only through the broker', () => {
     const androidDeviceStatus = vi.fn(() => ({
       available: true,
       detail: 'adb 35.0.0',
-      devices: [{ id: 'd0123456789a', nickname: 'Pixel-USB-01', queueDepth: 2, leaseOwner: { project: 'AppDied' } }],
+      devices: [{ id: 'd0123456789abcdef0123456789abcdef', nickname: 'Pixel-USB-01', queueDepth: 2, leaseOwner: { project: 'AppDied' } }],
       recentEvents: []
     }))
 

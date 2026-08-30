@@ -177,11 +177,13 @@ export interface AndroidDevicesRepo {
   setNickname(id: string, nickname: string): AndroidDevice
   activeLease(deviceId: string): DeviceLease | null
   activeLeaseForRoom(roomId: string): DeviceLease | null
+  latestLeaseForRoom(roomId: string): DeviceLease | null
   listActiveLeases(): DeviceLease[]
   getLease(id: string): DeviceLease | null
   insertLease(input: LeaseInsert): DeviceLease
   touchLease(id: string, heartbeatAt: string, activityAt: string | null): DeviceLease
   closeLease(id: string, state: 'released' | 'expired' | 'revoked', at: string, reason: string): DeviceLease
+  acknowledgeRevokedLease(id: string, at: string, reason: string): DeviceLease
   waiting(deviceId: string | null): DeviceQueueEntry[]
   waitingForRoom(roomId: string, deviceId: string | null): DeviceQueueEntry | null
   getQueueEntry(id: string): DeviceQueueEntry | null
@@ -212,7 +214,7 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
           `INSERT INTO android_devices
              (id, serial, nickname, model, android_version, api_level, connection, health, first_seen_at, last_seen_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
+           ON CONFLICT(serial) DO UPDATE SET
              model = COALESCE(excluded.model, android_devices.model),
              android_version = COALESCE(excluded.android_version, android_devices.android_version),
              api_level = COALESCE(excluded.api_level, android_devices.api_level),
@@ -232,7 +234,10 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
           input.seenAt,
           input.seenAt
         )
-      return repo.getDevice(input.id)!
+      // The serial is private but is the durable identity key. The public ID is
+      // random, so a racing discovery must retain whichever opaque ID was
+      // persisted first rather than fail or replace it.
+      return repo.getDeviceBySerial(input.serial)!
     },
     markHealth(id, health, at) {
       sqlite.prepare('UPDATE android_devices SET health = ?, last_seen_at = ? WHERE id = ?').run(health, at, id)
@@ -251,6 +256,12 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
     activeLeaseForRoom(roomId) {
       const row = sqlite
         .prepare("SELECT * FROM android_device_leases WHERE room_id = ? AND state = 'active'")
+        .get(roomId) as unknown as LeaseRow | undefined
+      return row ? toLease(row) : null
+    },
+    latestLeaseForRoom(roomId) {
+      const row = sqlite
+        .prepare('SELECT * FROM android_device_leases WHERE room_id = ? ORDER BY acquired_at DESC, rowid DESC LIMIT 1')
         .get(roomId) as unknown as LeaseRow | undefined
       return row ? toLease(row) : null
     },
@@ -305,6 +316,16 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
         )
         .run(state, at, reason, id)
       if (changed.changes === 0) throw new Error(`no active lease to close: ${id}`)
+      return repo.getLease(id)!
+    },
+    acknowledgeRevokedLease(id, at, reason) {
+      const changed = sqlite
+        .prepare(
+          `UPDATE android_device_leases SET released_at = ?, release_reason = ?
+           WHERE id = ? AND state = 'revoked' AND release_reason = 'device disconnected'`
+        )
+        .run(at, reason, id)
+      if (changed.changes === 0) throw new Error(`no disconnected lease to acknowledge: ${id}`)
       return repo.getLease(id)!
     },
     waiting(deviceId) {

@@ -166,7 +166,7 @@ export async function startControlApi(
       }
       if (safeRoomId && !op && req.method === 'GET') {
         const inspection = await orch.inspectRoomRuntime(safeRoomId)
-        sendJson(res, 200, { ...inspection, room: roomForAgent(inspection.room), dataDir: '[Hotel data hidden]' } satisfies RoomInspection)
+        sendJson(res, 200, inspectionForAgent(inspection))
         return
       }
       if (safeRoomId && !op && req.method === 'DELETE') {
@@ -413,6 +413,24 @@ export async function startControlApi(
 
 function roomForAgent(room: RoomRecord): RoomRecord {
   return room.sourceType === 'linked-folder' ? { ...room, sourceRef: '[Host folder hidden]' } : room
+}
+
+function inspectionForAgent(inspection: RoomInspection): RoomInspection {
+  const device = inspection.device
+  return {
+    ...inspection,
+    room: roomForAgent(inspection.room),
+    dataDir: '[Hotel data hidden]',
+    device: device
+      ? {
+          deviceId: device.deviceId,
+          project: device.project,
+          purpose: device.purpose,
+          state: device.state,
+          acquiredAt: device.acquiredAt
+        }
+      : null
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

@@ -5,7 +5,6 @@ import { DeviceLeaseError } from '@devhotel/shared'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   SpawnedAdbHost,
-  deviceIdForSerial,
   type AdbBinaryResult,
   type AdbDeviceLine,
   type AdbHost,
@@ -87,15 +86,19 @@ acceptanceDescribe('real USB Device Broker acceptance', () => {
 
       const adb = new RecordingAdbHost(new SpawnedAdbHost())
       const now = { value: Date.now() }
+      const repo = androidDevicesRepo(db)
       const broker = new AndroidDeviceBroker({
-        repo: androidDevicesRepo(db),
+        repo,
         adb,
         now: () => now.value,
         ownerLiveness: (lease) => lease.roomId !== 'aaaa1111',
         graceMs: 0
       })
       await broker.refreshInventory()
-      const device = broker.listDevices().find((candidate) => candidate.id === deviceIdForSerial(serial))
+      const privateDevice = repo.getDeviceBySerial(serial)
+      const device = privateDevice
+        ? broker.listDevices().find((candidate) => candidate.id === privateDevice.id)
+        : undefined
       expect(device).toMatchObject({ connection: 'usb', health: 'ready', brokered: true })
       if (!device) throw new Error('requested USB device was not found')
 
@@ -125,7 +128,7 @@ acceptanceDescribe('real USB Device Broker acceptance', () => {
       expect(() => broker.authorize('bbbb2222', device.id, ['install', '-r', projectB.apk])).toThrow(DeviceLeaseError)
 
       const run = async (roomId: string, args: string[], timeoutMs = 180_000): Promise<ExecResult> => {
-        const authorized = broker.authorize(roomId, device.id, args)
+        const authorized = broker.authorizeInternalOperation(roomId, device.id, 'running the trusted USB acceptance proof')
         const result = await broker.hostAdb.exec(authorized.serial, args, { timeoutMs })
         if (result.code !== 0) {
           throw new Error(`USB acceptance adb ${args[0] ?? 'command'} failed: ${(result.stderr || result.stdout).trim().slice(-300)}`)
