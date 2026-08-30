@@ -17,7 +17,9 @@ While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
 - Every request needs `Authorization: Bearer <token>`.
 - The port and token change on every app start: re-read the file on
   connection errors, and treat a missing file as "DevHotel is not running".
-- Errors are JSON `{ "error": "…" }` with 4xx/5xx status.
+- Errors are JSON `{ "error": "…" }` with 4xx/5xx status. Stable DevHotel
+  contract failures also include `code` and `recoveryHint`; engine-specific
+  diagnostics are not exposed as the public error contract.
 
 ## Agent semantics
 
@@ -49,7 +51,7 @@ room's Changes list. Host boundaries hold:
 | Method & path | Result |
 |---|---|
 | `GET /v1/ping` | `{ version }` |
-| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator }] }` — `emulator` is `running/exited/missing` for awake Android rooms, else `null` |
+| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }] }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
 
@@ -57,15 +59,15 @@ room's Changes list. Host boundaries hold:
 
 | Method & path | Body / query | Result |
 |---|---|---|
-| `GET /v1/rooms` | | `RoomRecord[]` |
+| `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
-| `GET /v1/rooms/:id` | | inspection: room, urls, backups, stack line, latest check, recent changes |
+| `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. |
 | `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
 | `POST /v1/rooms/:id/start` · `/sleep` | | `204` |
 | `POST /v1/rooms/:id/restart-web` | | change entry |
 | `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
-| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? }` | `{ code, stdout, stderr }` — buffered until exit; redirect long output to a file |
+| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? }` | `{ code, stdout, stderr }` — buffered until exit; redirect long output to a file. A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
 | `POST /v1/rooms/:id/checks` | | 14-step check report |
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |

@@ -16,6 +16,7 @@ import type {
   RoomInspection,
   RoomPlan,
   RoomRecord,
+  RoomRuntimeStatus,
   SourceType
 } from '@devhotel/shared'
 import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
@@ -41,6 +42,7 @@ import { slugify } from './detect/detector'
 import type { SourceReader } from './detect/sourceReader'
 import { fsSourceReader } from './detect/sourceReader'
 import { buildDiagnostic } from './diagnostics/bundle'
+import { DevHotelError } from './errors'
 import type { Gateway } from './gateway/gateway'
 import { LogHub, type LogKind } from './logs'
 import { writeManifest } from './manifest'
@@ -297,8 +299,160 @@ export class RoomOrchestrator {
     return this.rooms.list()
   }
 
+  /** Public Room listing with live liveness overlaid; persisted records remain unchanged. */
+  async listRoomsRuntime(): Promise<(RoomRecord & { runtimeStatus: RoomRuntimeStatus })[]> {
+    let backendAvailable = false
+    try {
+      backendAvailable = (await this.backend.health()).ok
+    } catch {
+      // Each OCI Room reports unknown below; Windows Rooms use their own provider probe.
+    }
+    const rooms = [] as (RoomRecord & { runtimeStatus: RoomRuntimeStatus })[]
+    for (const room of this.rooms.list()) {
+      const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+      rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
+    }
+    return rooms
+  }
+
   backendHealth(): Promise<{ ok: boolean; detail: string }> {
     return this.backend.health()
+  }
+
+  private runtimeExpectation(room: RoomRecord): RoomRuntimeStatus['expected'] {
+    if (room.status === 'preparing') return 'transitional'
+    if (room.status === 'running' || room.status === 'ready' || room.status === 'attention') return 'running'
+    return 'stopped'
+  }
+
+  private runtimeRecoveryHint(room: RoomRecord): string {
+    return room.provider === 'windows'
+      ? 'Start or restart the Windows Room, then retry.'
+      : 'Start or restart the Room, then retry.'
+  }
+
+  private async observeRuntimeStatus(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+    const observedAt = new Date().toISOString()
+    const expected = this.runtimeExpectation(room)
+    if (expected !== 'running') {
+      return {
+        state: expected === 'stopped' ? 'stopped' : 'unknown',
+        expected,
+        recordedStatus: room.status,
+        main: 'not-checked',
+        emulator: null,
+        observedAt,
+        detail: expected === 'stopped' ? 'The recorded Room state does not expect a running runtime.' : 'The Room is transitioning.',
+        recoveryHint: null
+      }
+    }
+
+    if (room.provider === 'windows') {
+      if (!this.windowsVm) {
+        return {
+          state: 'unknown',
+          expected,
+          recordedStatus: room.status,
+          main: 'unknown',
+          emulator: null,
+          observedAt,
+          detail: 'Windows runtime liveness is unavailable.',
+          recoveryHint: this.runtimeRecoveryHint(room)
+        }
+      }
+      try {
+        const state = await this.windowsVm.state(room.id)
+        const running = state === 'running'
+        return {
+          state: running ? 'running' : 'dead',
+          expected,
+          recordedStatus: room.status,
+          main: state,
+          emulator: null,
+          observedAt,
+          detail: running ? 'The Windows Room VM is running.' : `The recorded Room is ${room.status}, but its VM is ${state}.`,
+          recoveryHint: running ? null : this.runtimeRecoveryHint(room)
+        }
+      } catch {
+        return {
+          state: 'unknown',
+          expected,
+          recordedStatus: room.status,
+          main: 'unknown',
+          emulator: null,
+          observedAt,
+          detail: 'Windows runtime liveness could not be determined.',
+          recoveryHint: this.runtimeRecoveryHint(room)
+        }
+      }
+    }
+
+    let available = backendAvailable
+    if (available === undefined) {
+      try {
+        available = (await this.backend.health()).ok
+      } catch {
+        available = false
+      }
+    }
+    if (!available) {
+      return {
+        state: 'unknown',
+        expected,
+        recordedStatus: room.status,
+        main: 'unknown',
+        emulator: room.provider === 'android' ? 'unknown' : null,
+        observedAt,
+        detail: 'Runtime liveness is unavailable because the isolation backend is not responding.',
+        recoveryHint: this.runtimeRecoveryHint(room)
+      }
+    }
+
+    const [main, emulator] = await Promise.all([
+      this.backend.webState(room.id).catch(() => 'unknown' as const),
+      room.provider === 'android'
+        ? this.backend.emulatorState(room.id).catch(() => 'unknown' as const)
+        : Promise.resolve(null)
+    ])
+    if (room.provider !== 'android') {
+      const running = main === 'running'
+      return {
+        state: running ? 'running' : main === 'unknown' ? 'unknown' : 'dead',
+        expected,
+        recordedStatus: room.status,
+        main,
+        emulator: null,
+        observedAt,
+        detail: running ? 'The Room runtime is running.' : main === 'unknown' ? 'Runtime liveness could not be determined.' : `The recorded Room is ${room.status}, but its runtime is ${main}.`,
+        recoveryHint: running ? null : this.runtimeRecoveryHint(room)
+      }
+    }
+
+    const bothRunning = main === 'running' && emulator === 'running'
+    const eitherRunning = main === 'running' || emulator === 'running'
+    const eitherUnknown = main === 'unknown' || emulator === 'unknown'
+    const state = bothRunning ? 'running' : eitherRunning ? 'degraded' : eitherUnknown ? 'unknown' : 'dead'
+    return {
+      state,
+      expected,
+      recordedStatus: room.status,
+      main,
+      emulator,
+      observedAt,
+      detail: bothRunning
+        ? 'The Android build runtime and emulator are running.'
+        : state === 'degraded'
+          ? `The Android Room is partially available (main: ${main}; emulator: ${emulator}).`
+          : state === 'unknown'
+            ? 'Android runtime liveness could not be determined.'
+            : `The recorded Android Room is ${room.status}, but its runtime is dead (main: ${main}; emulator: ${emulator}).`,
+      recoveryHint: bothRunning ? null : this.runtimeRecoveryHint(room)
+    }
+  }
+
+  private effectiveRoom(room: RoomRecord, runtimeStatus: RoomRuntimeStatus): RoomRecord {
+    if (runtimeStatus.expected !== 'running' || runtimeStatus.state === 'running') return room
+    return { ...room, status: runtimeStatus.state === 'dead' ? 'broken' : 'attention' }
   }
 
   async planRoom(input: {
@@ -1124,35 +1278,27 @@ export class RoomOrchestrator {
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
     gateway: ReturnType<Gateway['status']>
-    rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
+    rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
   }> {
     const backend = await this.backend.health()
-    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null }[]
+    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
-      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
-      let emulator: 'running' | 'exited' | 'missing' | null = null
-      if (room.provider === 'android' && awake && backend.ok) {
-        try {
-          emulator = await this.backend.emulatorState(room.id)
-        } catch {
-          emulator = null
-        }
-      }
-      let url: string | null = null
-      try {
-        url = awake ? this.inspectRoom(room.id).urls.app : null
-      } catch {
-        url = null
-      }
+      const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
+      const effective = this.effectiveRoom(room, runtimeStatus)
+      const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
+        ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
+        : null
+      const url = runtimeStatus.state === 'running' ? this.inspectRoom(room.id).urls.app : null
       rooms.push({
         id: room.id,
         project: room.project,
         nickname: room.nickname,
         provider: room.provider,
-        status: room.status,
+        status: effective.status,
         domain: room.domain,
         url,
-        emulator
+        emulator,
+        runtimeStatus
       })
     }
     return { backend, gateway: this.gateway.status(), rooms }
@@ -1178,6 +1324,19 @@ export class RoomOrchestrator {
       recentChanges: recent,
       lastUndoable: this.changes.lastUndoable(roomId),
       storage: null
+    }
+  }
+
+  /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
+  async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
+    const recorded = this.mustGet(roomId)
+    const runtimeStatus = await this.observeRuntimeStatus(recorded)
+    const inspection = this.inspectRoom(roomId)
+    return {
+      ...inspection,
+      room: this.effectiveRoom(recorded, runtimeStatus),
+      urls: { app: runtimeStatus.state === 'running' ? inspection.urls.app : null },
+      runtimeStatus
     }
   }
 
@@ -1567,9 +1726,39 @@ export class RoomOrchestrator {
       if (actor === 'agent' && room.workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent commands are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
       }
+      if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
+      const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+      if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
       this.markWorkspaceModified(roomId)
-      return this.backend.execInRoom(roomId, cmd, opts)
+      try {
+        const result = await this.backend.execInRoom(roomId, cmd, opts)
+        if (result.code !== 0) {
+          const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+          if (after !== 'running') throw this.runtimeNotRunningError(room, after)
+        }
+        return result
+      } catch (error) {
+        if (error instanceof DevHotelError) throw error
+        const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+        if (after !== 'running') throw this.runtimeNotRunningError(room, after, error)
+        throw error
+      }
     })
+  }
+
+  private runtimeNotRunningError(room: RoomRecord, state: string, cause?: unknown): DevHotelError {
+    const unavailable = state === 'unknown'
+    return new DevHotelError(
+      unavailable ? 'ROOM_RUNTIME_STATUS_UNAVAILABLE' : 'ROOM_RUNTIME_NOT_RUNNING',
+      unavailable
+        ? `DevHotel could not verify that Room ${room.id} is running.`
+        : `Room ${room.id} cannot run commands because its runtime is ${state}.`,
+      {
+        recoveryHint: this.runtimeRecoveryHint(room),
+        httpStatus: unavailable ? 503 : 409,
+        cause
+      }
+    )
   }
 
   spawnInteractiveExec(roomId: string, cmd: string[]) {

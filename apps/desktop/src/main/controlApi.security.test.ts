@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { RoomOrchestrator } from '@devhotel/core'
+import { DevHotelError, type RoomOrchestrator } from '@devhotel/core'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -16,9 +16,9 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-redaction-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', sourceRef: 'C:\\private\\project' }
-    const listRooms = vi.fn(() => [room])
-    const inspectRoom = vi.fn(() => ({ room, dataDir: 'C:\\private\\devhotel' }))
-    const control = await startControlApi({ listRooms, inspectRoom } as unknown as RoomOrchestrator, userData, 'test')
+    const listRoomsRuntime = vi.fn(async () => [room])
+    const inspectRoomRuntime = vi.fn(async () => ({ room, dataDir: 'C:\\private\\devhotel' }))
+    const control = await startControlApi({ listRoomsRuntime, inspectRoomRuntime } as unknown as RoomOrchestrator, userData, 'test')
 
     try {
       const headers = { authorization: `Bearer ${control.info.token}` }
@@ -32,6 +32,41 @@ describe('agent control API host boundary', () => {
       expect(list[0]?.sourceRef).toBe('[Host folder hidden]')
       expect(inspection.room.sourceRef).toBe('[Host folder hidden]')
       expect(inspection.dataDir).toBe('[Hotel data hidden]')
+    } finally {
+      control.stop()
+    }
+  })
+
+  it('returns stable DevHotel runtime errors without exposing engine text', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-runtime-error-'))
+    roots.push(userData)
+    const execInRoom = vi.fn(async () => {
+      throw new DevHotelError('ROOM_RUNTIME_NOT_RUNNING', 'Room room1abc cannot run commands because its runtime is exited.', {
+        recoveryHint: 'Start or restart the Room, then retry.',
+        httpStatus: 409,
+        cause: new Error('container raw-engine-id is not running')
+      })
+    })
+    const control = await startControlApi({ execInRoom } as unknown as RoomOrchestrator, userData, 'test')
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/exec`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${control.info.token}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ cmd: ['node', '--version'] })
+      })
+      const body = (await response.json()) as { error: string; code: string; recoveryHint: string }
+
+      expect(response.status).toBe(409)
+      expect(body).toEqual({
+        error: 'Room room1abc cannot run commands because its runtime is exited.',
+        code: 'ROOM_RUNTIME_NOT_RUNNING',
+        recoveryHint: 'Start or restart the Room, then retry.'
+      })
+      expect(JSON.stringify(body)).not.toContain('raw-engine-id')
     } finally {
       control.stop()
     }
