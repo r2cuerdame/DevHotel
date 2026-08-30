@@ -1,7 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from 'node:fs'
+import { isAbsolute, join, relative } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
   Actor,
@@ -26,6 +37,10 @@ import type {
   SourceType
 } from '@devhotel/shared'
 import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
+import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
+import { AndroidDeviceBroker } from './devices/broker'
+import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
+import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
@@ -118,6 +133,62 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'an
  */
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
+const ADB_INSTALL_VERBS = new Set(['install', 'install-multiple', 'install-multi-package'])
+const ADB_UNSAFE_HOST_FILE_VERBS = new Set(['pull', 'push', 'restore', 'sideload', 'sync'])
+const ADB_INSTALL_BOOLEAN_FLAGS = new Set([
+  '-r', '-t', '-d', '-g', '-s',
+  '--instant', '--full', '--preload', '--force-sdk', '--no-streaming', '--streaming',
+  '--fastdeploy', '--no-fastdeploy', '--force-agent', '--date-check-agent', '--version-check-agent',
+  '--staged', '--non-staged', '--enable-rollback', '--skip-verification', '--bypass-low-target-sdk-block'
+])
+const ADB_INSTALL_VALUE_FLAGS = new Set([
+  '-i', '--installer-package-name', '--abi', '--user', '--install-location', '--install-reason',
+  '--originating-uri', '--referrer', '--force-uuid', '--staged-ready-timeout'
+])
+const MAX_STAGED_APK_BYTES = 512 * 1024 * 1024
+const MAX_STAGED_INSTALL_BYTES = 1024 * 1024 * 1024
+
+function workerProcessLiveness(workerId: string): boolean | 'unknown' {
+  const match = /^pid:(\d{1,10})$/.exec(workerId)
+  if (!match) return 'unknown'
+  const pid = Number.parseInt(match[1]!, 10)
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : 'unknown'
+  }
+}
+
+interface AdbOutputReplacement {
+  privateValue: string
+  publicValue: string
+}
+
+function redactAdbText(value: string, serial: string, replacements: AdbOutputReplacement[] = []): string {
+  let safe = value
+  for (const replacement of replacements) {
+    for (const candidate of new Set([replacement.privateValue, replacement.privateValue.replaceAll('\\', '/')])) {
+      const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      safe = safe.replace(new RegExp(escaped, 'gi'), replacement.publicValue)
+    }
+  }
+  const escapedSerial = serial.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return safe.replace(new RegExp(escapedSerial, 'gi'), '[device-serial-redacted]')
+}
+
+function redactAdbResult(
+  result: ExecResult,
+  serial: string,
+  replacements: AdbOutputReplacement[] = []
+): ExecResult {
+  return {
+    ...result,
+    stdout: redactAdbText(result.stdout, serial, replacements),
+    stderr: redactAdbText(result.stderr, serial, replacements)
+  }
+}
 
 export interface OrchestratorEvent {
   roomId: string
@@ -149,6 +220,8 @@ export interface OrchestratorOptions {
   appVersion: string
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
+  /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
+  adb?: AdbHost
 }
 
 interface PendingHostResyncConfirmation {
@@ -189,6 +262,8 @@ export class RoomOrchestrator {
   private readonly gateway: Gateway
   private readonly appVersion: string
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
+  /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
+  readonly devices: AndroidDeviceBroker
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -208,6 +283,21 @@ export class RoomOrchestrator {
     this.operations = new OperationTracker(this.operationRecords)
     this.logs = new LogHub(opts.userData, opts.backend)
     this.runs = new RunOutputStore(opts.userData)
+    this.devices = new AndroidDeviceBroker({
+      repo: androidDevicesRepo(opts.db),
+      adb: opts.adb ?? new SpawnedAdbHost(),
+      // A lease survives only while its Room is awake. A sleeping or deleted
+      // Room cannot be running a test, so its phone belongs to the queue.
+      ownerLiveness: (lease) => {
+        const room = this.rooms.get(lease.roomId)
+        if (room === null || room.status === 'sleeping' || room.status === 'broken') return false
+        return workerProcessLiveness(lease.workerId)
+      },
+      roomEligible: (roomId) => {
+        const room = this.rooms.get(roomId)
+        return room !== null && room.status !== 'sleeping' && room.status !== 'broken'
+      }
+    })
     registerQuickChanges(this.engine)
   }
 
@@ -290,6 +380,7 @@ export class RoomOrchestrator {
       try {
         if (room.status === 'broken') {
           // broken rooms may still own running containers — stop them but keep the status visible
+          if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
           if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
           else await this.backend.stopRoomPod(room.id)
           this.rooms.update(room.id, { hostPort: null })
@@ -1263,6 +1354,7 @@ export class RoomOrchestrator {
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'sleep room')
+    await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
       this.rooms.update(roomId, { status: 'sleeping', hostPort: null, lastUsedAt: new Date().toISOString() })
@@ -1412,6 +1504,7 @@ export class RoomOrchestrator {
   private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
+    await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
       const { reclaimedBytes } = await windowsVm.delete(roomId)
@@ -1501,11 +1594,308 @@ export class RoomOrchestrator {
    * 'screen' grabs the X display instead, which also shows FLAG_SECURE apps
    * (exactly what the preview shows).
    */
-  async androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
+  // ---------------------------------------------------------------------------
+  // Shared Android devices
+  //
+  // A USB phone is Hotel infrastructure shared by every Room, so the Room-facing
+  // API is deliberately narrow: attach, release, heartbeat, and "run this on
+  // whatever is attached". Rooms never name a serial, and never reach the phone
+  // except through the broker's lease check.
+  // ---------------------------------------------------------------------------
+
+  refreshAndroidDevices(): Promise<ReturnType<AndroidDeviceBroker['listDevices']>> {
+    return this.devices.refreshInventory()
+  }
+
+  androidDeviceStatus(): DeviceBrokerStatus {
+    return this.devices.status()
+  }
+
+  /** Ask for a phone for this Room. Returns a lease, or a place in the queue. */
+  async attachAndroidDevice(
+    roomId: string,
+    request: Omit<DeviceRequest, 'roomId' | 'project'> & { project?: string }
+  ): Promise<DeviceRequestResult> {
+    return this.withRoomLock(roomId, () => this.attachAndroidDeviceLocked(roomId, request))
+  }
+
+  private async attachAndroidDeviceLocked(
+    roomId: string,
+    request: Omit<DeviceRequest, 'roomId' | 'project'> & { project?: string }
+  ): Promise<DeviceRequestResult> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Only Android Rooms can attach an Android device')
+    if (room.status === 'sleeping' || room.status === 'broken') {
+      throw new Error('Wake the Android Room before attaching a physical device')
+    }
+    const result = await this.devices.requestDevice({ ...request, roomId, project: request.project ?? room.project })
+    this.olog(
+      roomId,
+      result.state === 'granted'
+        ? `attached device ${result.device.nickname} for ${request.purpose}`
+        : `queued for a device (#${result.position}): ${result.reason}`
+    )
+    this.emit(roomId, 'status')
+    return result
+  }
+
+  releaseAndroidDevice(roomId: string, reason = 'released by the Room'): Promise<DeviceLease | null> {
+    return this.withRoomLock(roomId, () => this.releaseAndroidDeviceLocked(roomId, reason))
+  }
+
+  private async releaseAndroidDeviceLocked(roomId: string, reason: string): Promise<DeviceLease | null> {
+    const released = await this.devices.releaseRoom(roomId, reason)
+    if (released) {
+      this.olog(roomId, `released the attached device: ${reason}`)
+      this.emit(roomId, 'status')
+    }
+    return released?.lease ?? null
+  }
+
+  heartbeatAndroidDevice(leaseId: string, opts: { busy?: boolean } = {}): DeviceLease {
+    return this.devices.heartbeat(leaseId, opts)
+  }
+
+  cancelAndroidDeviceRequest(requestId: string): DeviceQueueEntry {
+    return this.devices.cancelRequest(requestId)
+  }
+
+  setAndroidDeviceNickname(deviceId: string, nickname: string): ReturnType<AndroidDeviceBroker['setNickname']> {
+    return this.devices.setNickname(deviceId, nickname)
+  }
+
+  /** Reclaim phones from dead owners; the desktop app calls this on a timer. */
+  reapAndroidDevices(): ReturnType<AndroidDeviceBroker['reap']> {
+    return this.devices.reap()
+  }
+
+  /**
+   * Where a Room's Android automation should point.
+   *
+   * This is the whole reason a high-level primitive never has to write a serial:
+   * a Room with a phone attached targets that phone, and a Room without one
+   * targets its own emulator. Attaching a device changes what `android-run` and
+   * screenshots drive, with nothing else in the caller changing.
+   */
+  async resolveAdbTarget(roomId: string): Promise<{ kind: 'physical' | 'emulator'; deviceId: string | null; nickname: string }> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Only Android Rooms have an ADB target')
+    const device = this.devices.deviceForRoom(roomId)
+    if (device) {
+      // Keep an attached physical target sticky. An offline/unauthorized phone
+      // or a just-revoked disconnect is an acceptance failure, never permission
+      // to silently use the Room emulator and report success against the wrong
+      // device. Explicit release clears the disconnected target.
+      const authorized = this.devices.authorizeInternalOperation(roomId, device.id, 'checking the attached physical device')
+      return { kind: 'physical', deviceId: authorized.device.id, nickname: authorized.device.nickname }
+    }
+    return { kind: 'emulator', deviceId: null, nickname: 'Room emulator' }
+  }
+
+  /**
+   * Run an ADB command against the Room's attached phone, through the lease
+   * check. An interfering command from a Room that does not hold the lease is
+   * refused here — before anything reaches the device.
+   */
+  adbOnDevice(roomId: string, args: string[], opts: { deviceId?: string; timeoutMs?: number } = {}): Promise<ExecResult> {
+    return this.withRoomLock(roomId, () => this.adbOnDeviceLocked(roomId, args, opts))
+  }
+
+  private async adbOnDeviceLocked(
+    roomId: string,
+    args: string[],
+    opts: { deviceId?: string; timeoutMs?: number } = {},
+    internal?: { reason: string; expectedLeaseId: string }
+  ): Promise<ExecResult> {
+    const room = this.mustGet(roomId)
+    if (room.provider !== 'android') throw new Error('Only Android Rooms can use a physical Android device')
+    const verb = args[0]
+    if (!verb) throw new Error('Pass an ADB command without the leading adb executable')
+    // The command must be first. This closes both split (`-s SERIAL`) and
+    // attached (`-sSERIAL`, `--one-device=SERIAL`) selector variants without
+    // rejecting command-local flags such as `adb install -t`.
+    if (verb.startsWith('-')) {
+      throw new Error('ADB global and target-selector options are owned by the Device Broker and cannot be supplied by a Room')
+    }
+    if (ADB_UNSAFE_HOST_FILE_VERBS.has(verb) || verb === 'bugreport') {
+      throw new Error(`adb ${verb} exposes a Host filesystem path and is not available through the Device Broker`)
+    }
+    // Select synchronously, then let the first authorization capture the exact
+    // lease ID. Awaiting a separate target probe here would let release +
+    // reacquire by the same Room substitute a new lease under a stale call.
+    const target = { deviceId: opts.deviceId ?? this.devices.deviceForRoom(roomId)?.id ?? null }
+    if (!target.deviceId) {
+      throw new Error('This Room has no physical Android device attached. Use run_in_room for its own emulator.')
+    }
+    const authorize = (argv: string[], expectedLeaseId?: string | null): ReturnType<AndroidDeviceBroker['authorize']> =>
+      internal
+        ? this.devices.authorizeInternalOperation(roomId, target.deviceId!, internal.reason, internal.expectedLeaseId)
+        : this.devices.authorize(roomId, target.deviceId!, argv, expectedLeaseId)
+    // Refuse an unleased writer before copying any Room bytes into Host staging.
+    const capturedAuthorization = authorize(args, internal?.expectedLeaseId)
+    const capturedLeaseId = internal?.expectedLeaseId ?? capturedAuthorization.leaseId
+    let stagedDir: string | null = null
+    const outputReplacements: AdbOutputReplacement[] = []
+    const executableArgs = [...args]
+    try {
+      if (ADB_INSTALL_VERBS.has(verb)) {
+        const workspaceInputs: { arg: string; index: number }[] = []
+        for (let index = 1; index < args.length; index++) {
+          const arg = args[index]!
+          if (arg.startsWith('/workspace/')) {
+            workspaceInputs.push({ arg, index })
+            continue
+          }
+          if (ADB_INSTALL_BOOLEAN_FLAGS.has(arg)) continue
+          if (ADB_INSTALL_VALUE_FLAGS.has(arg)) {
+            const value = args[++index]
+            if (!value || value.startsWith('-') || /[\\/]/.test(value) || value.startsWith('@')) {
+              throw new Error(`adb ${verb} option ${arg} needs a non-path value`)
+            }
+            continue
+          }
+          const valueFlag = [...ADB_INSTALL_VALUE_FLAGS].find((flag) => arg.startsWith(`${flag}=`))
+          if (valueFlag) {
+            const value = arg.slice(valueFlag.length + 1)
+            if (!value || /[\\/]/.test(value) || value.startsWith('@')) {
+              throw new Error(`adb ${verb} option ${valueFlag} needs a non-path value`)
+            }
+            continue
+          }
+          throw new Error(
+            `adb ${verb} accepts only approved flags and .apk inputs from /workspace; relative and Host paths are refused`
+          )
+        }
+        if (workspaceInputs.length === 0) {
+          throw new Error('Physical-device installs accept APKs only from /workspace; Host paths are never passed to adb')
+        }
+        if (workspaceInputs.some(({ arg }) => !/\.apk$/i.test(arg))) {
+          throw new Error('Physical-device installs accept only .apk files from /workspace')
+        }
+        const stagingRoot = join(this.userData, 'tmp')
+        mkdirSync(stagingRoot, { recursive: true })
+        stagedDir = mkdtempSync(join(stagingRoot, 'device-adb-'))
+        const privateStagingRoot = realpathSync(stagedDir)
+        let stagedInstallBytes = 0
+        for (const [stagedIndex, input] of workspaceInputs.entries()) {
+          const roomPath = this.validateRoomFilePath(roomId, input.arg)
+          const hostPath = join(stagedDir, `${String(stagedIndex).padStart(3, '0')}.apk`)
+          try {
+            await this.backend.copyFromRoom(roomId, roomPath, hostPath)
+          } catch {
+            throw new Error(`Physical-device install could not stage ${roomPath}`)
+          }
+          let stagedFile: ReturnType<typeof lstatSync>
+          let stagedRealPath: string
+          try {
+            stagedFile = lstatSync(hostPath)
+            stagedRealPath = realpathSync(hostPath)
+          } catch {
+            throw new Error(`Physical-device install received an invalid staged object for ${roomPath}`)
+          }
+          const escapedRoot = relative(privateStagingRoot, stagedRealPath)
+          if (
+            stagedFile.isSymbolicLink() ||
+            !stagedFile.isFile() ||
+            escapedRoot === '' ||
+            escapedRoot === '..' ||
+            escapedRoot.startsWith('../') ||
+            escapedRoot.startsWith('..\\') ||
+            isAbsolute(escapedRoot)
+          ) {
+            throw new Error(`Physical-device install refused a non-regular or escaped APK staged from ${roomPath}`)
+          }
+          stagedInstallBytes += stagedFile.size
+          if (
+            stagedFile.size <= 0 ||
+            stagedFile.size > MAX_STAGED_APK_BYTES ||
+            stagedInstallBytes > MAX_STAGED_INSTALL_BYTES
+          ) {
+            throw new Error(`Physical-device install refused an empty or oversized APK staged from ${roomPath}`)
+          }
+          executableArgs[input.index] = hostPath
+          outputReplacements.push({ privateValue: hostPath, publicValue: roomPath })
+        }
+      }
+
+      // Re-check after staging: a short TTL may have expired while bytes moved.
+      const authorized = authorize(executableArgs, capturedLeaseId)
+      const result = await this.withDeviceHeartbeat(roomId, target.deviceId, authorized.leaseId, () =>
+        this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs }).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new Error(redactAdbText(message, authorized.serial, outputReplacements))
+        })
+      )
+      // Defense in depth for read commands such as `cat`: even a vendor path
+      // that happens to echo the transport serial cannot pierce the opaque ID.
+      return redactAdbResult(result, authorized.serial, outputReplacements)
+    } finally {
+      if (stagedDir) rmSync(stagedDir, { recursive: true, force: true })
+    }
+  }
+
+  private async withDeviceHeartbeat<T>(
+    roomId: string,
+    deviceId: string,
+    expectedLeaseId: string | null,
+    run: () => Promise<T>,
+    busy = true
+  ): Promise<T> {
+    if (!expectedLeaseId) return run()
+    this.devices.authorizeInternalOperation(roomId, deviceId, 'starting the fenced device operation', expectedLeaseId)
+    const lease = this.devices.leaseForRoom(roomId)
+    if (!lease || lease.id !== expectedLeaseId || lease.deviceId !== deviceId) {
+      throw new Error('The captured Android device lease changed before execution')
+    }
+    const pulse = (strict = false): void => {
+      try {
+        this.devices.heartbeat(expectedLeaseId, { busy })
+      } catch (error) {
+        if (strict) throw error
+        // A concurrent disconnect/recovery owns the lease now; the in-flight
+        // adb process will surface its own transport result.
+      }
+    }
+    pulse(true)
+    const interval = Math.max(1000, Math.min(30_000, Math.floor(lease.ttlMs / 3)))
+    const timer = setInterval(pulse, interval)
+    timer.unref?.()
+    try {
+      return await run()
+    } finally {
+      clearInterval(timer)
+      pulse()
+    }
+  }
+
+  androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
+    return this.withRoomLock(roomId, () => this.androidScreenshotLocked(roomId, mode))
+  }
+
+  private async androidScreenshotLocked(roomId: string, mode: 'auto' | 'screen'): Promise<{ png: string; source: 'adb' | 'screen' }> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
     if (!awake) throw new Error('Wake the room before taking a screenshot')
+    // Auto follows whatever this Room is driving. Explicit screen mode always
+    // captures the Room display so FLAG_SECURE surfaces remain visible there.
+    const physicalDevice = this.devices.deviceForRoom(roomId)
+    if (physicalDevice && mode === 'auto') {
+      const args = ['exec-out', 'screencap', '-p']
+      const authorized = this.devices.authorizeInternalOperation(roomId, physicalDevice.id, 'capturing the attached phone screen')
+      const result = await this.withDeviceHeartbeat(roomId, physicalDevice.id, authorized.leaseId, () =>
+        this.devices.hostAdb.execBinary(authorized.serial, args, { timeoutMs: 60_000 })
+      )
+      const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      if (result.code === 0 && result.stdout.subarray(0, signature.length).equals(signature)) {
+        return { png: result.stdout.toString('base64'), source: 'adb' }
+      }
+      const safeError = redactAdbResult(
+        { code: result.code, stdout: '', stderr: result.stderr },
+        authorized.serial
+      ).stderr
+      throw new Error(`screenshot of ${physicalDevice.nickname} failed: ${safeError.trim().slice(0, 200) || `adb exited ${result.code}`}`)
+    }
     if (mode !== 'screen') {
       const result = await this.backend.execInRoom(
         roomId,
@@ -1523,6 +1913,7 @@ export class RoomOrchestrator {
     backend: { ok: boolean; detail: string }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
+    devices: DeviceBrokerStatus
   }> {
     const backend = await this.backend.health()
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
@@ -1545,13 +1936,14 @@ export class RoomOrchestrator {
         runtimeStatus
       })
     }
-    return { backend, gateway: this.gateway.status(), rooms }
+    return { backend, gateway: this.gateway.status(), rooms, devices: this.devices.status() }
   }
 
   inspectRoom(roomId: string): RoomInspection {
     const room = this.mustGet(roomId)
     const recent = this.changes.list(roomId).slice(0, 15)
     const baseUrl = room.provider === 'windows' ? null : this.gateway.urlFor(room.domain, room.https)
+    const deviceLease = this.devices.leaseForRoom(roomId)
     return {
       room,
       // android rooms open the emulator screen fullscreen and auto-connected
@@ -1567,7 +1959,18 @@ export class RoomOrchestrator {
       latestCheck: this.checks.latest(roomId),
       recentChanges: recent,
       lastUndoable: this.changes.lastUndoable(roomId),
-      storage: null
+      storage: null,
+      // Capability IDs, worker identity and heartbeat/cancellation facts stay
+      // private to the broker; inspection needs only display-safe ownership.
+      device: deviceLease
+        ? {
+            deviceId: deviceLease.deviceId,
+            project: deviceLease.project,
+            purpose: deviceLease.purpose,
+            state: deviceLease.state,
+            acquiredAt: deviceLease.acquiredAt
+          }
+        : null
     }
   }
 
@@ -2537,6 +2940,20 @@ export class RoomOrchestrator {
   /* ------------------------------------------------------------------ */
 
   private ctxFor(roomId: string): ChangeCtx {
+    const physicalDevice = this.devices.deviceForRoom(roomId)
+    let physicalLeaseFence: string | null = null
+    const capturePhysicalLease = (): string => {
+      if (physicalLeaseFence) return physicalLeaseFence
+      if (!physicalDevice) throw new Error('This Room has no physical Android device target')
+      const authorized = this.devices.authorizeInternalOperation(
+        roomId,
+        physicalDevice.id,
+        'starting the tracked Android operation'
+      )
+      if (!authorized.leaseId) throw new Error('The physical Android operation has no device lease')
+      physicalLeaseFence = authorized.leaseId
+      return physicalLeaseFence
+    }
     return {
       roomId,
       backend: this.backend,
@@ -2553,7 +2970,18 @@ export class RoomOrchestrator {
         return s === 'running' || s === 'ready' || s === 'attention'
       },
       syncRoute: () => this.syncRouteFor(roomId),
-      clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined
+      clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
+      physicalAndroidDevice:
+        physicalDevice
+          ? {
+              nickname: physicalDevice.nickname,
+              exec: (args, opts) => this.adbOnDeviceLocked(roomId, args, opts, {
+                reason: 'running the tracked Android app',
+                expectedLeaseId: capturePhysicalLease()
+              }),
+              keepAlive: (run) => this.withDeviceHeartbeat(roomId, physicalDevice.id, capturePhysicalLease(), run, false)
+            }
+          : undefined
     }
   }
 

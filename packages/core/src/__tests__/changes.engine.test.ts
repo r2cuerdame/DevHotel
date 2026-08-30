@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
+import { androidRunChange } from '../changes/definitions/androidRun'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
@@ -134,6 +135,49 @@ describe('Android emulator changes', () => {
     expect(changes.list('room1abc')).toHaveLength(0)
   })
 
+  it('retries a normal pidof exit 1 while an emulator app is still starting', async () => {
+    let pidProbes = 0
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.includes("'pidof'")) {
+        pidProbes += 1
+        return pidProbes < 3
+          ? { code: 1, stdout: '', stderr: '' }
+          : { code: 0, stdout: '1234\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    vi.useFakeTimers()
+    try {
+      const verifying = androidRunChange.verify(
+        ctx(),
+        {},
+        null,
+        { id: 'verify-delayed-emulator-app', createdAt: '2026-08-30T00:00:00.000Z' }
+      )
+      for (let turn = 0; pidProbes === 0 && turn < 20; turn++) await Promise.resolve()
+      expect(pidProbes).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(4_000)
+
+      await expect(verifying).resolves.toMatchObject({ ok: true, detail: expect.stringContaining('Room emulator') })
+      expect(pidProbes).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('emulator-config swaps the emulator container and undo restores the previous device', async () => {
     rooms.update('room1abc', {
       provider: 'android',
@@ -206,6 +250,65 @@ describe('change crash durability', () => {
 
     release()
     await expect(task).resolves.toMatchObject({ status: 'verified' })
+  })
+
+  it('persists a bounded failed verification when a generic verifier rejects', async () => {
+    engine.register({
+      kind: 'verify-throws-test',
+      plan: () => ({
+        title: 'Throwing verifier',
+        component: 'Test',
+        before: null,
+        after: null,
+        undoable: false,
+        undoStrategy: 'none',
+        autoRollback: false
+      }),
+      async apply(_changeCtx, _params, steps) {
+        steps.push('Applied before verification')
+      },
+      async verify() {
+        throw new Error('token=super-secret C:\\Users\\private\\backend.exe --raw-argument')
+      }
+    } satisfies ChangeDefinition<Record<string, never>>)
+
+    const entry = await engine.execute(ctx(), 'verify-throws-test', {}, 'user')
+
+    expect(entry).toMatchObject({
+      status: 'applied',
+      steps: ['Applied before verification'],
+      verify: { ok: false, detail: 'Verification could not complete because its probe failed unexpectedly.' }
+    })
+    expect(JSON.stringify(entry.verify)).not.toMatch(/super-secret|Users|backend\.exe|raw-argument/i)
+    expect(changes.get(entry.id)).toMatchObject({ status: 'applied', verify: { ok: false } })
+  })
+
+  it('sends a rejected verifier through the normal automatic rollback path', async () => {
+    let undone = false
+    engine.register({
+      kind: 'verify-throws-rollback-test',
+      plan: () => ({
+        title: 'Rollback throwing verifier',
+        component: 'Test',
+        before: null,
+        after: null,
+        undoable: true,
+        undoStrategy: 'restore-test-state',
+        autoRollback: true
+      }),
+      async apply() {},
+      async verify() {
+        throw new Error('private verifier failure')
+      },
+      async undo() {
+        undone = true
+      }
+    } satisfies ChangeDefinition<Record<string, never>>)
+
+    const entry = await engine.execute(ctx(), 'verify-throws-rollback-test', {}, 'user')
+
+    expect(undone).toBe(true)
+    expect(entry).toMatchObject({ status: 'rolled-back', verify: { ok: false } })
   })
 })
 

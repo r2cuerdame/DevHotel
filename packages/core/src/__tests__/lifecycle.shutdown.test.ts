@@ -2,7 +2,7 @@ import { rmSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
-import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir } from './fakes'
+import { FakeAdbHost, FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir } from './fakes'
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
@@ -33,7 +33,8 @@ describe('RoomOrchestrator shutdown gate', () => {
       backend,
       gateway: gateway.asGateway(),
       db,
-      appVersion: 'test'
+      appVersion: 'test',
+      adb: new FakeAdbHost([{ serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' }])
     })
   })
 
@@ -198,6 +199,35 @@ describe('RoomOrchestrator shutdown gate', () => {
     expect(backend.calls).toContain(`attemptStop:${second.id}`)
     expect(orch.rooms.get(second.id)?.status).toBe('sleeping')
     expect(gatewayStopped).toBe(true)
+  })
+
+  it('releases the physical-device lease when shutting down a broken Android Room', async () => {
+    const room = makeRoom({
+      id: 'broken15',
+      project: 'android-broken',
+      nickname: 'dev',
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: 'gradle assembleDebug --no-daemon',
+      internalPort: 6080,
+      status: 'ready'
+    })
+    orch.rooms.create(room)
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice(room.id, {
+      purpose: 'acceptance',
+      workerId: 'worker-a'
+    })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    orch.rooms.update(room.id, { status: 'broken' })
+
+    await orch.shutdown()
+
+    expect(orch.devices.leaseForRoom(room.id)).toBeNull()
+    expect(orch.androidDeviceStatus().devices[0]?.leaseOwner).toBeNull()
+    expect(backend.calls).toContain(`stopRoomPod:${room.id}`)
+    expect(orch.rooms.get(room.id)?.status).toBe('broken')
   })
 
   it('drains an admitted clone before clean removal snapshots and deletes its stable inventory', async () => {

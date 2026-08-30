@@ -17,7 +17,21 @@ describe('agent control API host boundary', () => {
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', sourceRef: 'C:\\private\\project' }
     const listRoomsRuntime = vi.fn(async () => [room])
-    const inspectRoomRuntime = vi.fn(async () => ({ room, dataDir: 'C:\\private\\devhotel' }))
+    const inspectRoomRuntime = vi.fn(async () => ({
+      room,
+      dataDir: 'C:\\private\\devhotel',
+      device: {
+        id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        deviceId: 'd0123456789abcdef0123456789abcdef',
+        roomId: 'room1abc',
+        project: 'demo',
+        purpose: 'acceptance',
+        state: 'active',
+        acquiredAt: '2026-08-31T00:00:00.000Z',
+        workerId: 'secret-worker',
+        runId: 'secret-run'
+      }
+    }))
     const control = await startControlApi({ listRoomsRuntime, inspectRoomRuntime } as unknown as RoomOrchestrator, userData, 'test')
 
     try {
@@ -27,11 +41,21 @@ describe('agent control API host boundary', () => {
       }[]
       const inspection = (await (
         await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc`, { headers })
-      ).json()) as { room: { sourceRef: string }; dataDir: string }
+      ).json()) as { room: { sourceRef: string }; dataDir: string; device: Record<string, unknown> }
 
       expect(list[0]?.sourceRef).toBe('[Host folder hidden]')
       expect(inspection.room.sourceRef).toBe('[Host folder hidden]')
       expect(inspection.dataDir).toBe('[Hotel data hidden]')
+      expect(inspection.device).toEqual({
+        deviceId: 'd0123456789abcdef0123456789abcdef',
+        project: 'demo',
+        purpose: 'acceptance',
+        state: 'active',
+        acquiredAt: '2026-08-31T00:00:00.000Z'
+      })
+      expect(JSON.stringify(inspection)).not.toContain('secret-worker')
+      expect(JSON.stringify(inspection)).not.toContain('secret-run')
+      expect(JSON.stringify(inspection)).not.toContain('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
     } finally {
       control.stop()
     }

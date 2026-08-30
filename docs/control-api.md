@@ -40,8 +40,9 @@ room's Changes list. Host boundaries hold:
   user-only.
 - The Host's mouse, keyboard and foreground window are not on this API. UI
   input belongs inside the Room — for an Android Room, `exec` an
-  `adb -s emulator-5554 shell input …` command rather than automating the Host
-  desktop against the DevHotel preview window. See
+  `adb -s emulator-5554 shell input …` command against its own emulator, or
+  drive a leased physical phone through `POST /v1/rooms/:id/device/adb`, rather
+  than automating the Host desktop against the DevHotel preview window. See
   [Host input isolation](./host-input-isolation.md).
 
 ## Long operations
@@ -117,17 +118,41 @@ can drive the whole thing by polling.
 |---|---|
 | `GET /v1/ping` | `{ version }` |
 | `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
-| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }] }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. |
+| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
 
+### Shared Android devices
+
+A physical Android phone is Hotel infrastructure lent to one Room at a time —
+see [Android Device Broker](./android-device-broker.md). Room-owned emulators
+are not brokered and never enter this queue.
+
+| Method & path | Body | Result |
+|---|---|---|
+| `GET /v1/devices` | | `{ available, detail, devices: [{ id, nickname, model, androidVersion, apiLevel, connection, health, brokered, leaseOwner, queueDepth, waiters[] }], recentEvents[] }` |
+| `POST /v1/devices/refresh` | | re-enumerate the Host's devices; returns the inventory |
+| `POST /v1/devices/heartbeat` | `{ leaseId, busy? }` | the refreshed lease — `busy: true` marks real device activity so a long instrumentation run is warned about, not reclaimed |
+| `POST /v1/devices/cancel` | `{ requestId }` | leave the queue |
+| `POST /v1/rooms/:id/device/attach` | `{ purpose, workerId, issueRef?, runId?, priority?, ttlMs?, maxDurationMs?, constraints? }` | `{ state: 'granted', lease, device }` or `{ state: 'queued', requestId, position, owner, reason }`. `project` is taken from the Room and is rejected in the body. |
+| `POST /v1/rooms/:id/device/release` | `{ reason? }` | the closed lease; promotes the next queued Room. Nothing is uninstalled or cleared. |
+| `POST /v1/rooms/:id/device/adb` | `{ args: string[], timeoutMs? }` | `{ code, stdout, stderr }` — bounded raw argv without `adb` or any global target selector; the broker picks this Room's leased device. Install inputs must be `/workspace/*.apk` paths. Bytes are staged as canonical regular files in private Host temp storage (512 MiB/APK, 1 GiB/install), and returned text maps the private path back to its Room path. State-changing commands need the exact still-active lease captured at authorization. Cross-app/large-output reads (`logcat`, `dumpsys`, `exec-out`, app/process listings, raw screen capture) are always refused; use high-level screenshot/tracked-app operations. |
+
+Use `pid:<OS process id>` for `workerId` when the caller can provide it, so the
+broker can distinguish a live worker from a dead one directly. Other stable
+worker IDs are supported but must heartbeat; after TTL plus grace an opaque,
+silent owner is reclaimed rather than parking a phone indefinitely.
+
+Development belongs on the Room emulator (`POST /v1/rooms/:id/exec`); request
+a physical device for final acceptance/release verification and for behaviour an
+emulator cannot reproduce, then release it.
 ### Rooms
 
 | Method & path | Body / query | Result |
 |---|---|---|
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
-| `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. |
+| `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
 | `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
 | `POST /v1/rooms/:id/sleep` | | `204` |

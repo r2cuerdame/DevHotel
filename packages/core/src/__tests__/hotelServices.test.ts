@@ -77,7 +77,7 @@ describe('Hotel Services control-plane persistence', () => {
   it('registers a strict manifest without claiming the service was provisioned or connected', () => {
     const dir = mkdtempSync(join(tmpdir(), 'devhotel-services-')); dirs.push(dir)
     const db = openDb(dir), repo = hotelServicesRepo(db)
-    expect((db.sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((row) => row.version)).toEqual([1, 2, 3, 4, 5])
+    expect((db.sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6])
     const columns = (db.sqlite.prepare('PRAGMA table_info(hotel_services)').all() as { name: string }[]).map((column) => column.name)
     expect(columns).toContain('manifest_json')
     expect(columns).not.toContain('installed')

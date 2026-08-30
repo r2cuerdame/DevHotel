@@ -1,5 +1,5 @@
 import type { ChangeEntry, RoomRecord } from '@devhotel/shared'
-import type { IsolationBackend, WebSpec } from '../backend/types'
+import type { ExecResult, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { ChangesRepo } from '../store/changesRepo'
 import type { RoomsRepo } from '../store/roomsRepo'
@@ -29,6 +29,13 @@ export interface ChangeCtx {
    * partition; absent in headless contexts, where there is no profile to clear.
    */
   clearBrowserData?: () => Promise<void>
+  /** Present while this Android Room owns a physical-device lease; exec fails closed when the target is unhealthy. */
+  physicalAndroidDevice?: {
+    nickname: string
+    exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
+    /** Keep the lease alive while a long build prepares the next device action. */
+    keepAlive<T>(run: () => Promise<T>): Promise<T>
+  }
 }
 
 export interface ChangePlanned {
