@@ -162,7 +162,9 @@ The durable receipt contains the Room, opaque target identity, Change ID, APK
 SHA-256, and install time. Recreating an emulator clears its receipts; installing
 the same package on a shared phone transfers that exact target/package receipt
 to the last installing Room. Package disappearance is probed live and invalidates
-a stale receipt. Physical receipts are also fenced to the lease that performed
+a stale receipt. The installed `base.apk` SHA-256 is compared with the receipt
+before each high-level session trusts it, so a same-name replacement also
+invalidates authority. Physical receipts are fenced to the lease that performed
 the install, so releasing and reacquiring the same phone requires a fresh
 `android-run` before automation.
 
@@ -188,8 +190,9 @@ Automation POST bodies are strict and capped at 64 KiB.
 
 UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals
-the tracked app cross the boundary. Taps require one match and recheck foreground
-ownership immediately before input. Logcat resolves an exact unshared UID and
+the tracked app cross the boundary. Taps require the same unique node and bounds
+across two consecutive dumps, then recheck foreground ownership immediately
+before input. Logcat resolves an exact unshared UID and
 fails closed when `--uid` isolation is unavailable; it never reads global logs.
 
 ### Rooms

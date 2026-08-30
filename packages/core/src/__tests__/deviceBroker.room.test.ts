@@ -790,6 +790,7 @@ describe('Android automation targets the attached device without a hand-written 
     })
     backend.execInRoomHandler = (_roomId, cmd) => {
       if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (cmd[4] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
       }
@@ -821,6 +822,7 @@ describe('Android automation targets the attached device without a hand-written 
     })
     backend.execInRoomHandler = (_roomId, cmd, opts) => {
       if (cmd[4] === 'pm' && cmd[5] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (cmd[4] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (cmd[4] === 'sh' && cmd.at(-1)?.includes('dumpsys window')) {
         opts?.onStdout?.(`mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n${'x'.repeat(3_000)}`)
         return { code: 0, stdout: '', stderr: '' }
@@ -857,6 +859,7 @@ describe('Android automation targets the attached device without a hand-written 
     let replaced = false
     adb.execResultFor = async (_serial, args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
       }
