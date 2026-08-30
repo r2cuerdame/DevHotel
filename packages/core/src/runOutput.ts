@@ -13,24 +13,24 @@ import {
 } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { StringDecoder } from 'node:string_decoder'
 import type { Actor } from '@devhotel/shared'
 
 /** Inline bytes returned per stream when the caller does not choose a budget. */
 export const DEFAULT_OUTPUT_BYTES = 64_000
 export const MIN_OUTPUT_BYTES = 256
 export const MAX_OUTPUT_BYTES = 4_000_000
-/** Filters are agent-supplied regular expressions: keep them small and cheap. */
+export const MAX_OUTPUT_LINES = 1_000_000
+/** Filters are agent-supplied literal strings: keep their matching state small. */
 export const MAX_FILTER_LENGTH = 200
-/** A longer line is matched on its first bytes only, so one pathological line cannot stall a scan. */
-const MATCH_LINE_CAP = 8_192
-/** Whole-file scans stop rather than block the main process on a runaway pattern. */
-const SCAN_TIME_BUDGET_MS = 15_000
+/** One synchronous retained-file read is capped so it cannot freeze Electron on a huge log. */
+const MAX_SCAN_BYTES = 4 * 1024 * 1024
 const DEFAULT_RETAINED_RUNS = 20
 const DEFAULT_RETAINED_BYTES = 256 * 1024 * 1024
 
 export type OutputStreamName = 'stdout' | 'stderr'
 export type OutputMode = 'head' | 'tail'
+export type OutputChunk = string | Uint8Array
+export type OutputEncoding = 'utf8' | 'base64'
 
 export interface OutputSelection {
   /** Inline budget for this stream, in bytes. */
@@ -38,10 +38,11 @@ export interface OutputSelection {
   maxLines?: number
   /** Which end of the output to keep when it does not fit — defaults to the tail. */
   mode?: OutputMode
-  /** Keep only lines matching this regular expression. */
+  /** Keep only lines containing this literal UTF-8 string. */
   include?: string
-  /** Drop lines matching this regular expression. */
+  /** Drop lines containing this literal UTF-8 string. */
   exclude?: string
+  /** ASCII case-insensitive matching; non-ASCII filters remain exact. */
   ignoreCase?: boolean
 }
 
@@ -62,36 +63,266 @@ export interface StreamReport {
   retained: boolean
 }
 
-/**
- * What the window did with one line. `partialBytes` means only that many bytes
- * of the line fit, which is what lets a reader resume mid-line instead of
- * skipping the rest of an oversized one.
- */
 export interface LineFate {
   kept: boolean
   partialBytes?: number
 }
 
-function byteLength(text: string): number {
-  return Buffer.byteLength(text, 'utf8')
+function asBuffer(chunk: OutputChunk): Buffer {
+  if (typeof chunk === 'string') return Buffer.from(chunk, 'utf8')
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
 }
 
-function sliceBytes(line: string, max: number, from: OutputMode): string {
-  const buf = Buffer.from(line, 'utf8')
-  if (buf.byteLength <= max) return line
-  return from === 'head' ? buf.subarray(0, max).toString('utf8') : buf.subarray(buf.byteLength - max).toString('utf8')
+/** Encode even a backend's accidentally huge buffered string in bounded pieces. */
+function forEachRawChunk(chunk: OutputChunk, visit: (raw: Buffer) => void): void {
+  if (typeof chunk !== 'string') {
+    visit(asBuffer(chunk))
+    return
+  }
+  const maxCodeUnits = 64 * 1024
+  for (let start = 0; start < chunk.length;) {
+    let end = Math.min(chunk.length, start + maxCodeUnits)
+    if (end < chunk.length) {
+      const last = chunk.charCodeAt(end - 1)
+      const next = chunk.charCodeAt(end)
+      if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--
+    }
+    visit(Buffer.from(chunk.slice(start, end), 'utf8'))
+    start = end
+  }
 }
 
-function compileFilter(pattern: string | undefined, ignoreCase: boolean | undefined, label: string): RegExp | undefined {
+function foldAscii(byte: number): number {
+  return byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte
+}
+
+/**
+ * Streaming Knuth-Morris-Pratt matcher. Unlike JavaScript RegExp, its work is
+ * linear in the bytes received and its memory is fixed by the (capped) needle.
+ * Metacharacters therefore have no special meaning: filters are deliberately
+ * literal substrings on the Electron main thread.
+ */
+class LiteralMatcher {
+  private readonly needle: Buffer
+  private readonly failure: Uint32Array
+  private progress = 0
+  matched = false
+
+  constructor(pattern: string, private readonly ignoreCase: boolean) {
+    this.needle = Buffer.from(pattern, 'utf8')
+    if (ignoreCase) {
+      for (let index = 0; index < this.needle.length; index++) this.needle[index] = foldAscii(this.needle[index] ?? 0)
+    }
+    this.failure = new Uint32Array(this.needle.length)
+    for (let index = 1, prefix = 0; index < this.needle.length; index++) {
+      const byte = this.needle[index] ?? 0
+      while (prefix > 0 && byte !== this.needle[prefix]) prefix = this.failure[prefix - 1] ?? 0
+      if (byte === this.needle[prefix]) prefix++
+      this.failure[index] = prefix
+    }
+  }
+
+  push(chunk: Uint8Array): void {
+    if (this.matched) return
+    for (const raw of chunk) {
+      const byte = this.ignoreCase ? foldAscii(raw) : raw
+      while (this.progress > 0 && byte !== this.needle[this.progress]) {
+        this.progress = this.failure[this.progress - 1] ?? 0
+      }
+      if (byte === this.needle[this.progress]) this.progress++
+      if (this.progress === this.needle.length) {
+        this.matched = true
+        return
+      }
+    }
+  }
+
+  reset(): void {
+    this.progress = 0
+    this.matched = false
+  }
+}
+
+function compileFilter(
+  pattern: string | undefined,
+  ignoreCase: boolean | undefined,
+  label: string
+): LiteralMatcher | undefined {
   if (pattern === undefined || pattern === '') return undefined
   if (pattern.length > MAX_FILTER_LENGTH) {
-    throw new Error(`${label} pattern is longer than ${MAX_FILTER_LENGTH} characters`)
+    throw new Error(`${label} filter is longer than ${MAX_FILTER_LENGTH} characters`)
   }
-  try {
-    return new RegExp(pattern, ignoreCase ? 'i' : '')
-  } catch (err) {
-    throw new Error(`${label} is not a valid regular expression: ${err instanceof Error ? err.message : String(err)}`)
+  return new LiteralMatcher(pattern, ignoreCase === true)
+}
+
+/** One line's bounded head or tail, implemented as a fixed-size byte ring. */
+class BoundedByteBuffer {
+  private readonly storage: Buffer
+  private start = 0
+  private length = 0
+  totalBytes = 0
+
+  constructor(
+    private readonly capacity: number,
+    private readonly mode: OutputMode
+  ) {
+    this.storage = Buffer.allocUnsafe(capacity)
   }
+
+  push(chunk: Uint8Array): void {
+    if (chunk.byteLength === 0) return
+    this.totalBytes += chunk.byteLength
+    const source = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    if (this.mode === 'head') {
+      const copy = Math.min(source.length, this.capacity - this.length)
+      if (copy > 0) source.copy(this.storage, this.length, 0, copy)
+      this.length += copy
+      return
+    }
+    if (source.length >= this.capacity) {
+      source.copy(this.storage, 0, source.length - this.capacity)
+      this.start = 0
+      this.length = this.capacity
+      return
+    }
+    const overflow = Math.max(0, this.length + source.length - this.capacity)
+    if (overflow > 0) {
+      this.start = (this.start + overflow) % this.capacity
+      this.length -= overflow
+    }
+    const writeAt = (this.start + this.length) % this.capacity
+    const first = Math.min(source.length, this.capacity - writeAt)
+    source.copy(this.storage, writeAt, 0, first)
+    if (first < source.length) source.copy(this.storage, 0, first)
+    this.length += source.length
+  }
+
+  bytes(): Buffer {
+    if (this.length === 0) return Buffer.alloc(0)
+    const out = Buffer.allocUnsafe(this.length)
+    const first = Math.min(this.length, this.capacity - this.start)
+    this.storage.copy(out, 0, this.start, this.start + first)
+    if (first < this.length) this.storage.copy(out, first, 0, this.length - first)
+    return out
+  }
+
+  reset(): void {
+    this.start = 0
+    this.length = 0
+    this.totalBytes = 0
+  }
+
+  get bufferedBytes(): number {
+    return this.length
+  }
+}
+
+interface DroppedBytes {
+  bytes: number
+  newlines: number
+}
+
+/** Fixed-size selected-output ring; one allocation regardless of line count. */
+class ByteRing {
+  private readonly storage: Buffer
+  private start = 0
+  private length = 0
+
+  constructor(private readonly capacity: number) {
+    this.storage = Buffer.allocUnsafe(capacity)
+  }
+
+  append(chunk: Uint8Array): DroppedBytes {
+    if (chunk.byteLength === 0) return { bytes: 0, newlines: 0 }
+    const source = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    if (source.length >= this.capacity) {
+      const dropped = this.dropPrefix(this.length)
+      source.copy(this.storage, 0, source.length - this.capacity)
+      this.start = 0
+      this.length = this.capacity
+      return dropped
+    }
+    const overflow = Math.max(0, this.length + source.length - this.capacity)
+    const dropped = this.dropPrefix(overflow)
+    const writeAt = (this.start + this.length) % this.capacity
+    const first = Math.min(source.length, this.capacity - writeAt)
+    source.copy(this.storage, writeAt, 0, first)
+    if (first < source.length) source.copy(this.storage, 0, first)
+    this.length += source.length
+    return dropped
+  }
+
+  /** Drop the oldest complete/partial logical line. */
+  dropFirstLine(): DroppedBytes {
+    const newline = this.indexOf(0x0a)
+    return this.dropPrefix(newline === -1 ? this.length : newline + 1)
+  }
+
+  /** A tail byte window may start inside a valid UTF-8 sequence. */
+  trimLeadingContinuation(): number {
+    let dropped = 0
+    while (dropped < 3 && this.length > 0 && isUtf8Continuation(this.byteAt(0))) {
+      this.dropPrefix(1)
+      dropped++
+    }
+    return dropped
+  }
+
+  bytes(): Buffer {
+    if (this.length === 0) return Buffer.alloc(0)
+    const out = Buffer.allocUnsafe(this.length)
+    const first = Math.min(this.length, this.capacity - this.start)
+    this.storage.copy(out, 0, this.start, this.start + first)
+    if (first < this.length) this.storage.copy(out, first, 0, this.length - first)
+    return out
+  }
+
+  get byteLength(): number {
+    return this.length
+  }
+
+  private dropPrefix(requested: number): DroppedBytes {
+    const count = Math.min(Math.max(0, requested), this.length)
+    let newlines = 0
+    for (let index = 0; index < count; index++) {
+      if (this.byteAt(index) === 0x0a) newlines++
+    }
+    this.start = this.capacity === 0 ? 0 : (this.start + count) % this.capacity
+    this.length -= count
+    return { bytes: count, newlines }
+  }
+
+  private indexOf(needle: number): number {
+    for (let index = 0; index < this.length; index++) {
+      if (this.byteAt(index) === needle) return index
+    }
+    return -1
+  }
+
+  private byteAt(index: number): number {
+    return this.storage[(this.start + index) % this.capacity] ?? 0
+  }
+}
+
+function isUtf8Continuation(byte: number): boolean {
+  return (byte & 0xc0) === 0x80
+}
+
+function utf8SequenceLength(lead: number): number {
+  if ((lead & 0x80) === 0) return 1
+  if ((lead & 0xe0) === 0xc0) return 2
+  if ((lead & 0xf0) === 0xe0) return 3
+  if ((lead & 0xf8) === 0xf0) return 4
+  return 1
+}
+
+/** Do not return a trailing lead byte without the rest of its UTF-8 sequence. */
+function utf8SafeHeadLength(bytes: Uint8Array): number {
+  if (bytes.byteLength === 0) return 0
+  let lead = bytes.byteLength - 1
+  while (lead > 0 && isUtf8Continuation(bytes[lead] ?? 0)) lead--
+  const available = bytes.byteLength - lead
+  return utf8SequenceLength(bytes[lead] ?? 0) > available ? lead : bytes.byteLength
 }
 
 export function normalizeSelection(selection: OutputSelection = {}): Required<Pick<OutputSelection, 'maxBytes' | 'mode'>> & OutputSelection {
@@ -99,8 +330,11 @@ export function normalizeSelection(selection: OutputSelection = {}): Required<Pi
   if (!Number.isFinite(requested) || requested < MIN_OUTPUT_BYTES || requested > MAX_OUTPUT_BYTES) {
     throw new Error(`maxBytes must be between ${MIN_OUTPUT_BYTES} and ${MAX_OUTPUT_BYTES}`)
   }
-  if (selection.maxLines !== undefined && (!Number.isInteger(selection.maxLines) || selection.maxLines < 1)) {
-    throw new Error('maxLines must be a positive integer')
+  if (
+    selection.maxLines !== undefined &&
+    (!Number.isInteger(selection.maxLines) || selection.maxLines < 1 || selection.maxLines > MAX_OUTPUT_LINES)
+  ) {
+    throw new Error(`maxLines must be between 1 and ${MAX_OUTPUT_LINES}`)
   }
   return { ...selection, maxBytes: Math.floor(requested), mode: selection.mode ?? 'tail' }
 }
@@ -113,16 +347,26 @@ export function normalizeSelection(selection: OutputSelection = {}): Required<Pi
  * instead of silent.
  */
 export class OutputWindow {
-  private readonly includeRe?: RegExp
-  private readonly excludeRe?: RegExp
+  private readonly includeMatcher?: LiteralMatcher
+  private readonly excludeMatcher?: LiteralMatcher
   private readonly maxBytes: number
   private readonly maxLines: number
   private readonly mode: OutputMode
   private readonly filtering: boolean
-  private rest = ''
+  private readonly current: BoundedByteBuffer
+  private readonly selected: ByteRing
+  private currentRawBytes = 0
   private ended = false
-  private kept: string[] = []
-  private keptBytes = 0
+  private finalUtf8 = false
+  private keptLines = 0
+  private readonly initialLineSkipBytes: number
+  private readonly preserveRawPageBytes: boolean
+  /** Bytes through the last complete line received by this window. */
+  completedInputBytes = 0
+  /** Input offset just past the most recent kept bytes, relative to this window. */
+  lastKeptInputOffset = 0
+  /** Distinguishes a legitimate zero resume offset from no selected input. */
+  hasKeptInputOffset = false
 
   /** Raw bytes seen. */
   bytes = 0
@@ -137,65 +381,72 @@ export class OutputWindow {
   /** Head mode only: the window cannot accept more, so scanning may stop. */
   full = false
 
-  constructor(selection: OutputSelection = {}) {
+  constructor(
+    selection: OutputSelection = {},
+    internal: { initialLineSkipBytes?: number; preserveRawPageBytes?: boolean } = {}
+  ) {
     const normalized = normalizeSelection(selection)
     this.maxBytes = normalized.maxBytes
     this.maxLines = normalized.maxLines ?? Number.MAX_SAFE_INTEGER
     this.mode = normalized.mode
-    this.includeRe = compileFilter(selection.include, selection.ignoreCase, 'include')
-    this.excludeRe = compileFilter(selection.exclude, selection.ignoreCase, 'exclude')
-    this.filtering = this.includeRe !== undefined || this.excludeRe !== undefined
+    this.includeMatcher = compileFilter(selection.include, selection.ignoreCase, 'include')
+    this.excludeMatcher = compileFilter(selection.exclude, selection.ignoreCase, 'exclude')
+    this.filtering = this.includeMatcher !== undefined || this.excludeMatcher !== undefined
+    this.current = new BoundedByteBuffer(this.maxBytes, this.mode)
+    this.selected = new ByteRing(this.maxBytes)
+    this.initialLineSkipBytes = Math.max(0, Math.floor(internal.initialLineSkipBytes ?? 0))
+    this.preserveRawPageBytes = internal.preserveRawPageBytes === true
   }
 
-  /** Feed raw output; partial lines are held until their newline arrives. */
-  push(chunk: string): void {
-    if (chunk.length === 0) return
-    this.bytes += byteLength(chunk)
-    const text = this.rest + chunk
+  /** Feed raw bytes; a line candidate never grows beyond maxBytes. */
+  push(chunk: OutputChunk): void {
+    forEachRawChunk(chunk, (raw) => this.pushRaw(raw))
+  }
+
+  private pushRaw(raw: Buffer): void {
+    if (raw.length === 0) return
+    this.bytes += raw.length
     let start = 0
     for (;;) {
-      const nl = text.indexOf('\n', start)
+      const nl = raw.indexOf(0x0a, start)
       if (nl === -1) break
-      this.pushLine(text.slice(start, nl))
+      this.pushLineBytes(raw.subarray(start, nl), raw.subarray(nl, nl + 1))
       start = nl + 1
     }
-    this.rest = text.slice(start)
+    this.pushFragment(raw.subarray(start))
   }
 
   /** Feed one complete line. Reports whether — and how much of — it was kept. */
   pushLine(line: string): LineFate {
-    this.lines++
-    if (!this.matches(line)) {
-      this.droppedByFilter++
-      return { kept: false }
-    }
-    this.matched++
-    if (this.full) {
-      this.truncated = true
-      return { kept: false }
-    }
-    return this.add(line)
+    const raw = Buffer.from(line, 'utf8')
+    this.bytes += raw.length
+    this.pushFragment(raw)
+    return this.finishLine()
   }
 
   /** Flush a trailing line that never got its newline. */
-  end(): void {
+  end(finalUtf8 = true): void {
     if (this.ended) return
     this.ended = true
-    if (this.rest.length > 0) this.pushLine(this.rest)
-    this.rest = ''
+    this.finalUtf8 = finalUtf8
+    if (this.currentRawBytes > 0) this.finishLine()
   }
 
   text(): string {
-    return this.kept.join('\n')
+    return this.rawBytes().toString('utf8')
+  }
+
+  /** The exact selected bytes, for lossless base64 retained-output reads. */
+  rawBytes(): Buffer {
+    return this.selected.bytes()
   }
 
   report(retained = false): StreamReport {
-    const text = this.text()
     return {
       bytes: this.bytes,
       lines: this.lines,
-      returnedBytes: byteLength(text),
-      returnedLines: this.kept.length,
+      returnedBytes: this.selected.byteLength,
+      returnedLines: this.keptLines,
       ...(this.filtering ? { matchedLines: this.matched } : {}),
       truncated: this.truncated,
       filtered: this.filtering,
@@ -208,45 +459,145 @@ export class OutputWindow {
     return this.truncated || this.droppedByFilter > 0
   }
 
-  private matches(line: string): boolean {
-    if (!this.filtering) return true
-    const probe = line.length > MATCH_LINE_CAP ? line.slice(0, MATCH_LINE_CAP) : line
-    if (this.includeRe && !this.includeRe.test(probe)) return false
-    if (this.excludeRe && this.excludeRe.test(probe)) return false
-    return true
+  /** Test/debug invariant: selected bytes plus the current line stay bounded. */
+  get bufferedBytes(): number {
+    return this.selected.byteLength + this.current.bufferedBytes
   }
 
-  private add(line: string): LineFate {
-    this.kept.push(line)
-    this.keptBytes += byteLength(line) + 1
-    if (this.mode === 'head') {
-      if (this.keptBytes <= this.maxBytes && this.kept.length <= this.maxLines) return { kept: true }
-      this.full = true
+  get isFiltering(): boolean {
+    return this.filtering
+  }
+
+  get pendingInputBytes(): number {
+    return this.currentRawBytes
+  }
+
+  /** An unfiltered raw page may stop mid-line; a filter must see the whole line. */
+  get canFinalizePartialPage(): boolean {
+    if (this.mode !== 'head' || this.currentRawBytes === 0) return false
+    const remaining = this.maxBytes - this.selected.byteLength
+    if (this.currentRawBytes < remaining) return false
+    return !this.filtering
+  }
+
+  private pushFragment(fragment: Uint8Array): void {
+    if (fragment.byteLength === 0) return
+    this.captureLineBytes(fragment)
+    this.includeMatcher?.push(fragment)
+    this.excludeMatcher?.push(fragment)
+  }
+
+  /** Capture only the requested suffix of the first aligned line. */
+  private captureLineBytes(fragment: Uint8Array): void {
+    const skip = this.lines === 0 ? this.initialLineSkipBytes : 0
+    const captureAt = Math.min(fragment.byteLength, Math.max(0, skip - this.currentRawBytes))
+    if (captureAt < fragment.byteLength) this.current.push(fragment.subarray(captureAt))
+    this.currentRawBytes += fragment.byteLength
+  }
+
+  private pushLineBytes(content: Uint8Array, terminator: Uint8Array): LineFate {
+    this.pushFragment(content)
+    this.captureLineBytes(terminator)
+    return this.finishLine()
+  }
+
+  private finishLine(): LineFate {
+    const rawLineBytes = this.currentRawBytes
+    const lineStart = this.completedInputBytes
+    const captureSkip = this.lines === 0 ? Math.min(this.initialLineSkipBytes, rawLineBytes) : 0
+    const selectedRawLineBytes = rawLineBytes - captureSkip
+    this.completedInputBytes += rawLineBytes
+    this.lines++
+    const matches = (!this.includeMatcher || this.includeMatcher.matched) &&
+      (!this.excludeMatcher || !this.excludeMatcher.matched)
+    let fate: LineFate
+    if (!matches) {
+      this.droppedByFilter++
+      fate = { kept: false }
+    } else {
+      this.matched++
+      fate = this.add(this.current.bytes(), selectedRawLineBytes)
+      if (fate.kept) {
+        this.hasKeptInputOffset = true
+        this.lastKeptInputOffset = fate.partialBytes === undefined
+          ? this.completedInputBytes
+          : lineStart + captureSkip + fate.partialBytes
+      }
+    }
+    this.current.reset()
+    this.currentRawBytes = 0
+    this.includeMatcher?.reset()
+    this.excludeMatcher?.reset()
+    return fate
+  }
+
+  private add(line: Buffer, rawLineBytes: number): LineFate {
+    if (this.full) {
       this.truncated = true
-      if (this.kept.length > 1) {
-        const dropped = this.kept.pop()
-        this.keptBytes -= byteLength(dropped ?? '') + 1
+      return { kept: false }
+    }
+    if (rawLineBytes > line.length) this.truncated = true
+    if (this.mode === 'head') {
+      const remaining = this.maxBytes - this.selected.byteLength
+      if (remaining <= 0 || this.keptLines >= this.maxLines) {
+        this.full = true
+        this.truncated = true
         return { kept: false }
       }
-      // One line alone is over budget: return the part that fits and let the
-      // reader resume inside the line rather than losing its remainder.
-      const only = sliceBytes(line, this.maxBytes, 'head')
-      this.kept = [only]
-      this.keptBytes = byteLength(only)
-      return { kept: true, partialBytes: this.keptBytes }
+      // A filtered page must resume at a line boundary. Splitting a matching
+      // line here would make the next request start after its match text and
+      // silently discard the remainder when it re-applies the filter.
+      if (this.filtering && this.keptLines > 0 && line.length > remaining) {
+        this.full = true
+        this.truncated = true
+        return { kept: false }
+      }
+      const proposed = line.subarray(0, Math.min(line.length, remaining))
+      const canReturnFinalInvalidUtf8 = this.finalUtf8 && proposed.length === line.length
+      const safeLength = this.preserveRawPageBytes || canReturnFinalInvalidUtf8
+        ? proposed.length
+        : utf8SafeHeadLength(proposed)
+      if (safeLength === 0) {
+        this.full = true
+        this.truncated = true
+        // The producer may append the continuation bytes after this active
+        // snapshot. Mark offset zero as an intentional resume point.
+        return { kept: true, partialBytes: 0 }
+      }
+      const selected = proposed.subarray(0, safeLength)
+      if (selected.length < line.length) this.truncated = true
+      this.selected.append(selected)
+      this.keptLines++
+      this.full =
+        this.selected.byteLength >= this.maxBytes || this.keptLines >= this.maxLines || selected.length < rawLineBytes
+      return selected.length < rawLineBytes ? { kept: true, partialBytes: selected.length } : { kept: true }
     }
-    while (this.kept.length > 1 && (this.keptBytes > this.maxBytes || this.kept.length > this.maxLines)) {
-      const dropped = this.kept.shift()
-      this.keptBytes -= byteLength(dropped ?? '') + 1
+    const tailEnd = this.preserveRawPageBytes || this.finalUtf8 ? line.length : utf8SafeHeadLength(line)
+    const trailingIncompleteBytes = line.length - tailEnd
+    let tailStart = 0
+    while (
+      !this.preserveRawPageBytes &&
+      tailStart < Math.min(3, tailEnd) &&
+      isUtf8Continuation(line[tailStart] ?? 0)
+    ) tailStart++
+    const selected = line.subarray(tailStart, tailEnd)
+    if (tailStart > 0 || trailingIncompleteBytes > 0) this.truncated = true
+    if (selected.length === 0) {
+      return { kept: true, partialBytes: Math.max(0, rawLineBytes - trailingIncompleteBytes) }
+    }
+    const dropped = this.selected.append(selected)
+    this.keptLines = Math.max(0, this.keptLines - dropped.newlines) + 1
+    if (dropped.bytes > 0) this.truncated = true
+    if (!this.preserveRawPageBytes && this.selected.trimLeadingContinuation() > 0) this.truncated = true
+    while (this.keptLines > this.maxLines) {
+      const removed = this.selected.dropFirstLine()
+      if (removed.bytes === 0) break
+      this.keptLines = Math.max(0, this.keptLines - Math.max(1, removed.newlines))
       this.truncated = true
     }
-    if (this.kept.length === 1 && this.keptBytes > this.maxBytes) {
-      const only = sliceBytes(this.kept[0] ?? '', this.maxBytes, 'tail')
-      if (only !== this.kept[0]) this.truncated = true
-      this.kept = [only]
-      this.keptBytes = byteLength(only)
-    }
-    return { kept: true }
+    return trailingIncompleteBytes > 0
+      ? { kept: true, partialBytes: rawLineBytes - trailingIncompleteBytes }
+      : { kept: true }
   }
 }
 
@@ -266,21 +617,28 @@ class RunSink {
     this.window = new OutputWindow(selection)
   }
 
-  push(chunk: string): void {
-    if (chunk.length === 0) return
-    this.window.push(chunk)
-    // Once retention has failed the window keeps working; retrying the write
-    // per chunk would only repeat the same error.
-    if (this.writeError) return
-    if (this.fd === null) this.open()
-    if (this.fd === null) return
-    try {
-      // Written synchronously so a still-running command is readable *now*:
-      // a buffered stream would leave a live tail several chunks behind.
-      writeSync(this.fd, chunk, null, 'utf8')
-    } catch (err) {
-      this.writeError = err instanceof Error ? err : new Error(String(err))
-    }
+  push(chunk: OutputChunk): void {
+    forEachRawChunk(chunk, (raw) => {
+      if (raw.length === 0) return
+      this.window.push(raw)
+      // Once retention has failed the window keeps working; retrying the write
+      // per chunk would only repeat the same error.
+      if (this.writeError) return
+      if (this.fd === null) this.open()
+      if (this.fd === null) return
+      try {
+        // Written synchronously so a still-running command is readable *now*:
+        // a buffered stream would leave a live tail several chunks behind.
+        let offset = 0
+        while (offset < raw.length) {
+          const written = writeSync(this.fd, raw, offset, raw.length - offset)
+          if (written <= 0) throw new Error('retained output write made no progress')
+          offset += written
+        }
+      } catch (err) {
+        this.writeError = err instanceof Error ? err : new Error(String(err))
+      }
+    })
   }
 
   finish(): { retained: boolean; error: string | null } {
@@ -294,14 +652,22 @@ class RunSink {
       this.fd = null
     }
     if (this.writeError) {
-      rmSync(this.file, { force: true })
+      try {
+        rmSync(this.file, { force: true })
+      } catch {
+        // Best-effort cleanup; the run manifest will not advertise this file.
+      }
       return { retained: false, error: this.writeError.message }
     }
     if (!this.window.bytes) return { retained: false, error: null }
     // Nothing was held back: the caller already has every byte, so keeping a
     // second copy would only grow Hotel storage.
     if (!this.window.withheld) {
-      rmSync(this.file, { force: true })
+      try {
+        rmSync(this.file, { force: true })
+      } catch {
+        // The run directory cleanup below gets another chance.
+      }
       return { retained: false, error: null }
     }
     this.retained = true
@@ -360,7 +726,7 @@ export class ActiveRun {
     }
   }
 
-  push(stream: OutputStreamName, chunk: string): void {
+  push(stream: OutputStreamName, chunk: OutputChunk): void {
     if (this.finished) return
     this.sinks[stream].push(chunk)
   }
@@ -444,6 +810,8 @@ export interface RunReadOptions extends OutputSelection {
   stream?: OutputStreamName
   /** Start the scan at this byte offset — pass a previous read's nextOffset to page forward. */
   offsetBytes?: number
+  /** Return exact selected bytes as base64 instead of decoding them as UTF-8 text. */
+  encoding?: OutputEncoding
 }
 
 export interface RunReadResult {
@@ -451,6 +819,9 @@ export interface RunReadResult {
   stream: OutputStreamName
   status: 'running' | 'exited'
   text: string
+  encoding: OutputEncoding
+  /** Present when encoding=base64; concatenate decoded pages for exact recovery. */
+  contentBase64?: string
   /** Size of the retained stream at the moment of the read. */
   bytes: number
   offsetBytes: number
@@ -478,6 +849,7 @@ export class RunOutputStore {
   private readonly active = new Map<string, ActiveRun>()
   private readonly maxRetainedRuns: number
   private readonly maxRetainedBytes: number
+  private lastFinishedAtMs = 0
 
   constructor(
     private readonly userData: string,
@@ -506,17 +878,37 @@ export class RunOutputStore {
 
   complete(run: ActiveRun, code: number): RunOutcome {
     const { outcome, summary } = run.finish(code)
+    // ISO timestamps only carry milliseconds. Make completion order strict so
+    // several tiny commands finishing in one tick still prune oldest-first.
+    this.lastFinishedAtMs = Math.max(Date.now(), this.lastFinishedAtMs + 1)
+    summary.finishedAt = new Date(this.lastFinishedAtMs).toISOString()
     this.active.delete(run.runId)
     if (outcome.retained) {
       try {
         writeFileSync(join(run.directory, 'run.json'), JSON.stringify(summary, null, 2), 'utf8')
-      } catch {
-        // A missing manifest only costs discoverability, never the command.
+      } catch (error) {
+        // Without a manifest the advertised run id cannot be read after this
+        // method returns. Fail the retention claim closed and clean up.
+        outcome.retained = false
+        outcome.stdout.report.retained = false
+        outcome.stderr.report.retained = false
+        outcome.notes = [
+          `complete raw output could not be retained: ${error instanceof Error ? error.message : String(error)}`
+        ]
+        try {
+          rmSync(run.directory, { recursive: true, force: true })
+        } catch {
+          // An undiscoverable leftover is swept by a later prune.
+        }
       }
     } else if (existsSync(run.directory)) {
-      rmSync(run.directory, { recursive: true, force: true })
+      try {
+        rmSync(run.directory, { recursive: true, force: true })
+      } catch {
+        // Storage cleanup must not turn a successful Room command into failure.
+      }
     }
-    this.prune(run.roomId)
+    this.prune(run.roomId, outcome.retained ? run.runId : undefined)
     return outcome
   }
 
@@ -525,7 +917,7 @@ export class RunOutputStore {
     const running = [...this.active.values()].filter((run) => run.roomId === roomId).map((run) => run.summary())
     const retained = this.retainedSummaries(roomId)
     running.sort((a, b) => b.startedAt.localeCompare(a.startedAt))
-    retained.sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+    retained.sort((a, b) => (b.finishedAt ?? b.startedAt).localeCompare(a.finishedAt ?? a.startedAt))
     return [...running, ...retained]
   }
 
@@ -537,22 +929,52 @@ export class RunOutputStore {
       throw new Error(`no output is retained for run ${runId} — list_room_runs shows what this Room still has`)
     }
     const stream: OutputStreamName = opts.stream ?? 'stdout'
+    const encoding: OutputEncoding = opts.encoding ?? 'utf8'
     const file = join(dir, `${stream}.log`)
     const status: 'running' | 'exited' = active ? 'running' : 'exited'
-    const window = new OutputWindow(opts)
     const offsetBytes = Math.max(0, Math.floor(opts.offsetBytes ?? 0))
     if (!existsSync(file)) {
-      return emptyRead(runId, stream, status, offsetBytes)
+      return emptyRead(runId, stream, status, offsetBytes, encoding)
     }
     const size = statSync(file).size
-    if (offsetBytes >= size) return { ...emptyRead(runId, stream, status, offsetBytes), bytes: size, nextOffset: size, eof: true }
-    const scan = scanFile(file, offsetBytes, window)
+    if (offsetBytes >= size) {
+      return { ...emptyRead(runId, stream, status, offsetBytes, encoding), bytes: size, nextOffset: size, eof: true }
+    }
+    const filtering = hasFilters(opts)
+    if (filtering && opts.mode === 'tail') {
+      throw new Error('filtered retained-output reads use head paging; omit mode or set mode=head')
+    }
+    const selection: RunReadOptions = {
+      ...opts,
+      // A retained read is a paging operation, unlike exec's inline diagnostic
+      // window. Start at the requested offset unless tail was explicit.
+      mode: filtering ? 'head' : (opts.mode ?? 'head')
+    }
+    const normalized = normalizeSelection(selection)
+    const filteredLineStart = filtering ? findFilteredLineStart(file, offsetBytes) : offsetBytes
+    const scanOffset = !filtering && normalized.mode === 'tail'
+      ? Math.max(offsetBytes, size - normalized.maxBytes - (encoding === 'utf8' ? 3 : 0))
+      : filteredLineStart
+    const window = new OutputWindow(selection, {
+      initialLineSkipBytes: filtering ? offsetBytes - filteredLineStart : 0,
+      preserveRawPageBytes: encoding === 'base64'
+    })
+    const scan = scanFile(
+      file,
+      scanOffset,
+      size,
+      window,
+      status === 'exited' || !filtering,
+      status === 'exited'
+    )
     const report = window.report(true)
     return {
       runId,
       stream,
       status,
-      text: window.text(),
+      text: encoding === 'utf8' ? window.text() : '',
+      encoding,
+      ...(encoding === 'base64' ? { contentBase64: window.rawBytes().toString('base64') } : {}),
       bytes: size,
       offsetBytes,
       nextOffset: scan.nextOffset,
@@ -562,30 +984,59 @@ export class RunOutputStore {
       returnedBytes: report.returnedBytes,
       returnedLines: report.returnedLines,
       ...(report.matchedLines !== undefined ? { matchedLines: report.matchedLines } : {}),
-      truncated: report.truncated || !scan.reachedEnd,
+      truncated: scanOffset > offsetBytes || report.truncated || !scan.reachedEnd || scan.pendingLine,
       filtered: report.filtered
     }
   }
 
   /** Drop the oldest retained runs once a Room holds too many, or too much. */
-  prune(roomId: string): void {
+  prune(roomId: string, protectedRunId?: string): void {
     const root = this.roomDir(roomId)
     if (!existsSync(root)) return
     const summaries = this.retainedSummaries(roomId, true)
-    summaries.sort((a, b) => b.summary.startedAt.localeCompare(a.summary.startedAt))
+    summaries.sort((a, b) => {
+      if (a.summary.runId === b.summary.runId) return 0
+      if (a.summary.runId === protectedRunId) return -1
+      if (b.summary.runId === protectedRunId) return 1
+      return (b.summary.finishedAt ?? b.summary.startedAt).localeCompare(a.summary.finishedAt ?? a.summary.startedAt)
+    })
     let kept = 0
     let bytes = 0
-    for (const entry of summaries) {
+    let pruningSuffix = false
+    for (const [index, entry] of summaries.entries()) {
+      // The newest/just-finished run is the only recovery path promised in the
+      // exec response. Keep it even when that one run alone exceeds the byte
+      // budget, then evict every older run until the policy is satisfied.
+      const mustKeep = index === 0
+      const fits = !pruningSuffix && kept < this.maxRetainedRuns && bytes + entry.bytes <= this.maxRetainedBytes
+      if (!mustKeep && !fits) {
+        // Retention is newest-first, not a bin-packing problem. Once one run
+        // does not fit, every older run is part of the pruned suffix even if a
+        // smaller one could fit in the remaining bytes.
+        pruningSuffix = true
+        try {
+          rmSync(join(root, entry.summary.runId), { recursive: true, force: true })
+        } catch {
+          // A later completion retries pruning; never fail the command itself.
+        }
+        continue
+      }
       kept++
       bytes += entry.bytes
-      if (kept > this.maxRetainedRuns || bytes > this.maxRetainedBytes) {
-        rmSync(join(root, entry.summary.runId), { recursive: true, force: true })
-      }
+      if (bytes > this.maxRetainedBytes || kept >= this.maxRetainedRuns) pruningSuffix = true
     }
-    // Directories without a manifest are crash leftovers: no run can read them.
+    // Missing or invalid manifests are crash leftovers: no run can safely read
+    // or account for them, so their logs must not escape the retention cap.
     for (const name of safeReaddir(root)) {
       if (this.active.has(name)) continue
-      if (!existsSync(join(root, name, 'run.json'))) rmSync(join(root, name), { recursive: true, force: true })
+      const directory = join(root, name)
+      if (!readRetainedSummary(join(directory, 'run.json'), name, roomId)) {
+        try {
+          rmSync(directory, { recursive: true, force: true })
+        } catch {
+          // A later prune retries crash-leftover cleanup.
+        }
+      }
     }
   }
 
@@ -598,15 +1049,38 @@ export class RunOutputStore {
       if (this.active.has(name)) continue
       const manifest = join(root, name, 'run.json')
       if (!existsSync(manifest)) continue
-      try {
-        const summary = JSON.parse(readFileSync(manifest, 'utf8')) as RunSummary
-        if (summary.runId !== name) continue
-        out.push({ summary, bytes: retainedBytes(join(root, name)) })
-      } catch {
-        // An unreadable manifest is pruned rather than reported.
-      }
+      const summary = readRetainedSummary(manifest, name, roomId)
+      if (summary) out.push({ summary, bytes: retainedBytes(join(root, name)) })
     }
     return withBytes ? out : out.map((entry) => entry.summary)
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isStoredStreamSummary(value: unknown): value is RunSummary['stdout'] {
+  if (!isRecord(value)) return false
+  return Number.isSafeInteger(value.bytes) && (value.bytes as number) >= 0 &&
+    Number.isSafeInteger(value.lines) && (value.lines as number) >= 0 &&
+    typeof value.retained === 'boolean'
+}
+
+function readRetainedSummary(file: string, runId: string, roomId: string): RunSummary | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (!isRecord(value)) return null
+    if (value.runId !== runId || value.roomId !== roomId) return null
+    if (!Array.isArray(value.cmd) || !value.cmd.every((part) => typeof part === 'string')) return null
+    if (value.actor !== 'user' && value.actor !== 'devhotel' && value.actor !== 'agent') return null
+    if (typeof value.startedAt !== 'string' || !Number.isFinite(Date.parse(value.startedAt))) return null
+    if (typeof value.finishedAt !== 'string' || !Number.isFinite(Date.parse(value.finishedAt))) return null
+    if (value.status !== 'exited' || (value.code !== null && !Number.isInteger(value.code))) return null
+    if (!isStoredStreamSummary(value.stdout) || !isStoredStreamSummary(value.stderr)) return null
+    return value as unknown as RunSummary
+  } catch {
+    return null
   }
 }
 
@@ -632,12 +1106,20 @@ function retainedBytes(dir: string): number {
   return total
 }
 
-function emptyRead(runId: string, stream: OutputStreamName, status: 'running' | 'exited', offsetBytes: number): RunReadResult {
+function emptyRead(
+  runId: string,
+  stream: OutputStreamName,
+  status: 'running' | 'exited',
+  offsetBytes: number,
+  encoding: OutputEncoding
+): RunReadResult {
   return {
     runId,
     stream,
     status,
     text: '',
+    encoding,
+    ...(encoding === 'base64' ? { contentBase64: '' } : {}),
     bytes: 0,
     offsetBytes,
     nextOffset: offsetBytes,
@@ -651,6 +1133,43 @@ function emptyRead(runId: string, stream: OutputStreamName, status: 'running' | 
   }
 }
 
+function hasFilters(selection: OutputSelection): boolean {
+  return (selection.include !== undefined && selection.include !== '') ||
+    (selection.exclude !== undefined && selection.exclude !== '')
+}
+
+/**
+ * Align a filtered continuation to its logical line so include and exclude are
+ * re-evaluated instead of trusting an arbitrary caller-supplied mid-line
+ * offset. The backward work is fixed; longer lines use unfiltered byte paging.
+ */
+function findFilteredLineStart(file: string, offsetBytes: number): number {
+  if (offsetBytes <= 0) return 0
+  const fd = openSync(file, 'r')
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  let cursor = offsetBytes
+  let inspected = 0
+  try {
+    while (cursor > 0 && inspected < MAX_SCAN_BYTES) {
+      const requested = Math.min(buffer.byteLength, cursor, MAX_SCAN_BYTES - inspected)
+      const start = cursor - requested
+      const read = readSync(fd, buffer, 0, requested, start)
+      if (read === 0) break
+      const newline = buffer.subarray(0, read).lastIndexOf(0x0a)
+      if (newline !== -1) return start + newline + 1
+      cursor = start
+      inspected += read
+    }
+    if (cursor === 0) return 0
+    throw new Error(
+      `filtered retained-output reads require logical lines no longer than ${MAX_SCAN_BYTES} bytes; ` +
+      'page this stream without include/exclude'
+    )
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /**
  * Scan a retained stream from `offsetBytes`, feeding complete lines into the
  * window. Head mode stops as soon as the window is full, so paging through a
@@ -661,66 +1180,59 @@ function emptyRead(runId: string, stream: OutputStreamName, status: 'running' | 
 function scanFile(
   file: string,
   offsetBytes: number,
-  window: OutputWindow
-): { nextOffset: number; scannedBytes: number; reachedEnd: boolean } {
+  size: number,
+  window: OutputWindow,
+  finalizeTrailingLine: boolean,
+  finalizeUtf8: boolean
+): { nextOffset: number; scannedBytes: number; reachedEnd: boolean; pendingLine: boolean } {
   const fd = openSync(file, 'r')
   const buffer = Buffer.allocUnsafe(64 * 1024)
-  const decoder = new StringDecoder('utf8')
-  const deadline = Date.now() + SCAN_TIME_BUDGET_MS
-  const NEWLINE = '\n'
+  const scanLimit = Math.min(size, offsetBytes + MAX_SCAN_BYTES)
   let position = offsetBytes
-  let pending = ''
-  /** Absolute byte offset of `pending`'s first character. */
-  let pendingStart = offsetBytes
-  /** Offset just past the last line the window kept. */
-  let afterKept = offsetBytes
-  /** Offset just past the last complete line seen, kept or not. */
-  let afterSeen = offsetBytes
   let reachedEnd = false
-  let outOfTime = false
   try {
-    for (;;) {
-      const read = readSync(fd, buffer, 0, buffer.byteLength, position)
-      if (read === 0) {
-        pending += decoder.end()
-        if (pending.length > 0) {
-          const lineStart = pendingStart
-          afterSeen = pendingStart + byteLength(pending)
-          if (!window.full) {
-            const fate = window.pushLine(pending)
-            if (fate.kept) afterKept = fate.partialBytes === undefined ? afterSeen : lineStart + fate.partialBytes
-          }
-        }
-        reachedEnd = !window.full
-        break
-      }
+    while (position < scanLimit) {
+      const requested = Math.min(buffer.byteLength, scanLimit - position)
+      const read = readSync(fd, buffer, 0, requested, position)
+      if (read === 0) break
       position += read
-      pending += decoder.write(buffer.subarray(0, read))
-      let start = 0
-      for (;;) {
-        const nl = pending.indexOf(NEWLINE, start)
-        if (nl === -1) break
-        const line = pending.slice(start, nl)
-        const lineStart = pendingStart + byteLength(pending.slice(0, start))
-        const lineEnd = pendingStart + byteLength(pending.slice(0, nl + 1))
-        afterSeen = lineEnd
-        const fate = window.pushLine(line)
-        if (fate.kept) afterKept = fate.partialBytes === undefined ? lineEnd : lineStart + fate.partialBytes
-        start = nl + 1
-        if (window.full) break
-      }
-      if (start > 0) {
-        pendingStart += byteLength(pending.slice(0, start))
-        pending = pending.slice(start)
-      }
-      outOfTime = Date.now() > deadline
-      if (window.full || outOfTime) break
+      window.push(buffer.subarray(0, read))
+      // An unfiltered head page can make progress without waiting for an
+      // unbounded logical line to terminate.
+      if (window.canFinalizePartialPage) window.end(false)
+      if (window.full) break
+    }
+    reachedEnd = position >= size
+    if (reachedEnd && finalizeTrailingLine) window.end(finalizeUtf8)
+
+    // A filtered first pass has to see a complete line before it can decide
+    // whether that line matches. Refuse a >4 MiB logical line instead of
+    // synchronously scanning an attacker-controlled amount on Electron's main
+    // thread. Unfiltered byte paging remains available for that output.
+    if (
+      window.isFiltering &&
+      !reachedEnd &&
+      position >= scanLimit &&
+      window.pendingInputBytes > 0 &&
+      window.completedInputBytes === 0
+    ) {
+      throw new Error(
+        `filtered retained-output reads require logical lines no longer than ${MAX_SCAN_BYTES} bytes; ` +
+        'page this stream without include/exclude'
+      )
     }
   } finally {
     closeSync(fd)
   }
-  // Resuming after the last *kept* line never skips a matching line; when the
-  // scan gave up on time instead, resume after the last line it looked at.
-  const nextOffset = reachedEnd ? afterSeen : outOfTime ? Math.max(afterSeen, afterKept) : afterKept
-  return { nextOffset, scannedBytes: position - offsetBytes, reachedEnd }
+  const pendingLine = window.pendingInputBytes > 0
+  const relativeNext = reachedEnd && !window.truncated && !pendingLine
+    ? position - offsetBytes
+    : window.hasKeptInputOffset
+      ? window.lastKeptInputOffset
+      : window.completedInputBytes
+  const nextOffset = offsetBytes + relativeNext
+  // If the window filled before the snapshot ended, the caller has more to
+  // page even when the final 64KB read happened to reach the snapshot's EOF.
+  reachedEnd = reachedEnd && !pendingLine && (!window.truncated || nextOffset >= size)
+  return { nextOffset, scannedBytes: position - offsetBytes, reachedEnd, pendingLine }
 }

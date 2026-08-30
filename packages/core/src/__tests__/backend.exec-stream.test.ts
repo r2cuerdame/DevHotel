@@ -28,10 +28,10 @@ describe('runDocker output sinks', () => {
     const result = await runDocker(emitScript(2000, 'both'), {
       timeoutMs: 30_000,
       onStdout: (chunk) => {
-        stdout += chunk
+        stdout += Buffer.from(chunk).toString('utf8')
       },
       onStderr: (chunk) => {
-        stderr += chunk
+        stderr += Buffer.from(chunk).toString('utf8')
       }
     })
 
@@ -50,12 +50,24 @@ describe('runDocker output sinks', () => {
     expect(result.stdout.split('\n').filter(Boolean)).toHaveLength(50)
   })
 
+  it('delivers raw bytes to a chunk sink without UTF-8 replacement', async () => {
+    const chunks: Buffer[] = []
+    const result = await runDocker(['-e', 'process.stdout.write(Buffer.from([0, 255, 13, 10, 254]))'], {
+      timeoutMs: 30_000,
+      onStdout: (chunk) => chunks.push(Buffer.from(chunk))
+    })
+
+    expect(result.code).toBe(0)
+    expect(Buffer.concat(chunks)).toEqual(Buffer.from([0, 255, 13, 10, 254]))
+    expect(result.stdout).toBe('')
+  })
+
   it('delivers the timeout notice through the stderr sink instead of dropping it', async () => {
     let stderr = ''
     const result = await runDocker(['-e', 'setTimeout(() => {}, 30000)'], {
       timeoutMs: 250,
       onStderr: (chunk) => {
-        stderr += chunk
+        stderr += Buffer.from(chunk).toString('utf8')
       }
     })
 

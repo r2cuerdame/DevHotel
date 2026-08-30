@@ -54,23 +54,28 @@ the command.
   with `output`: raw bytes and lines against returned bytes and lines, and
   whether the text was truncated or filtered. Callers choose `maxBytes`,
   `maxLines`, and `head`/`tail`.
-- **Server-side filtering.** `include` / `exclude` regular expressions (with
-  `ignoreCase`) select lines inside the Room, so finding one stack trace no
+- **Server-side filtering.** `include` / `exclude` literal substrings (with
+  ASCII `ignoreCase`) select lines inside the Room using bounded,
+  non-backtracking matching, so finding one stack trace no
   longer means wrapping every command in `grep`/`sed` — and the lines the filter
   removed are still retrievable.
 - **Retention instead of loss.** Whenever the response could not carry
   everything, the complete raw output is kept under the Room and returned as
   `output.runId`. `read_run_output` pages it by byte offset (`nextOffset` /
-  `eof`) or searches it with the same filters, and `list_room_runs` shows what a
-  Room is running now and what it still holds. Retention is bounded (20 runs,
-  256MB per Room) and is deleted with the Room.
+  `eof`), returns arbitrary bytes losslessly with `encoding=base64`, or searches
+  it with the same filters, and `list_room_runs` shows what a Room is running
+  now and what it still holds. Retention is bounded (20 runs, 256MB per Room)
+  and is deleted with the Room.
 - **Readable while it runs.** Output streams into Room-owned run storage as it
   is produced and reads take no Room lock, so a Gradle build's output is
   readable before it exits — that is also how a caller tells "hung" from "busy"
   after a dropped connection.
 - **Bounded memory too.** The Room exec path no longer accumulates the whole
   stream in the app's memory; it keeps the configured window and streams the
-  rest to disk. A timeout notice still reaches the caller through stderr.
+  rest to disk byte-for-byte, including exact CRLF/final-newline boundaries. A
+  timeout notice still reaches the caller through stderr. The just-finished
+  retained run remains readable even when it alone exceeds the Room byte cap.
+  Retained reads also use a fixed 4MiB scan budget per request.
 
 ## 0.4.3 — 2026-08-16
 

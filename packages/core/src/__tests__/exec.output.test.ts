@@ -38,7 +38,7 @@ describe('bounded Room command output', () => {
     const res = await orch.execInRoom('room1abc', ['node', '--version'])
 
     expect(res.code).toBe(0)
-    expect(res.stdout).toBe('v22.14.0')
+    expect(res.stdout).toBe('v22.14.0\n')
     expect(res.output.retained).toBe(false)
     expect(res.output.stdout.truncated).toBe(false)
     expect(res.output.notes).toEqual([])
@@ -65,8 +65,8 @@ describe('bounded Room command output', () => {
 
     const first = orch.readRunOutput('room1abc', res.output.runId, { mode: 'head', maxBytes: 4096 })
     expect(first.text.startsWith('node0 0\n')).toBe(true)
-    const found = orch.readRunOutput('room1abc', res.output.runId, { include: '^node49 99$' })
-    expect(found.text).toBe('node49 99')
+    const found = orch.readRunOutput('room1abc', res.output.runId, { include: 'node49 99' })
+    expect(found.text).toBe('node49 99\n')
     expect(found.eof).toBe(true)
   })
 
@@ -76,17 +76,17 @@ describe('bounded Room command output', () => {
     }
 
     const res = await orch.execInRoom('room1abc', ['sh', '-lc', 'adb logcat -d'], {
-      output: { include: 'FATAL|E/AndroidRuntime', maxBytes: 4096 }
+      output: { include: 'FATAL EXCEPTION', maxBytes: 4096 }
     })
 
-    expect(res.stdout).toBe('E/AndroidRuntime: FATAL EXCEPTION: main')
+    expect(res.stdout).toBe('E/AndroidRuntime: FATAL EXCEPTION: main\n')
     expect(res.output.stdout.filtered).toBe(true)
     expect(res.output.stdout.matchedLines).toBe(1)
     expect(res.output.stdout.lines).toBe(4001)
     // The lines the filter removed are not lost: the raw stream is retained.
     expect(res.output.retained).toBe(true)
-    const raw = orch.readRunOutput('room1abc', res.output.runId, { include: '^D/chatty2 1999$' })
-    expect(raw.text).toBe('D/chatty2 1999')
+    const raw = orch.readRunOutput('room1abc', res.output.runId, { include: 'D/chatty2 1999' })
+    expect(raw.text).toBe('D/chatty2 1999\n')
   })
 
   it('bounds and retains stdout and stderr separately for a mixed-stream build', async () => {
@@ -98,8 +98,8 @@ describe('bounded Room command output', () => {
     })
 
     expect(res.code).toBe(1)
-    expect(res.stdout.endsWith('out 2999')).toBe(true)
-    expect(res.stderr.endsWith('err 2999')).toBe(true)
+    expect(res.stdout.endsWith('out 2999\n')).toBe(true)
+    expect(res.stderr.endsWith('err 2999\n')).toBe(true)
     expect(res.output.stdout.retained).toBe(true)
     expect(res.output.stderr.retained).toBe(true)
     expect(res.output.notes).toHaveLength(2)
@@ -122,9 +122,7 @@ describe('bounded Room command output', () => {
 
   it('rejects an output selection it cannot honour before running anything', async () => {
     await expect(orch.execInRoom('room1abc', ['echo', 'hi'], { output: { maxBytes: 4 } })).rejects.toThrow(/maxBytes/)
-    await expect(orch.execInRoom('room1abc', ['echo', 'hi'], { output: { include: '(' } })).rejects.toThrow(
-      /valid regular expression/
-    )
+    await expect(orch.execInRoom('room1abc', ['echo', 'hi'], { output: { include: 'x'.repeat(500) } })).rejects.toThrow(/longer than/)
   })
 
   it('deletes retained run output together with the Room', async () => {

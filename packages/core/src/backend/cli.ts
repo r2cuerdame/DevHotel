@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import path from 'node:path'
-import type { ExecResult } from './types'
+import type { ExecOutputChunk, ExecResult } from './types'
 
 export interface RunDockerOpts {
   timeoutMs?: number
@@ -16,9 +16,9 @@ export interface RunDockerOpts {
    * result, so a caller that bounds or retains the stream itself never pays for
    * a gigabyte of log in JS memory.
    */
-  onStdout?: (chunk: string) => void
+  onStdout?: (chunk: ExecOutputChunk) => void
   /** Same contract as onStdout, for stderr. */
-  onStderr?: (chunk: string) => void
+  onStderr?: (chunk: ExecOutputChunk) => void
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -202,27 +202,29 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
         finish()
       })
       child.stdout.pipe(output)
-    } else {
+    } else if (!opts.onStdout) {
       child.stdout.setEncoding('utf8')
     }
-    child.stderr.setEncoding('utf8')
+    if (!opts.onStderr) child.stderr.setEncoding('utf8')
     if (!opts.outputFile) {
-      child.stdout.on('data', (chunk: string) => {
+      child.stdout.on('data', (chunk: string | Buffer) => {
         if (opts.onStdout) {
           opts.onStdout(chunk)
           return
         }
-        stdout += chunk
-        outRest = feed(outRest, chunk)
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+        stdout += text
+        outRest = feed(outRest, text)
       })
     }
-    child.stderr.on('data', (chunk: string) => {
+    child.stderr.on('data', (chunk: string | Buffer) => {
       if (opts.onStderr) {
         opts.onStderr(chunk)
         return
       }
-      stderr += chunk
-      errRest = feed(errRest, chunk)
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+      stderr += text
+      errRest = feed(errRest, text)
     })
 
     const timer = setTimeout(() => {

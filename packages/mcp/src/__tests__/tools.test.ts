@@ -207,6 +207,7 @@ describe('makeTools', () => {
       runId: RUN_ID,
       stream: 'stderr',
       offsetBytes: 4096,
+      encoding: 'base64',
       include: 'FATAL'
     })
     expect(firstText(res)).toContain('FATAL')
@@ -214,6 +215,7 @@ describe('makeTools', () => {
     const query = new URLSearchParams(req!.url.split('?')[1])
     expect(query.get('stream')).toBe('stderr')
     expect(query.get('offsetBytes')).toBe('4096')
+    expect(query.get('encoding')).toBe('base64')
     expect(query.get('include')).toBe('FATAL')
   })
 

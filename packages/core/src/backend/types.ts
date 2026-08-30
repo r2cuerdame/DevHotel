@@ -43,6 +43,8 @@ export interface ExecResult {
   stderr: string
 }
 
+export type ExecOutputChunk = string | Uint8Array
+
 export interface ExecOpts {
   timeoutMs?: number
   /**
@@ -50,9 +52,9 @@ export interface ExecOpts {
    * accumulate the stream into `ExecResult.stdout` — that is the whole point:
    * the caller bounds and retains the output itself.
    */
-  onStdout?: (chunk: string) => void
+  onStdout?: (chunk: ExecOutputChunk) => void
   /** Same contract as onStdout, for stderr. */
-  onStderr?: (chunk: string) => void
+  onStderr?: (chunk: ExecOutputChunk) => void
 }
 
 export interface ManagedNetwork {

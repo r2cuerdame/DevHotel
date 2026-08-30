@@ -305,11 +305,24 @@ describe('bounded command output contract', () => {
   })
 
   it('reads run-output query strings as typed values', () => {
-    const parsed = zRunOutputQuery.parse({ stream: 'stderr', offsetBytes: '4096', maxBytes: '512', ignoreCase: 'true' })
-    expect(parsed).toEqual({ stream: 'stderr', offsetBytes: 4096, maxBytes: 512, ignoreCase: true })
+    const parsed = zRunOutputQuery.parse({
+      stream: 'stderr',
+      offsetBytes: '4096',
+      encoding: 'base64',
+      maxBytes: '512',
+      ignoreCase: 'true'
+    })
+    expect(parsed).toEqual({
+      stream: 'stderr',
+      offsetBytes: 4096,
+      encoding: 'base64',
+      maxBytes: 512,
+      ignoreCase: true
+    })
     expect(zRunOutputQuery.parse({ ignoreCase: 'false' }).ignoreCase).toBe(false)
     expect(zRunOutputQuery.safeParse({ offsetBytes: '-1' }).success).toBe(false)
     expect(zRunOutputQuery.safeParse({ stream: 'both' }).success).toBe(false)
+    expect(zRunOutputQuery.safeParse({ encoding: 'hex' }).success).toBe(false)
     expect(zRunOutputQuery.safeParse({ path: '/workspace/secret' }).success).toBe(false)
   })
 })

@@ -282,6 +282,7 @@ export const zRunOutputQuery = z
   .object({
     stream: z.enum(['stdout', 'stderr']).optional(),
     offsetBytes: z.coerce.number().int().min(0).optional(),
+    encoding: z.enum(['utf8', 'base64']).optional(),
     maxBytes: z.coerce.number().int().min(256).max(4_000_000).optional(),
     maxLines: z.coerce.number().int().min(1).max(1_000_000).optional(),
     mode: z.enum(['head', 'tail']).optional(),

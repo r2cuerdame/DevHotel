@@ -69,7 +69,7 @@ room's Changes list. Host boundaries hold:
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
 | `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs?, output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
 | `GET /v1/rooms/:id/runs` | | `{ runs[] }` — commands running now, plus finished runs whose full output the Room still holds |
-| `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
+| `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&encoding=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
 | `POST /v1/rooms/:id/checks` | | 15-step check report (includes `line-endings`) |
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
@@ -105,12 +105,18 @@ truncation, and never the whole of a 400MB logcat inlined into one response.
 | `maxBytes` | inline budget **per stream** (default `64000`, min `256`, max `4000000`) |
 | `maxLines` | inline budget per stream, in lines |
 | `mode` | `tail` (default) or `head` — which end to keep when it does not fit |
-| `include` | keep only lines matching this regular expression (server-side `grep`) |
-| `exclude` | drop lines matching this regular expression (server-side `grep -v`) |
-| `ignoreCase` | match `include`/`exclude` case-insensitively |
+| `include` | keep only lines containing this literal UTF-8 substring |
+| `exclude` | drop lines containing this literal UTF-8 substring |
+| `ignoreCase` | match ASCII letters in `include`/`exclude` case-insensitively |
 
-Filters are regular expressions of at most 200 characters, matched against the
-first 8KB of each line.
+Filters are literal strings of at most 200 characters. Regex metacharacters
+have no special meaning. Matching uses a streaming, non-backtracking algorithm
+whose memory is bounded by the filter length, so an Agent cannot stall the
+Electron main thread with a catastrophic regular expression.
+
+Returned text preserves the selected raw line terminators exactly, including
+CRLF, a final newline, and newline-only output. Byte counts describe the raw
+bytes selected, not a newline-normalized reconstruction.
 
 `output` on the response reports what happened:
 
@@ -138,19 +144,33 @@ by run id. When the response did carry everything, nothing is retained and
 
 Retention lives in Hotel storage beside the Room's logs and artifacts, is
 deleted with the Room, and is bounded — a Room keeps its most recent 20
-retained runs, up to 256MB.
+retained runs, up to 256MB. The just-finished run named by an exec response is
+never immediately pruned; if that single run exceeds 256MB it remains readable
+and all older retained runs are evicted.
 
 ### Reading a run
 
 `GET /v1/rooms/:id/runs/:runId/output` takes the same selection fields plus
-`stream` (`stdout` | `stderr`, default `stdout`) and `offsetBytes`. It returns
-the window plus `bytes` (size of the retained stream), `nextOffset`, `eof`,
-`scannedBytes`, `scannedLines` and the same truncation flags.
+`stream` (`stdout` | `stderr`, default `stdout`), `offsetBytes`, and `encoding`
+(`utf8` | `base64`, default `utf8`). It returns the window plus `bytes` (size
+of the retained stream), `nextOffset`, `eof`, `scannedBytes`, `scannedLines`
+and the same truncation flags. Base64 reads leave `text` empty and return the
+selected bytes in `contentBase64`, so arbitrary non-UTF-8 output is recoverable
+exactly.
 
-- **Page through everything**: `mode=head` and pass each response's
-  `nextOffset` back as `offsetBytes` until `eof` is true.
+- **Page through everything**: reads default to `mode=head`; pass each
+  response's `nextOffset` back as `offsetBytes` until `eof` is true. Decode and
+  concatenate `contentBase64` pages when byte-for-byte recovery is required.
 - **Search it**: pass `include`; `nextOffset` resumes after the last returned
   line, so paging stays exact even when the filter skipped the lines between.
+  Filtered reads are head-paged and deliberately reject a single logical line
+  over 4MiB; page that stream without `include`/`exclude` instead.
+
+Each synchronous read scans at most 4MiB forward. A filtered continuation may
+also inspect at most 4MiB backward to find and re-evaluate its line boundary.
+This fixed work bound protects Electron's main thread; a response can therefore
+return no matching text with `eof=false` and a larger `nextOffset`, which the
+caller should continue paging normally.
 
 Reading takes no Room lock, so a run is readable **while it is still running** —
 `GET /v1/rooms/:id/runs` lists active runs with the bytes and lines they have

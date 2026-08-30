@@ -33,10 +33,10 @@ const outputControls = {
   mode: z
     .enum(['head', 'tail'])
     .optional()
-    .describe("which end to keep when the output does not fit — 'tail' (default) for build/log failures, 'head' for dumps"),
-  include: z.string().max(200).optional().describe('server-side grep: keep only lines matching this regular expression'),
-  exclude: z.string().max(200).optional().describe('server-side grep -v: drop lines matching this regular expression'),
-  ignoreCase: z.boolean().optional().describe('match include/exclude case-insensitively')
+    .describe("which end to keep when output does not fit — run_in_room defaults to 'tail'; read_run_output defaults to 'head' for paging"),
+  include: z.string().max(200).optional().describe('keep only lines containing this literal string'),
+  exclude: z.string().max(200).optional().describe('drop lines containing this literal string'),
+  ignoreCase: z.boolean().optional().describe('match ASCII letters in include/exclude case-insensitively')
 }
 
 type OutputArgs = {
@@ -157,7 +157,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'run_in_room',
       description:
-        'Run a command inside the room (never on the host). Dead runtimes are rejected with a stable DevHotel error code and recovery hint before Docker exec. Returns the exit code plus a BOUNDED view of stdout/stderr: by default the last 64000 bytes of each. Filter server-side with include/exclude regexes and choose head/tail with mode. Nothing is dropped silently — `output` reports raw versus returned bytes/lines, and complete raw output is retained under `output.runId` whenever the response omits content. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at DevHotel.',
+        'Run a command inside the room (never on the host). Dead runtimes are rejected with a stable DevHotel error code and recovery hint before Docker exec. Returns the exit code plus a BOUNDED view of stdout/stderr: by default the last 64000 bytes of each. Filter server-side with literal include/exclude substrings and choose head/tail with mode. Nothing is dropped silently — `output` reports raw versus returned bytes/lines, and complete raw output is retained under `output.runId` whenever the response omits content. UI input belongs here too: drive an Android room with `adb -s emulator-5554 shell input ...`, never with host mouse/keyboard automation aimed at DevHotel.',
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
@@ -169,10 +169,13 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'read_run_output',
       description:
-        "Read the complete raw output of a command run in the room — the one run_in_room retained when its response was bounded. Page through it with offsetBytes + the nextOffset each read returns, or filter it server-side with include/exclude. Works while the command is still running, so a long Gradle build or logcat capture is readable before it exits.",
+        "Read output for a run whose output.retained flag is true (or a still-running run). Reads default to head paging: pass each nextOffset back as offsetBytes until eof. Filter server-side with literal include/exclude, or set encoding=base64 to recover arbitrary raw bytes exactly. Works while the command is still running.",
       schema: {
         roomId: zRoomId,
-        runId: z.string().uuid().describe('run id from run_in_room (output.runId) or list_room_runs'),
+        runId: z
+          .string()
+          .uuid()
+          .describe('run id from list_room_runs, or output.runId when run_in_room returned output.retained=true'),
         stream: z.enum(['stdout', 'stderr']).optional().describe("defaults to 'stdout'"),
         offsetBytes: z
           .number()
@@ -180,13 +183,18 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           .min(0)
           .optional()
           .describe('start at this byte offset: pass the previous read nextOffset to continue'),
+        encoding: z
+          .enum(['utf8', 'base64'])
+          .optional()
+          .describe("'utf8' (default) returns text; 'base64' returns exact bytes in contentBase64"),
         ...outputControls
       },
       handler: wrap(async (a) =>
         (await getClient()).readRunOutput(a.roomId, a.runId, {
           ...outputSelection(a),
           ...(a.stream !== undefined ? { stream: a.stream } : {}),
-          ...(a.offsetBytes !== undefined ? { offsetBytes: a.offsetBytes } : {})
+          ...(a.offsetBytes !== undefined ? { offsetBytes: a.offsetBytes } : {}),
+          ...(a.encoding !== undefined ? { encoding: a.encoding } : {})
         })
       )
     },

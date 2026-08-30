@@ -16,6 +16,7 @@ export interface OutputSelection {
 export interface RunOutputQuery extends OutputSelection {
   stream?: 'stdout' | 'stderr'
   offsetBytes?: number
+  encoding?: 'utf8' | 'base64'
 }
 
 export interface StreamReport {

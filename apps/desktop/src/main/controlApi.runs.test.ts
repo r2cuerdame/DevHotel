@@ -75,13 +75,14 @@ describe('agent control API bounded command output', () => {
     const readRunOutput = vi.fn(() => ({ runId: RUN_ID, text: 'FATAL', eof: true }))
     await withApi({ readRunOutput } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {
       const res = await fetch(
-        `${base}/v1/rooms/room1abc/runs/${RUN_ID}/output?stream=stderr&offsetBytes=4096&maxBytes=512&mode=head&include=FATAL&ignoreCase=true`,
+        `${base}/v1/rooms/room1abc/runs/${RUN_ID}/output?stream=stderr&offsetBytes=4096&encoding=base64&maxBytes=512&mode=head&include=FATAL&ignoreCase=true`,
         { headers }
       )
       expect(res.status).toBe(200)
       expect(readRunOutput).toHaveBeenCalledWith('room1abc', RUN_ID, {
         stream: 'stderr',
         offsetBytes: 4096,
+        encoding: 'base64',
         maxBytes: 512,
         mode: 'head',
         include: 'FATAL',
