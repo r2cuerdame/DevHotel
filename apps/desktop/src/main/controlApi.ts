@@ -16,8 +16,12 @@ import {
   zApplyChangeBody,
   zAgentCreateRoomInput,
   zAgentAdbBody,
+  zArtifactId,
+  zArtifactListLimit,
+  zArtifactExportBody,
   zAttachDeviceBody,
   zCancelRequestBody,
+  zCaptureScreenshotArtifactBody,
   zExecBody,
   zHeartbeatBody,
   zLogKind,
@@ -49,8 +53,9 @@ import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/
  * result can explicitly opt into a bounded wait.
  */
 const DEFAULT_START_WAIT_MS = 0
-const DEFAULT_BODY_LIMIT_BYTES = 24 * 1024 * 1024
 const ANDROID_AUTOMATION_BODY_LIMIT_BYTES = 64 * 1024
+const DEFAULT_JSON_BODY_MAX_BYTES = 64 * 1024
+const ROOM_FILE_JSON_BODY_MAX_BYTES = 23 * 1024 * 1024
 
 /** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
 function parseWaitMs(raw: string | null): number {
@@ -275,6 +280,39 @@ export async function startControlApi(
         }
       }
 
+      // Durable screenshots are addressed by both Room and artifact ID. Every
+      // lookup keeps the Room predicate, so an ID learned in one Room cannot
+      // read or export another Room's content.
+      if (safeRoomId && op === 'artifacts') {
+        const artifactSegment = parts[4]
+        if (!artifactSegment && req.method === 'GET') {
+          const rawLimit = url.searchParams.get('limit')
+          const limit = rawLimit === null ? undefined : zArtifactListLimit.parse(Number(rawLimit))
+          sendJson(res, 200, { artifacts: orch.listRoomArtifacts(safeRoomId, limit) })
+          return
+        }
+        if (artifactSegment === 'screenshots' && !parts[5] && req.method === 'POST') {
+          const body = zCaptureScreenshotArtifactBody.parse(await readBody(req))
+          sendJson(res, 201, await orch.captureAndroidScreenshotArtifact(safeRoomId, body, 'agent'))
+          return
+        }
+        const artifactId = zArtifactId.safeParse(artifactSegment)
+        if (artifactId.success && !parts[5] && req.method === 'GET') {
+          sendJson(res, 200, orch.getRoomArtifact(safeRoomId, artifactId.data))
+          return
+        }
+        if (artifactId.success && parts[5] === 'content' && !parts[6] && req.method === 'GET') {
+          const { artifact, content } = orch.readRoomArtifactContent(safeRoomId, artifactId.data)
+          sendPng(res, artifact.filename, artifact.sha256, content)
+          return
+        }
+        if (artifactId.success && parts[5] === 'export' && !parts[6] && req.method === 'POST') {
+          const body = zArtifactExportBody.parse(await readBody(req))
+          sendJson(res, 200, await orch.exportRoomArtifact(safeRoomId, artifactId.data, body, 'agent'))
+          return
+        }
+      }
+
       if (safeRoomId && op && req.method === 'POST') {
         switch (op) {
           case 'start': {
@@ -408,7 +446,7 @@ export async function startControlApi(
         return
       }
       if (safeRoomId && op === 'file' && req.method === 'PUT') {
-        const body = (await readBody(req)) as { path?: unknown; contentBase64?: unknown }
+        const body = (await readBody(req, ROOM_FILE_JSON_BODY_MAX_BYTES)) as { path?: unknown; contentBase64?: unknown }
         if (typeof body.path !== 'string' || typeof body.contentBase64 !== 'string') {
           sendJson(res, 400, { error: 'expected { path, contentBase64 }' })
           return
@@ -515,26 +553,38 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
-async function readBody(req: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTES): Promise<unknown> {
-  const declared = Number(req.headers['content-length'])
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
-      recoveryHint: 'Send only the bounded fields accepted by this route.',
+function sendPng(res: ServerResponse, filename: string, sha256: string, content: Buffer): void {
+  res.writeHead(200, {
+    'content-type': 'image/png',
+    'content-length': content.byteLength,
+    'content-disposition': `inline; filename="${filename}"`,
+    'cache-control': 'private, no-store',
+    'x-content-type-options': 'nosniff',
+    'x-devhotel-sha256': sha256
+  })
+  res.end(content)
+}
+
+async function readBody(req: IncomingMessage, maxBytes = DEFAULT_JSON_BODY_MAX_BYTES): Promise<unknown> {
+  const declaredLength = Number(req.headers['content-length'] ?? 0)
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new DevHotelError('REQUEST_BODY_TOO_LARGE', 'Request body exceeds the allowed size.', {
+      recoveryHint: 'Send only the documented JSON fields within the endpoint limit.',
       httpStatus: 413
     })
   }
   const chunks: Buffer[] = []
   let bytes = 0
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    bytes += buffer.byteLength
+  for await (const rawChunk of req) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk)
+    bytes += chunk.byteLength
     if (bytes > maxBytes) {
-      throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
-        recoveryHint: 'Send only the bounded fields accepted by this route.',
+      throw new DevHotelError('REQUEST_BODY_TOO_LARGE', 'Request body exceeds the allowed size.', {
+        recoveryHint: 'Send only the documented JSON fields within the endpoint limit.',
         httpStatus: 413
       })
     }
-    chunks.push(buffer)
+    chunks.push(chunk)
   }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw) return {}

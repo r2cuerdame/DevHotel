@@ -34,6 +34,7 @@ import type {
   AndroidUiDumpResult,
   AndroidWaitForTextInput,
   AndroidWaitForTextResult,
+  ArtifactExportResult,
   BackupInfo,
   ChangeEntry,
   CheckReport,
@@ -50,17 +51,20 @@ import type {
   RoomPlan,
   RoomRecord,
   RoomRuntimeStatus,
+  RoomArtifact,
   RuntimeRoomRecord,
   SafeHostResyncOutcome,
   SourceType
 } from '@devhotel/shared'
-import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
+import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY, zArtifactExportBody, zArtifactListLimit } from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
 import { AndroidAutomationSession } from './devices/androidAutomation'
+import { artifactsRepo } from './store/artifactsRepo'
+import { RoomArtifactStore } from './artifacts/store'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
@@ -306,6 +310,7 @@ export class RoomOrchestrator {
   readonly logs: LogHub
   readonly runs: RunOutputStore
   readonly androidInstalls: AndroidAppInstallsRepo
+  readonly artifacts: RoomArtifactStore
   private readonly operations: OperationTracker
   private readonly pendingHostResyncConfirmations = new Map<string, PendingHostResyncConfirmation>()
   private readonly engine = new ChangeEngine()
@@ -346,6 +351,7 @@ export class RoomOrchestrator {
     this.logs = new LogHub(opts.userData, opts.backend)
     this.runs = new RunOutputStore(opts.userData)
     this.androidInstalls = androidAppInstallsRepo(opts.db)
+    this.artifacts = new RoomArtifactStore(opts.userData, artifactsRepo(opts.db))
     this.devices = new AndroidDeviceBroker({
       repo: androidDevicesRepo(opts.db),
       adb: opts.adb ?? new SpawnedAdbHost(),
@@ -369,6 +375,13 @@ export class RoomOrchestrator {
     // dependency. The desktop still exposes its control API when init fails;
     // callers must never keep polling work that died with the prior process.
     this.markInterruptedOperations()
+    for (const room of this.rooms.list()) {
+      try {
+        this.artifacts.reconcileRoom(room.id)
+      } catch (error) {
+        this.olog(room.id, `screenshot artifact recovery needs attention: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     await this.gateway.start()
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
@@ -1650,6 +1663,117 @@ export class RoomOrchestrator {
       }
       this.markWorkspaceModified(roomId)
       return { path: safePath, size: content.byteLength }
+    })
+  }
+
+  listRoomArtifacts(roomId: string, limit = 20): RoomArtifact[] {
+    this.mustGet(roomId)
+    return this.artifacts.list(roomId, zArtifactListLimit.parse(limit))
+  }
+
+  getRoomArtifact(roomId: string, artifactId: string): RoomArtifact {
+    this.mustGet(roomId)
+    const artifact = this.artifacts.get(roomId, artifactId)
+    if (!artifact) {
+      throw new DevHotelError('ARTIFACT_NOT_FOUND', 'Screenshot artifact not found in this Room.', {
+        recoveryHint: 'List this Room’s artifacts and use an ID from that response.',
+        httpStatus: 404
+      })
+    }
+    return artifact
+  }
+
+  readRoomArtifactContent(roomId: string, artifactId: string): { artifact: RoomArtifact; content: Buffer } {
+    this.mustGet(roomId)
+    try {
+      return this.artifacts.readContent(roomId, artifactId)
+    } catch (error) {
+      if (error instanceof Error && /not found in this Room/.test(error.message)) {
+        throw new DevHotelError('ARTIFACT_NOT_FOUND', 'Screenshot artifact not found in this Room.', {
+          recoveryHint: 'List this Room’s artifacts and use an ID from that response.',
+          httpStatus: 404
+        })
+      }
+      throw new DevHotelError('ARTIFACT_CORRUPT', 'Screenshot artifact failed its integrity check.', {
+        recoveryHint: 'Capture a fresh screenshot; the stored artifact was not served.',
+        cause: error
+      })
+    }
+  }
+
+  exportRoomArtifact(
+    roomId: string,
+    artifactId: string,
+    rawInput: { relativePath: string },
+    _actor: Actor
+  ): Promise<ArtifactExportResult> {
+    return this.withRoomLock(roomId, async () => {
+      const input = zArtifactExportBody.parse(rawInput)
+      const room = this.mustGet(roomId)
+      if (room.workspaceMode !== 'hotel') {
+        throw new DevHotelError(
+          'ARTIFACT_EXPORT_NOT_ALLOWED',
+          'Artifacts can be exported only into a Hotel-owned project workspace.',
+          {
+            recoveryHint: 'Move a legacy linked Room into the Hotel before exporting; Host paths are never accepted.',
+            httpStatus: 403
+          }
+        )
+      }
+      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      if (!awake) {
+        throw new DevHotelError('ROOM_RUNTIME_NOT_RUNNING', 'Wake the Room before exporting an artifact.', {
+          recoveryHint: 'Start the Room, wait for it to finish waking, then retry the export.'
+        })
+      }
+      const { artifact, content } = this.readRoomArtifactContent(roomId, artifactId)
+      const targetPath = `/workspace/${input.relativePath}`
+      const targetDirectory = targetPath.slice(0, targetPath.lastIndexOf('/')) || '/workspace'
+      const stageDirectory = `/workspace/.devhotel-artifact-${randomUUID()}`
+      const stagePath = `${stageDirectory}/content.png`
+      let staged = false
+      try {
+        const madeStage = await this.backend.execInRoom(roomId, ['mkdir', stageDirectory], { timeoutMs: 30_000 })
+        if (madeStage.code !== 0) throw new Error('Could not create the private Room artifact staging directory')
+        staged = true
+        const temporaryRoot = join(this.userData, 'tmp')
+        mkdirSync(temporaryRoot, { recursive: true })
+        const temporary = mkdtempSync(join(temporaryRoot, 'artifact-export-'))
+        const hostFile = join(temporary, 'content.png')
+        try {
+          writeFileSync(hostFile, content, { flag: 'wx', mode: 0o600 })
+          await this.backend.copyIntoRoom(roomId, hostFile, stagePath)
+        } finally {
+          rmSync(temporary, { recursive: true, force: true })
+        }
+        if (targetDirectory !== '/workspace') {
+          const madeTarget = await this.backend.execInRoom(roomId, ['mkdir', '-p', targetDirectory], { timeoutMs: 30_000 })
+          if (madeTarget.code !== 0) throw new Error('Could not create the artifact export directory inside the Room')
+        }
+        // A hard link is atomic and fails when the destination already exists.
+        // If a Room path component points outside the workspace volume, the
+        // cross-filesystem link also fails closed instead of following it.
+        const published = await this.backend.execInRoom(roomId, ['ln', stagePath, targetPath], { timeoutMs: 30_000 })
+        if (published.code !== 0) {
+          throw new DevHotelError('ARTIFACT_DESTINATION_EXISTS', 'Artifact export destination already exists or is unsafe.', {
+            recoveryHint: 'Choose a new repo-relative .png path; exports never overwrite project files.'
+          })
+        }
+      } finally {
+        if (staged) {
+          await this.backend.execInRoom(roomId, ['rm', '-f', stagePath], { timeoutMs: 30_000 }).catch(() => undefined)
+          await this.backend.execInRoom(roomId, ['rmdir', stageDirectory], { timeoutMs: 30_000 }).catch(() => undefined)
+        }
+      }
+      this.markWorkspaceModified(roomId)
+      return {
+        artifactId: artifact.id,
+        path: targetPath,
+        relativePath: input.relativePath,
+        sizeBytes: artifact.sizeBytes,
+        sha256: artifact.sha256,
+        markdown: `![${artifact.filename}](${input.relativePath})`
+      }
     })
   }
 

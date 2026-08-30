@@ -219,7 +219,12 @@ fails closed when `--uid` isolation is unavailable; it never reads global logs.
 | `GET /v1/rooms/:id/operations` | `?limit=` | `{ operations }` — this Room's recent long operations, newest first |
 | `GET /v1/rooms/:id/logs` | `?kind=web\|orchestrator` | `{ lines[] }` tail |
 | `GET /v1/rooms/:id/diagnostic` | | `{ text }` secret-redacted bundle |
-| `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | `{ png: base64, source }` — Android rooms; `screen` captures the display (FLAG_SECURE included) |
+| `POST /v1/rooms/:id/artifacts/screenshots` | `{ filename: '*.png', mode?: 'auto'\|'screen', association?: { changeId?, runId? } }` | `201` plus an immutable screenshot artifact receipt. Filename is required; the response contains metadata, never image base64. |
+| `GET /v1/rooms/:id/artifacts` | `?limit=1..100` | `{ artifacts[] }`, newest first, metadata only |
+| `GET /v1/rooms/:id/artifacts/:artifactId` | | one metadata receipt; IDs are resolved only with the owning Room |
+| `GET /v1/rooms/:id/artifacts/:artifactId/content` | | bounded `image/png` bytes with `Content-Length` and `X-DevHotel-Sha256`; integrity is checked before any byte is served |
+| `POST /v1/rooms/:id/artifacts/:artifactId/export` | `{ relativePath: 'docs/evidence/shot.png' }` | writes a new file only inside a Hotel-owned Room workspace and returns `{ path, relativePath, sizeBytes, sha256, markdown }`; absolute/Host/backslash/`.`/`..`/`.git` paths and overwrites are refused |
+| `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | compatibility-only ephemeral `{ png: base64, source }`; new agents should create a durable artifact |
 | `GET /v1/rooms/:id/file` | `?path=/workspace/…` | `{ path, size, contentBase64 }` (16MB cap) |
 | `PUT /v1/rooms/:id/file` | `{ path: '/workspace/…', contentBase64 }` | `{ path, size }` — creates parents, marks workspace modified |
 
@@ -232,6 +237,24 @@ rejected, as is any entry whose parent directory resolves outside the linked
 folder through a symlink. Included generated paths participate in the baseline
 and are copied during linked-folder import. A real conflict response has the shape
 `{ error: "workspace_drift", message, conflictReason: "room-source-modified", changedPaths: [{ path, reason }] }`.
+
+### Screenshot artifacts
+
+Screenshot bytes live in Hotel storage under their owning Room, not in a
+caller-selected Host path. Publication validates the complete PNG structure,
+CRC and bounded decoded dimensions, strips ancillary text/profile chunks, then
+atomically publishes `content.png` with a matching SQLite and on-disk receipt.
+Reads re-check size, SHA-256, receipt equality and PNG canonical form. A Room
+holds at most 500 screenshots and 1 GiB total; each image is at most 16 MiB.
+Crash-left temporary/unindexed screenshot directories are reconciled at startup,
+and deleting the Room removes both receipts and content.
+
+Metadata records the Room revisions, capture time/source/orientation, opaque
+device identity/API/model/version, safe tracked foreground package (or null),
+locale, exact tracked install change/APK digest/time when available, and optional
+change/run association. Raw device serials, lease capabilities, Host paths and
+arbitrary untracked foreground package names are never persisted. Structured
+metadata is passed through the same central secret redactor as diagnostics.
 
 ## Command output
 

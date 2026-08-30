@@ -274,6 +274,27 @@ export const migrations: Migration[] = [
       CREATE INDEX idx_android_app_installs_room_target
         ON android_app_installs(room_id, target_kind, target_id, application_id);
     `
+  },
+  {
+    // Immutable Room screenshot artifacts. Content paths are derived from the
+    // validated Room/artifact IDs and never stored as caller-controlled text.
+    version: 8,
+    sql: `
+      CREATE TABLE room_artifacts (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind = 'android-screenshot'),
+        filename TEXT NOT NULL,
+        media_type TEXT NOT NULL CHECK (media_type = 'image/png'),
+        size_bytes INTEGER NOT NULL CHECK (size_bytes > 0 AND size_bytes <= 16777216),
+        sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+        actor TEXT NOT NULL CHECK (actor IN ('user', 'devhotel', 'agent')),
+        created_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL
+      );
+      CREATE INDEX idx_room_artifacts_room_created
+        ON room_artifacts(room_id, created_at DESC, id DESC);
+    `
   }
 ]
 
