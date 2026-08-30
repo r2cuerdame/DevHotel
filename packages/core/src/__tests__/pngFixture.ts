@@ -29,7 +29,7 @@ function chunk(type: string, data: Uint8Array): Buffer {
 export function screenshotPng(
   width = 2,
   height = 3,
-  opts: { text?: string; filter?: number } = {}
+  opts: { text?: string; filter?: number; idatSuffix?: Uint8Array } = {}
 ): Buffer {
   const header = Buffer.alloc(13)
   header.writeUInt32BE(width, 0)
@@ -39,11 +39,12 @@ export function screenshotPng(
   const rows = Buffer.alloc((width * 4 + 1) * height)
   for (let row = 0; row < height; row++) rows[row * (width * 4 + 1)] = opts.filter ?? 0
   const optional = opts.text ? [chunk('tEXt', Buffer.from(`note\0${opts.text}`, 'utf8'))] : []
+  const imageData = deflateSync(rows)
   return Buffer.concat([
     signature,
     chunk('IHDR', header),
     ...optional,
-    chunk('IDAT', deflateSync(rows)),
+    chunk('IDAT', opts.idatSuffix ? Buffer.concat([imageData, opts.idatSuffix]) : imageData),
     chunk('IEND', Buffer.alloc(0))
   ])
 }

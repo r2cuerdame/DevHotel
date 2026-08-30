@@ -175,9 +175,17 @@ export function validateAndSanitizeScreenshotPng(input: Uint8Array): ValidatedSc
   if (!Number.isSafeInteger(expectedInflated) || expectedInflated > MAX_INFLATED_BYTES) {
     throw new Error('PNG decoded size is outside the safe limit')
   }
+  const compressedBytes = Buffer.concat(compressed)
   let inflated: Buffer
   try {
-    inflated = inflateSync(Buffer.concat(compressed), { maxOutputLength: expectedInflated })
+    const result = inflateSync(compressedBytes, {
+      info: true,
+      maxOutputLength: expectedInflated
+    }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } }
+    inflated = result.buffer
+    if (result.engine.bytesWritten !== compressedBytes.byteLength) {
+      throw new Error('PNG image data contains trailing compressed bytes')
+    }
   } catch {
     throw new Error('PNG image data could not be decoded within the safe limit')
   }

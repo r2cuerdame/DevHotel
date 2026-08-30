@@ -12,7 +12,10 @@ const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
 const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 const ARTIFACT_ID = '99999999-8888-4777-8666-555555555555'
 const OVERSIZED_ARTIFACT_ID = '77777777-6666-4555-8444-333333333333'
-const ARTIFACT_PNG = Buffer.from('directly-reviewable-png')
+const ARTIFACT_PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from('directly-reviewable-png')
+])
 const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
 const artifact = {
   id: ARTIFACT_ID,

@@ -1,5 +1,5 @@
 import { rmSync } from 'node:fs'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeAdbHost, FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
@@ -195,6 +195,36 @@ describe('Android screenshot artifact capture', () => {
       capture: { source: 'screen', width: 2, height: 4 },
       device: { kind: 'emulator', deviceId: null }
     })
+    expect(adb.execs).toEqual([])
+  })
+
+  it('does not switch emulator evidence to a phone granted after exact target resolution', async () => {
+    const { backend, adb, orch } = setup()
+    await orch.refreshAndroidDevices()
+    adb.execs = []
+    const png = screenshotPng(2, 3, { text: 'exact-target-race-padding' })
+    emulatorStatus(backend, png)
+    const openSession = orch.openAndroidAutomationSessionLocked.bind(orch)
+    vi.spyOn(orch, 'openAndroidAutomationSessionLocked').mockImplementationOnce(async (roomId, target) => {
+      const session = await openSession(roomId, target)
+      const granted = await orch.devices.requestDevice({
+        roomId,
+        project: 'demo',
+        purpose: 'acceptance',
+        workerId: 'queued-worker'
+      })
+      expect(granted.state).toBe('granted')
+      return session
+    })
+
+    const artifact = await orch.captureAndroidScreenshotArtifact(
+      'aaaa1111',
+      { filename: 'exact-emulator.png' },
+      'agent'
+    )
+
+    expect(artifact.metadata.device).toMatchObject({ kind: 'emulator', deviceId: null })
+    expect(artifact.metadata.capture.source).toBe('adb')
     expect(adb.execs).toEqual([])
   })
 })

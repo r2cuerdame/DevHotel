@@ -2,6 +2,7 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFi
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
+import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
 import {
@@ -34,11 +35,21 @@ import {
   webName,
   workspaceSnapshotVolume,
 } from './naming'
-import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, ManagedNetwork, WebSpec } from './types'
+import type {
+  AnchorSpec,
+  ExecOpts,
+  ExecOutputChunk,
+  ExecResult,
+  ExportedArtifact,
+  IsolationBackend,
+  ManagedNetwork,
+  WebSpec
+} from './types'
 
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
+const SCREENSHOT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
   '.git',
@@ -55,6 +66,30 @@ const GENERATED_SYNC_DIRS = [
   'target',
   'coverage'
 ] as const
+
+function boundedCommandOutput(maxBytes: number): {
+  push(chunk: ExecOutputChunk): void
+  text(): string
+  readonly exceeded: boolean
+} {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  let exceeded = false
+  return {
+    push(chunk) {
+      const data = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk)
+      const remaining = Math.max(0, maxBytes - bytes)
+      if (remaining > 0) {
+        const captured = data.subarray(0, remaining)
+        chunks.push(captured)
+        bytes += captured.byteLength
+      }
+      if (data.byteLength > remaining) exceeded = true
+    },
+    text: () => Buffer.concat(chunks, bytes).toString('utf8'),
+    get exceeded() { return exceeded }
+  }
+}
 
 function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
   const findFilter = entries === 'files' ? "\\( -type f -o -type l \\) " : ''
@@ -1416,15 +1451,22 @@ export class OciCliBackend implements IsolationBackend {
 
   async captureEmulatorScreen(roomId: string): Promise<string> {
     await this.assertPinnedEngineIdentity()
+    const stdout = boundedCommandOutput(SCREENSHOT_MAX_BASE64_BYTES)
+    const stderr = boundedCommandOutput(64 * 1024)
     const result = await runDocker([
       'exec',
       emulatorName(roomId),
       'sh',
       '-c',
       "ffmpeg -y -loglevel error -f x11grab -i :0 -frames:v 1 -f image2pipe -vcodec png - | base64 | tr -d '\\n'"
-    ])
-    must(result, 'capture emulator screen')
-    const png = result.stdout.trim()
+    ], {
+      onStdout: (chunk) => stdout.push(chunk),
+      onStderr: (chunk) => stderr.push(chunk)
+    })
+    if (stdout.exceeded || stderr.exceeded) throw new Error('emulator screen capture exceeded its safety limit')
+    const completed = { ...result, stdout: stdout.text(), stderr: stderr.text() }
+    must(completed, 'capture emulator screen')
+    const png = completed.stdout.trim()
     if (png.length < 100) throw new Error('emulator screen capture returned no image')
     return png
   }

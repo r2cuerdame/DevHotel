@@ -30,4 +30,10 @@ describe('screenshot PNG validation', () => {
       /IEND|after/
     )
   })
+
+  it('rejects hidden bytes appended inside the checksummed IDAT payload', () => {
+    expect(() =>
+      validateAndSanitizeScreenshotPng(screenshotPng(2, 3, { idatSuffix: Buffer.from('hidden-secret') }))
+    ).toThrow(/image data/)
+  })
 })

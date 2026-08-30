@@ -91,7 +91,10 @@ describe('Room screenshot artifact export', () => {
     })
     expect(backend.execInRoomCalls.map(({ cmd }) => cmd)).toEqual(
       expect.arrayContaining([
-        ['mkdir', '-p', '/workspace/docs/evidence'],
+        ['mkdir', '/workspace/docs'],
+        ['mkdir', '/workspace/docs/evidence'],
+        ['test', '!', '-L', '/workspace/docs'],
+        ['test', '!', '-L', '/workspace/docs/evidence'],
         expect.arrayContaining(['ln', expect.stringMatching(/^\/workspace\/\.devhotel-artifact-/), '/workspace/docs/evidence/login-success.png'])
       ])
     )
@@ -107,10 +110,31 @@ describe('Room screenshot artifact export', () => {
       cmd[0] === 'ln' ? { code: 1, stdout: '', stderr: 'File exists' } : { code: 0, stdout: '', stderr: '' }
 
     await expect(
-      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'existing.png' }, 'agent')
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/existing.png' }, 'agent')
     ).rejects.toMatchObject({ code: 'ARTIFACT_DESTINATION_EXISTS' })
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 4, syncStatus: expect.not.stringMatching(/^modified$/) })
     expect(backend.execInRoomCalls.map(({ cmd }) => cmd[0])).toEqual(expect.arrayContaining(['rm', 'rmdir']))
+    expect(backend.execInRoomCalls.map(({ cmd }) => cmd)).toEqual(
+      expect.arrayContaining([['rmdir', '/workspace/docs']])
+    )
+  })
+
+  it('refuses an existing symlink parent before publishing into it', async () => {
+    const { backend, orch } = setup()
+    const artifact = publish(orch)
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      if (cmd[0] === 'mkdir' && cmd[1] === '/workspace/docs') return { code: 1, stdout: '', stderr: 'exists' }
+      if (cmd[0] === 'test' && cmd[1] === '!' && cmd[3] === '/workspace/docs') {
+        return { code: 1, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/unsafe.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_UNSAFE_PATH' })
+    expect(backend.execInRoomCalls.some(({ cmd }) => cmd[0] === 'ln')).toBe(false)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 4, syncStatus: expect.not.stringMatching(/^modified$/) })
   })
 
   it('refuses legacy Host-bound workspaces before staging any bytes', async () => {
@@ -122,5 +146,17 @@ describe('Room screenshot artifact export', () => {
     ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_NOT_ALLOWED' })
     expect(backend.execInRoomCalls).toEqual([])
     expect(backend.calls.some((call) => call.startsWith('copyIntoRoom:'))).toBe(false)
+  })
+
+  it('removes artifact receipts and content with the owning Room', async () => {
+    const { userData, orch } = setup()
+    const artifact = publish(orch)
+    const artifactDirectory = join(userData, 'rooms', 'aaaa1111', 'artifacts', 'screenshots', artifact.id)
+    expect(existsSync(artifactDirectory)).toBe(true)
+
+    await orch.deleteRoom('aaaa1111', 'user')
+
+    expect(existsSync(artifactDirectory)).toBe(false)
+    expect(orch.artifacts.get('aaaa1111', artifact.id)).toBeNull()
   })
 })

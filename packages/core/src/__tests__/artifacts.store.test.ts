@@ -1,6 +1,9 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { AndroidScreenshotArtifactMetadata } from '@devhotel/shared'
+import {
+  SCREENSHOT_ARTIFACT_MAX_PER_ROOM,
+  type AndroidScreenshotArtifactMetadata
+} from '@devhotel/shared'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RoomArtifactStore } from '../artifacts/store'
 import { artifactsRepo } from '../store/artifactsRepo'
@@ -127,6 +130,23 @@ describe('Room screenshot artifact store', () => {
       })
     ).toThrow(/test refusal/)
     expect(readdirSync(join(userData, 'rooms', 'aaaa1111', 'artifacts', 'screenshots'))).toEqual([])
+  })
+
+  it('refuses the Room quota before creating artifact storage', () => {
+    const { store, repo, userData } = setup()
+    repo.usageForRoom = () => ({ count: SCREENSHOT_ARTIFACT_MAX_PER_ROOM, bytes: 0 })
+
+    expect(() =>
+      store.publishScreenshot({
+        roomId: 'aaaa1111',
+        filename: 'over-quota.png',
+        png: screenshotPng(),
+        actor: 'agent',
+        createdAt: '2026-08-31T00:00:00.000Z',
+        metadata: metadata('aaaa1111')
+      })
+    ).toThrow(/quota reached/)
+    expect(existsSync(join(userData, 'rooms', 'aaaa1111', 'artifacts'))).toBe(false)
   })
 
   it('cleans crash leftovers but never traverses into other artifact families', () => {

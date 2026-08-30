@@ -148,9 +148,13 @@ export class ControlClient {
     if (res.headers.get('content-type')?.split(';', 1)[0] !== 'image/png') {
       throw new Error('DevHotel control API returned a non-PNG artifact')
     }
-    const declared = Number(res.headers.get('content-length') ?? 0)
-    if (Number.isFinite(declared) && declared > SCREENSHOT_ARTIFACT_MAX_BYTES) {
-      throw new Error('DevHotel control API artifact exceeds the 16MB response limit')
+    const declaredHeader = res.headers.get('content-length')
+    const declared = declaredHeader === null ? null : Number(declaredHeader)
+    if (
+      declared !== null &&
+      (!Number.isSafeInteger(declared) || declared < 1 || declared > SCREENSHOT_ARTIFACT_MAX_BYTES)
+    ) {
+      throw new Error('DevHotel control API artifact has an invalid length or exceeds the 16MB response limit')
     }
     if (!res.body) throw new Error('DevHotel control API returned an empty artifact response')
     const reader = res.body.getReader()
@@ -167,9 +171,18 @@ export class ControlClient {
       chunks.push(value)
     }
     const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), length)
+    if (declared !== null && declared !== bytes.byteLength) {
+      throw new Error('DevHotel control API artifact content length does not match')
+    }
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    if (bytes.byteLength < pngSignature.byteLength || !bytes.subarray(0, pngSignature.byteLength).equals(pngSignature)) {
+      throw new Error('DevHotel control API artifact bytes are not a PNG')
+    }
     const sha256 = createHash('sha256').update(bytes).digest('hex')
     const expected = res.headers.get('x-devhotel-sha256')
-    if (!expected || expected !== sha256) throw new Error('DevHotel control API artifact checksum does not match')
+    if (!expected || !/^[a-f0-9]{64}$/.test(expected) || expected !== sha256) {
+      throw new Error('DevHotel control API artifact checksum does not match')
+    }
     return { bytes, sha256 }
   }
 

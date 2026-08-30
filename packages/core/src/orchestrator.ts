@@ -18,6 +18,7 @@ import { customAlphabet } from 'nanoid'
 import type {
   Actor,
   AndroidAutomationStatus,
+  AndroidAutomationTarget,
   AndroidCrashScenarioResult,
   AndroidDumpUiInput,
   AndroidForceStopInput,
@@ -168,6 +169,7 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'an
  */
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
+const SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 const ADB_INSTALL_VERBS = new Set(['install', 'install-multiple', 'install-multi-package'])
 const ADB_UNSAFE_HOST_FILE_VERBS = new Set(['pull', 'push', 'restore', 'sideload', 'sync'])
 const ADB_INSTALL_BOOLEAN_FLAGS = new Set([
@@ -242,10 +244,9 @@ function emulatorApiLevel(version: string): number | null {
 }
 
 function decodeScreenshotBase64(value: string): Buffer {
-  const maxEncodedBytes = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
   if (
     value.length === 0 ||
-    value.length > maxEncodedBytes ||
+    value.length > SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES ||
     value.length % 4 !== 0 ||
     !/^[A-Za-z0-9+/]*={0,2}$/.test(value)
   ) {
@@ -1784,7 +1785,7 @@ export class RoomOrchestrator {
       const releaseCapture = this.devices.beginCapturePermit()
       try {
         const session = await this.openAndroidAutomationSessionLocked(roomId, target)
-        const shot = await this.androidScreenshotWithCapturePermit(roomId, input.mode ?? 'auto')
+        const shot = await this.androidScreenshotWithCapturePermit(roomId, input.mode ?? 'auto', session.target)
         const capturedAt = new Date().toISOString()
         let validated: ReturnType<typeof validateAndSanitizeScreenshotPng>
         try {
@@ -1905,10 +1906,15 @@ export class RoomOrchestrator {
       }
       const { artifact, content } = this.readRoomArtifactContent(roomId, artifactId)
       const targetPath = `/workspace/${input.relativePath}`
-      const targetDirectory = targetPath.slice(0, targetPath.lastIndexOf('/')) || '/workspace'
+      const targetDirectories = input.relativePath.split('/').slice(0, -1).reduce<string[]>((paths, segment) => {
+        paths.push(`${paths.at(-1) ?? '/workspace'}/${segment}`)
+        return paths
+      }, [])
       const stageDirectory = `/workspace/.devhotel-artifact-${randomUUID()}`
       const stagePath = `${stageDirectory}/content.png`
+      const createdTargetDirectories: string[] = []
       let staged = false
+      let published = false
       try {
         const madeStage = await this.backend.execInRoom(roomId, ['mkdir', stageDirectory], { timeoutMs: 30_000 })
         if (madeStage.code !== 0) throw new Error('Could not create the private Room artifact staging directory')
@@ -1923,23 +1929,34 @@ export class RoomOrchestrator {
         } finally {
           rmSync(temporary, { recursive: true, force: true })
         }
-        if (targetDirectory !== '/workspace') {
-          const madeTarget = await this.backend.execInRoom(roomId, ['mkdir', '-p', targetDirectory], { timeoutMs: 30_000 })
-          if (madeTarget.code !== 0) throw new Error('Could not create the artifact export directory inside the Room')
+        for (const directory of targetDirectories) {
+          const madeTarget = await this.backend.execInRoom(roomId, ['mkdir', directory], { timeoutMs: 30_000 })
+          if (madeTarget.code === 0) createdTargetDirectories.push(directory)
+          await this.assertSafeArtifactExportDirectory(roomId, directory)
         }
+        // Recheck immediately before publication. Room processes can edit their
+        // workspace while the control-plane lock is held; existing symlink
+        // components must never redirect a supposedly repo-relative export.
+        for (const directory of targetDirectories) await this.assertSafeArtifactExportDirectory(roomId, directory)
         // A hard link is atomic and fails when the destination already exists.
         // If a Room path component points outside the workspace volume, the
         // cross-filesystem link also fails closed instead of following it.
-        const published = await this.backend.execInRoom(roomId, ['ln', stagePath, targetPath], { timeoutMs: 30_000 })
-        if (published.code !== 0) {
+        const publication = await this.backend.execInRoom(roomId, ['ln', stagePath, targetPath], { timeoutMs: 30_000 })
+        if (publication.code !== 0) {
           throw new DevHotelError('ARTIFACT_DESTINATION_EXISTS', 'Artifact export destination already exists or is unsafe.', {
             recoveryHint: 'Choose a new repo-relative .png path; exports never overwrite project files.'
           })
         }
+        published = true
       } finally {
         if (staged) {
           await this.backend.execInRoom(roomId, ['rm', '-f', stagePath], { timeoutMs: 30_000 }).catch(() => undefined)
           await this.backend.execInRoom(roomId, ['rmdir', stageDirectory], { timeoutMs: 30_000 }).catch(() => undefined)
+        }
+        if (!published) {
+          for (const directory of createdTargetDirectories.reverse()) {
+            await this.backend.execInRoom(roomId, ['rmdir', directory], { timeoutMs: 30_000 }).catch(() => undefined)
+          }
         }
       }
       this.markWorkspaceModified(roomId)
@@ -1952,6 +1969,17 @@ export class RoomOrchestrator {
         markdown: `![${artifact.filename}](${input.relativePath})`
       }
     })
+  }
+
+  private async assertSafeArtifactExportDirectory(roomId: string, directory: string): Promise<void> {
+    const isDirectory = await this.backend.execInRoom(roomId, ['test', '-d', directory], { timeoutMs: 30_000 })
+    const isNotSymlink = await this.backend.execInRoom(roomId, ['test', '!', '-L', directory], { timeoutMs: 30_000 })
+    if (isDirectory.code !== 0 || isNotSymlink.code !== 0) {
+      throw new DevHotelError('ARTIFACT_EXPORT_UNSAFE_PATH', 'Artifact export path contains an unsafe directory.', {
+        recoveryHint: 'Choose a repo-relative path whose parent directories are regular Room workspace directories.',
+        httpStatus: 400
+      })
+    }
   }
 
   /**
@@ -2465,19 +2493,39 @@ export class RoomOrchestrator {
     }
   }
 
-  private async androidScreenshotWithCapturePermit(roomId: string, mode: 'auto' | 'screen'): Promise<{ png: string; source: 'adb' | 'screen' }> {
+  private async androidScreenshotWithCapturePermit(
+    roomId: string,
+    mode: 'auto' | 'screen',
+    exactTarget?: AndroidAutomationTarget
+  ): Promise<{ png: string; source: 'adb' | 'screen' }> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
     if (!awake) throw new Error('Wake the room before taking a screenshot')
     // Auto follows whatever this Room is driving. Explicit screen mode always
     // captures the Room display so FLAG_SECURE surfaces remain visible there.
-    const physicalDevice = this.devices.deviceForRoom(roomId)
+    const assignedPhysicalDevice = this.devices.deviceForRoom(roomId)
+    if (
+      exactTarget?.kind === 'physical' &&
+      (!assignedPhysicalDevice || assignedPhysicalDevice.id !== exactTarget.deviceId)
+    ) {
+      throw new DevHotelError('SCREENSHOT_TARGET_CHANGED', 'Android target changed before screenshot evidence was captured.', {
+        recoveryHint: 'Reacquire the intended target and capture a fresh artifact.'
+      })
+    }
+    // A queued phone can be granted while an emulator capture is starting.
+    // Artifact capture stays on the session resolved before capture instead of
+    // silently switching the pixels to that newly assigned physical target.
+    const physicalDevice = exactTarget?.kind === 'emulator' ? null : assignedPhysicalDevice
     if (physicalDevice && mode === 'auto') {
       const args = ['exec-out', 'screencap', '-p']
       const authorized = this.devices.authorizeInternalOperation(roomId, physicalDevice.id, 'capturing the attached phone screen')
       const result = await this.withDeviceHeartbeat(roomId, physicalDevice.id, authorized.leaseId, () =>
-        this.devices.hostAdb.execBinary(authorized.serial, args, { timeoutMs: 60_000 })
+        this.devices.hostAdb.execBinary(authorized.serial, args, {
+          timeoutMs: 60_000,
+          maxStdoutBytes: SCREENSHOT_ARTIFACT_MAX_BYTES,
+          maxStderrBytes: 64 * 1024
+        })
       )
       const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
       if (result.code === 0 && result.stdout.subarray(0, signature.length).equals(signature)) {
@@ -2490,13 +2538,27 @@ export class RoomOrchestrator {
       throw new Error(`screenshot of ${physicalDevice.nickname} failed: ${safeError.trim().slice(0, 200) || `adb exited ${result.code}`}`)
     }
     if (mode !== 'screen') {
+      const stdout = boundedTextCapture(SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES)
+      const stderr = boundedTextCapture(64 * 1024)
+      let sawStdout = false
+      let sawStderr = false
       const result = await this.backend.execInRoom(
         roomId,
         ['sh', '-lc', `adb -s ${EMULATOR_ADB_SERIAL} exec-out screencap -p | base64 | tr -d '\\n'`],
-        { timeoutMs: 60_000 }
+        {
+          timeoutMs: 60_000,
+          onStdout: (chunk) => { sawStdout = true; stdout.push(chunk) },
+          onStderr: (chunk) => { sawStderr = true; stderr.push(chunk) }
+        }
       )
-      const png = result.stdout.trim()
-      if (result.code === 0 && png.length > 100) return { png, source: 'adb' }
+      // Preserve compatibility with an IsolationBackend that does not yet
+      // honour streaming callbacks while still enforcing the same bound.
+      if (!sawStdout && result.stdout) stdout.push(result.stdout)
+      if (!sawStderr && result.stderr) stderr.push(result.stderr)
+      const png = stdout.text().trim()
+      if (!stdout.exceeded && !stderr.exceeded && result.code === 0 && png.length > 100) {
+        return { png, source: 'adb' }
+      }
     }
     return { png: await this.backend.captureEmulatorScreen(roomId), source: 'screen' }
   }
