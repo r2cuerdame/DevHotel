@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { connectionForSerial, resolveAdbExecutable, SpawnedAdbHost } from '../devices/adbHost'
+import { connectionForSerial, parseAdbPairingServices, resolveAdbExecutable, SpawnedAdbHost } from '../devices/adbHost'
 
 const dirs: string[] = []
 afterEach(() => {
@@ -171,5 +171,64 @@ describe('Host adb output isolation', () => {
       expect(message).toBe('Host ADB process could not be launched; inspect Host diagnostics locally')
       expect(message).not.toMatch(/private-sdk|missing-adb/i)
     }
+  })
+})
+
+describe('Host adb secure pairing', () => {
+  it('parses only strict IPv4 mDNS pairing services and ignores connect, legacy and malformed rows', () => {
+    const output = [
+      'List of discovered mdns services',
+      'adb-private-pair _adb-tls-pairing._tcp 192.0.2.10:37111',
+      'adb-private-connect _adb-tls-connect._tcp 192.0.2.10:37222',
+      'adb-legacy _adb._tcp 192.0.2.10:5555',
+      'adb-private-pair-duplicate _adb-tls-pairing._tcp. 192.0.2.10:37111',
+      'adb-bad-port _adb-tls-pairing._tcp 192.0.2.10:65536',
+      'adb-bad-host _adb-tls-pairing._tcp attacker.example:37111',
+      'too many _adb-tls-pairing._tcp 192.0.2.12:37113 columns'
+    ].join('\n')
+
+    expect(parseAdbPairingServices(output)).toEqual([
+      { serviceName: 'adb-private-pair', endpoint: '192.0.2.10:37111' }
+    ])
+  })
+
+  it('passes the code only on stdin, keeps it out of argv, and discards secret-bearing output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'devhotel-adb-pair-'))
+    dirs.push(dir)
+    const script = join(dir, 'fake-adb.cjs')
+    const capture = join(dir, 'capture.json')
+    writeFileSync(
+      script,
+      [
+        "const { writeFileSync } = require('node:fs')",
+        "let stdin = ''",
+        "process.stdin.on('data', chunk => { stdin += chunk.toString('utf8') })",
+        "process.stdin.on('end', () => {",
+        "  writeFileSync(process.argv[2], JSON.stringify({ argv: process.argv.slice(3), stdinOk: stdin === '481516\\n' }))",
+        "  process.stdout.write(`Successfully paired to ${process.argv[4]} using ${stdin}`)",
+        "  process.stderr.write(`private pairing diagnostic ${process.argv[4]} ${stdin}`)",
+        "})"
+      ].join('\n')
+    )
+    const adb = new SpawnedAdbHost({ executable: process.execPath, prefixArgs: [script, capture] })
+
+    const result = await adb.pairWithCode('192.0.2.99:38999', '481516')
+    const observed = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[]; stdinOk: boolean }
+
+    expect(result).toEqual({ ok: true })
+    expect(observed).toEqual({ argv: ['pair', '192.0.2.99:38999'], stdinOk: true })
+    expect(JSON.stringify(result)).not.toMatch(/192\.0\.2\.99|38999|481516/)
+    expect(observed.argv).not.toContain('481516')
+  })
+
+  it('returns a fixed failure bit even when adb writes pairing material on failure', async () => {
+    const adb = scriptedAdb(
+      "process.stdin.resume(); process.stdout.write('pairing code 112358 endpoint 192.0.2.77:37777'); process.stderr.write('private-token'); process.exitCode = 9"
+    )
+
+    const result = await adb.pairWithCode('192.0.2.77:37777', '112358')
+
+    expect(result).toEqual({ ok: false })
+    expect(JSON.stringify(result)).not.toMatch(/112358|192\.0\.2\.77|37777|private-token/)
   })
 })

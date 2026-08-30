@@ -146,6 +146,13 @@ silent owner is reclaimed rather than parking a phone indefinitely.
 Development belongs on the Room emulator (`POST /v1/rooms/:id/exec`); request
 a physical device for final acceptance/release verification and for behaviour an
 emulator cannot reproduce, then release it.
+
+There is deliberately no Control API or MCP pairing operation. Secure wireless
+pairing candidates and their private mDNS endpoints live only inside the Host
+broker for a future trusted desktop consent flow; agents cannot provide an
+endpoint, port, token or pairing code. All JSON responses pass through the same
+structured secret-redaction boundary used by diagnostics, logs and device
+events.
 ### Rooms
 
 | Method & path | Body / query | Result |

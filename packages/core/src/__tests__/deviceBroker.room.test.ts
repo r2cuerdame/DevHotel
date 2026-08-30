@@ -811,6 +811,27 @@ describe('Screenshots follow the attached device', () => {
     expect(adb.execs).toEqual([])
   })
 
+  it('blocks every Android screenshot while a trusted pairing-code capture is active', async () => {
+    const { orch, adb, backend } = setup()
+    adb.pairingServices = [
+      { serviceName: 'adb-private._adb-tls-pairing._tcp', endpoint: '192.0.2.60:37660' }
+    ]
+    const discovery = await orch.devices.discoverPairingCandidates()
+    if (!discovery.ok) throw new Error('unreachable')
+    const candidate = discovery.candidates[0]!
+    orch.devices.beginPairingCodeCapture(candidate.id, discovery.generation)
+
+    await expect(orch.androidScreenshot('aaaa1111')).rejects.toThrow(
+      'Capture is temporarily disabled while an ADB pairing code is visible.'
+    )
+    expect(adb.execs).toEqual([])
+    expect(backend.calls).not.toContain('captureEmulatorScreen:aaaa1111')
+
+    orch.devices.cancelPairingCodeCapture(candidate.id, discovery.generation)
+    backend.execResult = { code: 0, stdout: 'A'.repeat(200), stderr: '' }
+    await expect(orch.androidScreenshot('aaaa1111')).resolves.toMatchObject({ source: 'adb' })
+  })
+
   it('screenshots the leased phone once one is attached, with no serial from the caller', async () => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()

@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { IsolationBackend } from './backend/types'
+import { redactSecrets } from './diagnostics/redact'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 
@@ -91,21 +92,23 @@ export class LogHub extends EventEmitter {
     if (!existsSync(file)) return []
     const content = readFileSync(file, 'utf8')
     const lines = content.split(/\r?\n/).filter((l) => l.length > 0)
-    return lines.slice(-maxLines)
+    // Also protect logs written by an older build or another local producer.
+    return lines.slice(-maxLines).map((line) => redactSecrets(line))
   }
 
   private write(roomId: string, kind: LogKind, line: string): void {
+    const safeLine = redactSecrets(line)
     try {
       mkdirSync(this.logDir(roomId), { recursive: true })
       const file = this.logFile(roomId, kind)
       if (existsSync(file) && statSync(file).size > MAX_LOG_BYTES) {
         renameSync(file, `${file}.1`)
       }
-      appendFileSync(file, line + '\n', 'utf8')
+      appendFileSync(file, safeLine + '\n', 'utf8')
     } catch {
       // logging must never take the orchestrator down
     }
-    this.emit('line', { roomId, kind, line } satisfies LogLineEvent)
+    this.emit('line', { roomId, kind, line: safeLine } satisfies LogLineEvent)
   }
 
   dispose(): void {

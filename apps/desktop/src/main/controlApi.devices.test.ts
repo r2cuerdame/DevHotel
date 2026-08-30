@@ -174,4 +174,44 @@ describe('agents reach the shared phone only through the broker', () => {
       control.stop()
     }
   })
+
+  it('has no agent pairing route and never forwards endpoint or code input', async () => {
+    const pairCandidate = vi.fn()
+
+    await withApi({ pairCandidate } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      for (const method of ['GET', 'POST'] as const) {
+        const result = await call('/v1/devices/pairing', {
+          method,
+          ...(method === 'POST'
+            ? { body: JSON.stringify({ endpoint: '192.0.2.99:38999', pairingCode: '481516' }) }
+            : {})
+        })
+        expect(result.status).toBe(404)
+      }
+      expect(pairCandidate).not.toHaveBeenCalled()
+    })
+  })
+
+  it('redacts structured pairing material at the final Control API boundary', async () => {
+    const androidDeviceStatus = vi.fn(() => ({
+      available: false,
+      detail: 'pairing endpoint: 192.0.2.77:37777 pairing code: 112358',
+      pairingCode: 112358,
+      pairing_endpoint: '192.0.2.77:37777',
+      ordinaryPort: 7385,
+      devices: [],
+      recentEvents: []
+    }))
+
+    await withApi({ androidDeviceStatus } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/devices')
+      expect(result.status).toBe(200)
+      expect(result.body).toMatchObject({
+        pairingCode: '•••',
+        pairing_endpoint: '•••',
+        ordinaryPort: 7385
+      })
+      expect(JSON.stringify(result.body)).not.toMatch(/112358|192\.0\.2\.77|37777/)
+    })
+  })
 })

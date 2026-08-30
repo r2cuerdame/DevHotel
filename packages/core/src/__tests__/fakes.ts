@@ -7,7 +7,14 @@ import type { RoomRecord } from '@devhotel/shared'
 import type { ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
-import type { AdbBinaryResult, AdbDeviceLine, AdbHost, AdbHostAvailability } from '../devices/adbHost'
+import type {
+  AdbBinaryResult,
+  AdbDeviceLine,
+  AdbHost,
+  AdbHostAvailability,
+  AdbPairingAttempt,
+  AdbPairingService
+} from '../devices/adbHost'
 import type { WindowsVmLifecycle } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
 
@@ -456,6 +463,10 @@ export class FakeAdbHost implements AdbHost {
   execBinaryResultFor:
     | ((serial: string, args: string[]) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
     | null = null
+  pairingServices: AdbPairingService[] = []
+  pairingDiscoveryError: Error | null = null
+  pairingResult: AdbPairingAttempt = { ok: true }
+  pairingAttempts: { endpoint: string; pairingCode: string }[] = []
 
   constructor(public phones: FakePhone[] = []) {}
 
@@ -472,6 +483,16 @@ export class FakeAdbHost implements AdbHost {
       usb: phone.usb ?? null,
       transportId: null
     }))
+  }
+
+  async discoverPairingServices(): Promise<AdbPairingService[]> {
+    if (this.pairingDiscoveryError) throw this.pairingDiscoveryError
+    return this.pairingServices
+  }
+
+  async pairWithCode(endpoint: string, pairingCode: string): Promise<AdbPairingAttempt> {
+    this.pairingAttempts.push({ endpoint, pairingCode })
+    return this.pairingResult
   }
 
   async exec(serial: string, args: string[]): Promise<ExecResult> {

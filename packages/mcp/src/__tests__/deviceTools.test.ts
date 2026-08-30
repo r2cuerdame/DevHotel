@@ -80,6 +80,7 @@ describe('Android device broker MCP tools', () => {
         'heartbeat_android_device'
       ])
     )
+    expect(names.some((name) => /pair/i.test(name))).toBe(false)
   })
 
   it('answers "why can I not use the test phone" with the owner and the queue', async () => {

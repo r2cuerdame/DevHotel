@@ -27,6 +27,7 @@ import {
   readPhysicalDeviceIdentity,
   type AdbHost
 } from './adbHost'
+import { AdbPairingCoordinator, type PairingActionResult, type PairingDiscoveryResult } from './pairing'
 
 export interface DeviceBrokerOptions {
   repo: AndroidDevicesRepo
@@ -41,6 +42,8 @@ export interface DeviceBrokerOptions {
   /** Synchronous Room lifecycle fence used before a durable waiter is promoted. */
   roomEligible?: (roomId: string) => boolean
   graceMs?: number
+  /** Test/internal override; candidates always remain process-local. */
+  pairingCandidateTtlMs?: number
 }
 
 /** What the broker reclaimed on this sweep, for the operator-visible history. */
@@ -74,6 +77,7 @@ export class AndroidDeviceBroker {
   private readonly ownerLiveness: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
   private readonly roomEligible: (roomId: string) => boolean
   private readonly graceMs: number
+  private readonly pairing: AdbPairingCoordinator
   /** When a dead owner was first observed, so the grace period is real time. */
   private readonly deathObservedAt = new Map<string, number>()
   private lastAvailability: { ok: boolean; detail: string } = { ok: false, detail: 'not probed yet' }
@@ -89,6 +93,11 @@ export class AndroidDeviceBroker {
     this.ownerLiveness = opts.ownerLiveness ?? (() => 'unknown')
     this.roomEligible = opts.roomEligible ?? (() => true)
     this.graceMs = opts.graceMs ?? LEASE_DEFAULT_GRACE_MS
+    this.pairing = new AdbPairingCoordinator({
+      adb: opts.adb,
+      now: this.now,
+      candidateTtlMs: opts.pairingCandidateTtlMs
+    })
   }
 
   /** The Host adb, for callers that already passed `authorize` above. */
@@ -384,6 +393,46 @@ export class AndroidDeviceBroker {
 
   setNickname(deviceId: string, nickname: string): AndroidDevice {
     return this.repo.setNickname(deviceId, nickname)
+  }
+
+  // Trusted desktop-only pairing primitives. Room, Control API and MCP layers
+  // intentionally have no wrappers for these methods.
+  discoverPairingCandidates(): Promise<PairingDiscoveryResult> {
+    return this.pairing.discover()
+  }
+
+  beginPairingCodeCapture(candidateId: string, generation: number): PairingActionResult {
+    return this.pairing.beginCapture(candidateId, generation)
+  }
+
+  cancelPairingCodeCapture(candidateId: string, generation: number): PairingActionResult {
+    return this.pairing.cancelCapture(candidateId, generation)
+  }
+
+  async pairCandidate(candidateId: string, generation: number, pairingCode: string): Promise<PairingActionResult> {
+    const result = await this.pairing.pair(candidateId, generation, pairingCode)
+    if (result.code === 'paired' || result.code === 'pairing-failed') {
+      this.repo.recordEvent({
+        deviceId: null,
+        roomId: null,
+        kind: result.ok ? 'pairing-succeeded' : 'pairing-failed',
+        detail: result.ok ? 'Secure wireless Android pairing succeeded' : 'Secure wireless Android pairing failed',
+        at: this.at()
+      })
+    }
+    return result
+  }
+
+  get sensitivePairingCaptureActive(): boolean {
+    return this.pairing.captureActive
+  }
+
+  assertCaptureAllowed(): void {
+    this.pairing.assertCaptureAllowed()
+  }
+
+  beginCapturePermit(): () => void {
+    return this.pairing.beginOrdinaryCapture()
   }
 
   private matches(device: AndroidDevice, constraints: DeviceRequest['constraints']): boolean {

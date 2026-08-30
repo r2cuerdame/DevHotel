@@ -159,6 +159,8 @@ export type DeviceEventKind =
   | 'stale-recovered'
   | 'max-duration-warning'
   | 'max-duration-reclaimed'
+  | 'pairing-succeeded'
+  | 'pairing-failed'
   | 'denied'
 
 export interface DeviceEvent {
