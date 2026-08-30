@@ -98,7 +98,7 @@ than being polled forever.
 
 | Method & path | Body / query | Result |
 |---|---|---|
-| `POST /v1/rooms/:id/start` | `{ waitMs? }` — how long the call may hold before answering (default `10000`, max `600000`, `0` = answer at once) | `{ operation }` |
+| `POST /v1/rooms/:id/start` | `{ waitMs? }` — how long the call may hold before answering (default `0`, max `600000`; opt into a wait for an inline terminal result) | `{ operation }` |
 | `GET /v1/operations/:operationId` | `?waitMs=` (default `0`) | `{ operation }`, `404` if unknown |
 | `GET /v1/rooms/:id/operations` | `?limit=` (default 20, max 200) | `{ operations }`, newest first |
 

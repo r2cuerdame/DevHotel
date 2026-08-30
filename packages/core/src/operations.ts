@@ -36,6 +36,8 @@ export interface OperationHandle {
   record: OperationRecord
   /** Resolves when work and terminal persistence settle; rejects if either fails. */
   completion: Promise<void>
+  /** True only for the call that created and scheduled this operation. */
+  newlyStarted: boolean
 }
 
 interface LiveOperation {
@@ -95,6 +97,21 @@ export class OperationTracker {
     return this.store.listForRoom(roomId, limit)
   }
 
+  /** Forget any in-memory snapshots after the owning Room has been deleted. */
+  forgetRoom(roomId: string): void {
+    const forgotten = new Set<string>()
+    for (const [id, live] of this.live) {
+      if (live.record.roomId !== roomId) continue
+      forgotten.add(id)
+      this.live.delete(id)
+      for (const wake of [...live.waiters]) wake()
+      live.waiters.clear()
+    }
+    for (const [key, id] of this.runningByKey) {
+      if (forgotten.has(id)) this.runningByKey.delete(key)
+    }
+  }
+
   /** The running operation of this kind for this room, if there is one. */
   running(kind: OperationKind, roomId: string): OperationRecord | null {
     const id = this.runningByKey.get(`${kind}:${roomId}`)
@@ -147,7 +164,7 @@ export class OperationTracker {
     const key = `${kind}:${roomId}`
     const existingId = this.runningByKey.get(key)
     const existing = existingId ? this.live.get(existingId) : undefined
-    if (existing) return { record: clone(existing.record), completion: existing.settled }
+    if (existing) return { record: clone(existing.record), completion: existing.settled, newlyStarted: false }
 
     const startedAt = nowIso()
     const record: OperationRecord = {
@@ -167,11 +184,20 @@ export class OperationTracker {
     // is visible and no task is scheduled, so a retry can start cleanly rather
     // than joining an in-memory operation that never had any work behind it.
     this.persist(record)
-    const entry: LiveOperation = { record, settled: Promise.resolve(), waiters: new Set() }
+    // Install the real completion promise before invoking task(). A task may
+    // synchronously re-enter run() for the same key; that join must observe the
+    // pending completion, never an already-resolved placeholder.
+    let resolveSettled!: () => void
+    let rejectSettled!: (error: unknown) => void
+    const settled = new Promise<void>((resolve, reject) => {
+      resolveSettled = resolve
+      rejectSettled = reject
+    })
+    const entry: LiveOperation = { record, settled, waiters: new Set() }
     this.live.set(record.id, entry)
     this.runningByKey.set(key, record.id)
 
-    let failed = false
+    let reportedFailure: string | undefined
     const openStage = (): OperationStage | undefined => {
       const last = record.stages[record.stages.length - 1]
       return last?.status === 'running' ? last : undefined
@@ -189,7 +215,7 @@ export class OperationTracker {
     }
     const report: OperationReporter = {
       begin: (stageKey, label) => {
-        if (failed) return
+        if (reportedFailure !== undefined) return
         closeOpen('done')
         record.stages.push({
           key: stageKey,
@@ -203,58 +229,77 @@ export class OperationTracker {
         touch()
       },
       detail: (text) => {
+        if (reportedFailure !== undefined) return
         const stage = openStage()
         if (!stage) return
         stage.detail = text
         touch()
       },
       skip: (detail) => {
-        if (failed) return
+        if (reportedFailure !== undefined) return
         closeOpen('skipped', detail)
         touch()
       },
       fail: (message, error) => {
-        if (failed) return
-        failed = true
-        const detail = error === undefined ? message : `${message}: ${messageOf(error)}`
-        closeOpen('failed', detail)
-        record.error = { stage: record.stage, message: detail }
-        touch()
+        if (reportedFailure !== undefined) return
+        // Keep the public snapshot coherent while the task performs any final
+        // cleanup. The terminal status, failed stage, error and finishedAt are
+        // published together by finish(); a poll must never see a running
+        // operation that already carries a terminal error.
+        reportedFailure = error === undefined ? message : `${message}: ${messageOf(error)}`
       }
     }
 
-    const settled = Promise.resolve()
-      .then(() => task(report))
-      .then(
-        () => {
-          this.finish(key, entry, failed ? null : undefined)
-        },
-        (error: unknown) => {
-          this.finish(key, entry, messageOf(error))
-          throw error
+    let work: Promise<void>
+    try {
+      // Invoke the task synchronously so lifecycle wrappers can reserve their
+      // room lock before run() returns. The work itself remains asynchronous.
+      work = Promise.resolve(task(report))
+    } catch (error) {
+      work = Promise.reject(error)
+    }
+    void work.then(
+      () => {
+        try {
+          this.finish(key, entry, reportedFailure)
+          resolveSettled()
+        } catch (error) {
+          rejectSettled(error)
         }
-      )
-    entry.settled = settled
+      },
+      (error: unknown) => {
+        const thrown = messageOf(error)
+        try {
+          this.finish(
+            key,
+            entry,
+            reportedFailure === undefined ? thrown : `${reportedFailure}; finalization failed: ${thrown}`
+          )
+        } catch (finishError) {
+          rejectSettled(finishError)
+          return
+        }
+        rejectSettled(error)
+      }
+    )
     // A caller may take the record and never await; the rejection is carried by
     // the operation record instead of becoming an unhandled rejection.
     void settled.catch(() => undefined)
-    return { record: clone(record), completion: settled }
+    return { record: clone(record), completion: settled, newlyStarted: true }
   }
 
-  /** `failureMessage`: a string to fail with, null when already failed, undefined on success. */
-  private finish(key: string, entry: LiveOperation, failureMessage: string | null | undefined): void {
+  /** `failureMessage` is defined for failure and omitted for success. */
+  private finish(key: string, entry: LiveOperation, failureMessage: string | undefined): void {
     const { record } = entry
     const finishedAt = nowIso()
     const open = record.stages[record.stages.length - 1]
     if (failureMessage !== undefined) {
-      if (failureMessage !== null) {
-        if (open?.status === 'running') {
-          open.status = 'failed'
-          open.detail = failureMessage
-          open.endedAt = finishedAt
-        }
-        record.error = { stage: record.stage, message: failureMessage }
+      if (open?.status === 'running') {
+        open.status = 'failed'
+        open.detail = failureMessage
+        open.endedAt = finishedAt
       }
+      record.error = { stage: record.stage, message: failureMessage }
       record.status = 'failed'
     } else {
       if (open?.status === 'running') {

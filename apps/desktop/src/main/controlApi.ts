@@ -23,12 +23,11 @@ import { isDevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@de
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /**
- * How long `POST /v1/rooms/:id/start` holds the call by default. Long enough
- * that an already-awake Room or a quick wake answers `succeeded` inline, short
- * enough that a slow wake returns an operation ID well inside any client
- * timeout instead of dying with the connection.
+ * Return the durable ID immediately by default. A caller cannot safely assume
+ * its own deadline is longer than ours; clients that want an inline terminal
+ * result can explicitly opt into a bounded wait.
  */
-const DEFAULT_START_WAIT_MS = 10_000
+const DEFAULT_START_WAIT_MS = 0
 
 /** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
 function parseWaitMs(raw: string | null): number {

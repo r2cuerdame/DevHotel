@@ -145,7 +145,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           .min(0)
           .max(600_000)
           .optional()
-          .describe('how long DevHotel may hold this call waiting for the wake (default 10000; 0 returns at once)')
+          .describe('how long DevHotel may hold this call waiting for the wake (default 0, which returns at once)')
       },
       handler: wrap(async (a) => (await (await getClient()).startRoom(a.roomId, a.waitMs)).operation)
     },

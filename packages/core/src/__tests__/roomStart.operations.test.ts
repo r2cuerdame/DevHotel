@@ -1,6 +1,7 @@
 import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { OperationRecord, OperationStageKey } from '@devhotel/shared'
+import { OperationTracker } from '../operations'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, FakeWindowsVm, listeningPort, makeRoom, tempDir, testDb } from './fakes'
@@ -204,6 +205,65 @@ describe('Room start as a trackable operation', () => {
     const retry = orch.startRoomOperation(room.id, 'agent')
     expect(retry.id).not.toBe(started.id)
     await expect(orch.waitForOperation(retry.id, 30_000)).resolves.toMatchObject({ status: 'succeeded' })
+  })
+
+  it('keeps a reported failure non-terminal until task cleanup has settled', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const failureReported = gate()
+    const cleanup = gate()
+
+    const handle = tracker.run('room-start', room.id, 'agent', async (report) => {
+      report.begin('container-start', 'Start the Room containers')
+      report.fail('wake failed', new Error('docker daemon stopped'))
+      failureReported.open()
+      await cleanup.promise
+    })
+    await failureReported.promise
+
+    expect(tracker.get(handle.record.id)).toMatchObject({
+      status: 'running',
+      error: null,
+      finishedAt: null
+    })
+
+    cleanup.open()
+    await handle.completion
+    expect(tracker.get(handle.record.id)).toMatchObject({
+      status: 'failed',
+      error: { stage: 'container-start', message: expect.stringContaining('docker daemon stopped') },
+      finishedAt: expect.any(String)
+    })
+  })
+
+  it('gives a synchronous re-entrant join the real pending completion', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const finishWork = gate()
+    let joinedCompletion: Promise<void> | undefined
+    let duplicateTaskRan = false
+
+    const first = tracker.run('room-start', room.id, 'agent', async (report) => {
+      report.begin('container-start', 'Start the Room containers')
+      const joined = tracker.run('room-start', room.id, 'agent', async () => {
+        duplicateTaskRan = true
+      })
+      joinedCompletion = joined.completion
+      await finishWork.promise
+    })
+    let joinedSettled = false
+    void joinedCompletion!.then(() => {
+      joinedSettled = true
+    })
+    await Promise.resolve()
+
+    expect(duplicateTaskRan).toBe(false)
+    expect(joinedSettled).toBe(false)
+
+    finishWork.open()
+    await first.completion
+    await joinedCompletion
+    expect(joinedSettled).toBe(true)
   })
 
   it('reports an unfinished wake as running, never as failed, when the wait runs out', async () => {
@@ -412,6 +472,74 @@ describe('Room start as a trackable operation', () => {
     expect(backend.calls).toEqual(callsAfterWake)
   })
 
+  it('recreates a recorded-ready Web Room whose live runtime is dead', async () => {
+    const { backend, orch, room } = await setup({ status: 'ready', hostPort: 45123 })
+    backend.webStateValue = 'missing'
+    const recreateAnchor = backend.recreateAnchor.bind(backend)
+    backend.recreateAnchor = async (spec) => {
+      const result = await recreateAnchor(spec)
+      backend.webStateValue = 'running'
+      return result
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const finished = await orch.waitForOperation(started.id, 30_000)
+
+    expect(finished?.status).toBe('succeeded')
+    expect(stageKeys(finished!)).toContain('container-start')
+    expect(backend.calls).toContain(`recreateAnchor:${room.id}:${room.internalPort}`)
+    expect(backend.calls.some((call) => call.startsWith(`recreateWeb:${room.id}:`))).toBe(true)
+  })
+
+  it('recreates a recorded-ready Android Room whose emulator runtime is dead', async () => {
+    const { backend, orch, room } = await setup({
+      provider: 'android',
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      syncStatus: 'empty',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: 'gradle assembleDebug --no-daemon',
+      internalPort: 6080,
+      android: { device: 'Pixel 6', version: '15.0' },
+      status: 'ready',
+      hostPort: 45123
+    })
+    backend.webStateValue = 'running'
+    backend.emulatorStateValue = 'missing'
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const finished = await orch.waitForOperation(started.id, 30_000)
+
+    expect(finished?.status).toBe('succeeded')
+    expect(stageKeys(finished!)).toContain('emulator-boot')
+    expect(backend.calls).toContain(`recreateAnchor:${room.id}:${room.internalPort}`)
+    expect(backend.calls.some((call) => call.startsWith(`createEmulator:${room.id}:`))).toBe(true)
+  })
+
+  it('recovers an awake Windows Room when its first state probe is unknown', async () => {
+    const { windowsVm, orch, room } = await setup({
+      provider: 'windows',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      startCommand: '',
+      internalPort: 0,
+      windows: { backend: 'vmware', templateId: 'd'.repeat(64), snapshot: 'devhotel-clean' },
+      status: 'ready',
+      hostPort: null
+    })
+    windowsVm.failNextState = true
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const finished = await orch.waitForOperation(started.id, 30_000)
+
+    expect(finished?.status).toBe('succeeded')
+    expect(stageKeys(finished!)).toEqual(['preparing', 'vm-start', 'complete'])
+    expect(windowsVm.calls).toEqual([`state:${room.id}`, `start:${room.id}`, `state:${room.id}`])
+    expect(orch.logs.tail(room.id, 'orchestrator').join(' ')).toMatch(/attempting recovery start/)
+  })
+
   it('answers a poll for an operation the app restart interrupted', async () => {
     const { orch, room, db, userData } = await setup()
     const started = interruptedOperation(room.id)
@@ -475,5 +603,104 @@ describe('Room start as a trackable operation', () => {
 
     expect(orch.listOperations(room.id)).toHaveLength(0)
     expect(orch.getOperation(started.id)).toBeNull()
+  })
+
+  it('reserves the Room lock before returning an operation so a following delete cannot orphan it', async () => {
+    const { backend, orch, room } = await setup()
+    const wakeEntered = gate()
+    const finishWake = gate()
+    const recreateAnchor = backend.recreateAnchor.bind(backend)
+    backend.recreateAnchor = async (spec) => {
+      wakeEntered.open()
+      await finishWake.promise
+      return recreateAnchor(spec)
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const deleting = orch.deleteRoom(room.id, 'user')
+    await wakeEntered.promise
+    expect(orch.getOperation(started.id)?.status).toBe('running')
+
+    finishWake.open()
+    await deleting
+
+    expect(orch.rooms.get(room.id)).toBeNull()
+    expect(orch.getOperation(started.id)).toBeNull()
+    expect(orch.listOperations(room.id)).toEqual([])
+  })
+
+  it('rejects a start before durable publication while that Room is being deleted', async () => {
+    const { backend, orch, room } = await setup()
+    const deleteEntered = gate()
+    const finishDelete = gate()
+    const deleteRoomPod = backend.deleteRoomPod.bind(backend)
+    backend.deleteRoomPod = async (roomId) => {
+      deleteEntered.open()
+      await finishDelete.promise
+      return deleteRoomPod(roomId)
+    }
+
+    const deleting = orch.deleteRoom(room.id, 'user')
+    await deleteEntered.promise
+
+    expect(() => orch.startRoomOperation(room.id, 'agent')).toThrow(/being deleted/)
+    expect(orch.listOperations(room.id)).toEqual([])
+
+    finishDelete.open()
+    await deleting
+    expect(orch.listOperations(room.id)).toEqual([])
+  })
+
+  it('forgets a terminal in-memory snapshot when both terminal saves failed before deletion', async () => {
+    const { orch, room } = await setup()
+    const save = orch.operationRecords.save.bind(orch.operationRecords)
+    orch.operationRecords.save = (record) => {
+      if (record.status !== 'running') throw new Error('SQLITE_FULL: terminal operation record could not be saved')
+      save(record)
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const failed = await orch.waitForOperation(started.id, 30_000)
+    expect(failed).toMatchObject({ status: 'failed', error: { message: expect.stringContaining('SQLITE_FULL') } })
+    expect(orch.getOperation(started.id)?.status).toBe('failed')
+
+    await orch.deleteRoom(room.id, 'user')
+
+    expect(orch.rooms.get(room.id)).toBeNull()
+    expect(orch.getOperation(started.id)).toBeNull()
+    expect(orch.listOperations(room.id)).toEqual([])
+  })
+
+  it('drains an admitted start before delete-all and leaves no orphan operation', async () => {
+    const { backend, orch, room } = await setup()
+    const wakeEntered = gate()
+    const finishWake = gate()
+    const recreateAnchor = backend.recreateAnchor.bind(backend)
+    backend.recreateAnchor = async (spec) => {
+      wakeEntered.open()
+      await finishWake.promise
+      return recreateAnchor(spec)
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const deletingAll = orch.deleteAllRooms('user')
+    await wakeEntered.promise
+
+    expect(() => orch.startRoomOperation(room.id, 'agent')).toThrow(/shutting down or removing/)
+    finishWake.open()
+    await deletingAll
+
+    expect(orch.rooms.get(room.id)).toBeNull()
+    expect(orch.getOperation(started.id)).toBeNull()
+    expect(orch.listOperations(room.id)).toEqual([])
+  })
+
+  it('rejects a start before durable publication after shutdown closes the mutation gate', async () => {
+    const { orch, room } = await setup()
+    const shuttingDown = orch.shutdown()
+
+    expect(() => orch.startRoomOperation(room.id, 'agent')).toThrow(/shutting down or removing/)
+    expect(orch.listOperations(room.id)).toEqual([])
+    await shuttingDown
   })
 })

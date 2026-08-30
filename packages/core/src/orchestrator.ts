@@ -164,6 +164,7 @@ export class RoomOrchestrator {
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
   private readonly activeMutations = new Set<Promise<unknown>>()
+  private readonly deletingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
@@ -304,7 +305,7 @@ export class RoomOrchestrator {
   /** Serializes lifecycle mutations per room — concurrent UI/MCP calls queue instead of interleaving docker operations. */
   private withRoomLock<T>(roomId: string, fn: () => Promise<T>, admittedBeforeGate = false): Promise<T> {
     if (this.mutationGate !== 'open' && !admittedBeforeGate) {
-      return Promise.reject(new Error('DevHotel is shutting down or removing its data; no new room changes can start'))
+      return Promise.reject(this.mutationGateError())
     }
     const prev = this.roomOps.get(roomId) ?? Promise.resolve()
     const next = prev.catch(() => undefined).then(fn)
@@ -313,6 +314,10 @@ export class RoomOrchestrator {
       next.catch(() => undefined)
     )
     return next
+  }
+
+  private mutationGateError(): Error {
+    return new Error('DevHotel is shutting down or removing its data; no new room changes can start')
   }
 
   /**
@@ -1046,11 +1051,23 @@ export class RoomOrchestrator {
   }
 
   private beginRoomStart(roomId: string, actor: Actor): { record: OperationRecord; completion: Promise<void> } {
+    // OperationTracker persists before it publishes. Reject before that
+    // boundary when global or per-Room deletion already owns the lifecycle, so
+    // cleanup cannot be followed by a terminal write that resurrects an orphan
+    // operation row.
+    if (this.mutationGate !== 'open') throw this.mutationGateError()
+    if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
     // Fail an unknown Room before an operation exists: there is nothing to poll.
     this.mustGet(roomId)
-    return this.operations.run('room-start', roomId, actor, (report) =>
+    const handle = this.operations.run('room-start', roomId, actor, (report) =>
       this.withRoomLock(roomId, () => this.startRoomLocked(roomId, actor, report))
     )
+    // The lifecycle lock's task resolves just before OperationTracker stores its
+    // terminal snapshot. Make later delete/drain work wait for that publication
+    // too, otherwise it could remove the Room and then lose a race to the final
+    // operation INSERT.
+    if (handle.newlyStarted) this.roomOps.set(roomId, handle.completion.catch(() => undefined))
+    return handle
   }
 
   /** The Room's recent operations, newest first. */
@@ -1308,7 +1325,19 @@ export class RoomOrchestrator {
   }
 
   deleteRoom(roomId: string, actor: Actor): Promise<{ reclaimedBytes: number }> {
-    return this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+    if (this.deletingRooms.has(roomId)) {
+      return Promise.reject(new Error(`Room ${roomId} is already being deleted`))
+    }
+    // Reserve deletion synchronously. A concurrent start must fail before it
+    // creates its durable operation record, not queue behind deletion and write
+    // a terminal orphan after the Room row is gone.
+    this.deletingRooms.add(roomId)
+    const task = this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+    void task.then(
+      () => this.deletingRooms.delete(roomId),
+      () => this.deletingRooms.delete(roomId)
+    )
+    return task
   }
 
   /**
@@ -1360,6 +1389,7 @@ export class RoomOrchestrator {
       const windowsVm = this.mustWindowsVm()
       const { reclaimedBytes } = await windowsVm.delete(roomId)
       this.rooms.delete(roomId)
+      this.operations.forgetRoom(roomId)
       rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
       this.emit(roomId, 'deleted')
       return { reclaimedBytes }
@@ -1368,6 +1398,7 @@ export class RoomOrchestrator {
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
+    this.operations.forgetRoom(roomId)
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
     return { reclaimedBytes }

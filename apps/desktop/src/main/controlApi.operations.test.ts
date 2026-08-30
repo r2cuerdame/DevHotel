@@ -95,6 +95,30 @@ describe('agent control API long operations', () => {
     }
   })
 
+  it('returns the durable operation id immediately when waitMs is omitted', async () => {
+    const startRoomOperation = vi.fn(() => operation())
+    const waitForOperation = vi.fn(async () => operation({ status: 'succeeded' }))
+    const control = await startControlApi(
+      { startRoomOperation, waitForOperation } as unknown as RoomOrchestrator,
+      userDataDir('devhotel-control-start-default-nowait-'),
+      'test'
+    )
+    try {
+      const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/start`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${control.info.token}`, 'content-type': 'application/json' },
+        body: '{}'
+      })
+      const body = (await response.json()) as { operation: OperationRecord }
+
+      expect(response.status).toBe(200)
+      expect(body.operation).toMatchObject({ id: OPERATION_ID, status: 'running' })
+      expect(waitForOperation).not.toHaveBeenCalled()
+    } finally {
+      control.stop()
+    }
+  })
+
   it('repeated starts join one wake instead of asking for another', async () => {
     // The orchestrator dedupes; the API must not defeat that by, say, waking
     // the Room itself before asking for an operation.
