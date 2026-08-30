@@ -71,7 +71,8 @@ const ANDROID_CHANGE_KINDS = new Set([
   'start-command',
   'restart-web',
   'os-settings',
-  'room-reset'
+  'room-reset',
+  'normalize-line-endings'
 ])
 
 const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'android-run'])

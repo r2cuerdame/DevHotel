@@ -230,6 +230,7 @@ export const es: Translation = {
     'Copiar diagnóstico genera un paquete censurado — contraseñas, tokens y valores de .env quedan ocultos — listo para pegar en un issue o en un LLM.',
   'diag.stepBackend': 'Backend de aislamiento',
   'diag.stepMetadata': 'Metadatos de la habitación',
+  'diag.stepLineEndings': 'Fin de línea de scripts',
   'diag.stepEnv': 'Variables de entorno',
   'diag.stepGateway': 'Ruta del gateway',
   'diag.stepHttps': 'DNS / HTTPS',

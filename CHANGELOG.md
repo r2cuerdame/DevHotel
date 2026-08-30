@@ -14,6 +14,33 @@ An audit of every input and focus path DevHotel owns, turned into an enforced co
 - MCP guidance now tells agents where UI input belongs: `adb -s emulator-5554 shell input …` through `run_in_room`, never Host automation aimed at the DevHotel preview window.
 - New: [Host input isolation](./docs/host-input-isolation.md) — the contract, the full audit table, the capability model, the regression coverage, and the platform limits it cannot remove.
 
+### CRLF scripts from a Windows Host are named, not guessed at
+
+Reported from an AppDied Android Room: a `gradlew` imported from a Windows
+folder failed with `not found`, which reads as a broken Gradle install. It was
+never Gradle — the kernel was looking for an interpreter called `/bin/sh\r`.
+
+- **A `line-endings` check step.** Room checks now scan the workspace for CRLF
+  in the files Linux actually executes — `gradlew`, `mvnw`, `*.sh` and anything
+  with a shebang — and report them by path with a Fix button. Generated and
+  vendored trees, symlinks and files over 1 MB are skipped.
+- **Build and Build & Run refuse before they waste your time.** Either Android
+  action stops a CRLF `gradlew` or `mvnw` in preflight with the real reason
+  instead of a Gradle-shaped failure minutes later. A command that fails for
+  any other reason re-scans the exact workspace it used, so a Gradle task that
+  shelled out to a CRLF helper script is attributed correctly rather than left
+  ambiguous.
+- **`normalize-line-endings`, and only when asked.** A new Quick Change rewrites
+  CRLF to LF in the Room's copy of those scripts. It runs on a copy of the
+  workspace and publishes it as a new generation, so it is undoable like a
+  package install. Nothing normalizes as a side effect of import, sync, wake or
+  build. Intermediate files are created exclusively under the container's
+  `/tmp`, never at a predictable workspace-controlled path.
+- **Host files are still never written.** The change is refused for Rooms bound
+  to a Host folder, and the diagnostic also names the Host-side fix — a
+  `.gitattributes` rule such as `* text=auto eol=lf` — for people who would
+  rather fix the source of the problem.
+
 ## 0.4.3 — 2026-08-16
 
 ### Reset Room — housekeeping without checking out

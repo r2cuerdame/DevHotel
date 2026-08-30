@@ -229,6 +229,7 @@ export const ja: Translation = {
     '診断のコピーは、パスワード・トークン・.env の値をマスクした安全なバンドルを作成します — そのまま issue や LLM に貼り付けられます。',
   'diag.stepBackend': '分離バックエンド',
   'diag.stepMetadata': 'ルームのメタデータ',
+  'diag.stepLineEndings': 'スクリプトの改行コード',
   'diag.stepEnv': '環境変数',
   'diag.stepGateway': 'ゲートウェイルート',
   'diag.stepHttps': 'DNS / HTTPS',

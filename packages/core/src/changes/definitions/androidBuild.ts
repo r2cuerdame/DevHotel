@@ -6,7 +6,8 @@ import type { RoomRecord } from '@devhotel/shared'
 import { z } from 'zod'
 import { srcVolume, workspaceSnapshotVolume } from '../../backend/naming'
 import { ANDROID_IMAGE } from '../../providers/androidProvider'
-import type { ChangeDefinition } from '../types'
+import { assertLaunchersAreExecutable, lineEndingAttributionInSnapshot } from './androidLineEndings'
+import type { ChangeCtx, ChangeDefinition } from '../types'
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/)
 const provenanceSchema = z.object({
@@ -102,6 +103,7 @@ export const androidBuildChange: ChangeDefinition<Record<string, never>> = {
       throw new Error('Android builds require a Room-owned Hotel workspace')
     }
     if (!ctx.isAwake()) throw new Error('Wake the room before building')
+    await assertLaunchersAreExecutable(ctx)
   },
   async apply(ctx, _p, steps, operation) {
     const room = ctx.room()
@@ -176,7 +178,8 @@ export const androidBuildChange: ChangeDefinition<Record<string, never>> = {
       steps.push(`Run ${room.startCommand} against immutable input ${buildInputSha256.slice(0, 12)}`)
       const result = await ctx.backend.runOneShot(spec, room.startCommand, (line) => ctx.log(`  ${line}`))
       if (result.code !== 0) {
-        throw new Error(`build failed (exit ${result.code}): ${(result.stderr || result.stdout).slice(-500)}`)
+        const attribution = await lineEndingAttributionInSnapshot(ctx, spec)
+        throw new Error(`build failed (exit ${result.code}): ${(result.stderr || result.stdout).slice(-500)}${attribution}`)
       }
 
       const artifacts = await ctx.backend.exportAndroidArtifacts(room.id, snapshot, artifactsRoot, operation.id)

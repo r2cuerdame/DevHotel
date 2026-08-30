@@ -7,6 +7,7 @@ export type QuickChange =
   | { kind: 'https'; enabled: boolean }
   | { kind: 'internal-port'; port: number }
   | { kind: 'deps-install'; clean: boolean }
+  | { kind: 'normalize-line-endings' }
   | { kind: 'package-install'; name: string; version: string; dev: boolean }
   | { kind: 'android-build' }
   | { kind: 'android-run'; applicationId?: string }

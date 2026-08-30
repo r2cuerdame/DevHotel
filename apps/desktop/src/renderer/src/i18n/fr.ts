@@ -230,6 +230,7 @@ export const fr: Translation = {
     'Copier le diagnostic produit un paquet expurgé — mots de passe, jetons et valeurs .env sont masqués — prêt à coller dans une issue ou un LLM.',
   'diag.stepBackend': "Backend d'isolation",
   'diag.stepMetadata': 'Métadonnées de la chambre',
+  'diag.stepLineEndings': 'Fins de ligne des scripts',
   'diag.stepEnv': "Variables d'environnement",
   'diag.stepGateway': 'Route de la passerelle',
   'diag.stepHttps': 'DNS / HTTPS',

@@ -63,6 +63,9 @@ export class FakeBackend implements IsolationBackend {
     { relativePath: 'app/build/outputs/apk/debug/app-debug.apk', size: 8, sha256: 'a'.repeat(64) }
   ]
   execResult: ExecResult = ok
+  /** per-command answers for tests that drive several different in-room probes */
+  execHandler: ((cmd: string[]) => ExecResult) | null = null
+  oneShotHandler: ((spec: WebSpec, cmd: string) => ExecResult) | null = null
   hostPort = 45000
   relayTokenValue = ''
   lastWebSpec: WebSpec | null = null
@@ -111,8 +114,8 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`deleteRoomPod:${roomId}`)
     return { reclaimedBytes: 1024 }
   }
-  async execInRoom(_roomId: string, _cmd: string[], _opts?: { timeoutMs?: number }): Promise<ExecResult> {
-    return this.execResult
+  async execInRoom(_roomId: string, cmd: string[], _opts?: { timeoutMs?: number }): Promise<ExecResult> {
+    return this.execHandler?.(cmd) ?? this.execResult
   }
   async spawnInteractiveExec(): Promise<ChildProcessWithoutNullStreams> {
     throw new Error('interactive process streaming is not available in FakeBackend')
@@ -123,7 +126,7 @@ export class FakeBackend implements IsolationBackend {
   async runOneShot(spec: WebSpec, cmd: string): Promise<ExecResult> {
     this.calls.push(`runOneShot:${spec.workspaceVolumeOverride ?? spec.depsVolumeOverride ?? 'default'}:${cmd}`)
     this.lastWebSpec = spec
-    return this.oneShotResult
+    return this.oneShotHandler?.(spec, cmd) ?? this.oneShotResult
   }
   async exportAndroidArtifacts(roomId: string, workspaceVolume: string, artifactsRoot: string, operationId: string) {
     const hostDir = join(artifactsRoot, operationId)
