@@ -132,6 +132,12 @@ describe('scan and normalize scripts', () => {
     expect(LINE_ENDING_NORMALIZE_SCRIPT).toContain('cat -- "$tmp" > "$p"')
   })
 
+  it('creates the intermediate file exclusively outside workspace-controlled paths', () => {
+    expect(LINE_ENDING_NORMALIZE_SCRIPT).toContain('tmp=$(mktemp /tmp/devhotel-lf.XXXXXX)')
+    expect(LINE_ENDING_NORMALIZE_SCRIPT).not.toContain('$p.devhotel-lf.')
+    expect(LINE_ENDING_NORMALIZE_SCRIPT).not.toContain('${TMPDIR')
+  })
+
   it('checks only the launchers a build actually execs', () => {
     expect(LAUNCHER_SCAN_SCRIPT).toContain('for p in ./gradlew ./mvnw; do')
     expect(LAUNCHER_SCAN_SCRIPT).not.toContain('find')

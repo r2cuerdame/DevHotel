@@ -3,17 +3,10 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realp
 import { isDeepStrictEqual } from 'node:util'
 import { isAbsolute, join, relative } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { WebSpec } from '../../backend/types'
 import { z } from 'zod'
 import { srcVolume, workspaceSnapshotVolume } from '../../backend/naming'
 import { ANDROID_IMAGE } from '../../providers/androidProvider'
-import {
-  LAUNCHER_SCAN_SCRIPT,
-  LINE_ENDING_SCAN_SCRIPT,
-  lineEndingDiagnostic,
-  parseScriptPaths,
-  scanCommand
-} from '../../checks/lineEndings'
+import { assertLaunchersAreExecutable, lineEndingAttributionInSnapshot } from './androidLineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/)
@@ -87,37 +80,6 @@ function cleanupArtifacts(userData: string, roomId: string, operationId: string)
     return null
   } catch (error) {
     return error instanceof Error ? error.message : String(error)
-  }
-}
-
-/**
- * A CRLF `gradlew` cannot start at all — `sh ./gradlew` reports a stray `\r` or
- * a syntax error, and exec'ing it reports "not found" — so refusing here costs
- * nothing and replaces a Gradle-shaped failure with the real reason. Only the
- * launchers the build command actually runs are checked: an unrelated CRLF
- * `.sh` elsewhere in the tree is a check-tab warning, not a reason to block a
- * build. A probe that cannot run is never a reason to block one either.
- */
-async function assertLaunchersAreExecutable(ctx: ChangeCtx): Promise<void> {
-  const res = await ctx.backend.execInRoom(ctx.roomId, scanCommand(LAUNCHER_SCAN_SCRIPT), { timeoutMs: 30_000 })
-  if (res.code !== 0) return
-  const paths = parseScriptPaths(res.stdout)
-  if (paths.length > 0) throw new Error(lineEndingDiagnostic(paths))
-}
-
-/**
- * Re-attribute a failed build. Gradle can fail because a task shells out to a
- * CRLF script that never had a chance to run, and its own output says only that
- * the task failed, so the build input itself is the evidence worth checking.
- */
-async function lineEndingAttribution(ctx: ChangeCtx, spec: WebSpec): Promise<string> {
-  try {
-    const scan = await ctx.backend.runOneShot(spec, LINE_ENDING_SCAN_SCRIPT)
-    if (scan.code !== 0) return ''
-    const paths = parseScriptPaths(scan.stdout)
-    return paths.length > 0 ? ` ${lineEndingDiagnostic(paths)}` : ''
-  } catch {
-    return ''
   }
 }
 
@@ -216,7 +178,7 @@ export const androidBuildChange: ChangeDefinition<Record<string, never>> = {
       steps.push(`Run ${room.startCommand} against immutable input ${buildInputSha256.slice(0, 12)}`)
       const result = await ctx.backend.runOneShot(spec, room.startCommand, (line) => ctx.log(`  ${line}`))
       if (result.code !== 0) {
-        const attribution = await lineEndingAttribution(ctx, spec)
+        const attribution = await lineEndingAttributionInSnapshot(ctx, spec)
         throw new Error(`build failed (exit ${result.code}): ${(result.stderr || result.stdout).slice(-500)}${attribution}`)
       }
 

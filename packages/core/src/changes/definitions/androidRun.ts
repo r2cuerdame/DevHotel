@@ -1,4 +1,5 @@
 import { EMULATOR_ADB_SERIAL } from '../../backend/naming'
+import { assertLaunchersAreExecutable, lineEndingAttributionInRoom } from './androidLineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
@@ -60,6 +61,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     if ((await ctx.backend.emulatorState(room.id)) !== 'running') {
       throw new Error('The emulator is not running — restart the room')
     }
+    await assertLaunchersAreExecutable(ctx)
   },
   async apply(ctx, p, steps) {
     const room = ctx.room()
@@ -68,7 +70,8 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       timeoutMs: BUILD_TIMEOUT_MS
     })
     if (build.code !== 0) {
-      throw new Error(`build failed (exit ${build.code}): ${(build.stderr || build.stdout).slice(-500)}`)
+      const attribution = await lineEndingAttributionInRoom(ctx)
+      throw new Error(`build failed (exit ${build.code}): ${(build.stderr || build.stdout).slice(-500)}${attribution}`)
     }
 
     const apps = await builtApps(ctx)

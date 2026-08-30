@@ -3,7 +3,12 @@ import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
-import { LINE_ENDING_NORMALIZE_SCRIPT, LINE_ENDING_SCAN_SCRIPT, SCAN_SENTINEL } from '../checks/lineEndings'
+import {
+  LAUNCHER_SCAN_SCRIPT,
+  LINE_ENDING_NORMALIZE_SCRIPT,
+  LINE_ENDING_SCAN_SCRIPT,
+  SCAN_SENTINEL
+} from '../checks/lineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../changes/types'
 import { changesRepo, type ChangesRepo } from '../store/changesRepo'
 import { roomsRepo, type RoomsRepo } from '../store/roomsRepo'
@@ -704,6 +709,58 @@ describe('android build line-ending preflight', () => {
         ? { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
         : { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
     const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('Execution failed for task')
+    expect(entry.verify?.detail).toContain('./scripts/sign.sh')
+    expect(entry.verify?.detail).toContain('not a Gradle or build failure')
+  })
+})
+
+describe('android Build & Run line-ending preflight', () => {
+  function androidRunRoom(): void {
+    rooms.update('room1abc', {
+      provider: 'android',
+      sourceType: 'linked-folder',
+      sourceRef: 'D:\\Projects\\app',
+      workspaceMode: 'hotel',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: 'sh ./gradlew assembleDebug --no-daemon'
+    })
+    backend.emulatorStateValue = 'running'
+  }
+
+  it('refuses Build & Run before invoking a CRLF gradlew', async () => {
+    androidRunRoom()
+    backend.execHandler = (cmd) => ({
+      code: 0,
+      stdout: cmd[2] === LAUNCHER_SCAN_SCRIPT ? `${SCAN_SENTINEL}\0./gradlew\0` : '',
+      stderr: ''
+    })
+
+    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(
+      /not a Gradle or build failure/
+    )
+    expect(changes.list('room1abc')).toHaveLength(0)
+  })
+
+  it('re-attributes a failed Build & Run when a CRLF helper caused it', async () => {
+    androidRunRoom()
+    backend.execHandler = (cmd) => {
+      const script = cmd[2] ?? ''
+      if (script === LAUNCHER_SCAN_SCRIPT) {
+        return { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
+      }
+      if (script === LINE_ENDING_SCAN_SCRIPT) {
+        return { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
+      }
+      if (script.startsWith('cd /workspace && ')) {
+        return { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await engine.execute(ctx(), 'android-run', {}, 'user')
     expect(entry.status).toBe('failed')
     expect(entry.verify?.detail).toContain('Execution failed for task')
     expect(entry.verify?.detail).toContain('./scripts/sign.sh')

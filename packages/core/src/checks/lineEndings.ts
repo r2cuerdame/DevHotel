@@ -70,11 +70,13 @@ export const LINE_ENDING_SCAN_SCRIPT = `${candidateScan('      printf "%s\\0" "$
  * the ones it rewrote. `sed` strips only a CR that ends a line (a lone CR is
  * left alone), and the result is written back through `cat >` so the inode,
  * mode and ownership survive — the file the Room already trusts stays the same
- * file. A file with no trailing newline does not gain one.
+ * file. The intermediate file is created exclusively in the container's `/tmp`
+ * rather than beside a workspace-controlled path. A file with no trailing
+ * newline does not gain one.
  */
 export const LINE_ENDING_NORMALIZE_SCRIPT = candidateScan(
   [
-    '      tmp="$p.devhotel-lf.$$"',
+    '      tmp=$(mktemp /tmp/devhotel-lf.XXXXXX) || { echo "cannot create normalization temporary file" >&2; exit 1; }',
     '      if ! sed "s/$CR\\$//" -- "$p" > "$tmp"; then rm -f -- "$tmp"; echo "cannot rewrite $p" >&2; exit 1; fi',
     '      if ! cat -- "$tmp" > "$p"; then rm -f -- "$tmp"; echo "cannot rewrite $p" >&2; exit 1; fi',
     '      rm -f -- "$tmp"',
