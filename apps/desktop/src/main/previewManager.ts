@@ -11,7 +11,7 @@ import {
   type PreviewViewport
 } from '@devhotel/shared'
 import type { RoomOrchestrator } from '@devhotel/core'
-import { calculatePreviewBounds, previewScale } from './previewLayout'
+import { calculatePreviewBounds, previewScale, type PreviewBounds } from './previewLayout'
 import {
   isAllowedRoomNavigation,
   isAllowedPreviewRequest,
@@ -52,11 +52,14 @@ export class PreviewManager {
   private roomId: string | null = null
   private thumbTimer: NodeJS.Timeout | null = null
   private configuredPartitions = new Set<string>()
-  private lastBounds: { x: number; y: number; width: number; height: number } | null = null
+  private lastBounds: PreviewBounds | null = null
   private previewLayout: PreviewLayout = { ...DEFAULT_LAYOUT, rightViewport: { ...DEFAULT_LAYOUT.rightViewport } }
   private pendingRightLoads = new PreviewSyncGuard()
   private visible = true
   private attachAttempt = 0
+  private pendingRoomId: string | null = null
+  private pendingBounds: PreviewBounds | null = null
+  private pendingVisible = true
 
   constructor(
     private readonly win: BrowserWindow,
@@ -75,16 +78,39 @@ export class PreviewManager {
     })
   }
 
-  async attach(roomId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void> {
+  async attach(roomId: string, bounds: PreviewBounds): Promise<void> {
+    if (this.roomId === roomId && this.view) {
+      this.lastBounds = bounds
+      this.layout()
+      return
+    }
+    if (this.pendingRoomId === roomId) {
+      this.pendingBounds = bounds
+      return
+    }
+    if (this.roomId) this.detach()
     const attempt = ++this.attachAttempt
+    this.pendingRoomId = roomId
+    this.pendingBounds = bounds
+    this.pendingVisible = true
     let inspection: Awaited<ReturnType<RoomOrchestrator['inspectRoomRuntime']>>
     try {
       inspection = await this.orch.inspectRoomRuntime(roomId)
     } catch {
-      if (attempt === this.attachAttempt && this.roomId) this.detach()
+      if (attempt === this.attachAttempt) {
+        this.pendingRoomId = null
+        this.pendingBounds = null
+        this.pendingVisible = true
+        if (this.roomId) this.detach()
+      }
       return
     }
     if (attempt !== this.attachAttempt) return
+    const latestBounds = this.pendingBounds ?? bounds
+    const latestVisible = this.pendingVisible
+    this.pendingRoomId = null
+    this.pendingBounds = null
+    this.pendingVisible = true
     const room = { ...inspection.room, runtimeStatus: inspection.runtimeStatus }
     if (!isPreviewableRoom(room)) {
       // A forged/stale renderer attach must never leave another Room visible.
@@ -93,6 +119,7 @@ export class PreviewManager {
     }
     if (this.roomId !== roomId) {
       this.detach()
+      this.visible = latestVisible
       const partition = roomPreviewPartition(roomId)
       this.configurePartition(partition, roomId)
       const view = this.createPreviewView(roomId, partition, 'left')
@@ -125,7 +152,7 @@ export class PreviewManager {
       if (this.previewLayout.mode === 'split') this.ensureRightView()
       this.thumbTimer = setInterval(() => void this.capture(), THUMB_INTERVAL_MS)
     }
-    this.lastBounds = bounds
+    this.lastBounds = latestBounds
     this.layout()
   }
 
@@ -189,6 +216,10 @@ export class PreviewManager {
 
   /** Keeps the Room's browser alive while another renderer surface covers it. */
   setVisible(roomId: string, visible: boolean): void {
+    if (this.pendingRoomId === roomId) {
+      this.pendingVisible = visible
+      return
+    }
     if (this.roomId !== roomId || !this.view) return
     this.visible = visible
     this.updateVisibility()
@@ -218,6 +249,9 @@ export class PreviewManager {
 
   detach(): void {
     this.attachAttempt += 1
+    this.pendingRoomId = null
+    this.pendingBounds = null
+    this.pendingVisible = true
     const detachedRoomId = this.roomId
     if (this.thumbTimer) {
       clearInterval(this.thumbTimer)
