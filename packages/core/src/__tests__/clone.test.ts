@@ -430,4 +430,46 @@ describe('RoomOrchestrator.cloneRoom', () => {
     expect(backend.calls.some((call) => call.startsWith('startWeb:'))).toBe(false)
     expect(orch.listRooms().map((room) => room.nickname)).toEqual(['dev'])
   })
+
+  it('does not publish a start operation for a clone target that may still roll back', async () => {
+    const source = makeRoom({
+      id: 'source14',
+      project: 'api',
+      nickname: 'dev',
+      domain: 'api-dev.localhost',
+      hostPort: backend.hostPort
+    })
+    orch.rooms.create(source)
+    let copyEntered!: () => void
+    const entered = new Promise<void>((resolve) => {
+      copyEntered = resolve
+    })
+    let failCopy!: () => void
+    const copyFailure = new Promise<void>((resolve) => {
+      failCopy = resolve
+    })
+    backend.copyVolume = async () => {
+      copyEntered()
+      await copyFailure
+      throw new Error('copy failed after target publication')
+    }
+
+    const cloning = orch.cloneRoom({
+      sourceRoomId: source.id,
+      nickname: 'rollback',
+      copyDependencies: false,
+      services: 'exclude',
+      actor: 'user'
+    })
+    await entered
+    const target = orch.listRooms().find((room) => room.id !== source.id)!
+
+    expect(() => orch.startRoomOperation(target.id, 'agent')).toThrow(/still being created/)
+    expect(orch.listOperations(target.id)).toEqual([])
+
+    failCopy()
+    await expect(cloning).rejects.toThrow(/copy failed after target publication/)
+    expect(orch.rooms.get(target.id)).toBeNull()
+    expect(orch.listOperations(target.id)).toEqual([])
+  })
 })

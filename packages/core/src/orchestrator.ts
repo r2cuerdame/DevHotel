@@ -165,6 +165,7 @@ export class RoomOrchestrator {
   private readonly roomOps = new Map<string, Promise<unknown>>()
   private readonly activeMutations = new Set<Promise<unknown>>()
   private readonly deletingRooms = new Set<string>()
+  private readonly materializingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
@@ -322,10 +323,13 @@ export class RoomOrchestrator {
 
   /**
    * Reserve a newly-created Room ID while another Room's operation is still
-   * materializing it. Public target operations queue behind this barrier, and
-   * global shutdown/delete-all drains it through roomOps like any other lock.
+   * materializing it. Ordinary target mutations queue behind this barrier;
+   * durable starts are rejected until release because rollback can delete the
+   * target. Global shutdown/delete-all drains it through roomOps like any other
+   * lock.
    */
   private reserveRoomBarrier(roomId: string): () => void {
+    this.materializingRooms.add(roomId)
     const previous = this.roomOps.get(roomId) ?? Promise.resolve()
     let release!: () => void
     const held = new Promise<void>((resolve) => {
@@ -337,6 +341,7 @@ export class RoomOrchestrator {
     return () => {
       if (released) return
       released = true
+      this.materializingRooms.delete(roomId)
       release()
     }
   }
@@ -1059,6 +1064,13 @@ export class RoomOrchestrator {
     if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
     // Fail an unknown Room before an operation exists: there is nothing to poll.
     this.mustGet(roomId)
+    // A clone publishes its preparing ownership row before the target exists.
+    // Other lifecycle calls may safely queue behind that target's barrier, but
+    // a start operation must not publish yet: clone rollback can delete the row
+    // before queued work runs, leaving the operation as an orphan afterwards.
+    if (this.materializingRooms.has(roomId)) {
+      throw new Error(`Room ${roomId} is still being created and cannot be started`)
+    }
     const handle = this.operations.run('room-start', roomId, actor, (report) =>
       this.withRoomLock(roomId, () => this.startRoomLocked(roomId, actor, report))
     )

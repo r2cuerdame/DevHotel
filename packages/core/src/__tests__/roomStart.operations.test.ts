@@ -671,6 +671,33 @@ describe('Room start as a trackable operation', () => {
     expect(orch.listOperations(room.id)).toEqual([])
   })
 
+  it('lets a queued delete remove the record even when both terminal saves fail', async () => {
+    const { backend, orch, room } = await setup()
+    const wakeEntered = gate()
+    const finishWake = gate()
+    const recreateAnchor = backend.recreateAnchor.bind(backend)
+    backend.recreateAnchor = async (spec) => {
+      wakeEntered.open()
+      await finishWake.promise
+      return recreateAnchor(spec)
+    }
+    const save = orch.operationRecords.save.bind(orch.operationRecords)
+    orch.operationRecords.save = (record) => {
+      if (record.status !== 'running') throw new Error('SQLITE_FULL: terminal operation record could not be saved')
+      save(record)
+    }
+
+    const started = orch.startRoomOperation(room.id, 'agent')
+    const deleting = orch.deleteRoom(room.id, 'user')
+    await wakeEntered.promise
+    finishWake.open()
+    await deleting
+
+    expect(orch.rooms.get(room.id)).toBeNull()
+    expect(orch.getOperation(started.id)).toBeNull()
+    expect(orch.listOperations(room.id)).toEqual([])
+  })
+
   it('drains an admitted start before delete-all and leaves no orphan operation', async () => {
     const { backend, orch, room } = await setup()
     const wakeEntered = gate()
