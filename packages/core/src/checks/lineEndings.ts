@@ -85,21 +85,106 @@ export const LINE_ENDING_NORMALIZE_SCRIPT = candidateScan(
 )
 
 /**
- * The two launchers the Room's own build command execs. Checked on its own
- * before a build because these are the files whose CRLF is fatal rather than
- * merely suspicious — an unrelated CRLF `.sh` must never block a build.
+ * Check only the well-known wrapper tokens the configured build command can
+ * actually execute. An unused alternate wrapper is still reported by the full
+ * diagnostic scan, but it must not block an otherwise valid build preflight.
+ * Returned shell paths are fixed literals, never text copied from the command.
  */
-export const LAUNCHER_SCAN_SCRIPT = [
-  'set -u',
-  'cd /workspace 2>/dev/null || exit 0',
-  `printf "%s\\0" ${SCAN_SENTINEL}`,
-  'CR=$(printf "\\r")',
-  'for p in ./gradlew ./mvnw; do',
-  '  [ -f "$p" ] || continue',
-  `  head -c ${MAX_SCRIPT_BYTES} -- "$p" 2>/dev/null | grep -qI -- "$CR\\$" 2>/dev/null || continue`,
-  '  printf "%s\\0" "$p"',
-  'done'
-].join('\n')
+export function launcherScanScript(startCommand: string): string {
+  const launchers = launchersExecutedBy(startCommand)
+  const script = [
+    'set -u',
+    'cd /workspace 2>/dev/null || exit 0',
+    `printf "%s\\0" ${SCAN_SENTINEL}`
+  ]
+  if (launchers.length === 0) return script.join('\n')
+  return [
+    ...script,
+    'CR=$(printf "\\r")',
+    `for p in ${launchers.join(' ')}; do`,
+    '  [ -f "$p" ] || continue',
+    `  head -c ${MAX_SCRIPT_BYTES} -- "$p" 2>/dev/null | grep -qI -- "$CR\\$" 2>/dev/null || continue`,
+    '  printf "%s\\0" "$p"',
+    'done'
+  ].join('\n')
+}
+
+function launchersExecutedBy(command: string): string[] {
+  const tokens = shellCommandTokens(command)
+  const found = new Set<string>()
+  let segment: string[] = []
+  const inspect = (): void => {
+    let words = segment
+    segment = []
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words = words.slice(1)
+    if (words[0] === 'env') {
+      words = words.slice(1)
+      while (words[0] && (words[0].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]))) {
+        words = words.slice(1)
+      }
+    }
+    if (words[0] === 'command' || words[0] === 'exec') {
+      words = words.slice(1)
+      while (words[0]?.startsWith('-')) words = words.slice(1)
+    }
+    let executable = words[0]
+    if (executable && ['sh', 'bash', 'dash'].includes(executable.split('/').pop() ?? '')) {
+      words = words.slice(1)
+      while (words[0]?.startsWith('-') && words[0] !== '-') words = words.slice(1)
+      executable = words[0]
+    }
+    const base = executable?.replace(/^\/workspace\//, '').replace(/^\.\//, '')
+    if (base === 'gradlew' || base === 'mvnw') found.add(`./${base}`)
+  }
+  for (const token of tokens) {
+    if (token === ';' || token === '&&' || token === '||' || token === '|') inspect()
+    else segment.push(token)
+  }
+  inspect()
+  return [...found]
+}
+
+/** Minimal shell lexer used only to identify executable positions; it never evaluates substitutions. */
+function shellCommandTokens(command: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quote: "'" | '"' | '`' | null = null
+  const flush = (): void => {
+    if (current) tokens.push(current)
+    current = ''
+  }
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i]!
+    if (quote) {
+      if (char === quote) quote = null
+      else if (char === '\\' && quote !== "'" && i + 1 < command.length) current += command[++i]
+      else current += char
+      continue
+    }
+    if (char === "'" || char === '"' || char === '`') {
+      quote = char
+      continue
+    }
+    if (/\s/.test(char)) {
+      flush()
+      continue
+    }
+    if (char === '\\' && i + 1 < command.length) {
+      current += command[++i]
+      continue
+    }
+    if (char === ';' || char === '|' || char === '&') {
+      flush()
+      const doubled = command[i + 1] === char
+      tokens.push(doubled ? `${char}${char}` : char)
+      if (doubled) i += 1
+      continue
+    }
+    current += char
+  }
+  flush()
+  return tokens
+}
 
 export function scanCommand(script: string): string[] {
   return ['sh', '-lc', script]

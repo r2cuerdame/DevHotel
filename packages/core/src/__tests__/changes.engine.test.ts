@@ -4,10 +4,10 @@ import { registerQuickChanges } from '../changes/definitions/index'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
-  LAUNCHER_SCAN_SCRIPT,
   LINE_ENDING_NORMALIZE_SCRIPT,
   LINE_ENDING_SCAN_SCRIPT,
-  SCAN_SENTINEL
+  SCAN_SENTINEL,
+  launcherScanScript
 } from '../checks/lineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../changes/types'
 import { changesRepo, type ChangesRepo } from '../store/changesRepo'
@@ -732,9 +732,10 @@ describe('android Build & Run line-ending preflight', () => {
 
   it('refuses Build & Run before invoking a CRLF gradlew', async () => {
     androidRunRoom()
+    const expectedProbe = launcherScanScript('sh ./gradlew assembleDebug --no-daemon')
     backend.execHandler = (cmd) => ({
       code: 0,
-      stdout: cmd[2] === LAUNCHER_SCAN_SCRIPT ? `${SCAN_SENTINEL}\0./gradlew\0` : '',
+      stdout: cmd[2] === expectedProbe ? `${SCAN_SENTINEL}\0./gradlew\0` : '',
       stderr: ''
     })
 
@@ -746,9 +747,10 @@ describe('android Build & Run line-ending preflight', () => {
 
   it('re-attributes a failed Build & Run when a CRLF helper caused it', async () => {
     androidRunRoom()
+    const expectedProbe = launcherScanScript('sh ./gradlew assembleDebug --no-daemon')
     backend.execHandler = (cmd) => {
       const script = cmd[2] ?? ''
-      if (script === LAUNCHER_SCAN_SCRIPT) {
+      if (script === expectedProbe) {
         return { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
       }
       if (script === LINE_ENDING_SCAN_SCRIPT) {
@@ -765,6 +767,21 @@ describe('android Build & Run line-ending preflight', () => {
     expect(entry.verify?.detail).toContain('Execution failed for task')
     expect(entry.verify?.detail).toContain('./scripts/sign.sh')
     expect(entry.verify?.detail).toContain('not a Gradle or build failure')
+  })
+
+  it('directs legacy Host-bound Build & Run failures to a Host-side line-ending fix', async () => {
+    androidRunRoom()
+    rooms.update('room1abc', { workspaceMode: 'legacy-host-bind' })
+    const expectedProbe = launcherScanScript('sh ./gradlew assembleDebug --no-daemon')
+    backend.execHandler = (cmd) => ({
+      code: 0,
+      stdout: cmd[2] === expectedProbe ? `${SCAN_SENTINEL}\0./gradlew\0` : '',
+      stderr: ''
+    })
+
+    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(
+      /still bound to its Host folder.*will not rewrite/s
+    )
   })
 })
 

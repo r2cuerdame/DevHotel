@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
-  LAUNCHER_SCAN_SCRIPT,
   LINE_ENDING_NORMALIZE_SCRIPT,
   LINE_ENDING_SCAN_SCRIPT,
   MAX_REPORTED_SCRIPTS,
   SCAN_SENTINEL,
+  launcherScanScript,
   lineEndingDiagnostic,
   lineEndingSummary,
   parseScriptPaths,
@@ -139,7 +139,17 @@ describe('scan and normalize scripts', () => {
   })
 
   it('checks only the launchers a build actually execs', () => {
-    expect(LAUNCHER_SCAN_SCRIPT).toContain('for p in ./gradlew ./mvnw; do')
-    expect(LAUNCHER_SCAN_SCRIPT).not.toContain('find')
+    const gradle = launcherScanScript('sh ./gradlew assembleDebug --no-daemon')
+    const maven = launcherScanScript('"./mvnw" package')
+    expect(gradle).toContain('for p in ./gradlew; do')
+    expect(gradle).not.toContain('./mvnw')
+    expect(maven).toContain('for p in ./mvnw; do')
+    expect(maven).not.toContain('./gradlew')
+    expect(gradle).not.toContain('find')
+  })
+
+  it('does not turn mentions or alternate wrapper filenames into blocking launchers', () => {
+    const probe = launcherScanScript('echo gradlew.bat && printf "mvnw docs"')
+    expect(probe).not.toContain('for p in')
   })
 })
