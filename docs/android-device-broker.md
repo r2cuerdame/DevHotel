@@ -170,6 +170,38 @@ drive, with nothing in the caller changing and no serial ever written by hand.
 Once attached, an offline/unauthorized phone or unavailable Host ADB fails that
 physical run; DevHotel never silently reports emulator results as physical proof.
 
+## Secure wireless-pairing foundation
+
+Pairing is Host-owned and is **not** an agent operation. Core can poll the
+Host's `_adb-tls-pairing._tcp` mDNS services, but it keeps every resolved
+address, port and service name in process memory. A trusted desktop flow sees
+only a random UUID candidate, a discovery generation, a generic label and a
+short expiry. A refresh invalidates the prior generation only when no trusted
+pairing prompt is active; while a prompt is visible, refresh returns the fixed
+`capture-busy` result and preserves its generation and guards. Expiry clears
+the private values, and a valid candidate is consumed before the asynchronous
+ADB attempt, so concurrent retries cannot reuse it.
+
+The pairing code is accepted only after a trusted code-capture session begins.
+It is validated as six digits and written to the stdin of `adb pair <internally
+discovered endpoint>`; it is never an argv value. Raw pairing stdout/stderr is
+discarded because ADB echoes transport details. The durable event is only the
+fixed fact that secure pairing succeeded or failed.
+
+While the trusted prompt is active, Android pixel capture fails closed: a
+pairing dialog or code cannot be made safe by text redaction. Text and
+structured values share one redactor at the log, device-event, diagnostic and
+Control API serialization boundaries. Pairing-context code/port/token fields
+and the exact active in-memory service values are masked before persistence or
+MCP output. A pairing attempt consumes its candidate immediately, but the
+capture guard remains held until the trusted prompt explicitly clears and
+dismisses its code field; expiry is the crash fallback.
+
+This foundation intentionally has no Control API route, MCP tool, or renderer
+UI yet. Agents cannot submit an endpoint or invoke pairing through raw ADB;
+`adb pair` remains a broker-only forbidden verb. A later trusted desktop UI can
+wire the internal candidate flow without widening the Room/Host boundary.
+
 ## Observability
 
 `GET /v1/status` and the `android_devices` MCP tool answer "why can I not use

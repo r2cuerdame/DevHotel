@@ -26,7 +26,7 @@ import {
   DeviceLeaseError,
   type ControlInfo
 } from '@devhotel/shared'
-import { isDevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
+import { isDevHotelError, redactStructuredSecrets, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /**
@@ -434,7 +434,10 @@ function inspectionForAgent(inspection: RoomInspection): RoomInspection {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = JSON.stringify(body)
+  // One last structured boundary protects every Control API response and,
+  // transitively, every MCP tool. Pairing fields are masked by key and all
+  // string values pass through the same central redactor as logs/events.
+  const text = JSON.stringify(redactStructuredSecrets(body))
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) })
   res.end(text)
 }

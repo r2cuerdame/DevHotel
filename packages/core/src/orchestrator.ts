@@ -63,6 +63,7 @@ import { slugify } from './detect/detector'
 import type { SourceReader } from './detect/sourceReader'
 import { fsSourceReader } from './detect/sourceReader'
 import { buildDiagnostic } from './diagnostics/bundle'
+import { redactSecrets } from './diagnostics/redact'
 import { DevHotelError } from './errors'
 import type { Gateway } from './gateway/gateway'
 import { LogHub, type LogKind } from './logs'
@@ -175,7 +176,7 @@ function redactAdbText(value: string, serial: string, replacements: AdbOutputRep
     }
   }
   const escapedSerial = serial.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return safe.replace(new RegExp(escapedSerial, 'gi'), '[device-serial-redacted]')
+  return redactSecrets(safe.replace(new RegExp(escapedSerial, 'gi'), '[device-serial-redacted]'))
 }
 
 function redactAdbResult(
@@ -1873,6 +1874,18 @@ export class RoomOrchestrator {
   }
 
   private async androidScreenshotLocked(roomId: string, mode: 'auto' | 'screen'): Promise<{ png: string; source: 'adb' | 'screen' }> {
+    // The permit makes the check bidirectional: pairing cannot start halfway
+    // through an awaited screenshot, and a screenshot cannot start while the
+    // pairing code is visible.
+    const releaseCapture = this.devices.beginCapturePermit()
+    try {
+      return await this.androidScreenshotWithCapturePermit(roomId, mode)
+    } finally {
+      releaseCapture()
+    }
+  }
+
+  private async androidScreenshotWithCapturePermit(roomId: string, mode: 'auto' | 'screen'): Promise<{ png: string; source: 'adb' | 'screen' }> {
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') throw new Error('Screenshots are available for Android rooms')
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'

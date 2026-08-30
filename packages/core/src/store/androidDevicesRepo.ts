@@ -9,6 +9,7 @@ import type {
   LeasePurpose
 } from '@devhotel/shared'
 import type { Db } from './db'
+import { redactSecrets } from '../diagnostics/redact'
 
 interface DeviceRow {
   id: string
@@ -125,7 +126,9 @@ const toEvent = (row: EventRow): DeviceEvent => ({
   deviceId: row.device_id,
   roomId: row.room_id,
   kind: row.kind as DeviceEventKind,
-  detail: row.detail,
+  // Read-time redaction covers rows created by older builds as well as the
+  // write-time sink below.
+  detail: redactSecrets(row.detail),
   at: row.at
 })
 
@@ -551,10 +554,11 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
     },
     recordEvent(input) {
       const id = randomUUID()
+      const detail = redactSecrets(input.detail)
       sqlite
         .prepare('INSERT INTO android_device_events (id, device_id, room_id, kind, detail, at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, input.deviceId, input.roomId, input.kind, input.detail, input.at)
-      return { id, deviceId: input.deviceId, roomId: input.roomId, kind: input.kind, detail: input.detail, at: input.at }
+        .run(id, input.deviceId, input.roomId, input.kind, detail, input.at)
+      return { id, deviceId: input.deviceId, roomId: input.roomId, kind: input.kind, detail, at: input.at }
     },
     recentEvents: (limit = 50) =>
       (sqlite.prepare('SELECT * FROM android_device_events ORDER BY at DESC, id DESC LIMIT ?').all(limit) as unknown as EventRow[]).map(toEvent)

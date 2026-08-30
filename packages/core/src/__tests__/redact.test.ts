@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { redactSecrets } from '../diagnostics/redact'
+import { redactSecrets, redactStructuredSecrets, registerSensitiveSecrets } from '../diagnostics/redact'
 
 describe('redactSecrets', () => {
   it('masks key-value secrets in many syntaxes', () => {
@@ -51,5 +51,91 @@ describe('redactSecrets', () => {
   it('applies custom patterns and survives invalid ones', () => {
     const out = redactSecrets('internal id ACME-9931 stays hidden', ['ACME-\\d+', '[invalid'])
     expect(out).not.toContain('ACME-9931')
+  })
+
+  it('masks common ADB pairing shapes without hiding unrelated numbers and application ports', () => {
+    const input = [
+      'Pairing code: 481516',
+      'pairing_port=37117',
+      '"adbPairingToken":"short-lived-token"',
+      'adb pair 192.0.2.44:37117 481516',
+      'Enter pairing code: 481516',
+      'adb-private _adb-tls-pairing._tcp 192.0.2.44:37117',
+      'build 481516 finished',
+      'repairing code: 246810',
+      'web server listening at localhost:3000'
+    ].join('\n')
+
+    const out = redactSecrets(input)
+    expect(out).not.toMatch(/192\.0\.2\.44|37117|short-lived-token/)
+    expect(out.match(/481516/g)).toHaveLength(1)
+    expect(out).toContain('build 481516 finished')
+    expect(out).toContain('repairing code: 246810')
+    expect(out).toContain('localhost:3000')
+  })
+
+  it('redacts pairing fields recursively but preserves intended opaque capability IDs', () => {
+    const confirmationToken = '11111111-2222-4333-8444-555555555555'
+    const safe = redactStructuredSecrets({
+      nested: {
+        pairingCode: 481516,
+        pairing_endpoint: '192.0.2.44:37117',
+        ordinaryPort: 3000,
+        confirmationToken
+      },
+      pairing: { code: 123456, port: 37117, status: 'waiting-for-consent' },
+      detail: 'pairing token: top-secret'
+    })
+
+    expect(safe).toEqual({
+      nested: {
+        pairingCode: '•••',
+        pairing_endpoint: '•••',
+        ordinaryPort: 3000,
+        confirmationToken
+      },
+      pairing: { code: '•••', port: '•••', status: 'waiting-for-consent' },
+      detail: 'pairing token: •••'
+    })
+
+    const shared = { code: 654321, port: 37654 }
+    const aliased = redactStructuredSecrets({ ordinary: shared, pairing: shared })
+    expect(aliased).toEqual({
+      ordinary: shared,
+      pairing: { code: '•••', port: '•••' }
+    })
+  })
+
+  it('preserves opaque base64 bytes while structured pairing fields still mask', () => {
+    // This is valid base64 and deliberately contains an AWS-token-shaped
+    // substring that normal prose redaction would replace.
+    const encodedBytes = 'AKIAABCDEFGHIJKLMNOP'
+
+    expect(redactStructuredSecrets({
+      contentBase64: encodedBytes,
+      nested: { png: encodedBytes },
+      malformedPayload: { contentBase64: 'pairing code: 918274' },
+      detail: encodedBytes,
+      pairingCode: encodedBytes
+    })).toEqual({
+      contentBase64: encodedBytes,
+      nested: { png: encodedBytes },
+      malformedPayload: { contentBase64: 'pairing code: •••' },
+      detail: '•••',
+      pairingCode: '•••'
+    })
+  })
+
+  it('reference-counts exact ephemeral values and releases them idempotently', () => {
+    const endpoint = '192.0.2.88:38888'
+    const first = registerSensitiveSecrets([endpoint])
+    const second = registerSensitiveSecrets([endpoint])
+    expect(redactSecrets(`trace ${endpoint}`)).toBe('trace •••')
+
+    first()
+    first()
+    expect(redactSecrets(`trace ${endpoint}`)).toBe('trace •••')
+    second()
+    expect(redactSecrets(`trace ${endpoint}`)).toBe(`trace ${endpoint}`)
   })
 })

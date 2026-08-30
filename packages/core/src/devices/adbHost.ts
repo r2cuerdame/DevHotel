@@ -20,6 +20,23 @@ export interface AdbHostAvailability {
   detail: string
 }
 
+/** Private mDNS data. It must never be returned by the Room/API/MCP surface. */
+export interface AdbPairingService {
+  serviceName: string
+  endpoint: string
+}
+
+/** Fixed result: raw `adb pair` output can contain the endpoint and is dropped. */
+export interface AdbPairingAttempt {
+  ok: boolean
+}
+
+/** Kept separate from AdbHost so Room-authorized callers cannot discover endpoints. */
+export interface AdbPairingHost {
+  discoverPairingServices(): Promise<AdbPairingService[]>
+  pairWithCode(endpoint: string, pairingCode: string): Promise<AdbPairingAttempt>
+}
+
 export interface AdbBinaryResult {
   code: number
   stdout: Buffer
@@ -61,6 +78,38 @@ function isDnsHost(raw: string): boolean {
     label.length <= 63 &&
     /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)
   )
+}
+
+function pairingEndpoint(raw: string): string | null {
+  const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(raw)
+  if (!match || isIP(match[1]!) !== 4 || !isTcpPort(match[2]!)) return null
+  return raw
+}
+
+/** Parse only active Android pairing services, never connect/legacy entries. */
+export function parseAdbPairingServices(stdout: string): AdbPairingService[] {
+  const services: AdbPairingService[] = []
+  const seen = new Set<string>()
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || /^list of discovered mdns services$/i.test(line)) continue
+    const [serviceName, serviceType, rawEndpoint, ...extra] = line.split(/\s+/)
+    if (
+      !serviceName ||
+      serviceName.length > 253 ||
+      !serviceType ||
+      serviceType.replace(/\.$/, '').toLowerCase() !== '_adb-tls-pairing._tcp' ||
+      !rawEndpoint ||
+      extra.length > 0
+    ) {
+      continue
+    }
+    const endpoint = pairingEndpoint(rawEndpoint)
+    if (!endpoint || seen.has(endpoint)) continue
+    seen.add(endpoint)
+    services.push({ serviceName, endpoint })
+  }
+  return services
 }
 
 export function connectionForSerial(serial: string, usbLocation: string | null = null): DeviceConnection {
@@ -250,6 +299,48 @@ async function run(executable: string, args: string[], opts: AdbExecOptions = {}
   return { code: result.code, stdout: result.stdout.toString('utf8'), stderr: result.stderr }
 }
 
+/**
+ * Invoke the interactive form (`adb pair ENDPOINT`) and write the short-lived
+ * code to stdin. Child output is drained and discarded because even successful
+ * ADB versions echo the private endpoint and transport identity.
+ */
+function runPairing(executable: string, args: string[], pairingCode: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<AdbPairingAttempt> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { windowsHide: true })
+    child.stdout.resume()
+    child.stderr.resume()
+    const secret = Buffer.from(`${pairingCode}\n`, 'utf8')
+    let settled = false
+    const clearSecret = (): void => {
+      secret.fill(0)
+    }
+    const finish = (result: AdbPairingAttempt): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearSecret()
+      resolve(result)
+    }
+    const fail = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearSecret()
+      reject(new Error('Host ADB pairing process could not be launched; inspect Host diagnostics locally'))
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      finish({ ok: false })
+    }, timeoutMs)
+    child.stdin.on('error', () => {
+      // ADB can exit before consuming stdin. Its exit status is the fixed result.
+    })
+    child.on('error', fail)
+    child.on('close', (code) => finish({ ok: code === 0 }))
+    child.stdin.end(secret, clearSecret)
+  })
+}
+
 export interface SpawnedAdbHostOptions {
   executable?: string
   /** Prefix used by tests/wrappers before adb argv; empty in production. */
@@ -260,7 +351,7 @@ export interface SpawnedAdbHostOptions {
 }
 
 /** The real Host adb. Every call names an explicit serial — never a default device. */
-export class SpawnedAdbHost implements AdbHost {
+export class SpawnedAdbHost implements AdbHost, AdbPairingHost {
   private readonly executable: string
   private readonly prefixArgs: string[]
   private readonly textStdoutLimitBytes: number
@@ -309,6 +400,24 @@ export class SpawnedAdbHost implements AdbHost {
     // become public broker status, so only the exit fact crosses this boundary.
     if (result.code !== 0) throw new Error(`adb devices failed with exit code ${result.code}; inspect Host diagnostics locally`)
     return parseAdbDevices(result.stdout)
+  }
+
+  async discoverPairingServices(): Promise<AdbPairingService[]> {
+    const result = await run(this.executable, this.argv(['mdns', 'services']), {
+      timeoutMs: 20_000,
+      maxStdoutBytes: this.textStdoutLimitBytes,
+      maxStderrBytes: this.stderrLimitBytes
+    })
+    if (result.code !== 0) {
+      throw new Error(`ADB pairing discovery failed with exit code ${result.code}; inspect Host diagnostics locally`)
+    }
+    return parseAdbPairingServices(result.stdout)
+  }
+
+  pairWithCode(endpoint: string, pairingCode: string): Promise<AdbPairingAttempt> {
+    if (pairingEndpoint(endpoint) === null) throw new Error('ADB pairing endpoint is invalid')
+    if (!/^\d{6}$/.test(pairingCode)) throw new Error('ADB pairing code is invalid')
+    return runPairing(this.executable, this.argv(['pair', endpoint]), pairingCode)
   }
 
   exec(serial: string, args: string[], opts: AdbExecOptions = {}): Promise<ExecResult> {
