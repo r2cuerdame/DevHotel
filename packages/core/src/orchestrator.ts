@@ -964,7 +964,16 @@ export class RoomOrchestrator {
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
-      if (alreadyAwake && (await windowsVm.state(roomId)) === 'running') return
+      if (alreadyAwake) {
+        try {
+          if ((await windowsVm.state(roomId)) === 'running') return
+        } catch (error) {
+          this.olog(
+            roomId,
+            `could not confirm Windows VM state; attempting recovery start: ${error instanceof Error ? error.message : String(error)}`
+          )
+        }
+      }
       this.rooms.update(roomId, { status: 'preparing', hostPort: null })
       this.emit(roomId, 'status')
       this.olog(roomId, 'wake Windows VM')

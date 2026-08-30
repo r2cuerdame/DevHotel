@@ -288,6 +288,7 @@ export class FakeWindowsVm implements WindowsVmLifecycle {
   healthValue = { ok: true, detail: 'fake vmrun' }
   baselineValue = { ok: true, detail: 'fake clean baseline' }
   failCreate = false
+  failNextState = false
   readonly templateId = 'd'.repeat(64)
 
   async health() {
@@ -314,6 +315,10 @@ export class FakeWindowsVm implements WindowsVmLifecycle {
 
   async state(roomId: string) {
     this.calls.push(`state:${roomId}`)
+    if (this.failNextState) {
+      this.failNextState = false
+      throw new Error('fake state probe failed')
+    }
     return this.stateValue
   }
 
