@@ -54,9 +54,12 @@ export const zAndroidForceStopBody = z
 export type AndroidForceStopInput = z.infer<typeof zAndroidForceStopBody>
 
 export const zAndroidTextMatch = z.enum(['exact', 'contains'])
+// Permit the join controls needed by emoji/complex scripts while continuing
+// to reject other control, invisible-format, surrogate, and line-separator code points.
+const printableAndroidText = /^(?:[^\p{C}\p{Zl}\p{Zp}]|[\u200c\u200d])*$/u
 const androidTextFields = {
   applicationId: zAndroidApplicationId,
-  text: z.string().min(1).max(200).regex(/^[^\p{C}]*$/u, 'printable text'),
+  text: z.string().min(1).max(200).regex(printableAndroidText, 'printable text'),
   match: zAndroidTextMatch.optional(),
   ...targetField
 }
@@ -76,7 +79,7 @@ export type AndroidTapTextInput = z.infer<typeof zAndroidTapTextBody>
 export const zAndroidDumpUiBody = z
   .object({
     applicationId: zAndroidApplicationId,
-    filter: z.string().max(200).regex(/^[^\p{C}]*$/u, 'printable filter').optional(),
+    filter: z.string().max(200).regex(printableAndroidText, 'printable filter').optional(),
     maxNodes: z.number().int().min(1).max(500).optional(),
     ...targetField
   })
@@ -87,7 +90,7 @@ export const zAndroidLogcatBody = z
   .object({
     applicationId: zAndroidApplicationId,
     since: z.string().datetime({ offset: true }).optional(),
-    filter: z.string().max(200).regex(/^[^\p{C}]*$/u, 'printable filter').optional(),
+    filter: z.string().max(200).regex(printableAndroidText, 'printable filter').optional(),
     maxLines: z.number().int().min(1).max(500).optional(),
     ...targetField
   })
@@ -99,7 +102,7 @@ export const zAndroidRunCrashScenarioBody = z
   .object({
     applicationId: zAndroidApplicationId,
     scenario: zAndroidCrashScenario,
-    runId: z.string().trim().min(1).max(200).regex(/^[^\p{C}]+$/u, 'printable run ID'),
+    runId: z.string().trim().min(1).max(200).regex(printableAndroidText, 'printable run ID'),
     ...targetField
   })
   .strict()

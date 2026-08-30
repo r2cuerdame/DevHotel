@@ -165,7 +165,19 @@ describe('Android automation schemas', () => {
       extras: { name: 'AppDied', retries: 2, enabled: true },
       target: { kind: 'physical', deviceId: `d${'a'.repeat(32)}` }
     })).toMatchObject({ applicationId: 'com.example.app', extras: { retries: 2 } })
+    expect(zAndroidLaunchAppBody.safeParse({
+      applicationId: 'com.example.app', activity: 'com.vendor.auth.LoginActivity'
+    }).success).toBe(true)
     expect(zAndroidTargetSelector.parse({ kind: 'emulator' })).toEqual({ kind: 'emulator' })
+  })
+
+  it('allows join controls needed by app text but rejects bidi controls', () => {
+    expect(zAndroidTapTextBody.safeParse({
+      applicationId: 'com.example.app', text: '\u{1f468}\u200d\u{1f469}'
+    }).success).toBe(true)
+    expect(zAndroidTapTextBody.safeParse({
+      applicationId: 'com.example.app', text: 'unsafe\u202econtrol'
+    }).success).toBe(false)
   })
 
   it('refuses shell-shaped identifiers, oversized extras and unknown fields', () => {

@@ -59,6 +59,33 @@ describe('bounded Android UI hierarchy parsing', () => {
     expect(() => parseAndroidUiHierarchy('x'.repeat(1024 * 1024 + 1), APP_ID)).toThrow(/byte limit/)
   })
 
+  it('preserves Unicode join controls while rejecting unsafe bidi controls', () => {
+    const joinedEmoji = '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}'
+    const parsed = parseAndroidUiHierarchy(
+      `<node package="${APP_ID}" text="${joinedEmoji}" bounds="[0,0][20,20]" />`,
+      APP_ID
+    )
+
+    expect(parsed.nodes[0]?.text).toBe(joinedEmoji)
+    expect(() => parseAndroidUiHierarchy(
+      `<node package="${APP_ID}" text="unsafe\u202econtrol" bounds="[0,0][20,20]" />`,
+      APP_ID
+    )).toThrow(/control character/)
+  })
+
+  it('validates raw XML entities before decoding literal entity-shaped text', () => {
+    const parsed = parseAndroidUiHierarchy(
+      `<node package="${APP_ID}" text="&amp;quot; &amp;name;" bounds="[0,0][20,20]" />`,
+      APP_ID
+    )
+
+    expect(parsed.nodes[0]?.text).toBe('&quot; &name;')
+    expect(() => parseAndroidUiHierarchy(
+      `<node package="${APP_ID}" text="&name;" bounds="[0,0][20,20]" />`,
+      APP_ID
+    )).toThrow(/unsupported XML entity/)
+  })
+
   it('counts all app nodes while bounding what is returned', () => {
     const xml = `<hierarchy>${Array.from({ length: 4 }, (_, index) =>
       `<node package="${APP_ID}" text="Item ${index}" bounds="[0,${index}][10,${index + 1}]" />`
@@ -150,6 +177,22 @@ describe('tracked Android automation session', () => {
       '--es', 'label', 'A $HOME; id', '--ei', 'retries', '2', '--ez', 'enabled', 'true'
     ])
     expect(calls.at(-1)?.[2]).toBe('start')
+  })
+
+  it('scopes a fully qualified activity from another Java namespace to the tracked app', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
+      return { code: 0, stdout: 'Status: ok\n', stderr: '' }
+    })
+
+    const result = await session.launch(APP_ID, 'com.vendor.auth.LoginActivity')
+
+    expect(result.component).toBe(`${APP_ID}/com.vendor.auth.LoginActivity`)
+    expect(calls.at(-1)).toEqual([
+      'shell', 'am', 'start', '-W', '--user', 'current', '-n',
+      `${APP_ID}/com.vendor.auth.LoginActivity`
+    ])
   })
 
   it('returns only bounded redacted evidence when a launch command fails', async () => {

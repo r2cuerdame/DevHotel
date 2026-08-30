@@ -99,14 +99,17 @@ function parsePids(value: string): number[] {
 }
 
 function componentForActivity(applicationId: string, activity: string): string {
-  if (activity.startsWith('.')) return `${applicationId}/${activity}`
-  if (!activity.startsWith(`${applicationId}.`)) {
+  if (!/^(?:\.[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*|[A-Za-z][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+)$/.test(activity)) {
     throw automationError(
-      'ANDROID_ACTIVITY_OUT_OF_SCOPE',
-      'The requested activity is outside the tracked application package.',
-      `Use an activity class inside ${applicationId}.`
+      'ANDROID_ACTIVITY_INVALID',
+      'The requested activity is not a valid Android activity class name.',
+      'Use a relative or fully qualified Java class name from the tracked application manifest.',
+      400
     )
   }
+  if (activity.startsWith('.')) return `${applicationId}/${activity}`
+  // Android scopes a component by the package before `/`; the activity class
+  // may legitimately live in a different Java namespace than applicationId.
   return `${applicationId}/${activity}`
 }
 
@@ -714,7 +717,13 @@ interface ParseUiOptions {
 }
 
 function decodeXml(value: string): string {
-  const decoded = value.replace(/&(?:quot|apos|lt|gt|amp|#\d+|#x[0-9A-Fa-f]+);/g, (entity) => {
+  const entityPattern = /&(?:quot|apos|lt|gt|amp|#\d+|#x[0-9A-Fa-f]+);/g
+  // Validate the encoded source. Re-validating after a one-pass decode would
+  // mistake literal text such as `&amp;name;` for a source entity.
+  if (value.replace(entityPattern, '').includes('&')) {
+    throw automationError('ANDROID_UI_DUMP_INVALID', 'The UI hierarchy contains an unsupported XML entity.', 'Retry after the app UI changes.')
+  }
+  const decoded = value.replace(entityPattern, (entity) => {
     switch (entity) {
       case '&quot;': return '"'
       case '&apos;': return "'"
@@ -731,10 +740,10 @@ function decodeXml(value: string): string {
         return String.fromCodePoint(codePoint)
       }
     }
-  }).replace(/&[^;\s]{1,40};/g, () => {
-    throw automationError('ANDROID_UI_DUMP_INVALID', 'The UI hierarchy contains an unsupported XML entity.', 'Retry after the app UI changes.')
   })
-  if (/[\p{C}\p{Zl}\p{Zp}]/u.test(decoded)) {
+  // ZWJ and ZWNJ are legitimate join controls in emoji and complex scripts.
+  // Keep rejecting other invisible/control code points, including bidi marks.
+  if (/[\p{C}\p{Zl}\p{Zp}]/u.test(decoded.replace(/[\u200c\u200d]/g, ''))) {
     throw automationError('ANDROID_UI_DUMP_INVALID', 'The UI hierarchy contains a control character.', 'Retry after the app UI changes.')
   }
   return decoded
