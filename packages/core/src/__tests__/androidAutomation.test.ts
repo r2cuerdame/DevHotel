@@ -12,6 +12,13 @@ import { makeRoom, testDb } from './fakes'
 
 const APP_ID = 'com.example.app'
 const INSTALLED_AT = '2026-08-31T01:02:03.000Z'
+const HOST_NOW_MS = Date.parse('2026-08-31T01:10:00.000Z')
+
+function targetEpoch(epochMs: number): string {
+  const seconds = Math.floor(epochMs / 1000)
+  return `${seconds}.${String(epochMs - (seconds * 1000)).padStart(3, '0')}`
+}
+
 const target: AndroidAutomationTarget = {
   kind: 'emulator',
   deviceId: null,
@@ -348,11 +355,12 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') return { code: 0, stdout: `${targetEpoch(HOST_NOW_MS)}\n`, stderr: '' }
       if (args[0] === 'logcat') {
         return { code: 0, stdout: '1690000000.000 token=ghp_ABCDEFGHIJKLMNOPQRSTUVWX123456\nnormal line\n', stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
-    })
+    }, { now: () => HOST_NOW_MS })
 
     const result = await session.logcat({
       applicationId: APP_ID,
@@ -377,6 +385,7 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') return { code: 0, stdout: `${targetEpoch(HOST_NOW_MS)}\n`, stderr: '' }
       if (args[0] === 'logcat') {
         return {
           code: 0,
@@ -385,7 +394,7 @@ describe('tracked Android automation session', () => {
         }
       }
       return { code: 0, stdout: '', stderr: '' }
-    })
+    }, { now: () => HOST_NOW_MS })
     const requestedSince = '2026-08-31T01:02:04.567Z'
 
     const result = await session.logcat({
@@ -408,11 +417,81 @@ describe('tracked Android automation session', () => {
     expect(logcat).not.toContain('-m')
   })
 
+  it.each([
+    {
+      label: 'five minutes ahead for a requested cutoff',
+      skewMs: 5 * 60_000,
+      since: '2026-08-31T01:05:04.567Z',
+      expectedHostSince: Date.parse('2026-08-31T01:05:04.567Z')
+    },
+    {
+      label: 'five minutes behind for the tracked-install cutoff',
+      skewMs: -5 * 60_000,
+      since: '2020-01-01T00:00:00.000Z',
+      expectedHostSince: Date.parse(INSTALLED_AT)
+    }
+  ])('translates Host time into target time when the device clock is $label', async ({ skewMs, since, expectedHostSince }) => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') return { code: 0, stdout: `${targetEpoch(HOST_NOW_MS + skewMs)}\n`, stderr: '' }
+      if (args[0] === 'logcat') return { code: 0, stdout: '', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => HOST_NOW_MS })
+
+    const result = await session.logcat({ applicationId: APP_ID, since })
+
+    expect(result.since).toBe(new Date(expectedHostSince).toISOString())
+    expect(calls.find((args) => args[1] === 'date')).toEqual(['shell', 'date', '+%s.%3N'])
+    expect(calls.find((args) => args[0] === 'logcat')).toEqual(expect.arrayContaining([
+      '-t', targetEpoch(expectedHostSince + skewMs)
+    ]))
+  })
+
+  it('fails closed when the target-clock round trip is too slow to bound safely', async () => {
+    let now = HOST_NOW_MS
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') {
+        now += 2_001
+        return { code: 0, stdout: `${targetEpoch(HOST_NOW_MS)}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => now })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_TARGET_CLOCK_UNVERIFIED'
+    })
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
+  })
+
+  it.each([
+    { label: 'malformed', clock: { code: 0, stdout: 'not-an-epoch\n', stderr: '' } },
+    { label: 'nonzero', clock: { code: 1, stdout: `${targetEpoch(HOST_NOW_MS)}\n`, stderr: 'date failed' } }
+  ])('fails closed on a $label target-clock result before reading logcat', async ({ clock }) => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') return clock
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => HOST_NOW_MS })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_TARGET_CLOCK_UNVERIFIED'
+    })
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
+  })
+
   it('fails closed with an actionable since hint when bounded logcat source overflows', async () => {
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'date') return { code: 0, stdout: `${targetEpoch(HOST_NOW_MS)}\n`, stderr: '' }
       if (args[0] === 'logcat') {
         return {
           code: -1,
@@ -421,7 +500,7 @@ describe('tracked Android automation session', () => {
         }
       }
       return { code: 0, stdout: '', stderr: '' }
-    })
+    }, { now: () => HOST_NOW_MS })
 
     await expect(session.logcat({
       applicationId: APP_ID,
@@ -562,6 +641,9 @@ describe('tracked Android automation session', () => {
           ? { code: 0, stdout: '1234\n', stderr: '' }
           : { code: -1, stdout: '', stderr: 'transport lost' }
       }
+      if (args[1] === 'sh' && args[3]?.includes('exec am crash')) {
+        return { code: 0, stdout: `DEVHOTEL_TARGET_EPOCH=${targetEpoch(Date.now())}\n`, stderr: '' }
+      }
       return { code: 0, stdout: '', stderr: '' }
     })
 
@@ -570,8 +652,60 @@ describe('tracked Android automation session', () => {
       scenario: 'am-crash',
       runId: 'post-probe-failure'
     })).rejects.toMatchObject({ code: 'ANDROID_PROCESS_PROBE_FAILED' })
-    expect(calls.some((args) => args[1] === 'am' && args[2] === 'crash')).toBe(true)
+    expect(calls.some((args) => args[1] === 'sh' && args[3]?.includes('exec am crash'))).toBe(true)
     expect(pidProbes).toBe(2)
+  })
+
+  it('captures the target cutoff immediately before a crash without a Host-clock translation', async () => {
+    let pidProbes = 0
+    const targetCrashSince = targetEpoch(HOST_NOW_MS + (5 * 60_000) + 123)
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'pidof') {
+        pidProbes += 1
+        return pidProbes === 1
+          ? { code: 0, stdout: '1234\n', stderr: '' }
+          : { code: 1, stdout: '', stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('exec am crash')) {
+        return {
+          code: 0,
+          stdout: `DEVHOTEL_TARGET_EPOCH=${targetCrashSince}\nCrash requested\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') return { code: 0, stdout: 'crash line\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => HOST_NOW_MS, sleep: async () => {} })
+
+    const result = await session.crashScenario({
+      applicationId: APP_ID,
+      scenario: 'am-crash',
+      runId: 'target-clock-crash'
+    })
+
+    expect(result).toMatchObject({
+      observed: true,
+      pidsBefore: [1234],
+      pidsAfter: [],
+      evidence: { stdout: 'Crash requested\n' },
+      logcat: {
+        since: new Date(HOST_NOW_MS).toISOString(),
+        lines: ['crash line']
+      }
+    })
+    const crash = calls.find((args) => args[1] === 'sh' && args[3]?.includes('exec am crash'))
+    expect(crash).toEqual([
+      'shell', 'sh', '-c',
+      'date \'+DEVHOTEL_TARGET_EPOCH=%s.%3N\' || exit $?; exec am crash --user current "$1"',
+      'devhotel-crash', APP_ID
+    ])
+    expect(calls.find((args) => args[0] === 'logcat')).toEqual(expect.arrayContaining([
+      '-t', targetCrashSince
+    ]))
+    expect(calls.some((args) => args[1] === 'date')).toBe(false)
   })
 
   it('transfers one exact target/package receipt to the last installing Room', () => {

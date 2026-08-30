@@ -185,7 +185,7 @@ Automation POST bodies are strict and capped at 64 KiB.
 | `POST /v1/rooms/:id/android/wait-for-text` | `{ applicationId, text, match?, timeoutMs?, pollIntervalMs?, target? }` | one sanitized app-owned node, attempts and elapsed time |
 | `POST /v1/rooms/:id/android/tap-text` | `{ applicationId, text, match?, target? }` | the one unambiguous app-owned node and bounded input evidence |
 | `POST /v1/rooms/:id/android/dump-ui` | `{ applicationId, filter?, maxNodes?, target? }` | at most 500 sanitized nodes plus scan/truncation accounting |
-| `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines, clamped no earlier than the tracked install |
+| `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines; Host-clock `since` is clamped no earlier than the tracked install, then translated through a bounded exact-target clock probe |
 | `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
 
 UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded

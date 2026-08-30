@@ -31,8 +31,11 @@ const MAX_UI_TAG_BYTES = 32 * 1024
 const MAX_UI_ATTRIBUTE_BYTES = 4 * 1024
 const MAX_EVIDENCE_BYTES = 4 * 1024
 const MAX_LOGCAT_BYTES = 64 * 1024
+const MAX_TARGET_CLOCK_RTT_MS = 2_000
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_INTERVAL_MS = 500
+const TARGET_CLOCK_FORMAT = '+%s.%3N'
+const CRASH_CLOCK_PREFIX = 'DEVHOTEL_TARGET_EPOCH='
 
 export interface AndroidAutomationExecOptions {
   timeoutMs?: number
@@ -153,6 +156,13 @@ function epochSecondsWithMillis(epochMs: number): string {
   const seconds = Math.floor(epochMs / 1000)
   const millis = epochMs - (seconds * 1000)
   return `${seconds}.${String(millis).padStart(3, '0')}`
+}
+
+function parseTargetEpochMillis(value: string): { epochMs: number; timestamp: string } | null {
+  const match = /^(\d{10,11})\.(\d{3})\r?\n?$/.exec(value)
+  if (!match) return null
+  const epochMs = (Number.parseInt(match[1]!, 10) * 1000) + Number.parseInt(match[2]!, 10)
+  return Number.isSafeInteger(epochMs) ? { epochMs, timestamp: `${match[1]}.${match[2]}` } : null
 }
 
 function matchesText(node: AndroidUiNode, text: string, match: 'exact' | 'contains'): boolean {
@@ -684,16 +694,57 @@ export class AndroidAutomationSession {
     return uid
   }
 
-  async logcat(input: AndroidLogcatInput): Promise<AndroidLogcatResult> {
+  private targetClockError(result: ExecResult): DevHotelError {
+    return automationError(
+      'ANDROID_TARGET_CLOCK_UNVERIFIED',
+      'The selected Android target did not provide a timely, exact millisecond clock sample.',
+      'Restore target responsiveness and retry on Android 11 or newer; DevHotel will not mix Host-clock and target-clock log evidence.',
+      409,
+      safeEvidence(result)
+    )
+  }
+
+  private async targetCutoffForHostTime(hostCutoffMs: number): Promise<string> {
+    const hostBefore = this.now()
+    const result = await this.command(
+      ['shell', 'date', TARGET_CLOCK_FORMAT],
+      { operation: 'Android target clock probe', timeoutMs: 5_000, stdoutLimit: 256 }
+    )
+    const hostAfter = this.now()
+    const target = parseTargetEpochMillis(result.stdout)
+    const rttMs = hostAfter - hostBefore
+    if (
+      result.code !== 0 ||
+      result.stderr.trim() ||
+      !target ||
+      rttMs < 0 ||
+      rttMs > MAX_TARGET_CLOCK_RTT_MS
+    ) {
+      throw this.targetClockError(result)
+    }
+    // The target sampled its clock at some point after hostBefore. Using the
+    // upper offset bound prevents an install/request fence from moving earlier
+    // than the equivalent target-clock instant; at worst a bounded RTT sliver
+    // is omitted instead of admitting pre-fence evidence.
+    const targetCutoffMs = hostCutoffMs + (target.epochMs - hostBefore)
+    if (!Number.isSafeInteger(targetCutoffMs)) throw this.targetClockError(result)
+    return epochSecondsWithMillis(targetCutoffMs)
+  }
+
+  private async readLogcat(
+    input: AndroidLogcatInput,
+    exactTargetSince?: string
+  ): Promise<AndroidLogcatResult> {
     const receipt = await this.requireInstalled(input.applicationId)
     const uid = await this.packageUid(input.applicationId)
     const requestedSince = input.since ? Date.parse(input.since) : Date.parse(receipt.installedAt)
     const sinceMs = Math.max(Number.isFinite(requestedSince) ? requestedSince : 0, Date.parse(receipt.installedAt))
     const since = new Date(sinceMs).toISOString()
+    const targetSince = exactTargetSince ?? await this.targetCutoffForHostTime(sinceMs)
     const result = await this.command(
       [
         'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${uid}`,
-        '-t', epochSecondsWithMillis(sinceMs)
+        '-t', targetSince
       ],
       {
         operation: 'Android package logcat',
@@ -750,6 +801,10 @@ export class AndroidAutomationSession {
     }
   }
 
+  async logcat(input: AndroidLogcatInput): Promise<AndroidLogcatResult> {
+    return this.readLogcat(input)
+  }
+
   private async pids(applicationId: string): Promise<number[]> {
     const result = await this.command(
       ['shell', 'pidof', applicationId],
@@ -781,10 +836,18 @@ export class AndroidAutomationSession {
       )
     }
     const crashStartedAt = this.now()
-    const result = await this.command(
-      ['shell', 'am', 'crash', '--user', 'current', input.applicationId],
+    const crashResult = await this.command(
+      [
+        'shell', 'sh', '-c',
+        `date '+${CRASH_CLOCK_PREFIX}${TARGET_CLOCK_FORMAT.slice(1)}' || exit $?; exec am crash --user current "$1"`,
+        'devhotel-crash', input.applicationId
+      ],
       { operation: 'Android crash scenario', timeoutMs: 30_000, stdoutLimit: 64 * 1024 }
     )
+    const clockLine = new RegExp(`^${CRASH_CLOCK_PREFIX}(\\d{10,11}\\.\\d{3})\\r?\\n`).exec(crashResult.stdout)
+    const targetCrashSince = clockLine ? parseTargetEpochMillis(`${clockLine[1]}\n`) : null
+    if (!clockLine || !targetCrashSince) throw this.targetClockError(crashResult)
+    const result = { ...crashResult, stdout: crashResult.stdout.slice(clockLine[0].length) }
     let pidsAfter = pidsBefore
     let observed = false
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -795,11 +858,11 @@ export class AndroidAutomationSession {
       }
       await this.pause(250)
     }
-    const logcat = await this.logcat({
+    const logcat = await this.readLogcat({
       applicationId: input.applicationId,
       since: new Date(crashStartedAt).toISOString(),
       maxLines: 200
-    })
+    }, targetCrashSince.timestamp)
     return {
       target: this.target,
       applicationId: input.applicationId,

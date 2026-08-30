@@ -477,7 +477,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_logcat',
       description:
-        'Read bounded logs for a tracked app only. DevHotel resolves and verifies an unshared package UID, clamps since to the tracked install time, redacts secrets, and never falls back to global logcat.',
+        'Read bounded logs for a tracked app only. DevHotel treats since as Host time, clamps it to the tracked install, translates it to the exact target clock, resolves an unshared package UID, redacts secrets, and never falls back to global logcat.',
       schema: {
         roomId: zRoomId,
         applicationId: zAndroidApplicationId,
