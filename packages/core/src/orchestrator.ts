@@ -12,6 +12,8 @@ import type {
   CloneRoomInput,
   CreateRoomInput,
   OperationRecord,
+  HostResyncDriftFacts,
+  HostResyncStateFacts,
   ProviderKind,
   QuickChange,
   RoomInspection,
@@ -19,6 +21,7 @@ import type {
   RoomRecord,
   RoomRuntimeStatus,
   RuntimeRoomRecord,
+  SafeHostResyncOutcome,
   SourceType
 } from '@devhotel/shared'
 import { hostInputCapability, VMWARE_CONSOLE_CAPABILITY } from '@devhotel/shared'
@@ -1569,6 +1572,81 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
   }
 
+  /**
+   * Inspect, refuse-or-confirm, and publish a Host resync under one Room lock.
+   * Confirmation accepts exactly the inspected generation; a later terminal or
+   * process edit invalidates that acceptance before the runtime can switch.
+   */
+  safeResyncFromHost(
+    roomId: string,
+    actor: Actor,
+    confirmDiscardRoomChanges = false
+  ): Promise<SafeHostResyncOutcome> {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (actor !== 'user' && !this.agentHostSyncAllowed(roomId)) {
+        throw new Error('Agent Host sync is revoked for this Room. Re-enable it in the Room, or run the sync yourself.')
+      }
+      if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
+        throw new Error('This Room is detached from its original Host folder')
+      }
+      if (room.workspaceMode !== 'hotel') {
+        throw new Error('Move this legacy Room into the Hotel before syncing')
+      }
+      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      if (!awake || (await this.backend.webState(roomId)) !== 'running') {
+        throw new Error('Wake the Room before importing Host changes')
+      }
+
+      const inspection = await this.inspectHostSyncDrift(room)
+      const before = this.hostResyncStateFacts(room)
+      const confirmationRequired = inspection.drift.status !== 'clean'
+      const recoveryBeforeSync = [
+        'Export or commit meaningful Room-side source changes before replacing them.',
+        'Retry with confirmDiscardRoomChanges=true only when the listed Room changes are intentionally disposable.'
+      ]
+      if (confirmationRequired && !confirmDiscardRoomChanges) {
+        return {
+          status: 'confirmation-required',
+          before,
+          drift: inspection.drift,
+          confirmation: { required: true, provided: false },
+          recoveryGuidance: recoveryBeforeSync
+        }
+      }
+
+      const title = confirmationRequired
+        ? 'Inspected and confirmed Room changes, then safely resynced from Host'
+        : 'Inspected a clean Room and safely resynced from Host'
+      const updated = await this.replaceWorkspaceFromHostLocked(roomId, actor, false, {
+        acceptedCurrentSnapshot: inspection.currentSnapshot,
+        journal: {
+          kind: 'safe-resync-from-host',
+          title,
+          before: { ...before, drift: inspection.drift },
+          after: (published) => ({
+            ...this.hostResyncStateFacts(published),
+            retainedWorkspaceVolumeRevision: before.workspaceVolumeRevision
+          })
+        }
+      })
+      const after = this.hostResyncStateFacts(updated)
+      return {
+        status: 'synced',
+        before,
+        after,
+        drift: inspection.drift,
+        confirmation: { required: confirmationRequired, provided: confirmDiscardRoomChanges },
+        baselineReset: true,
+        retainedWorkspaceVolumeRevision: before.workspaceVolumeRevision,
+        recoveryGuidance: [
+          `The replaced Room workspace remains retained as generation r${before.workspaceVolumeRevision} until the next Host sync.`,
+          'If the imported Host state is wrong, stop making Room changes and recover or export that retained generation before another sync.'
+        ]
+      }
+    })
+  }
+
   /** Revoke or restore this Room's inbound Host-sync grant for agents. */
   setAgentHostSync(roomId: string, allowed: boolean, actor: Actor): RoomRecord {
     const room = this.mustGet(roomId)
@@ -1636,7 +1714,15 @@ export class RoomOrchestrator {
     })
   }
 
-  private async replaceWorkspaceFromHostLocked(roomId: string, actor: Actor, migrateLegacy: boolean): Promise<RoomRecord> {
+  private async replaceWorkspaceFromHostLocked(
+    roomId: string,
+    actor: Actor,
+    migrateLegacy: boolean,
+    options: {
+      acceptedCurrentSnapshot?: WorkspaceSnapshot
+      journal?: { kind: string; title: string; before: unknown; after: (published: RoomRecord) => unknown }
+    } = {}
+  ): Promise<RoomRecord> {
     const room = this.mustGet(roomId)
     // Moving a legacy Room into the Hotel rewires where it executes: always a
     // human decision. Inbound sync re-reads the folder the human already linked
@@ -1665,33 +1751,45 @@ export class RoomOrchestrator {
     }
     if (!migrateLegacy) {
       const currentSnapshot = await this.backend.snapshotWorkspace(roomId, room.workspaceVolumeRevision)
-      const baseline = await this.workspaceSyncBaseline(room)
-      const changedPaths = baseline ? diffWorkspaceSnapshots(baseline, currentSnapshot) : null
-      let acceptedFingerprint = room.workspaceFingerprint
-      if (acceptedFingerprint && !baseline && currentSnapshot.fingerprint !== acceptedFingerprint) {
-        const legacyFingerprint = await this.backend.fingerprintWorkspaceLegacy(room.id, room.workspaceVolumeRevision)
-        const generatedOnlyFingerprint = legacyFingerprint === acceptedFingerprint
-          ? legacyFingerprint
-          : await this.backend.fingerprintWorkspaceLegacyCurrentExclusions(
-              room.id,
-              room.workspaceVolumeRevision
-            )
-        if (legacyFingerprint === acceptedFingerprint || generatedOnlyFingerprint === acceptedFingerprint) {
-          acceptedFingerprint = currentSnapshot.fingerprint
-          this.rooms.update(room.id, { workspaceFingerprint: acceptedFingerprint })
-          this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
-        }
-      }
-      if (!acceptedFingerprint || currentSnapshot.fingerprint !== acceptedFingerprint) {
+      if (options.acceptedCurrentSnapshot && currentSnapshot.fingerprint !== options.acceptedCurrentSnapshot.fingerprint) {
         this.rooms.update(roomId, { syncStatus: 'modified' })
-        if (changedPaths && changedPaths.length > 0) throw new WorkspaceDriftError(changedPaths)
-        throw new Error(
-          'Room files changed since the last Host sync. Export or commit them first, ' +
-            'or accept the current Room files as the new baseline (Reset baseline) and sync again.'
-        )
+        const changedSinceInspection = diffWorkspaceSnapshots(options.acceptedCurrentSnapshot, currentSnapshot)
+        if (changedSinceInspection.length > 0) throw new WorkspaceDriftError(changedSinceInspection)
+        throw new Error('Room files changed after Host resync inspection; inspect again before confirming.')
       }
-      // Upgrade pre-path-baseline Rooms without changing their accepted source.
-      if (!baseline) this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
+      if (options.acceptedCurrentSnapshot) {
+        // The combined operation explicitly accepted this exact snapshot. Do
+        // not persist it as a standalone baseline: the Host import and final
+        // baseline publish either complete together or not at all.
+      } else {
+        const baseline = await this.workspaceSyncBaseline(room)
+        const changedPaths = baseline ? diffWorkspaceSnapshots(baseline, currentSnapshot) : null
+        let acceptedFingerprint = room.workspaceFingerprint
+        if (acceptedFingerprint && !baseline && currentSnapshot.fingerprint !== acceptedFingerprint) {
+          const legacyFingerprint = await this.backend.fingerprintWorkspaceLegacy(room.id, room.workspaceVolumeRevision)
+          const generatedOnlyFingerprint = legacyFingerprint === acceptedFingerprint
+            ? legacyFingerprint
+            : await this.backend.fingerprintWorkspaceLegacyCurrentExclusions(
+                room.id,
+                room.workspaceVolumeRevision
+              )
+          if (legacyFingerprint === acceptedFingerprint || generatedOnlyFingerprint === acceptedFingerprint) {
+            acceptedFingerprint = currentSnapshot.fingerprint
+            this.rooms.update(room.id, { workspaceFingerprint: acceptedFingerprint })
+            this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
+          }
+        }
+        if (!acceptedFingerprint || currentSnapshot.fingerprint !== acceptedFingerprint) {
+          this.rooms.update(roomId, { syncStatus: 'modified' })
+          if (changedPaths && changedPaths.length > 0) throw new WorkspaceDriftError(changedPaths)
+          throw new Error(
+            'Room files changed since the last Host sync. Export or commit them first, ' +
+              'or accept the current Room files as the new baseline (Reset baseline) and sync again.'
+          )
+        }
+        // Upgrade pre-path-baseline Rooms without changing their accepted source.
+        if (!baseline) this.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(currentSnapshot))
+      }
     }
 
     const nextVolumeRevision = nextWorkspaceVolumeRevision(
@@ -1715,6 +1813,46 @@ export class RoomOrchestrator {
       workspaceMode: 'hotel',
       workspaceVolumeRevision: nextVolumeRevision
     })
+    if (options.acceptedCurrentSnapshot) {
+      let paused = false
+      try {
+        await this.backend.pauseWeb(roomId)
+        paused = true
+        const publishSnapshot = await this.backend.snapshotWorkspace(roomId, room.workspaceVolumeRevision)
+        if (publishSnapshot.fingerprint !== options.acceptedCurrentSnapshot.fingerprint) {
+          this.rooms.update(roomId, { syncStatus: 'modified' })
+          const changedDuringSync = diffWorkspaceSnapshots(options.acceptedCurrentSnapshot, publishSnapshot)
+          if (changedDuringSync.length > 0) throw new WorkspaceDriftError(changedDuringSync)
+          throw new Error('Room files changed while Host source was staged; nothing was published. Inspect and retry.')
+        }
+      } catch (guardError) {
+        if (paused) {
+          try {
+            await this.backend.unpauseWeb(roomId)
+          } catch (unpauseError) {
+            try {
+              await this.backend.recreateWeb(previousSpec)
+              this.olog(roomId, `Host resync guard restored the prior runtime after unpause failed: ${unpauseError instanceof Error ? unpauseError.message : String(unpauseError)}`)
+            } catch (recreateError) {
+              this.rooms.update(roomId, { status: 'broken' })
+              throw new AggregateError(
+                [guardError, unpauseError, recreateError],
+                'Host resync was refused, but the prior runtime could not be resumed or recreated'
+              )
+            }
+          }
+        }
+        try {
+          await this.backend.removeWorkspaceVolume(roomId, nextVolumeRevision)
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [guardError, cleanupError],
+            `Host resync was refused and staged generation r${nextVolumeRevision} requires cleanup`
+          )
+        }
+        throw guardError
+      }
+    }
     try {
       await this.backend.recreateWeb(nextSpec)
     } catch (switchError) {
@@ -1758,12 +1896,12 @@ export class RoomOrchestrator {
     await writeManifest(this.userData, updated)
     this.appendJournal(
       roomId,
-      migrateLegacy ? 'move-into-hotel' : 'sync-from-host',
-      migrateLegacy ? 'Moved workspace into the Hotel' : 'Synced workspace from Host',
+      options.journal?.kind ?? (migrateLegacy ? 'move-into-hotel' : 'sync-from-host'),
+      options.journal?.title ?? (migrateLegacy ? 'Moved workspace into the Hotel' : 'Synced workspace from Host'),
       actor,
       'Working State',
-      { revision: room.stateRevision, mode: room.workspaceMode },
-      { revision: updated.stateRevision, mode: updated.workspaceMode }
+      options.journal?.before ?? { revision: room.stateRevision, mode: room.workspaceMode },
+      options.journal?.after(updated) ?? { revision: updated.stateRevision, mode: updated.workspaceMode }
     )
     this.emit(roomId, 'change')
     this.emit(roomId, 'status')
@@ -1787,6 +1925,59 @@ export class RoomOrchestrator {
       }
     }
     return updated
+  }
+
+  private hostResyncStateFacts(room: RoomRecord): HostResyncStateFacts {
+    return {
+      stateRevision: room.stateRevision,
+      workspaceVolumeRevision: room.workspaceVolumeRevision,
+      syncStatus: room.syncStatus,
+      workspaceFingerprint: room.workspaceFingerprint,
+      lastSyncedAt: room.lastSyncedAt
+    }
+  }
+
+  private async inspectHostSyncDrift(room: RoomRecord): Promise<{
+    currentSnapshot: WorkspaceSnapshot
+    drift: HostResyncDriftFacts
+  }> {
+    const currentSnapshot = await this.backend.snapshotWorkspace(room.id, room.workspaceVolumeRevision)
+    const baseline = await this.workspaceSyncBaseline(room)
+    if (baseline) {
+      const changedPaths = diffWorkspaceSnapshots(baseline, currentSnapshot)
+      return {
+        currentSnapshot,
+        drift: {
+          status: changedPaths.length > 0 ? 'changed' : 'clean',
+          baselineEvidence: 'path-snapshot',
+          changedPaths
+        }
+      }
+    }
+
+    const acceptedFingerprint = room.workspaceFingerprint
+    if (acceptedFingerprint && currentSnapshot.fingerprint === acceptedFingerprint) {
+      return {
+        currentSnapshot,
+        drift: { status: 'clean', baselineEvidence: 'current-fingerprint', changedPaths: [] }
+      }
+    }
+    if (acceptedFingerprint) {
+      const legacyFingerprint = await this.backend.fingerprintWorkspaceLegacy(room.id, room.workspaceVolumeRevision)
+      const generatedOnlyFingerprint = legacyFingerprint === acceptedFingerprint
+        ? legacyFingerprint
+        : await this.backend.fingerprintWorkspaceLegacyCurrentExclusions(room.id, room.workspaceVolumeRevision)
+      if (legacyFingerprint === acceptedFingerprint || generatedOnlyFingerprint === acceptedFingerprint) {
+        return {
+          currentSnapshot,
+          drift: { status: 'clean', baselineEvidence: 'legacy-fingerprint', changedPaths: [] }
+        }
+      }
+    }
+    return {
+      currentSnapshot,
+      drift: { status: 'unknown', baselineEvidence: 'unavailable', changedPaths: [] }
+    }
   }
 
   private async workspaceSyncBaseline(room: RoomRecord): Promise<WorkspaceSnapshot | null> {

@@ -16,6 +16,7 @@ import {
   zRunOutputQuery,
   zRoomOperationsLimit,
   zStartRoomBody,
+  zSafeHostResyncBody,
   zUndoChangeBody,
   type ControlInfo
 } from '@devhotel/shared'
@@ -200,6 +201,39 @@ export async function startControlApi(
             }
             try {
               sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'agent')))
+            } catch (error) {
+              if (error instanceof WorkspaceDriftError) {
+                sendJson(res, 409, error.toResponse())
+                return
+              }
+              throw error
+            }
+            return
+          }
+          case 'safe-resync-from-host': {
+            const room = orch.rooms.get(safeRoomId)
+            if (!room) {
+              sendJson(res, 404, { error: 'room not found' })
+              return
+            }
+            if (room.sourceType !== 'linked-folder' || !room.hostSyncEnabled) {
+              sendJson(res, 409, { error: 'This Room has no linked Host folder to sync from' })
+              return
+            }
+            if (!orch.agentHostSyncAllowed(safeRoomId)) {
+              sendJson(res, 403, {
+                error: 'Agent Host sync is revoked for this Room. Re-enable it in the Room, or run the sync yourself.'
+              })
+              return
+            }
+            const body = zSafeHostResyncBody.parse(await readBody(req))
+            try {
+              const outcome = await orch.safeResyncFromHost(
+                safeRoomId,
+                'agent',
+                body.confirmDiscardRoomChanges
+              )
+              sendJson(res, outcome.status === 'confirmation-required' ? 409 : 200, outcome)
             } catch (error) {
               if (error instanceof WorkspaceDriftError) {
                 sendJson(res, 409, error.toResponse())

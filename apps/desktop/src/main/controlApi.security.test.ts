@@ -228,6 +228,76 @@ describe('agent control API host boundary', () => {
     }
   })
 
+  it('keeps safe Host resync read-only until exact Room drift is explicitly confirmed', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-safe-resync-'))
+    roots.push(userData)
+    const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\private\\project' }
+    const safeResyncFromHost = vi.fn(async (_roomId: string, _actor: string, confirmed: boolean) =>
+      confirmed
+        ? {
+            status: 'synced',
+            before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
+            after: { stateRevision: 5, workspaceVolumeRevision: 2, syncStatus: 'synced' },
+            drift: { status: 'changed', changedPaths: [{ path: 'src/app.ts', reason: 'modified' }] },
+            confirmation: { required: true, provided: true },
+            baselineReset: true,
+            retainedWorkspaceVolumeRevision: 1,
+            recoveryGuidance: ['generation r1 retained']
+          }
+        : {
+            status: 'confirmation-required',
+            before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
+            drift: { status: 'changed', changedPaths: [{ path: 'src/app.ts', reason: 'modified' }] },
+            confirmation: { required: true, provided: false },
+            recoveryGuidance: ['export or commit first']
+          }
+    )
+    const control = await startControlApi(
+      {
+        rooms: { get: () => room },
+        agentHostSyncAllowed: () => true,
+        safeResyncFromHost
+      } as unknown as RoomOrchestrator,
+      userData,
+      'test'
+    )
+    try {
+      const url = `http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/safe-resync-from-host`
+      const headers = {
+        authorization: `Bearer ${control.info.token}`,
+        'content-type': 'application/json'
+      }
+      const preview = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ confirmDiscardRoomChanges: false })
+      })
+      const previewBody = await preview.json() as { status: string; drift: { changedPaths: { path: string }[] } }
+
+      expect(preview.status).toBe(409)
+      expect(previewBody).toMatchObject({
+        status: 'confirmation-required',
+        drift: { changedPaths: [{ path: 'src/app.ts' }] }
+      })
+      expect(JSON.stringify(previewBody)).not.toContain(room.sourceRef)
+
+      const confirmed = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ confirmDiscardRoomChanges: true })
+      })
+      expect(confirmed.status).toBe(200)
+      await expect(confirmed.json()).resolves.toMatchObject({
+        status: 'synced',
+        retainedWorkspaceVolumeRevision: 1
+      })
+      expect(safeResyncFromHost).toHaveBeenNthCalledWith(1, 'room1abc', 'agent', false)
+      expect(safeResyncFromHost).toHaveBeenNthCalledWith(2, 'room1abc', 'agent', true)
+    } finally {
+      control.stop()
+    }
+  })
+
   it('refuses agent deletion of Host-linked rooms but allows Hotel-owned ones', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-delete-'))
     roots.push(userData)

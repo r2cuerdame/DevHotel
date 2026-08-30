@@ -1,7 +1,7 @@
 import type { ChangeEntry, QuickChange } from './changes'
 import type { CheckReport } from './checks'
 import type { RendererCreateRoomInput, RendererPlanRoomInput } from './control'
-import type { CloneRoomInput, RoomInspection, RoomPlan, RoomRecord, RuntimeRoomRecord } from './rooms'
+import type { CloneRoomInput, RoomInspection, RoomPlan, RoomRecord, RuntimeRoomRecord, SafeHostResyncOutcome } from './rooms'
 import type { GitHubServiceStatus, McpRegistryPage } from './hotelServices'
 
 /** IPC channel names. Events (`ev*`) flow main → renderer; the rest are invoke/handle. */
@@ -18,6 +18,7 @@ export const IPC = {
   roomsRename: 'rooms:rename',
   roomsComponents: 'rooms:components',
   roomsSyncFromHost: 'rooms:syncFromHost',
+  roomsSafeResyncFromHost: 'rooms:safeResyncFromHost',
   roomsMoveIntoHotel: 'rooms:moveIntoHotel',
   roomsResetSyncBaseline: 'rooms:resetSyncBaseline',
   roomsSetAgentHostSync: 'rooms:setAgentHostSync',
@@ -219,6 +220,11 @@ export interface IpcApi {
     rename(roomId: string, nickname: string): Promise<void>
     components(roomId: string): Promise<import('./ipc').ComponentInfo[]>
     syncFromHost(roomId: string, approvedHostPath: string): Promise<RoomRecord>
+    safeResyncFromHost(
+      roomId: string,
+      approvedHostPath: string,
+      confirmDiscardRoomChanges: boolean
+    ): Promise<SafeHostResyncOutcome>
     moveIntoHotel(roomId: string, approvedHostPath: string): Promise<RoomRecord>
     /** accept the Room's current files as the Host sync baseline */
     resetSyncBaseline(roomId: string): Promise<RoomRecord>

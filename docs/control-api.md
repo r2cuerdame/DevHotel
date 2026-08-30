@@ -31,7 +31,7 @@ room's Changes list. Host boundaries hold:
   or delete Host-linked ones.
 - Agent mutations on `legacy-host-bind` rooms are refused until the user moves
   the room into the Hotel.
-- `sync-from-host` runs under the Room's **inbound-sync grant**: the human
+- `safe-resync-from-host` (and the lower-level `sync-from-host`) runs under the Room's **inbound-sync grant**: the human
   linked that folder when creating the Room and can revoke agent sync per Room
   ("Agents may sync from Host" in the Working state card) — revoked returns
   `403`. It re-reads only `room.sourceRef`, never a path from the request, is
@@ -141,6 +141,7 @@ can drive the whole thing by polling.
 | `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
 | `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
 | `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
+| `POST /v1/rooms/:id/safe-resync-from-host` | `{ confirmDiscardRoomChanges?: boolean }` | preferred inspect/refuse-or-confirm/reset/resync operation. With meaningful or unprovable drift and no confirmation, returns `409` with `status: 'confirmation-required'`, exact Room-relative paths when available, before facts, and recovery guidance without importing anything. Explicit confirmation is bound to that inspected snapshot; a later edit aborts the staged import. Success returns structured before/after facts and the retained recovery generation. |
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |

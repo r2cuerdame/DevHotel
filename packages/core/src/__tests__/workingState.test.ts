@@ -269,6 +269,166 @@ describe('Room-owned working state', () => {
     expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(true)
   })
 
+  it('inspects exact Room drift and requires explicit confirmation before one-step Host resync', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      lastSyncedAt: '2026-08-10T10:00:00.000Z',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(
+      workspaceSyncBaseKey(room.id),
+      serializeWorkspaceSnapshot({
+        fingerprint: 'a'.repeat(64),
+        entries: [{ path: 'src/app.ts', kind: 'file', identity: 'old-source' }]
+      })
+    )
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    backend.workspaceSnapshotEntries = [{ path: 'src/app.ts', kind: 'file', identity: 'room-edit' }]
+
+    const refused = await orch.safeResyncFromHost(room.id, 'agent', false)
+
+    expect(refused).toMatchObject({
+      status: 'confirmation-required',
+      before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
+      drift: {
+        status: 'changed',
+        baselineEvidence: 'path-snapshot',
+        changedPaths: [{ path: 'src/app.ts', reason: 'modified' }]
+      },
+      confirmation: { required: true, provided: false }
+    })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('old-source')
+
+    const completed = await orch.safeResyncFromHost(room.id, 'agent', true)
+
+    expect(completed).toMatchObject({
+      status: 'synced',
+      before: { stateRevision: 4, workspaceVolumeRevision: 1, syncStatus: 'modified' },
+      after: { stateRevision: 5, workspaceVolumeRevision: 2, syncStatus: 'synced' },
+      confirmation: { required: true, provided: true },
+      baselineReset: true,
+      retainedWorkspaceVolumeRevision: 1
+    })
+    expect(backend.calls).toContain(`pauseWeb:${room.id}`)
+    expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r2`)
+    expect(orch.settings.get(retainedWorkspaceGenKey(room.id))).toBe('1')
+    expect(orch.listChanges(room.id)[0]).toMatchObject({ kind: 'safe-resync-from-host', actor: 'agent' })
+  })
+
+  it('safe Host resync needs no destructive confirmation when inspection is clean', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 7,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    orch.settings.set(
+      workspaceSyncBaseKey(room.id),
+      serializeWorkspaceSnapshot({
+        fingerprint: 'a'.repeat(64),
+        entries: [{ path: 'src/app.ts', kind: 'file', identity: 'same-source' }]
+      })
+    )
+    backend.workspaceFingerprintValue = 'a'.repeat(64)
+    backend.workspaceSnapshotEntries = [{ path: 'src/app.ts', kind: 'file', identity: 'same-source' }]
+
+    const completed = await orch.safeResyncFromHost(room.id, 'user')
+
+    expect(completed).toMatchObject({
+      status: 'synced',
+      drift: { status: 'clean', changedPaths: [] },
+      confirmation: { required: false, provided: false }
+    })
+  })
+
+  it('fails closed when an old Room has no path baseline that can prove its drift', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 2,
+      syncStatus: 'synced',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
+    backend.legacyWorkspaceFingerprintValue = 'c'.repeat(64)
+    backend.legacyCurrentExclusionsFingerprintValue = 'd'.repeat(64)
+
+    const refused = await orch.safeResyncFromHost(room.id, 'user')
+
+    expect(refused).toMatchObject({
+      status: 'confirmation-required',
+      drift: { status: 'unknown', baselineEvidence: 'unavailable', changedPaths: [] },
+      confirmation: { required: true, provided: false }
+    })
+    expect(backend.calls.some((call) => call.startsWith('importHostFolder:'))).toBe(false)
+  })
+
+  it('refuses a confirmed safe resync if Room source changes again while Host import is staged', async () => {
+    const room = makeRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified',
+      hostSyncEnabled: true,
+      workspaceFingerprint: 'a'.repeat(64)
+    })
+    orch.rooms.create(room)
+    const baseline = {
+      fingerprint: 'a'.repeat(64),
+      entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'baseline' }]
+    }
+    const inspected = {
+      fingerprint: 'b'.repeat(64),
+      entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'confirmed-room-edit' }]
+    }
+    const changedAgain = {
+      fingerprint: 'c'.repeat(64),
+      entries: [{ path: 'src/app.ts', kind: 'file' as const, identity: 'later-terminal-edit' }]
+    }
+    orch.settings.set(workspaceSyncBaseKey(room.id), serializeWorkspaceSnapshot(baseline))
+    let snapshotCalls = 0
+    backend.snapshotWorkspace = async () => {
+      snapshotCalls += 1
+      if (snapshotCalls === 3) return { fingerprint: 'd'.repeat(64), entries: [] }
+      return snapshotCalls <= 2 ? inspected : changedAgain
+    }
+
+    const error = await orch.safeResyncFromHost(room.id, 'user', true).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(WorkspaceDriftError)
+    expect((error as WorkspaceDriftError).changedPaths).toEqual([
+      { path: 'src/app.ts', reason: 'modified' }
+    ])
+    expect(backend.calls).toContain(`pauseWeb:${room.id}`)
+    expect(backend.calls).toContain(`unpauseWeb:${room.id}`)
+    expect(backend.calls).toContain('removeWorkspaceVolume:r2')
+    expect(orch.rooms.get(room.id)).toMatchObject({
+      workspaceVolumeRevision: 1,
+      stateRevision: 4,
+      syncStatus: 'modified'
+    })
+    expect(orch.settings.get(workspaceSyncBaseKey(room.id))).toContain('baseline')
+  })
+
   it('refuses agent file transfer for legacy Host-bound rooms, whose workspace is the Host folder', async () => {
     const room = makeRoom({
       sourceType: 'linked-folder',

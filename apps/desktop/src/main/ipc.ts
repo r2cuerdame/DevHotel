@@ -197,6 +197,13 @@ export function registerIpc(opts: {
   handle(IPC.roomsSyncFromHost, (_event, roomId, selectedPath) =>
     orch.syncFromHost(reauthorizeRoomSource(roomId, selectedPath), 'user')
   )
+  handle(IPC.roomsSafeResyncFromHost, (_event, roomId, selectedPath, confirmDiscardRoomChanges) =>
+    orch.safeResyncFromHost(
+      reauthorizeRoomSource(roomId, selectedPath),
+      'user',
+      confirmDiscardRoomChanges === true
+    )
+  )
   handle(IPC.roomsMoveIntoHotel, (_event, roomId, selectedPath) =>
     orch.moveIntoHotel(reauthorizeRoomSource(roomId, selectedPath), 'user')
   )

@@ -418,9 +418,21 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       )
     },
     {
+      name: 'safe_resync_from_host',
+      description:
+        'Preferred Host resync operation. It inspects meaningful Room-side source drift, returns exact Room-relative changed paths without modifying anything when confirmation is required, and only then performs the baseline acceptance plus Host import as one guarded operation. Retry with confirmDiscardRoomChanges=true only after reviewing/exporting the reported changes. The replaced Room generation is retained for recovery.',
+      schema: {
+        roomId: zRoomId,
+        confirmDiscardRoomChanges: z.boolean().optional().describe('default false; explicitly accept replacement of inspected Room-side source changes')
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).safeResyncFromHost(a.roomId, a.confirmDiscardRoomChanges ?? false)
+      )
+    },
+    {
       name: 'reset_sync_baseline',
       description:
-        "Accept the room's current meaningful source files as the Host-sync baseline. Use after reviewing real source drift reported by sync_from_host; ordinary build outputs are ignored automatically. Reads and copies nothing: it only records the comparison point, is journaled, and the sync itself still needs its own human approval.",
+        "Low-level compatibility operation. Accept the room's current meaningful source files as the Host-sync baseline without syncing. Prefer safe_resync_from_host when the goal is to replace the Room from Host, because it keeps inspection, confirmation and publish under one guard.",
       schema: { roomId: zRoomId },
       handler: wrap(async (a) => (await getClient()).resetSyncBaseline(a.roomId))
     },

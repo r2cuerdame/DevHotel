@@ -69,6 +69,24 @@ beforeAll(async () => {
           changedPaths: [{ path: 'app/src/main/java/App.kt', reason: 'modified' }]
         }))
       }
+      if (req.url === '/v1/rooms/abc12345/safe-resync-from-host') {
+        if (JSON.parse(raw).confirmDiscardRoomChanges === true) {
+          return void res.end(JSON.stringify({
+            status: 'synced',
+            retainedWorkspaceVolumeRevision: 1,
+            recoveryGuidance: ['generation r1 retained']
+          }))
+        }
+        res.writeHead(409, { 'content-type': 'application/json' })
+        return void res.end(JSON.stringify({
+          status: 'confirmation-required',
+          drift: {
+            status: 'changed',
+            changedPaths: [{ path: 'src/app.ts', reason: 'modified' }]
+          },
+          recoveryGuidance: ['export or commit first']
+        }))
+      }
       res.writeHead(404).end('not found')
     })
   })
@@ -178,6 +196,7 @@ describe('makeTools', () => {
         'room_pull_file',
         'room_push_file',
         'run_in_room',
+        'safe_resync_from_host',
         'sleep_room',
         'start_room',
         'sync_from_host',
@@ -310,5 +329,22 @@ describe('makeTools', () => {
     const res = await byName.check_operation!.handler({})
     expect(res.isError).toBe(true)
     expect(firstText(res)).toMatch(/operationId|roomId/)
+  })
+
+  it('safe_resync_from_host refuses by default and forwards an explicit confirmation', async () => {
+    const preview = await byName.safe_resync_from_host!.handler({ roomId: 'abc12345' })
+    expect(preview.isError).toBe(true)
+    expect(firstText(preview)).toContain('confirmation-required')
+    expect(firstText(preview)).toContain('src/app.ts')
+
+    const confirmed = await byName.safe_resync_from_host!.handler({
+      roomId: 'abc12345',
+      confirmDiscardRoomChanges: true
+    })
+    expect(confirmed.isError).toBeUndefined()
+    expect(firstText(confirmed)).toContain('"status": "synced"')
+    const requests = seen.filter((request) => request.url === '/v1/rooms/abc12345/safe-resync-from-host')
+    expect(requests.at(-2)?.body).toEqual({ confirmDiscardRoomChanges: false })
+    expect(requests.at(-1)?.body).toEqual({ confirmDiscardRoomChanges: true })
   })
 })
