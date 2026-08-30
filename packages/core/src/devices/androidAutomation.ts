@@ -127,6 +127,7 @@ export class AndroidAutomationSession {
   readonly target: AndroidAutomationTarget
   private readonly now: () => number
   private readonly pause: (ms: number) => Promise<void>
+  private readonly verifiedApkHashes = new Map<string, string>()
 
   constructor(private readonly opts: AndroidAutomationSessionOptions) {
     this.target = opts.target
@@ -167,6 +168,7 @@ export class AndroidAutomationSession {
 
   private async requireInstalled(applicationId: string): Promise<AndroidInstallReceipt> {
     const receipt = this.receipt(applicationId)
+    if (this.verifiedApkHashes.get(applicationId) === receipt.apkSha256) return receipt
     const result = await this.command(
       ['shell', 'pm', 'path', '--user', 'current', applicationId],
       { operation: 'Android package probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
@@ -175,6 +177,7 @@ export class AndroidAutomationSession {
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line.startsWith('package:'))
+      .map((line) => line.slice('package:'.length))
     if (result.code !== 0 || paths.length === 0) {
       this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
       throw automationError(
@@ -185,6 +188,48 @@ export class AndroidAutomationSession {
         safeEvidence(result)
       )
     }
+    const baseApks = paths.filter((path) =>
+      path.startsWith('/data/app/') &&
+      path.endsWith('/base.apk') &&
+      Buffer.byteLength(path, 'utf8') <= 4096 &&
+      !/[\p{C}\p{Zl}\p{Zp}]/u.test(path) &&
+      !path.split('/').some((segment) => segment === '.' || segment === '..')
+    )
+    if (baseApks.length !== 1) {
+      throw automationError(
+        'ANDROID_APP_IDENTITY_UNVERIFIED',
+        `${applicationId} did not expose one safe installed base APK path.`,
+        'Run android_run again on a supported Android target; DevHotel will not trust package name alone.',
+        409,
+        safeEvidence(result)
+      )
+    }
+    const hashed = await this.command(
+      ['shell', 'sha256sum', baseApks[0]!],
+      { operation: 'Android installed APK identity probe', timeoutMs: 60_000, stdoutLimit: 8192 }
+    )
+    const installedSha256 = /^([a-fA-F0-9]{64})(?:\s|$)/.exec(hashed.stdout.trim())?.[1]?.toLowerCase()
+    if (hashed.code !== 0 || !installedSha256) {
+      throw automationError(
+        'ANDROID_APP_IDENTITY_UNVERIFIED',
+        `${applicationId} installed bytes could not be verified.`,
+        'Use a target that supports sha256sum and rerun android_run; DevHotel will not trust package name alone.',
+        409,
+        safeEvidence(hashed)
+      )
+    }
+    if (installedSha256 !== receipt.apkSha256) {
+      this.opts.installs.remove(this.opts.roomId, this.opts.installTarget, applicationId)
+      this.verifiedApkHashes.delete(applicationId)
+      throw automationError(
+        'ANDROID_APP_REPLACED',
+        `${applicationId} no longer matches the APK installed by this Room.`,
+        'Run android_run again to install and authorize the current APK bytes.',
+        409,
+        safeEvidence(hashed)
+      )
+    }
+    this.verifiedApkHashes.set(applicationId, receipt.apkSha256)
     return receipt
   }
 
@@ -219,7 +264,10 @@ export class AndroidAutomationSession {
         await this.requireInstalled(candidate.applicationId)
         installedApplicationIds.push(candidate.applicationId)
       } catch (error) {
-        if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_APP_NOT_INSTALLED') throw error
+        if (
+          !(error instanceof DevHotelError) ||
+          (error.code !== 'ANDROID_APP_NOT_INSTALLED' && error.code !== 'ANDROID_APP_REPLACED')
+        ) throw error
       }
     }
     const foreground = await this.foregroundPackage()
@@ -417,8 +465,38 @@ export class AndroidAutomationSession {
         'Use a more specific text or make the screen state unambiguous before tapping.'
       )
     }
-    const tapped = matches[0]!
-    // A system dialog may have appeared after the hierarchy was captured.
+    const first = matches[0]!
+    // Re-read immediately before input: foreground can remain the same while
+    // an animation/list update moves the requested node under stale coordinates.
+    const confirmedDump = await this.dump(input.applicationId, input.text, 500)
+    const confirmedMatches = confirmedDump.nodes.filter((node) => matchesText(node, input.text, match))
+    if (confirmedMatches.length !== 1) {
+      throw automationError(
+        confirmedMatches.length === 0 ? 'ANDROID_UI_TEXT_NOT_FOUND' : 'ANDROID_UI_TEXT_AMBIGUOUS',
+        confirmedMatches.length === 0
+          ? `The requested text disappeared before input in ${input.applicationId}.`
+          : `${confirmedMatches.length} app-scoped UI nodes matched immediately before input.`,
+        'Wait for the screen to settle and retry with unambiguous text.'
+      )
+    }
+    const tapped = confirmedMatches[0]!
+    if (
+      first.text !== tapped.text ||
+      first.contentDescription !== tapped.contentDescription ||
+      first.resourceId !== tapped.resourceId ||
+      first.className !== tapped.className ||
+      first.bounds.left !== tapped.bounds.left ||
+      first.bounds.top !== tapped.bounds.top ||
+      first.bounds.right !== tapped.bounds.right ||
+      first.bounds.bottom !== tapped.bounds.bottom
+    ) {
+      throw automationError(
+        'ANDROID_UI_TEXT_MOVED',
+        'The requested UI node changed or moved before input could be injected.',
+        'Wait for animations and live content to settle, then retry.'
+      )
+    }
+    // A system dialog may still have appeared after the confirming hierarchy.
     await this.requireForeground(input.applicationId)
     const result = await this.command(
       ['shell', 'input', 'tap', String(tapped.center.x), String(tapped.center.y)],

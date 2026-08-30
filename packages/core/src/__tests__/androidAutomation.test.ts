@@ -114,7 +114,11 @@ describe('tracked Android automation session', () => {
       installs,
       exec: async (args) => {
         calls.push(args)
-        return handler(args)
+        const result = handler(args)
+        if (args[1] === 'sha256sum' && result.code === 0 && !result.stdout && !result.stderr) {
+          return { code: 0, stdout: `${'a'.repeat(64)}  ${args[2]}\n`, stderr: '' }
+        }
+        return result
       }
     })
     return { db, installs, calls, session }
@@ -123,6 +127,7 @@ describe('tracked Android automation session', () => {
   it('launches with typed argv and never constructs a shell command from extras', async () => {
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
       return { code: 0, stdout: 'Status: ok\n', stderr: '' }
     })
@@ -141,6 +146,7 @@ describe('tracked Android automation session', () => {
     const secret = `ghp_${'A'.repeat(24)}`
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
       return { code: 1, stdout: 'x'.repeat(5_000), stderr: `token=${secret}` }
     })
@@ -183,6 +189,32 @@ describe('tracked Android automation session', () => {
     })
     expect(calls.some((args) => args[1] === 'input')).toBe(false)
     expect(calls.some((args) => args[1] === 'rm')).toBe(true)
+  })
+
+  it('refuses stale coordinates when the unique text node moves between dumps', async () => {
+    let hierarchy = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sh' && args[2] === '-c' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        hierarchy += 1
+        const left = hierarchy === 1 ? 0 : 20
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[${left},0][${left + 20},20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
+      code: 'ANDROID_UI_TEXT_MOVED'
+    })
+    expect(hierarchy).toBe(2)
+    expect(calls.some((args) => args[1] === 'input')).toBe(false)
   })
 
   it('uses an exact unshared UID, clamps time to install, and redacts log secrets', async () => {
@@ -247,6 +279,22 @@ describe('tracked Android automation session', () => {
       { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
       APP_ID
     )).toBeNull()
+  })
+
+  it('invalidates a receipt when the installed base APK bytes were replaced', async () => {
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sha256sum') return { code: 0, stdout: `${'b'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).toBeNull()
+    expect(calls.some((args) => args[1] === 'am' && args[2] === 'force-stop')).toBe(false)
   })
 
   it('transfers one exact target/package receipt to the last installing Room', () => {
