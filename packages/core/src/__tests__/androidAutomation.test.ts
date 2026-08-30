@@ -22,14 +22,19 @@ const PACKAGE_INCARNATION = createHash('sha256')
   .update('\0')
   .update(BASE_APK_STAT)
   .digest('hex')
-const INSTALL_LOG_FENCE = 'devhotel-install-11111111-2222-4333-8444-555555555555'
-const EXCLUSIVE_PACKAGE_DUMP = [
-  'Packages:',
-  `  Package [${APP_ID}] (abc123):`,
-  '    userId=10123',
-  `    pkg=Package{abc123 ${APP_ID}}`,
-  `    codePath=${BASE_APK_PATH}`
-].join('\n')
+const INSTALL_LOG_FENCE = 'devhotel-install-u0-uid10123-11111111-2222-4333-8444-555555555555'
+const SECONDARY_INSTALL_LOG_FENCE = 'devhotel-install-u10-uid1010123-11111111-2222-4333-8444-555555555555'
+function exclusivePackageDump(idField: 'userId' | 'appId'): string {
+  return [
+    'Packages:',
+    `  Package [${APP_ID}] (abc123):`,
+    `    ${idField}=10123`,
+    `    pkg=Package{abc123 ${APP_ID}}`,
+    `    codePath=${BASE_APK_PATH}`
+  ].join('\n')
+}
+
+const EXCLUSIVE_PACKAGE_DUMP = exclusivePackageDump('appId')
 
 function targetEpoch(epochMs: number): string {
   const seconds = Math.floor(epochMs / 1000)
@@ -145,7 +150,8 @@ describe('tracked Android automation session', () => {
   function setup(
     handler: (args: string[]) => { code: number; stdout: string; stderr: string },
     timing: Pick<AndroidAutomationSessionOptions, 'now' | 'sleep'> = {},
-    targetOverride: AndroidAutomationTarget = target
+    targetOverride: AndroidAutomationTarget = target,
+    logFence: string | null = INSTALL_LOG_FENCE
   ) {
     const db = testDb()
     dbs.push(db)
@@ -165,7 +171,7 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
-      logFence: INSTALL_LOG_FENCE
+      logFence
     })
     const calls: string[][] = []
     const timeouts: Array<number | undefined> = []
@@ -199,12 +205,68 @@ describe('tracked Android automation session', () => {
     return { db, installs, calls, session, timeouts }
   }
 
-  it('seals install identity and a unique app-UID log fence on Android 12+', async () => {
+  it.each([
+    { apiLevel: 31, androidVersion: '12.0', idField: 'userId' as const, uid: 10123, userId: 0 },
+    { apiLevel: 33, androidVersion: '13.0', idField: 'userId' as const, uid: 10123, userId: 0 },
+    { apiLevel: 34, androidVersion: '14.0', idField: 'appId' as const, uid: 10123, userId: 0 },
+    { apiLevel: 35, androidVersion: '15.0', idField: 'appId' as const, uid: 1_010_123, userId: 10 }
+  ])('seals install identity and a unique app-UID log fence on API $apiLevel', async ({
+    apiLevel,
+    androidVersion,
+    idField,
+    uid,
+    userId
+  }) => {
     let emittedFence = ''
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
-      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return {
+          code: 0,
+          stdout: `${exclusivePackageDump(idField)}\n\n${args.at(-1)}\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
+      if (args[1] === 'run-as') {
+        emittedFence = args.at(-1)!
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'logcat') return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }, {}, { ...target, apiLevel, androidVersion })
+
+    const evidence = await session.establishInstallEvidence(APP_ID)
+    expect(evidence).toEqual({
+      apkSha256: 'a'.repeat(64),
+      packageIncarnation: PACKAGE_INCARNATION,
+      logFence: emittedFence
+    })
+    expect(emittedFence).toMatch(new RegExp(`^devhotel-install-u${userId}-uid${uid}-[0-9a-f-]{36}$`))
+    expect(calls.find((args) => args[1] === 'run-as')).toEqual([
+      'shell', 'run-as', APP_ID, '--user', String(userId),
+      'log', '-p', 'i', '-t', 'DEVHOTEL_INSTALL_FENCE', emittedFence
+    ])
+    expect(calls.find((args) => args[0] === 'logcat')).toEqual([
+      'logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`
+    ])
+  })
+
+  it('withholds an install log fence when the active Android user changes during proof', async () => {
+    let appUidProbes = 0
+    let emittedFence = ''
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        const requestedUid = args.at(-1)!
+        return { code: 0, stdout: `package:${APP_ID} uid:${requestedUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        appUidProbes += 1
+        const uid = appUidProbes === 1 ? 10123 : 1_010_123
+        return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
+      }
       if (args[1] === 'run-as') {
         emittedFence = args.at(-1)!
         return { code: 0, stdout: '', stderr: '' }
@@ -213,19 +275,8 @@ describe('tracked Android automation session', () => {
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    const evidence = await session.establishInstallEvidence(APP_ID)
-    expect(evidence).toEqual({
-      apkSha256: 'a'.repeat(64),
-      packageIncarnation: PACKAGE_INCARNATION,
-      logFence: emittedFence
-    })
-    expect(emittedFence).toMatch(/^devhotel-install-[0-9a-f-]{36}$/)
-    expect(calls.find((args) => args[1] === 'run-as')).toEqual([
-      'shell', 'run-as', APP_ID, 'log', '-p', 'i', '-t', 'DEVHOTEL_INSTALL_FENCE', emittedFence
-    ])
-    expect(calls.find((args) => args[0] === 'logcat')).toEqual([
-      'logcat', '-d', '-v', 'raw,printable', '--uid=10123'
-    ])
+    await expect(session.establishInstallEvidence(APP_ID)).resolves.toMatchObject({ logFence: null })
+    expect(appUidProbes).toBe(2)
   })
 
   it('keeps non-log install evidence when the bounded fence proof overflows', async () => {
@@ -534,8 +585,91 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args[1] === 'date')).toBe(false)
     expect(calls.filter((args) => args[1] === 'pm' && args[2] === 'list')).toEqual([
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', APP_ID],
+      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', '10123'],
+      ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', APP_ID],
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', '10123']
     ])
+  })
+
+  it('preserves the full package UID for a secondary Android user', async () => {
+    const secondaryUid = 1_010_123
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[0] === 'logcat') {
+        return {
+          code: 0,
+          stdout: `1690000000.000 ${SECONDARY_INSTALL_LOG_FENCE}\n1690000000.001 secondary-user row\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, {}, target, SECONDARY_INSTALL_LOG_FENCE)
+
+    await expect(session.logcat({ applicationId: APP_ID })).resolves.toMatchObject({
+      lines: ['1690000000.001 secondary-user row']
+    })
+    expect(calls.find((args) => args[0] === 'logcat')).toContain(`--uid=${secondaryUid}`)
+    expect(calls).toContainEqual([
+      'shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', String(secondaryUid)
+    ])
+  })
+
+  it('rejects a different active user before reading even if that user could replay the marker', async () => {
+    const secondaryUid = 1_010_123
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      }
+      if (args[0] === 'logcat') {
+        return { code: 0, stdout: `${INSTALL_LOG_FENCE}\nreplayed-user row\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_LOGCAT_USER_CHANGED'
+    })
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(false)
+  })
+
+  it('fails closed when the active Android user changes during a log capture', async () => {
+    let appUidProbes = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) {
+        const requestedUid = args.at(-1)!
+        return { code: 0, stdout: `package:${APP_ID} uid:${requestedUid}\n`, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        appUidProbes += 1
+        const uid = appUidProbes === 1 ? 10123 : 1_010_123
+        return { code: 0, stdout: `package:${APP_ID} uid:${uid}\n`, stderr: '' }
+      }
+      if (args[0] === 'logcat') {
+        return {
+          code: 0,
+          stdout: `1690000000.000 ${INSTALL_LOG_FENCE}\n1690000000.001 old-user row\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
+      code: 'ANDROID_LOGCAT_USER_CHANGED'
+    })
+    expect(appUidProbes).toBe(2)
+    expect(calls.some((args) => args[0] === 'logcat')).toBe(true)
   })
 
   it('invalidates the receipt when the package incarnation changes during a log read', async () => {
@@ -746,7 +880,7 @@ describe('tracked Android automation session', () => {
           stdout: [
             'Packages:',
             `  Package [${APP_ID}] (abc123):`,
-            '    userId=10123',
+            '    appId=10123',
             `    sharedUser=SharedUserSetting{def456 ${sharedUserName}/10123}`,
             `    pkg=Package{abc123 ${APP_ID}}`,
             `    codePath=${BASE_APK_PATH}`,
@@ -1014,6 +1148,8 @@ describe('tracked Android automation session', () => {
           ? { code: 0, stdout: '1234\n', stderr: '' }
           : { code: -1, stdout: '', stderr: 'transport lost' }
       }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.includes('exec am crash')) {
         return { code: 0, stdout: `DEVHOTEL_TARGET_EPOCH=${targetEpoch(Date.now())}\n`, stderr: '' }
       }
@@ -1030,6 +1166,7 @@ describe('tracked Android automation session', () => {
   })
 
   it('emits the app-UID fence immediately before crash and reads from that exact fence without a clock probe', async () => {
+    const secondaryUid = 1_010_123
     let pidProbes = 0
     let crashFence = ''
     const { calls, session } = setup((args) => {
@@ -1048,8 +1185,8 @@ describe('tracked Android automation session', () => {
           stderr: ''
         }
       }
-      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
-      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:${secondaryUid}\n`, stderr: '' }
       if (args[0] === 'logcat') {
         return {
           code: 0,
@@ -1058,7 +1195,7 @@ describe('tracked Android automation session', () => {
         }
       }
       return { code: 0, stdout: '', stderr: '' }
-    }, { now: () => HOST_NOW_MS, sleep: async () => {} })
+    }, { now: () => HOST_NOW_MS, sleep: async () => {} }, target, SECONDARY_INSTALL_LOG_FENCE)
 
     const result = await session.crashScenario({
       applicationId: APP_ID,
@@ -1079,11 +1216,13 @@ describe('tracked Android automation session', () => {
     const crash = calls.find((args) => args[1] === 'sh' && args[3]?.includes('exec am crash'))
     expect(crash).toEqual([
       'shell', 'sh', '-c',
-      'run-as "$1" log -p i -t DEVHOTEL_CRASH_FENCE "$2" && exec am crash --user current "$1"',
-      'devhotel-crash', APP_ID, crashFence
+      'run-as "$1" --user "$2" log -p i -t DEVHOTEL_CRASH_FENCE "$3" && exec am crash --user "$2" "$1"',
+      'devhotel-crash', APP_ID, '10', crashFence
     ])
     expect(crashFence).toMatch(/^devhotel-crash-[0-9a-f-]{36}$/)
-    expect(calls.find((args) => args[0] === 'logcat')).not.toContain('-t')
+    expect(calls.find((args) => args[0] === 'logcat')).toEqual([
+      'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${secondaryUid}`
+    ])
     expect(calls.some((args) => args[1] === 'date')).toBe(false)
   })
 

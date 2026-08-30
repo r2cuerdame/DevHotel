@@ -43,7 +43,7 @@ function installEvidenceResult(args: string[], state: { fence: string; apkSha256
       stdout: [
         'Packages:',
         '  Package [com.example.app] (abc123):',
-        '    userId=10123',
+        '    appId=10123',
         '    pkg=Package{abc123 com.example.app}',
         `    codePath=${TEST_BASE_APK}`,
         '',
@@ -668,7 +668,7 @@ describe('Android automation targets the attached device without a hand-written 
         apkSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
       })
     ])
-    expect(installEvidence.fence).toMatch(/^devhotel-install-[0-9a-f-]{36}$/)
+    expect(installEvidence.fence).toMatch(/^devhotel-install-u0-uid10123-[0-9a-f-]{36}$/)
     expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/My 앱-$&-debug.APK')
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
     expect(adb.execs.find((call) => logicalAdbArgs(call.args)[1] === 'am')?.serial).toBe('R5CT30ABCDE')
@@ -965,7 +965,7 @@ describe('Android automation targets the attached device without a hand-written 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry.status).toBe('verified')
-    expect(installEvidence.fence).toMatch(/^devhotel-install-[0-9a-f-]{36}$/)
+    expect(installEvidence.fence).toMatch(/^devhotel-install-u0-uid10123-[0-9a-f-]{36}$/)
     expect(entry.verify?.detail).toMatch(/Room emulator/)
     expect(orch.androidInstalls.list('aaaa1111', {
       kind: 'emulator', targetId: 'aaaa1111', deviceId: null

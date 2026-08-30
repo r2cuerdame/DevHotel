@@ -39,6 +39,9 @@ const TARGET_CLOCK_FORMAT = '+%s.%3N'
 const INSTALL_FENCE_TAG = 'DEVHOTEL_INSTALL_FENCE'
 const CRASH_FENCE_TAG = 'DEVHOTEL_CRASH_FENCE'
 const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$2"; exit "$status"`
+const ANDROID_PER_USER_RANGE = 100_000
+const ANDROID_FIRST_APPLICATION_ID = 10_000
+const ANDROID_LAST_APPLICATION_ID = 19_999
 
 export interface AndroidAutomationExecOptions {
   timeoutMs?: number
@@ -190,6 +193,29 @@ function packageIncarnation(path: string, stat: string): string {
   return createHash('sha256').update('devhotel-android-package-incarnation\0').update(path).update('\0').update(stat).digest('hex')
 }
 
+function installLogFence(authority: AndroidPackageAuthority): string {
+  return `devhotel-install-u${authority.userId}-uid${authority.uid}-${randomUUID()}`
+}
+
+function installLogFenceAuthority(value: string): AndroidPackageAuthority | null {
+  const match = /^devhotel-install-u(\d+)-uid(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.exec(value)
+  if (!match) return null
+  const userId = Number.parseInt(match[1]!, 10)
+  const uid = Number.parseInt(match[2]!, 10)
+  if (
+    !Number.isSafeInteger(userId) ||
+    !Number.isSafeInteger(uid) ||
+    userId < 0 ||
+    uid < 0 ||
+    Math.floor(uid / ANDROID_PER_USER_RANGE) !== userId
+  ) return null
+  return { uid, userId }
+}
+
+function samePackageAuthority(left: AndroidPackageAuthority, right: AndroidPackageAuthority): boolean {
+  return left.uid === right.uid && left.userId === right.userId
+}
+
 function logEpochMillis(line: string): number | null {
   const match = /^\s*(\d{10,11})\.(\d{3,9})\s/.exec(line)
   if (!match) return null
@@ -219,6 +245,11 @@ interface VerifiedTrackedInstall {
   receipt: AndroidInstallReceipt
   apkSha256: string
   packageIncarnation: string | null
+}
+
+interface AndroidPackageAuthority {
+  uid: number
+  userId: number
 }
 
 function matchesText(node: AndroidUiNode, text: string, match: 'exact' | 'contains'): boolean {
@@ -766,7 +797,7 @@ export class AndroidAutomationSession {
     return { target: this.target, applicationId: input.applicationId, tapped, evidence: safeEvidence(result) }
   }
 
-  private async packageUid(applicationId: string): Promise<number> {
+  private async packageUid(applicationId: string): Promise<AndroidPackageAuthority> {
     const completionFence = `devhotel-package-dump-${randomUUID()}`
     let packageDump: ExecResult
     try {
@@ -819,14 +850,18 @@ export class AndroidAutomationSession {
     }
     let fieldIndex = headerIndexes[0]! + 1
     if (/^ {4}compat name=/.test(dumpLines[fieldIndex] ?? '')) fieldIndex += 1
-    const userIdField = /^ {4}userId=(\d+)$/.exec(dumpLines[fieldIndex] ?? '')
+    // Settings.dumpPackageLPr renamed this exact structural field in Android
+    // 14. Bind the accepted spelling to the positively probed API so an
+    // APK-controlled lookalike cannot make an incompatible dump authoritative.
+    const packageIdLabel = (this.target.apiLevel ?? 0) >= 34 ? 'appId' : 'userId'
+    const packageIdField = new RegExp(`^ {4}${packageIdLabel}=(\\d+)$`).exec(dumpLines[fieldIndex] ?? '')
     fieldIndex += 1
     const hasSharedUser = /^ {4}sharedUser=\S/.test(dumpLines[fieldIndex] ?? '')
     if (hasSharedUser) fieldIndex += 1
     const hasStablePackageFields =
       /^ {4}pkg=\S/.test(dumpLines[fieldIndex] ?? '') &&
       /^ {4}codePath=\S/.test(dumpLines[fieldIndex + 1] ?? '')
-    if (!userIdField || !hasStablePackageFields) {
+    if (!packageIdField || !hasStablePackageFields) {
       throw automationError(
         'ANDROID_LOGCAT_UNSUPPORTED',
         'The selected Android target returned an ambiguous package shared-UID record.',
@@ -854,7 +889,16 @@ export class AndroidAutomationSession {
       { operation: 'Android package UID probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
     )
     const match = new RegExp(`^package:${escaped}\\s+uid[:=](\\d+)$`, 'm').exec(uidResult.stdout)
-    if (uidResult.code !== 0 || !match || match[1] !== userIdField[1]) {
+    const uid = match ? Number.parseInt(match[1]!, 10) : Number.NaN
+    const appId = Number.isSafeInteger(uid) && uid >= 0 ? uid % ANDROID_PER_USER_RANGE : Number.NaN
+    if (
+      uidResult.code !== 0 ||
+      !match ||
+      !Number.isSafeInteger(uid) ||
+      appId < ANDROID_FIRST_APPLICATION_ID ||
+      appId > ANDROID_LAST_APPLICATION_ID ||
+      String(appId) !== packageIdField[1]
+    ) {
       throw automationError(
         'ANDROID_LOGCAT_UNSUPPORTED',
         'The selected Android target did not expose an exact package UID.',
@@ -863,16 +907,24 @@ export class AndroidAutomationSession {
         safeEvidenceWithoutStdout(uidResult)
       )
     }
-    const uid = Number.parseInt(match[1]!, 10)
     const owners = await this.command(
       ['shell', 'pm', 'list', 'packages', '-U', '--user', 'current', '--uid', String(uid)],
       { operation: 'Android shared UID probe', timeoutMs: 15_000, stdoutLimit: 64 * 1024 }
     )
-    const packages = owners.stdout
+    const ownerLines = owners.stdout
       .split(/\r?\n/)
-      .map((line) => /^package:([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\s+uid[:=]\d+$/.exec(line.trim())?.[1])
-      .filter((value): value is string => Boolean(value))
-    if (owners.code !== 0 || packages.length !== 1 || packages[0] !== applicationId) {
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const ownerRecords = ownerLines.map((line) =>
+      /^package:([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\s+uid[:=](\d+)$/.exec(line)
+    )
+    if (
+      owners.code !== 0 ||
+      ownerRecords.length !== 1 ||
+      !ownerRecords[0] ||
+      ownerRecords[0][1] !== applicationId ||
+      ownerRecords[0][2] !== String(uid)
+    ) {
       throw automationError(
         'ANDROID_LOGCAT_SHARED_UID',
         `${applicationId} cannot be isolated to a single package UID on this target.`,
@@ -881,17 +933,17 @@ export class AndroidAutomationSession {
         safeEvidenceWithoutStdout(owners)
       )
     }
-    return uid
+    return { uid, userId: Math.floor(uid / ANDROID_PER_USER_RANGE) }
   }
 
   /** Trusted install-time proof. It never grants a receipt by itself. */
   async establishInstallEvidence(applicationId: string): Promise<AndroidInstallEvidence> {
     const identity = await this.installedPackageIdentity(applicationId)
     let provenLogFence: string | null = null
+    let authority: AndroidPackageAuthority | null = null
     if ((this.target.apiLevel ?? 0) >= 31) {
-      let uid: number | null = null
       try {
-        uid = await this.packageUid(applicationId)
+        authority = await this.packageUid(applicationId)
       } catch (error) {
         if (
           !(error instanceof DevHotelError) ||
@@ -900,17 +952,20 @@ export class AndroidAutomationSession {
           throw error
         }
       }
-      if (uid !== null) {
-        const candidate = `devhotel-install-${randomUUID()}`
+      if (authority) {
+        const candidate = installLogFence(authority)
         const emitted = await this.command(
-          ['shell', 'run-as', applicationId, 'log', '-p', 'i', '-t', INSTALL_FENCE_TAG, candidate],
+          [
+            'shell', 'run-as', applicationId, '--user', String(authority.userId),
+            'log', '-p', 'i', '-t', INSTALL_FENCE_TAG, candidate
+          ],
           { operation: 'Android install log fence', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
         )
         if (emitted.code === 0) {
           let proof: ExecResult | null = null
           try {
             proof = await this.command(
-              ['logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`],
+              ['logcat', '-d', '-v', 'raw,printable', `--uid=${authority.uid}`],
               { operation: 'Android install log fence proof', timeoutMs: 30_000, stdoutLimit: 1024 * 1024 }
             )
           } catch (error) {
@@ -930,6 +985,18 @@ export class AndroidAutomationSession {
     // every proof attempt, including the non-log fallback, before a caller may
     // commit the receipt.
     await this.assertInstalledPackageIdentity(applicationId, identity)
+    if (provenLogFence && authority) {
+      try {
+        const postflightAuthority = await this.packageUid(applicationId)
+        if (!samePackageAuthority(postflightAuthority, authority)) provenLogFence = null
+      } catch (error) {
+        if (
+          !(error instanceof DevHotelError) ||
+          (error.code !== 'ANDROID_LOGCAT_UNSUPPORTED' && error.code !== 'ANDROID_LOGCAT_SHARED_UID')
+        ) throw error
+        provenLogFence = null
+      }
+    }
     return {
       apkSha256: identity.apkSha256,
       packageIncarnation: identity.packageIncarnation,
@@ -985,7 +1052,8 @@ export class AndroidAutomationSession {
 
   private async readLogcat(
     input: AndroidLogcatInput,
-    exactLogFence?: string
+    exactLogFence?: string,
+    exactAuthority?: AndroidPackageAuthority
   ): Promise<AndroidLogcatResult> {
     const tracked = await this.requireInstalled(input.applicationId)
     const receipt = tracked.receipt
@@ -999,13 +1067,23 @@ export class AndroidAutomationSession {
       input.applicationId
     )
     if (!logFence) throw this.logFenceError(input.applicationId)
-    const uid = await this.packageUid(input.applicationId)
+    const sealedAuthority = exactAuthority ?? installLogFenceAuthority(logFence)
+    if (!sealedAuthority) throw this.logFenceError(input.applicationId)
+    const authority = await this.packageUid(input.applicationId)
+    if (!samePackageAuthority(authority, sealedAuthority)) {
+      throw automationError(
+        'ANDROID_LOGCAT_USER_CHANGED',
+        'The active Android user changed before package-scoped log evidence could be read.',
+        'Restore the original Android user and rerun the scenario; DevHotel will not cross user boundaries.',
+        409
+      )
+    }
     const targetRequestedSince = !exactLogFence && input.since && sinceMs > Date.parse(receipt.installedAt)
       ? await this.targetCutoffForHostTime(sinceMs)
       : null
     const result = await this.command(
       [
-        'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${uid}`
+        'logcat', '-d', '-v', 'epoch,UTC,printable', `--uid=${authority.uid}`
       ],
       {
         operation: 'Android package logcat',
@@ -1067,6 +1145,15 @@ export class AndroidAutomationSession {
     // the capture to the same package incarnation on both sides of the read so
     // old authorization can never be used to return rows from a replacement.
     await this.assertInstalledPackageIdentity(input.applicationId, tracked)
+    const postflightAuthority = await this.packageUid(input.applicationId)
+    if (!samePackageAuthority(postflightAuthority, authority)) {
+      throw automationError(
+        'ANDROID_LOGCAT_USER_CHANGED',
+        'The active Android user changed while package-scoped log evidence was being read.',
+        'Restore the original Android user and retry; DevHotel will not return evidence across user boundaries.',
+        409
+      )
+    }
     return {
       target: this.target,
       applicationId: input.applicationId,
@@ -1103,10 +1190,9 @@ export class AndroidAutomationSession {
 
   async crashScenario(input: AndroidRunCrashScenarioInput): Promise<AndroidCrashScenarioResult> {
     await this.requireInstalled(input.applicationId)
-    if (
-      (this.target.apiLevel ?? 0) < 31 ||
-      !this.opts.installs.logFence(this.opts.roomId, this.opts.installTarget, input.applicationId)
-    ) {
+    const installFence = this.opts.installs.logFence(this.opts.roomId, this.opts.installTarget, input.applicationId)
+    const installAuthority = installFence ? installLogFenceAuthority(installFence) : null
+    if ((this.target.apiLevel ?? 0) < 31 || !installAuthority) {
       throw this.logFenceError(input.applicationId)
     }
     const pidsBefore = await this.pids(input.applicationId)
@@ -1117,13 +1203,22 @@ export class AndroidAutomationSession {
         'Launch the tracked application before running the crash scenario.'
       )
     }
+    const crashAuthority = await this.packageUid(input.applicationId)
+    if (!samePackageAuthority(crashAuthority, installAuthority)) {
+      throw automationError(
+        'ANDROID_LOGCAT_USER_CHANGED',
+        'The active Android user no longer matches the tracked install log authority.',
+        'Restore the Android user used by android_run or rerun android_run for the active user.',
+        409
+      )
+    }
     const crashStartedAt = this.now()
     const crashLogFence = `devhotel-crash-${randomUUID()}`
     const crashResult = await this.command(
       [
         'shell', 'sh', '-c',
-        `run-as "$1" log -p i -t ${CRASH_FENCE_TAG} "$2" && exec am crash --user current "$1"`,
-        'devhotel-crash', input.applicationId, crashLogFence
+        `run-as "$1" --user "$2" log -p i -t ${CRASH_FENCE_TAG} "$3" && exec am crash --user "$2" "$1"`,
+        'devhotel-crash', input.applicationId, String(crashAuthority.userId), crashLogFence
       ],
       { operation: 'Android crash scenario', timeoutMs: 30_000, stdoutLimit: 64 * 1024 }
     )
@@ -1142,7 +1237,7 @@ export class AndroidAutomationSession {
       applicationId: input.applicationId,
       since: new Date(crashStartedAt).toISOString(),
       maxLines: 200
-    }, crashLogFence)
+    }, crashLogFence, crashAuthority)
     return {
       target: this.target,
       applicationId: input.applicationId,
