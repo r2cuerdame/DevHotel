@@ -16,14 +16,14 @@ import { hardenRoomSession } from './roomSessionPolicy'
  * control paths that do exist are Room-local, and the one capability that
  * genuinely takes the Host desktop is user-only and journaled.
  *
- * `hostInputIsolation.test.ts` adds the live Host observation on top.
+ * `hostInputProbe.globalSetup.ts` adds the live Host observation on top.
  */
 
 const REPO_ROOT = resolve(import.meta.dirname, '..', '..', '..', '..')
 const THIS_FILE = resolve(import.meta.filename)
 
 const SCANNED_ROOTS = ['apps', 'packages']
-const SCANNED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']
+const SCANNED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.ps1']
 const SKIPPED_DIRECTORIES = new Set(['node_modules', 'dist', 'out', 'release', '.git', 'coverage'])
 
 /**

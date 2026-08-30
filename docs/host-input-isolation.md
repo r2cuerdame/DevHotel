@@ -84,32 +84,77 @@ modeled rather than hidden:
 | …→ "drives the Android phone strip through in-Room adb" | Room UI input is an in-Room `adb` argv against the Room's own emulator serial, with no Host screen coordinates |
 | `windows.lifecycle.test.ts` → "treats the VMware console as a user-only, journaled Host-input capability" | An Agent is refused; a user's use is written to the Room log |
 | `controlApi.security.test.ts` → "exposes no Host-input operation to Agents" | The Agent-facing REST surface has no console/input/focus route |
-| `hostInputProbe.test.ts` | The drift detector reports a moved cursor, a stolen foreground window and injected keys |
+| `hostInputProbe.test.ts` | The drift detector retains mouse, focus and keyboard activity after every endpoint is restored; treats button/wheel activity with no cursor move as drift; and exposes only activity/injection booleans and pressed-key counts, never mouse-message or key identities. On every ordinary Windows test run it also compiles, starts and stops the native helper. |
 
 ### Live check on a real desktop
 
 The tests above prove DevHotel has no API that *can* move the Host cursor. To
 prove it *did not*, on the machine the suite actually ran on, run the suite
-under the live probe. It samples the real cursor position, foreground window
-and pressed keys before the first test and after the last one, and fails the
-run if any of them changed:
+under the live probe. One hidden, read-only Windows helper stays alive from
+global setup through teardown. Its low-level mouse hook latches every delivered
+mouse event, including button and wheel events that do not move the cursor. A
+low-level keyboard hook observes key transitions, a Windows event hook observes
+foreground-window changes, and a 10 ms state poll independently checks cursor,
+foreground and physical key state. A change is latched, so clicking without
+moving, moving away and back, pressing and releasing a key, or taking and
+returning focus still fails even when the final snapshot equals the initial
+one. No mouse-message or key identity leaves the helper: the wire report keeps
+only generic mouse/keyboard activity, whether any such activity was injected,
+the first changed cursor/focus value, and endpoint pressed-key counts. The
+helper compares an in-memory key-state bitmap only while it is alive so the
+independent poll can detect equal-count key substitutions; it never reports or
+logs that bitmap.
+
+The helper treats observation health as part of the assertion. Windows can
+silently remove a low-level hook whose owner does not service it within
+`LowLevelHooksTimeout`; the helper wakes every 10 ms and fails closed if its
+message-pump gap reaches that configured timeout (capped at Windows' 1000 ms
+maximum, with a conservative 300 ms fallback). That clock starts before the
+first low-level hook is installed, so the complete arming interval must pass
+the same health check before `READY`; queued events older than the ready
+boundary are ignored. At `STOP` it captures the final snapshot and a monotonic
+cutoff, keeps the owner thread pumping for a bounded 250 ms drain, accepts
+delayed foreground/input callbacks only when their event timestamp is at or
+before the cutoff, and then removes every hook on that same owner thread:
 
 ```powershell
 $env:DEVHOTEL_HOST_INPUT_PROBE='1'; pnpm --filter devhotel test
 ```
 
-It is opt-in because it measures the physical machine: a human who moves the
-mouse while it runs produces drift the run cannot tell apart from a
-regression. Run it on an idle desktop. It refuses to report success from a
-session with no interactive desktop, where the probe would read all zeros.
+The whole-suite policy assertion is opt-in because it measures the physical
+machine: a human who uses the mouse or keyboard while it runs produces an event
+the run cannot tell apart from a regression. Run it on an idle desktop. The
+ordinary Windows unit suite still compiles, starts and stops the helper so its
+native code and protocol cannot rot behind the option. The helper announces
+readiness only after every hook is installed. The run fails rather than
+claiming isolation if the interactive desktop is unavailable, a hook cannot be
+installed, its message pump becomes untrustworthy, the helper exits early, or
+teardown does not receive its final report.
 
 ## Platform limitations
 
 - **The VMware console cannot be made Room-local.** VMware Workstation's
   console is a Host application window; there is no in-Room rendering of it.
   The capability model is the answer, not a technical fix.
-- **The live probe is Windows-only**, matching the supported Host OS. It uses
-  `GetCursorPos`, `GetForegroundWindow` and `GetAsyncKeyState` — all read-only.
+- **The live probe is Windows-only**, matching the supported Host OS. Its
+  low-level hooks observe all mouse activity and physical-key transitions, and
+  `EVENT_SYSTEM_FOREGROUND` observes foreground changes; `GetCursorPos`,
+  `GetForegroundWindow` and `GetAsyncKeyState` provide read-only baseline,
+  final and periodic health samples.
+- **The live probe observes the current interactive desktop and session.** A
+  secure-desktop switch, locked desktop, inaccessible window station, or hook
+  failure makes the result inconclusive and therefore fails the run. It does
+  not attribute events to DevHotel, which is why the machine must be idle.
+- **Keyboard state means physical key up/down state.** The observer latches a
+  generic low-level key transition and independently polls the high bit from
+  `GetAsyncKeyState`; it reports only the number of keys down at each endpoint,
+  never which keys. Per-thread layout, IME, or lock-key toggle state is not a
+  Host key press and is outside this probe.
+- **The stop drain is intentionally bounded.** It gives already-issued,
+  pre-cutoff asynchronous foreground notifications 250 ms to reach the owner
+  thread while excluding post-cutoff input. An OS notification delayed longer
+  than that after the cutoff cannot be proven by the hook; endpoint snapshots
+  remain the backstop for state that was not restored.
 - **DevHotel cannot police what a Room's own test code does to a Host it can
   reach.** Isolation here is structural: container Rooms have no Host display
   or input device, and Windows Rooms have no exec path at all. A user who
