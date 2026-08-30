@@ -149,6 +149,65 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     db.close()
   })
 
+  it('keeps an unconstrained waiter eligible when a new matching phone appears', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const first = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a'
+    })
+    const waiting = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'MiracleKeyboard',
+      purpose: 'keyboard',
+      workerId: 'worker-b'
+    })
+    if (first.state !== 'granted' || waiting.state !== 'queued') throw new Error('unreachable')
+    expect(waiting.deviceId).toBeNull()
+
+    adb.phones = [
+      ...adb.phones,
+      { serial: 'R5CT30NEW01', state: 'device', model: 'Pixel_8', release: '15', sdk: '35', usb: '1-5' }
+    ]
+    await broker.refreshInventory()
+
+    expect(broker.leaseForRoom('aaaa1111')?.deviceId).toBe(first.device.id)
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ roomId: 'bbbb2222', project: 'MiracleKeyboard' })
+    expect(broker.leaseForRoom('bbbb2222')?.deviceId).not.toBe(first.device.id)
+  })
+
+  it('keeps an explicitly constrained waiter pinned when another phone appears', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const first = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'AppDied',
+      purpose: 'acceptance',
+      workerId: 'worker-a'
+    })
+    if (first.state !== 'granted') throw new Error('unreachable')
+    const waiting = await broker.requestDevice({
+      roomId: 'bbbb2222',
+      project: 'MiracleKeyboard',
+      purpose: 'keyboard',
+      workerId: 'worker-b',
+      constraints: { deviceId: first.device.id }
+    })
+    if (waiting.state !== 'queued') throw new Error('unreachable')
+    expect(waiting.deviceId).toBe(first.device.id)
+
+    adb.phones = [
+      ...adb.phones,
+      { serial: 'R5CT30NEW02', state: 'device', model: 'Pixel_8', release: '15', sdk: '35', usb: '1-6' }
+    ]
+    await broker.refreshInventory()
+
+    expect(broker.leaseForRoom('bbbb2222')).toBeNull()
+    expect(broker.listDevices().find((device) => device.id !== first.device.id)?.leaseOwner).toBeNull()
+  })
+
   it('hands the phone to the next queued Room when the owner releases it', async () => {
     const { broker, db } = makeBroker()
     await broker.refreshInventory()

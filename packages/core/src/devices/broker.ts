@@ -355,7 +355,7 @@ export class AndroidDeviceBroker {
 
     // Pin the queue to a specific device only when the request named one;
     // otherwise the entry stays free to be promoted by whichever phone frees up.
-    const pinned = request.constraints?.deviceId ?? (candidates.length === 1 ? candidates[0]!.id : null)
+    const pinned = request.constraints?.deviceId ?? null
     const existingEntry = this.repo.waitingForRoom(request.roomId, pinned)
     const entry =
       existingEntry ??

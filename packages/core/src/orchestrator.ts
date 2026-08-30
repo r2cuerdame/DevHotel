@@ -376,6 +376,7 @@ export class RoomOrchestrator {
       try {
         if (room.status === 'broken') {
           // broken rooms may still own running containers — stop them but keep the status visible
+          if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
           if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
           else await this.backend.stopRoomPod(room.id)
           this.rooms.update(room.id, { hostPort: null })
