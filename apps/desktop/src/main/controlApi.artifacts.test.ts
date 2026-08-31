@@ -131,12 +131,23 @@ describe('screenshot artifact control API', () => {
     const listRoomArtifacts = vi.fn(() => [tokenShapedArtifact])
     const getRoomArtifact = vi.fn(() => tokenShapedArtifact)
     const readRoomArtifactContent = vi.fn(() => ({ artifact: tokenShapedArtifact, content: png }))
+    const relativePath = `docs/${filename}`
+    const exportResult = {
+      artifactId,
+      path: `/workspace/${relativePath}`,
+      relativePath,
+      sizeBytes: png.byteLength,
+      sha256: artifact.sha256,
+      markdown: `![${filename}](${relativePath})`
+    }
+    const exportRoomArtifact = vi.fn(async () => exportResult)
     const control = await startControlApi(
       {
         captureAndroidScreenshotArtifact,
         listRoomArtifacts,
         getRoomArtifact,
-        readRoomArtifactContent
+        readRoomArtifactContent,
+        exportRoomArtifact
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -160,6 +171,13 @@ describe('screenshot artifact control API', () => {
 
       const content = await fetch(`${base}/${artifactId}/content`, { headers })
       expect(content.headers.get('content-disposition')).toBe(`inline; filename="${filename}"`)
+
+      const exported = await fetch(`${base}/${artifactId}/export`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ relativePath })
+      })
+      await expect(exported.json()).resolves.toEqual(exportResult)
     } finally {
       control.stop()
     }

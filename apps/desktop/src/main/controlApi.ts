@@ -37,6 +37,7 @@ import {
   zSafeHostResyncBody,
   zUndoChangeBody,
   DeviceLeaseError,
+  type ArtifactExportResult,
   type ControlInfo,
   type RoomArtifact
 } from '@devhotel/shared'
@@ -44,6 +45,7 @@ import {
   DevHotelError,
   isDevHotelError,
   redactStructuredSecrets,
+  sanitizeAndroidScreenshotArtifactMetadata,
   WorkspaceDriftError,
   type RoomOrchestrator
 } from '@devhotel/core'
@@ -376,7 +378,7 @@ export async function startControlApi(
         }
         if (artifactId && parts[5] === 'export' && !parts[6] && req.method === 'POST') {
           const body = parseArtifactInput(zArtifactExportBody, await readBody(req, ARTIFACT_BODY_LIMIT_BYTES))
-          sendJson(res, 200, await orch.exportRoomArtifact(safeRoomId, artifactId, body, 'agent'))
+          sendArtifactExportJson(res, 200, await orch.exportRoomArtifact(safeRoomId, artifactId, body, 'agent'))
           return
         }
       }
@@ -626,11 +628,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 function artifactForJson(value: RoomArtifact): RoomArtifact {
   const artifact = zRoomArtifact.parse(value)
-  // Artifact metadata remains defense-in-depth redacted at this boundary, but
-  // the strict public filename must stay identical to the value accepted and
-  // stored by Core. Treating it as prose corrupts token-shaped basenames.
-  const redacted = redactStructuredSecrets(artifact)
-  return zRoomArtifact.parse({ ...redacted, filename: artifact.filename })
+  return zRoomArtifact.parse({
+    ...artifact,
+    metadata: sanitizeAndroidScreenshotArtifactMetadata(artifact.metadata)
+  })
 }
 
 function sendArtifactJson(res: ServerResponse, status: number, artifact: RoomArtifact): void {
@@ -639,6 +640,13 @@ function sendArtifactJson(res: ServerResponse, status: number, artifact: RoomArt
 
 function sendArtifactListJson(res: ServerResponse, status: number, artifacts: RoomArtifact[]): void {
   writeJson(res, status, { artifacts: artifacts.map(artifactForJson) })
+}
+
+function sendArtifactExportJson(res: ServerResponse, status: number, result: ArtifactExportResult): void {
+  // Core derives these fields from a strict artifact receipt and the validated
+  // repo-relative request path. Prose redaction would corrupt the committed
+  // destination and its Markdown after a successful export.
+  writeJson(res, status, result)
 }
 
 function sendPng(res: ServerResponse, filename: string, sha256: string, content: Buffer): void {

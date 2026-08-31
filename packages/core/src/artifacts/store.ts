@@ -20,7 +20,6 @@ import {
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   SCREENSHOT_ARTIFACT_MAX_PER_ROOM,
   SCREENSHOT_ARTIFACT_MAX_ROOM_BYTES,
-  zAndroidScreenshotArtifactMetadata,
   zArtifactFilename,
   zArtifactId,
   zRoomArtifact,
@@ -28,9 +27,9 @@ import {
   type AndroidScreenshotArtifactMetadata,
   type RoomArtifact
 } from '@devhotel/shared'
-import { redactStructuredSecrets } from '../diagnostics/redact'
 import type { ArtifactsRepo } from '../store/artifactsRepo'
 import { validateAndSanitizeScreenshotPng } from './png'
+import { sanitizeAndroidScreenshotArtifactMetadata } from './sanitize'
 
 const UUID_DIR = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TEMP_DIR = /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -90,7 +89,7 @@ export class RoomArtifactStore {
   publishScreenshot(input: PublishScreenshotInput): RoomArtifact {
     const filename = zArtifactFilename.parse(input.filename)
     const validated = validateAndSanitizeScreenshotPng(input.png)
-    const metadata = zAndroidScreenshotArtifactMetadata.parse(redactStructuredSecrets(input.metadata))
+    const metadata = sanitizeAndroidScreenshotArtifactMetadata(input.metadata)
     if (
       metadata.room.id !== input.roomId ||
       metadata.capture.capturedAt !== input.createdAt ||

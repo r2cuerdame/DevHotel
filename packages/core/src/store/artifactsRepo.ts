@@ -4,7 +4,7 @@ import {
   type AndroidScreenshotArtifactMetadata,
   type RoomArtifact
 } from '@devhotel/shared'
-import { redactStructuredSecrets } from '../diagnostics/redact'
+import { sanitizeAndroidScreenshotArtifactMetadata } from '../artifacts/sanitize'
 import type { Db } from './db'
 
 interface ArtifactRow {
@@ -23,7 +23,7 @@ interface ArtifactRow {
 function rowToArtifact(row: ArtifactRow): RoomArtifact {
   let metadata: unknown
   try {
-    metadata = redactStructuredSecrets(JSON.parse(row.metadata_json))
+    metadata = sanitizeAndroidScreenshotArtifactMetadata(JSON.parse(row.metadata_json))
   } catch {
     throw new Error(`Artifact ${row.id} has invalid metadata JSON`)
   }
@@ -65,7 +65,7 @@ export function artifactsRepo(db: Db): ArtifactsRepo {
   const { sqlite } = db
   return {
     insert(input) {
-      const metadata = redactStructuredSecrets(input.metadata)
+      const metadata = sanitizeAndroidScreenshotArtifactMetadata(input.metadata)
       const ownsTransaction = !sqlite.isTransaction
       if (ownsTransaction) sqlite.exec('BEGIN IMMEDIATE')
       try {

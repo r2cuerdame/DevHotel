@@ -6,6 +6,7 @@ import {
 } from '@devhotel/shared'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RoomArtifactStore } from '../artifacts/store'
+import { registerSensitiveSecrets } from '../diagnostics/redact'
 import { artifactsRepo } from '../store/artifactsRepo'
 import { openDb, type Db } from '../store/db'
 import { roomsRepo } from '../store/roomsRepo'
@@ -113,6 +114,29 @@ describe('Room screenshot artifact store', () => {
 
     expect(artifact.filename).toBe('ghp_aaaaaaaaaaaaaaaaaaaa.png')
     expect(store.readContent('aaaa1111', artifact.id).artifact.filename).toBe('ghp_aaaaaaaaaaaaaaaaaaaa.png')
+  })
+
+  it('preserves schema-bearing package identifiers during metadata redaction and reload', () => {
+    const { store } = setup()
+    const packageName = 'com.ghp_aaaaaaaaaaaaaaaaaaaa.app'
+    const artifact = store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'package-id.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111', {
+        app: { status: 'tracked-active', packageName }
+      })
+    })
+    const release = registerSensitiveSecrets([packageName])
+    try {
+      expect(artifact.metadata.app.packageName).toBe(packageName)
+      expect(store.list('aaaa1111')[0]?.metadata.app.packageName).toBe(packageName)
+      expect(store.readContent('aaaa1111', artifact.id).artifact.metadata.app.packageName).toBe(packageName)
+    } finally {
+      release()
+    }
   })
 
   it('refuses tampered content instead of serving it', () => {
