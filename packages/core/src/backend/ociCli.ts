@@ -1755,14 +1755,20 @@ export class OciCliBackend implements IsolationBackend {
     let canonicalApk: string | undefined
     try {
       throwIfAborted(opts.signal)
+      const sourceStat = lstatSync(hostApkPath)
+      if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+        throw new Error('fenced emulator install refused an invalid private APK stage')
+      }
       canonicalApk = realpathSync.native(hostApkPath)
       const apkStat = lstatSync(canonicalApk)
       if (
-        canonicalApk !== resolve(hostApkPath) ||
         apkStat.isSymbolicLink() ||
         !apkStat.isFile() ||
         apkStat.size < 1 ||
-        apkStat.size > 512 * 1024 * 1024
+        apkStat.size > 512 * 1024 * 1024 ||
+        sourceStat.dev !== apkStat.dev ||
+        sourceStat.ino !== apkStat.ino ||
+        sourceStat.size !== apkStat.size
       ) {
         throw new Error('fenced emulator install refused an invalid private APK stage')
       }

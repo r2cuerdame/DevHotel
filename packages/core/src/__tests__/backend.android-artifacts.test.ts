@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
 import {
@@ -633,8 +633,14 @@ describe('OciCliBackend Android artifact export', () => {
 
     mockedRunDocker.mockClear()
     createOutputOverflow = false
-    const privateApk = join(tempDir(), 'host-secret-build.apk')
+    const privateStageRoot = tempDir()
+    const canonicalStageDir = join(privateStageRoot, 'canonical-stage')
+    const aliasedStageDir = join(privateStageRoot, 'aliased-stage')
+    mkdirSync(canonicalStageDir)
+    symlinkSync(canonicalStageDir, aliasedStageDir, process.platform === 'win32' ? 'junction' : 'dir')
+    const privateApk = join(aliasedStageDir, 'host-secret-build.apk')
     writeFileSync(privateApk, 'apk-bytes')
+    expect(realpathSync.native(privateApk)).not.toBe(resolve(privateApk))
     const callerAbortReason = new Error('caller cancelled the install operation')
     const callerAbort = new AbortController()
     callerAbort.abort(callerAbortReason)
