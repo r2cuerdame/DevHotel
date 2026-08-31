@@ -23,8 +23,13 @@ export async function reconcile(
     // A one-shot process is owned by the client operation that started it.
     // At process startup no such operation is live, even when its Room still
     // exists, so every surviving job container is stale and must be reaped.
-    if (c.role === 'job' || !c.roomId || !knownOciRooms.has(c.roomId)) {
-      const kind = c.role === 'job' ? 'stale job container' : 'stray container'
+    const interruptedEmulatorCreate = c.role === 'svc-emulator' && c.state === 'created'
+    if (c.role === 'job' || interruptedEmulatorCreate || !c.roomId || !knownOciRooms.has(c.roomId)) {
+      const kind = c.role === 'job'
+        ? 'stale job container'
+        : interruptedEmulatorCreate
+          ? 'interrupted emulator create'
+          : 'stray container'
       log(`reconcile: removing ${kind} ${c.name} (room ${c.roomId || 'unknown'})`)
       await backend.removeManagedContainer(c.name)
       straysRemoved.push(c.name)

@@ -1,15 +1,28 @@
-import { EMULATOR_ADB_SERIAL } from '../../backend/naming'
-import { assertLaunchersAreExecutable, lineEndingAttributionInRoom } from './androidLineEndings'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
+import { assertLaunchersAreExecutable } from './androidLineEndings'
+import {
+  buildSealedAndroidArtifacts,
+  cleanupAndroidBuildArtifacts,
+  sealedAndroidArtifactRef,
+  verifySealedAndroidBuild
+} from './androidBuild'
+import type { ExportedArtifact } from '../../backend/types'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
-const BUILD_TIMEOUT_MS = 15 * 60_000
-const ADB = `adb -s ${EMULATOR_ADB_SERIAL}`
 const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
+const MAX_BUILT_APPS = 64
+const MAX_METADATA_STDOUT_BYTES = 64 * 1024
+const DEBUG_APK_PATH = /^(?:[^/\0]+\/)*build\/outputs\/apk\/debug\/[^/\0]+\.apk$/i
 
 interface BuiltApp {
   appId: string
-  apkPath: string
+  artifact: ExportedArtifact
+}
+
+interface AndroidRunCapture {
+  applicationId: string
 }
 
 function assertApplicationId(value: string, source: 'build metadata' | 'request'): string {
@@ -23,22 +36,7 @@ function assertApplicationId(value: string, source: 'build metadata' | 'request'
   return value
 }
 
-function assertMetadataPath(metaPath: string): string {
-  const prefix = '/workspace/'
-  const suffix = '/build/outputs/apk/debug/output-metadata.json'
-  const segments = metaPath.slice(prefix.length).split('/')
-  if (
-    metaPath.length > 4096 ||
-    !metaPath.startsWith(prefix) ||
-    !metaPath.endsWith(suffix) ||
-    segments.some((segment) => !segment || segment === '.' || segment === '..' || !/^[A-Za-z0-9._+@ -]+$/.test(segment))
-  ) {
-    throw new Error('Android build returned an unsafe output-metadata path')
-  }
-  return metaPath
-}
-
-function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
+function builtAppFromMetadata(artifact: ExportedArtifact, stdout: string): BuiltApp {
   let metadata: unknown
   try {
     metadata = JSON.parse(stdout)
@@ -47,16 +45,17 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
   }
   if (!metadata || typeof metadata !== 'object') throw new Error('Android build returned invalid output metadata')
   const record = metadata as { applicationId?: unknown; elements?: unknown }
-  const element = Array.isArray(record.elements)
-    ? record.elements.find((candidate): candidate is { outputFile: string } =>
-        Boolean(candidate && typeof candidate === 'object' && typeof (candidate as { outputFile?: unknown }).outputFile === 'string')
-      )
+  const element = Array.isArray(record.elements) && record.elements.length === 1
+    ? record.elements[0]
     : null
   if (typeof record.applicationId !== 'string' || !element) {
     throw new Error('Android build output metadata is missing its applicationId or APK')
   }
+  if (typeof element !== 'object' || typeof (element as { outputFile?: unknown }).outputFile !== 'string') {
+    throw new Error('Android build output metadata is missing its applicationId or APK')
+  }
   const appId = assertApplicationId(record.applicationId, 'build metadata')
-  const outputFile = element.outputFile
+  const outputFile = (element as { outputFile: string }).outputFile
   const stem = outputFile.slice(0, -4)
   if (
     Buffer.byteLength(outputFile, 'utf8') > 255 ||
@@ -69,25 +68,88 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
   ) {
     throw new Error('Android build output metadata contains an unsafe APK filename')
   }
-  const outputDirectory = metaPath.slice(0, metaPath.lastIndexOf('/') + 1)
-  return { appId, apkPath: `${outputDirectory}${outputFile}` }
+  if (outputFile !== basename(artifact.relativePath)) {
+    throw new Error('Android build output metadata does not match its sealed APK artifact')
+  }
+  return { appId, artifact }
 }
 
-/** Every module's debug APK, resolved strictly from its own output-metadata.json. */
-async function builtApps(ctx: ChangeCtx): Promise<BuiltApp[]> {
-  const list = await ctx.backend.execInRoom(
-    ctx.roomId,
-    ['sh', '-lc', "find /workspace -path '*/build/outputs/apk/debug/output-metadata.json'"],
-    { timeoutMs: 30_000 }
-  )
+/** Resolve only bounded, verified debug APKs exported from this operation's private snapshot. */
+function builtApps(ctx: ChangeCtx, operationId: string, artifacts: ExportedArtifact[]): BuiltApp[] {
+  if (artifacts.length > MAX_BUILT_APPS) throw new Error('Android build returned too many APK artifacts')
+  const artifactRoot = join(ctx.userData, 'rooms', ctx.roomId, 'artifacts', operationId)
+  let canonicalRoot: string
+  try {
+    canonicalRoot = realpathSync.native(artifactRoot)
+  } catch {
+    throw new Error('sealed Android build metadata is missing or unreadable')
+  }
+  const debugArtifacts = artifacts.filter((artifact) => DEBUG_APK_PATH.test(artifact.relativePath))
   const apps: BuiltApp[] = []
-  for (const discoveredPath of list.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
-    const metaPath = assertMetadataPath(discoveredPath)
-    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat ${shellQuote(metaPath)}`], { timeoutMs: 30_000 })
-    if (meta.code !== 0) throw new Error('Android build output metadata could not be read')
-    apps.push(builtAppFromMetadata(metaPath, meta.stdout))
+  const applicationIds = new Set<string>()
+  const artifactPaths = new Set<string>()
+  const metadataPaths = new Set<string>()
+  for (const artifact of debugArtifacts) {
+    if (artifactPaths.has(artifact.relativePath)) {
+      throw new Error('Android build returned duplicate APK artifacts')
+    }
+    artifactPaths.add(artifact.relativePath)
+    const metadataRelativePath = `${dirname(artifact.relativePath).replaceAll('\\', '/')}/output-metadata.json`
+    if (metadataPaths.has(metadataRelativePath)) {
+      throw new Error('Android build returned multiple APKs for one tracked application')
+    }
+    metadataPaths.add(metadataRelativePath)
+    const metadataPath = join(artifactRoot, ...metadataRelativePath.split('/'))
+    let metadata: ReturnType<typeof lstatSync>
+    let canonicalMetadata: string
+    try {
+      metadata = lstatSync(metadataPath)
+      canonicalMetadata = realpathSync.native(metadataPath)
+    } catch {
+      throw new Error('sealed Android build metadata is missing or unreadable')
+    }
+    const metadataRelativeToRoot = relative(canonicalRoot, canonicalMetadata)
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isFile() ||
+      metadata.size < 2 ||
+      metadata.size > MAX_METADATA_STDOUT_BYTES ||
+      isAbsolute(metadataRelativeToRoot) ||
+      metadataRelativeToRoot === '..' ||
+      metadataRelativeToRoot.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    ) {
+      throw new Error('Android build returned unsafe output metadata')
+    }
+    let metadataText: string
+    try {
+      metadataText = readFileSync(canonicalMetadata, 'utf8')
+    } catch {
+      throw new Error('sealed Android build metadata is missing or unreadable')
+    }
+    const app = builtAppFromMetadata(artifact, metadataText)
+    if (applicationIds.has(app.appId)) {
+      throw new Error('Android build returned ambiguous duplicate app metadata')
+    }
+    applicationIds.add(app.appId)
+    apps.push(app)
   }
   return apps
+}
+
+function capturedTarget(captured: unknown, requestedApplicationId?: string): AndroidRunCapture | null {
+  if (!captured || typeof captured !== 'object' || Array.isArray(captured)) return null
+  const record = captured as { applicationId?: unknown }
+  if (Object.keys(record).length !== 1 || typeof record.applicationId !== 'string') return null
+  try {
+    const applicationId = assertApplicationId(record.applicationId, 'build metadata')
+    if (
+      requestedApplicationId !== undefined &&
+      applicationId !== assertApplicationId(requestedApplicationId, 'request')
+    ) return null
+    return { applicationId }
+  } catch {
+    return null
+  }
 }
 
 function pickTarget(apps: BuiltApp[], applicationId?: string): BuiltApp {
@@ -104,29 +166,8 @@ function pickTarget(apps: BuiltApp[], applicationId?: string): BuiltApp {
   return target
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
-async function runAdb(ctx: ChangeCtx, args: string[], timeoutMs: number) {
-  if (ctx.physicalAndroidDevice) return ctx.physicalAndroidDevice.exec(args, { timeoutMs })
-  return ctx.backend.execInRoom(
-    ctx.roomId,
-    ['sh', '-lc', `${ADB} ${args.map(shellQuote).join(' ')}`],
-    { timeoutMs }
-  )
-}
-
 function targetLabel(ctx: ChangeCtx): string {
   return ctx.physicalAndroidDevice?.nickname ?? 'the Room emulator'
-}
-
-function resolvedLauncher(stdout: string, appId: string): string | undefined {
-  const exactPackagePrefix = `${appId}/`
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.startsWith(exactPackagePrefix) && /^[A-Za-z0-9._]+\/[A-Za-z0-9._$]+$/.test(line))
 }
 
 function androidProbeFailure(ctx: ChangeCtx, appId: string): { ok: false; detail: string } {
@@ -151,12 +192,17 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       autoRollback: false
     }
   },
-  async preflight(ctx) {
+  async preflight(ctx, p) {
     const room = ctx.room()
     if (room.provider !== 'android') throw new Error('Only Android rooms can run Android apps')
     if (!ctx.isAwake()) throw new Error('Wake the room before running')
+    if (room.workspaceMode !== 'hotel') {
+      throw new Error('Android Build & Run requires a Room-owned Hotel workspace; move this Room into Hotel first')
+    }
+    if (p.applicationId) assertApplicationId(p.applicationId, 'request')
     if (ctx.physicalAndroidDevice) {
-      const state = await ctx.physicalAndroidDevice.exec(['get-state'], { timeoutMs: 20_000 })
+      if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
+      const state = await ctx.execFencedAndroidTarget(['get-state'], { timeoutMs: 20_000 })
       if (state.code !== 0 || state.stdout.trim() !== 'device') {
         throw new Error(`${ctx.physicalAndroidDevice.nickname} is not ready: ${(state.stderr || state.stdout).trim() || `adb exited ${state.code}`}`)
       }
@@ -165,78 +211,90 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     }
     await assertLaunchersAreExecutable(ctx)
   },
-  async apply(ctx, p, steps) {
+  async apply(ctx, p, steps, operation) {
     const apply = async (): Promise<void> => {
       const room = ctx.room()
-      steps.push(`Run ${room.startCommand}`)
-      const build = await ctx.backend.execInRoom(room.id, ['sh', '-lc', `cd /workspace && ${room.startCommand}`], {
-        timeoutMs: BUILD_TIMEOUT_MS
-      })
-      if (build.code !== 0) {
-        const attribution = await lineEndingAttributionInRoom(ctx)
-        throw new Error(`build failed (exit ${build.code}): ${(build.stderr || build.stdout).slice(-500)}${attribution}`)
-      }
+      const committed: string[] = []
+      let primaryError: unknown
+      try {
+        const sealed = await buildSealedAndroidArtifacts(ctx, steps, operation)
+        const verified = await verifySealedAndroidBuild(ctx, sealed.provenance, operation)
+        if (!verified.ok) throw new Error(verified.detail)
+        const apps = builtApps(ctx, operation.id, sealed.provenance.artifacts)
+        if (apps.length === 0) throw new Error('no sealed debug APK metadata was produced')
+        const target = pickTarget(apps, p.applicationId)
+        // Android-run owns only its validated target capture. Build provenance
+        // remains an operation-local capability and is never persisted here.
+        steps.setCaptured({ applicationId: target.appId } satisfies AndroidRunCapture)
 
-      const apps = await builtApps(ctx)
-      if (apps.length === 0) throw new Error('no output-metadata.json produced')
-      const target = pickTarget(apps, p.applicationId)
-
-      if (ctx.physicalAndroidDevice) {
-        steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
-      } else {
-        // the emulator boots asynchronously — wait until adb (shared netns)
-        // reports the device ready, bounded by wall clock (probes can block)
-        steps.push('Wait for the emulator to finish booting')
-        let booted = false
-        const bootDeadline = Date.now() + 5 * 60_000
-        while (Date.now() < bootDeadline) {
-          const probe = await runAdb(ctx, ['shell', 'getprop', 'sys.boot_completed'], 20_000)
-          if (probe.stdout.trim() === '1') {
-            booted = true
-            break
+        if (ctx.physicalAndroidDevice) {
+          steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
+        } else {
+          steps.push('Wait for the emulator to finish booting')
+          let booted = false
+          const bootDeadline = Date.now() + 5 * 60_000
+          if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
+          while (Date.now() < bootDeadline) {
+            const probe = await ctx.execFencedAndroidTarget(
+              ['shell', 'getprop', 'sys.boot_completed'],
+              { timeoutMs: 20_000 }
+            )
+            if (probe.code === 0 && probe.stdout.trim() === '1') {
+              booted = true
+              break
+            }
+            await sleep(5000)
           }
-          await sleep(5000)
+          if (!booted) throw new Error('emulator did not finish booting within 5 minutes')
         }
-        if (!booted) throw new Error('emulator did not finish booting within 5 minutes')
+
+        for (const app of apps) {
+          steps.push(`Install sealed ${app.artifact.relativePath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
+          // Register before awaiting: the installer may commit its receipt and
+          // then fail while cleaning the private stage.
+          committed.push(app.appId)
+          await ctx.installTrackedAndroidArtifact(
+            app.appId,
+            sealedAndroidArtifactRef(sealed, app.artifact),
+            operation.id
+          )
+        }
+
+        steps.push(`Resolve and launch ${target.appId}`)
+        if (!ctx.launchTrackedAndroidApp) throw new Error('tracked Android launcher authority is unavailable')
+        await ctx.launchTrackedAndroidApp(target.appId)
+      } catch (error) {
+        primaryError = error
       }
 
-      // multi-module apps (app + companion/crash-lab modules) install together
-      for (const app of apps) {
-        steps.push(`Install ${app.apkPath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
-        const install = await runAdb(ctx, ['install', '-r', app.apkPath], 180_000)
-        if (install.code !== 0) {
-          throw new Error(`adb install ${app.appId} failed: ${(install.stderr || install.stdout).slice(-300)}`)
+      const cleanupError = cleanupAndroidBuildArtifacts(ctx.userData, room.id, operation.id)
+      if (cleanupError) {
+        primaryError = primaryError
+          ? new AggregateError(
+              [primaryError, new Error(cleanupError)],
+              'Android run failed and its private build artifact cleanup also failed'
+            )
+          : new Error(`Android run private build artifact cleanup failed: ${cleanupError}`)
+      }
+      if (primaryError) {
+        for (const applicationId of committed) {
+          try {
+            ctx.removeTrackedAndroidInstall(applicationId, operation.id)
+          } catch {
+            // The exact target/lease may already be gone. The operation-wide
+            // repository cleanup below is the authoritative revocation.
+          }
         }
+        try {
+          ctx.removeTrackedAndroidInstalls(operation.id)
+        } catch {
+          throw new AggregateError(
+            [primaryError, new Error('tracked Android receipt cleanup failed')],
+            'Android run failed and one or more tracked install receipts could not be revoked'
+          )
+        }
+        throw primaryError
       }
-
-      steps.push(`Resolve and launch ${target.appId}`)
-      const resolved = await runAdb(
-        ctx,
-        [
-          'shell',
-          'cmd',
-          'package',
-          'resolve-activity',
-          '--brief',
-          '--components',
-          '-a',
-          'android.intent.action.MAIN',
-          '-c',
-          'android.intent.category.LAUNCHER',
-          target.appId
-        ],
-        30_000
-      )
-      const component = resolvedLauncher(resolved.stdout, target.appId)
-      if (resolved.code !== 0 || !component) {
-        throw new Error(`could not resolve launcher for ${target.appId}: ${(resolved.stderr || resolved.stdout).slice(-300)}`)
-      }
-      const launch = await runAdb(
-        ctx,
-        ['shell', 'am', 'start', '-W', '-n', component],
-        60_000
-      )
-      if (launch.code !== 0) throw new Error(`launch failed: ${(launch.stderr || launch.stdout).slice(-300)}`)
     }
 
     if (ctx.physicalAndroidDevice) {
@@ -245,20 +303,16 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       await apply()
     }
   },
-  async verify(ctx, p) {
-    let appId: string
-    try {
-      appId = pickTarget(await builtApps(ctx), p.applicationId).appId
-    } catch {
+  async verify(ctx, p, captured) {
+    const target = capturedTarget(captured, p.applicationId)
+    if (!target) {
       return { ok: false, detail: 'Android run verification could not read validated build metadata' }
     }
+    const appId = target.applicationId
     try {
+      if (!ctx.isTrackedAndroidAppForeground) return androidProbeFailure(ctx, appId)
       for (let i = 0; i < 6; i++) {
-        const pid = await runAdb(ctx, ['shell', 'pidof', appId], 20_000)
-        // Android's pidof normally exits 1 while a just-launched process is
-        // still absent. That is a retryable no-match, not a transport failure.
-        const processIds = pid.stdout.trim()
-        if (pid.code === 0 && /^\d+(?:\s+\d+)*$/.test(processIds)) {
+        if (await ctx.isTrackedAndroidAppForeground(appId)) {
           return { ok: true, detail: `${appId} running on ${targetLabel(ctx)}` }
         }
         await sleep(2000)

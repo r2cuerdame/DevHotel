@@ -4,12 +4,13 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
+import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type {
   AdbBinaryResult,
   AdbDeviceLine,
+  AdbExecOptions,
   AdbHost,
   AdbHostAvailability,
   AdbPairingAttempt,
@@ -63,7 +64,8 @@ const ok: ExecResult = { code: 0, stdout: '', stderr: '' }
 
 export class FakeBackend implements IsolationBackend {
   calls: string[] = []
-  execInRoomCalls: { roomId: string; cmd: string[] }[] = []
+  execInRoomCalls: { roomId: string; cmd: string[]; opts?: ExecOpts }[] = []
+  oneShotCalls: { spec: WebSpec; cmd: string; opts?: ExecOpts }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
   webStateValue: 'running' | 'exited' | 'missing' = 'running'
@@ -74,12 +76,13 @@ export class FakeBackend implements IsolationBackend {
   execResult: ExecResult = ok
   /** per-command answers for tests that drive several different in-room probes */
   execHandler: ((cmd: string[]) => ExecResult) | null = null
-  oneShotHandler: ((spec: WebSpec, cmd: string) => ExecResult) | null = null
+  oneShotHandler: ((spec: WebSpec, cmd: string, opts?: ExecOpts) => ExecResult) | null = null
   execInRoomHandler: ((roomId: string, cmd: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
   copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
   relayTokenValue = ''
   lastWebSpec: WebSpec | null = null
+  lastAnchorSpec: AnchorSpec | null = null
 
   async health() {
     return { ok: true, detail: 'fake docker' }
@@ -94,7 +97,7 @@ export class FakeBackend implements IsolationBackend {
   async relayToken(_roomId: string) {
     return this.relayTokenValue
   }
-  async startRoomPod(roomId: string, opts?: { standalone?: boolean }) {
+  async startRoomPod(roomId: string, opts?: { standalone?: boolean; androidRuntimeIsolation?: boolean }) {
     this.calls.push(`startRoomPod:${roomId}`)
     return { hostPort: opts?.standalone ? null : this.hostPort }
   }
@@ -106,9 +109,16 @@ export class FakeBackend implements IsolationBackend {
   }
   async pauseWeb(roomId: string) {
     this.calls.push(`pauseWeb:${roomId}`)
+    this.webPausedValue = true
   }
   async unpauseWeb(roomId: string) {
     this.calls.push(`unpauseWeb:${roomId}`)
+    this.webPausedValue = false
+  }
+  webPausedValue = false
+  async webPaused(roomId: string) {
+    this.calls.push(`webPaused:${roomId}`)
+    return this.webPausedValue
   }
   async restartWeb(roomId: string) {
     this.calls.push(`restartWeb:${roomId}`)
@@ -117,8 +127,9 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
   }
-  async recreateAnchor(spec: { roomId: string; internalPort: number }) {
+  async recreateAnchor(spec: AnchorSpec) {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
+    this.lastAnchorSpec = spec
     return { hostPort: this.hostPort }
   }
   async deleteRoomPod(roomId: string) {
@@ -128,7 +139,7 @@ export class FakeBackend implements IsolationBackend {
   /** Chunks to emit instead of `execResult`, so streaming callers can be tested. */
   execChunks: { stdout?: string[]; stderr?: string[] } | null = null
   async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
-    this.execInRoomCalls.push({ roomId, cmd })
+    this.execInRoomCalls.push({ roomId, cmd, ...(opts ? { opts } : {}) })
     const result = this.execInRoomHandler
       ? await this.execInRoomHandler(roomId, cmd, opts)
       : (this.execHandler?.(cmd) ?? this.execResult)
@@ -145,16 +156,22 @@ export class FakeBackend implements IsolationBackend {
   async followRoomLogs(): Promise<ChildProcessWithoutNullStreams> {
     throw new Error('log streaming is not available in FakeBackend')
   }
-  async runOneShot(spec: WebSpec, cmd: string): Promise<ExecResult> {
+  async runOneShot(
+    spec: WebSpec,
+    cmd: string,
+    _log?: (line: string) => void,
+    opts?: ExecOpts
+  ): Promise<ExecResult> {
     this.calls.push(`runOneShot:${spec.workspaceVolumeOverride ?? spec.depsVolumeOverride ?? 'default'}:${cmd}`)
+    this.oneShotCalls.push({ spec, cmd, ...(opts ? { opts } : {}) })
     this.lastWebSpec = spec
-    return this.oneShotHandler?.(spec, cmd) ?? this.oneShotResult
+    return this.oneShotHandler?.(spec, cmd, opts) ?? this.oneShotResult
   }
   async exportAndroidArtifacts(roomId: string, workspaceVolume: string, artifactsRoot: string, operationId: string) {
     const hostDir = join(artifactsRoot, operationId)
     this.calls.push(`exportAndroidArtifacts:${workspaceVolume}:${hostDir}`)
     const { mkdirSync, writeFileSync } = await import('node:fs')
-    const { dirname } = await import('node:path')
+    const { dirname, join: joinPath } = await import('node:path')
     const { createHash } = await import('node:crypto')
     const exported: ExportedArtifact[] = []
     for (const artifact of this.exportedArtifacts) {
@@ -162,6 +179,10 @@ export class FakeBackend implements IsolationBackend {
       const content = Buffer.from(`fake-apk:${artifact.relativePath}`)
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, content)
+      writeFileSync(
+        joinPath(dirname(path), 'output-metadata.json'),
+        JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: artifact.relativePath.split('/').at(-1) }] })
+      )
       exported.push({
         relativePath: artifact.relativePath,
         size: content.byteLength,
@@ -298,6 +319,37 @@ export class FakeBackend implements IsolationBackend {
     await this.copyFromRoomHook?.(roomId, containerPath, hostPath)
     const { existsSync, writeFileSync } = await import('node:fs')
     if (!existsSync(hostPath)) writeFileSync(hostPath, 'fake-room-file')
+  }
+  fencedEmulatorExecHandler: ((args: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
+  fencedEmulatorExecCalls: { args: string[]; opts?: ExecOpts }[] = []
+  async execFencedEmulatorAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {
+    this.calls.push(`execFencedEmulatorAdb:${args.join(' ')}`)
+    this.fencedEmulatorExecCalls.push({ args, opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const result = await (this.fencedEmulatorExecHandler?.(args, opts) ?? this.execResult)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+    if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+    return {
+      ...result,
+      stdout: opts?.onStdout ? '' : result.stdout,
+      stderr: opts?.onStderr ? '' : result.stderr
+    }
+  }
+  async installFencedEmulatorApk(_roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult> {
+    this.calls.push(`installFencedEmulatorApk:${hostApkPath}`)
+    const args = ['install', '-r', '[private-staged-apk]']
+    this.fencedEmulatorExecCalls.push({ args, opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const result = await (this.fencedEmulatorExecHandler?.(args, opts) ?? this.execResult)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+    if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+    return {
+      ...result,
+      stdout: opts?.onStdout ? '' : result.stdout,
+      stderr: opts?.onStderr ? '' : result.stderr
+    }
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   async createEmulator(
@@ -459,9 +511,11 @@ export class FakeAdbHost implements AdbHost {
   /** Raw PNG bytes this fake phone answers exec-out screencap with. */
   screencapPng = Buffer.alloc(0)
   execHook: ((serial: string, args: string[]) => void) | null = null
-  execResultFor: ((serial: string, args: string[]) => Promise<ExecResult | null> | ExecResult | null) | null = null
+  execResultFor:
+    | ((serial: string, args: string[], opts?: AdbExecOptions) => Promise<ExecResult | null> | ExecResult | null)
+    | null = null
   execBinaryResultFor:
-    | ((serial: string, args: string[]) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
+    | ((serial: string, args: string[], opts?: AdbExecOptions) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
     | null = null
   pairingServices: AdbPairingService[] = []
   pairingDiscoveryError: Error | null = null
@@ -495,12 +549,23 @@ export class FakeAdbHost implements AdbHost {
     return this.pairingResult
   }
 
-  async exec(serial: string, args: string[]): Promise<ExecResult> {
+  async exec(serial: string, args: string[], opts?: AdbExecOptions): Promise<ExecResult> {
     this.execs.push({ serial, args })
     this.execHook?.(serial, args)
-    const custom = await this.execResultFor?.(serial, args)
-    if (custom) return custom
-    if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const custom = await this.execResultFor?.(serial, args, opts)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const stream = (result: ExecResult): ExecResult => {
+      if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+      if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+      return {
+        ...result,
+        stdout: opts?.onStdout ? '' : result.stdout,
+        stderr: opts?.onStderr ? '' : result.stderr
+      }
+    }
+    if (custom) return stream(custom)
+    if (args[0] === 'get-state') return stream({ code: 0, stdout: 'device\n', stderr: '' })
     const phone = this.phones.find((candidate) => candidate.serial === serial)
     if (args[0] === 'shell' && args[1] === 'getprop') {
       const hardwareSerial = phone?.hardwareSerial === undefined ? phone?.serial : (phone.hardwareSerial ?? undefined)
@@ -512,14 +577,16 @@ export class FakeAdbHost implements AdbHost {
         'ro.boot.serialno': hardwareSerial
       }
       const value = values[args[2] ?? '']
-      return { code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' }
+      return stream({ code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' })
     }
-    return { code: 0, stdout: '', stderr: '' }
+    return stream({ code: 0, stdout: '', stderr: '' })
   }
 
-  async execBinary(serial: string, args: string[]): Promise<AdbBinaryResult> {
+  async execBinary(serial: string, args: string[], opts?: AdbExecOptions): Promise<AdbBinaryResult> {
     this.execs.push({ serial, args })
-    const custom = await this.execBinaryResultFor?.(serial, args)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const custom = await this.execBinaryResultFor?.(serial, args, opts)
+    if (opts?.signal?.aborted) throw opts.signal.reason
     if (custom) return custom
     if (args[0] === 'exec-out' && args[1] === 'screencap') {
       return { code: 0, stdout: this.screencapPng, stderr: '', outputLimitExceeded: false }

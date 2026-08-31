@@ -250,6 +250,49 @@ export const migrations: Migration[] = [
       );
       CREATE INDEX idx_android_events_at ON android_device_events(at DESC);
     `
+  },
+  {
+    // A package name alone is not an automation capability. Only the last
+    // successful DevHotel-managed install on one exact target owns a receipt;
+    // another Room installing the same package atomically replaces that owner.
+    version: 7,
+    sql: `
+      CREATE TABLE android_app_installs (
+        target_kind TEXT NOT NULL CHECK (target_kind IN ('emulator', 'physical')),
+        target_id TEXT NOT NULL,
+        lease_id TEXT CHECK (
+          (target_kind = 'emulator' AND lease_id IS NULL) OR
+          (target_kind = 'physical' AND lease_id IS NOT NULL)
+        ),
+        application_id TEXT NOT NULL,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        change_id TEXT NOT NULL,
+        apk_sha256 TEXT NOT NULL CHECK (length(apk_sha256) = 64),
+        installed_at TEXT NOT NULL,
+        package_incarnation TEXT NOT NULL CHECK (length(package_incarnation) = 64),
+        log_fence TEXT CHECK (log_fence IS NULL OR length(log_fence) BETWEEN 32 AND 200),
+        PRIMARY KEY (target_kind, target_id, application_id)
+      );
+      CREATE INDEX idx_android_app_installs_room_target
+        ON android_app_installs(room_id, target_kind, target_id, application_id);
+    `
+  },
+  {
+    // Android APK paths and bytes are shared across users, and numeric user
+    // IDs may be recycled after deletion. Keep the active user's non-reused
+    // serial together with its ID as private durable authority; legacy rows
+    // remain null and therefore fail closed until android_run.
+    version: 8,
+    sql: `
+      ALTER TABLE android_app_installs
+        ADD COLUMN install_user_id INTEGER CHECK (
+          install_user_id IS NULL OR install_user_id BETWEEN 0 AND 21474
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN install_user_serial INTEGER CHECK (
+          install_user_serial IS NULL OR install_user_serial BETWEEN 0 AND 2147483647
+        );
+    `
   }
 ]
 

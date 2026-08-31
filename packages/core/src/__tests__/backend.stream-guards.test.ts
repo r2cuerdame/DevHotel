@@ -89,4 +89,37 @@ describe('streaming Room process guards', () => {
     expect(mockedSpawnDocker).toHaveBeenNthCalledWith(1, ['exec', '-i', id, 'sh', '-li'])
     expect(mockedSpawnDocker).toHaveBeenNthCalledWith(2, ['logs', '-f', '--tail', '25', id])
   })
+
+  it('forwards hard output caps and cancellation to production Room exec', async () => {
+    const id = 'c'.repeat(64)
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: inspectWeb({ id }), stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const backend = new OciCliBackend()
+    const controller = new AbortController()
+    const onStdout = vi.fn()
+    const onStderr = vi.fn()
+
+    await backend.execInRoom('room1abc', ['sh', '-lc', 'bounded'], {
+      timeoutMs: 30_000,
+      signal: controller.signal,
+      maxStdoutBytes: 1234,
+      maxStderrBytes: 5678,
+      onStdout,
+      onStderr
+    })
+
+    expect(mockedRunDocker).toHaveBeenCalledWith(
+      ['exec', id, 'sh', '-lc', 'bounded'],
+      {
+        timeoutMs: 30_000,
+        signal: controller.signal,
+        maxStdoutBytes: 1234,
+        maxStderrBytes: 5678,
+        onStdout,
+        onStderr
+      }
+    )
+  })
 })

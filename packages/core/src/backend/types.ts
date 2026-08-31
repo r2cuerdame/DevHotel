@@ -20,6 +20,8 @@ export interface WebSpec {
   imageOverride?: string
   /** standalone containers join the owned Room network directly: no anchor or published port */
   standalone?: boolean
+  /** Android keeps user workloads in a runtime namespace isolated from the emulator relay/control namespace. */
+  androidRuntimeIsolation?: boolean
   /** skip the /workspace/node_modules deps volume (non-node providers) */
   noDepsVolume?: boolean
   /** skip the persistent Room cache for a clean, disposable job */
@@ -35,18 +37,27 @@ export interface WebSpec {
 export interface AnchorSpec {
   roomId: string
   internalPort: number
+  /** Recreate the Android control relay and ensure its separate runtime namespace leader is running. */
+  androidRuntimeIsolation?: boolean
 }
 
 export interface ExecResult {
   code: number
   stdout: string
   stderr: string
+  /** The process was killed as soon as a configured stdout/stderr byte cap was crossed. */
+  outputLimitExceeded?: boolean
 }
 
 export type ExecOutputChunk = string | Uint8Array
 
 export interface ExecOpts {
   timeoutMs?: number
+  /** Cancel the command and complete its mandatory ownership-safe cleanup. */
+  signal?: AbortSignal
+  /** Optional hard capture caps used by fenced helpers and high-level automation. */
+  maxStdoutBytes?: number
+  maxStderrBytes?: number
   /**
    * Receive stdout as it is produced. A backend that honours this must not also
    * accumulate the stream into `ExecResult.stdout` — that is the whole point:
@@ -77,12 +88,17 @@ export interface IsolationBackend {
   ): Promise<{ hostPort: number | null }>
   /** Secret needed by the host gateway to cross this Room's published relay gate. */
   relayToken(roomId: string): Promise<string>
-  startRoomPod(roomId: string, opts?: { standalone?: boolean }): Promise<{ hostPort: number | null }>
+  startRoomPod(
+    roomId: string,
+    opts?: { standalone?: boolean; androidRuntimeIsolation?: boolean }
+  ): Promise<{ hostPort: number | null }>
   startWeb(roomId: string): Promise<void>
   stopRoomPod(roomId: string): Promise<void>
   /** Freeze/unfreeze the web container while taking a consistent volume copy. */
   pauseWeb(roomId: string): Promise<void>
   unpauseWeb(roomId: string): Promise<void>
+  /** Exact execution fence state; acceptance code must not infer this from `running`. */
+  webPaused(roomId: string): Promise<boolean>
   restartWeb(roomId: string): Promise<void>
   recreateWeb(spec: WebSpec): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
@@ -92,7 +108,17 @@ export interface IsolationBackend {
   spawnInteractiveExec(roomId: string, cmd: string[]): Promise<ChildProcessWithoutNullStreams>
   /** Follow web logs only after engine and exact web-container ownership validation. */
   followRoomLogs(roomId: string, tail?: number): Promise<ChildProcessWithoutNullStreams>
-  runOneShot(spec: WebSpec, cmd: string, log?: (line: string) => void): Promise<ExecResult>
+  /**
+   * Run a disposable Room job with bounded output and ownership-safe cleanup.
+   * Existing callers may omit opts; the production backend still applies hard
+   * stdout/stderr caps and a finite timeout.
+   */
+  runOneShot(
+    spec: WebSpec,
+    cmd: string,
+    log?: (line: string) => void,
+    opts?: ExecOpts
+  ): Promise<ExecResult>
   /** Export APKs from an owned immutable workspace volume beneath a Room-owned Hotel artifact root. */
   exportAndroidArtifacts(
     roomId: string,
@@ -180,13 +206,17 @@ export interface IsolationBackend {
   copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void>
   /** copy a file out of the room's web/build container to the host */
   copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
+  /** Controlled emulator ADB outside the user Room; acceptance callers separately require a pause fence. */
+  execFencedEmulatorAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /** Install one Host-private staged APK without reopening the Room workspace. */
+  installFencedEmulatorApk(roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult>
   /* --- android emulator sidecar (KVM) --- */
   createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
   ): Promise<void>
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
-  captureEmulatorScreen(roomId: string): Promise<string>
+  captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>
   removeEmulator(roomId: string): Promise<void>
   emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'>
 }

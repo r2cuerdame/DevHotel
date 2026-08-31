@@ -98,6 +98,24 @@ describe('Host adb transport classification', () => {
 })
 
 describe('Host adb output isolation', () => {
+  it('kills a child when cancellation races spawn and abort-listener registration', async () => {
+    const adb = scriptedAdb("setInterval(() => undefined, 10_000)")
+    const reason = new Error('exact lease was revoked during spawn')
+    let abortedReads = 0
+    const signal = {
+      get aborted() {
+        abortedReads += 1
+        return abortedReads >= 2
+      },
+      reason,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined
+    } as unknown as AbortSignal
+
+    await expect(adb.exec('private-serial', ['get-state'], { signal })).rejects.toBe(reason)
+    expect(abortedReads).toBeGreaterThanOrEqual(2)
+  })
+
   it('terminates text and binary commands at strict byte caps with an explicit error', async () => {
     const adb = scriptedAdb("process.stdout.write(Buffer.alloc(8192, 0x78))")
 

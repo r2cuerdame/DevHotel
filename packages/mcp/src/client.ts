@@ -1,7 +1,28 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentCreateRoomInput, ControlInfo, OperationRecord, QuickChange } from '@devhotel/shared'
+import type {
+  AgentCreateRoomInput,
+  AndroidAutomationStatus,
+  AndroidCrashScenarioResult,
+  AndroidDumpUiInput,
+  AndroidForceStopInput,
+  AndroidForceStopResult,
+  AndroidLaunchAppInput,
+  AndroidLaunchResult,
+  AndroidLogcatInput,
+  AndroidLogcatResult,
+  AndroidRunCrashScenarioInput,
+  AndroidTapTextInput,
+  AndroidTapTextResult,
+  AndroidTargetSelector,
+  AndroidUiDumpResult,
+  AndroidWaitForTextInput,
+  AndroidWaitForTextResult,
+  ControlInfo,
+  OperationRecord,
+  QuickChange
+} from '@devhotel/shared'
 
 /** Bounded-output selection understood by the control API's exec and run reads. */
 export interface OutputSelection {
@@ -212,6 +233,39 @@ export class ControlClient {
     return this.req<{ png: string; source: 'adb' | 'screen' }>(
       'GET',
       `/v1/rooms/${encodeURIComponent(roomId)}/screenshot?mode=${mode}`
+    )
+  }
+  androidAutomationStatus(roomId: string, target: AndroidTargetSelector = { kind: 'auto' }) {
+    const query = new URLSearchParams({ target: target.kind })
+    if (target.kind === 'physical' && target.deviceId) query.set('deviceId', target.deviceId)
+    return this.req<AndroidAutomationStatus>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/status?${query.toString()}`
+    )
+  }
+  androidLaunchApp(roomId: string, input: AndroidLaunchAppInput) {
+    return this.req<AndroidLaunchResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/launch`, input)
+  }
+  androidForceStop(roomId: string, input: AndroidForceStopInput) {
+    return this.req<AndroidForceStopResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/force-stop`, input)
+  }
+  androidWaitForText(roomId: string, input: AndroidWaitForTextInput) {
+    return this.req<AndroidWaitForTextResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/wait-for-text`, input)
+  }
+  androidTapText(roomId: string, input: AndroidTapTextInput) {
+    return this.req<AndroidTapTextResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/tap-text`, input)
+  }
+  androidDumpUi(roomId: string, input: AndroidDumpUiInput) {
+    return this.req<AndroidUiDumpResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/dump-ui`, input)
+  }
+  androidLogcat(roomId: string, input: AndroidLogcatInput) {
+    return this.req<AndroidLogcatResult>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/android/logcat`, input)
+  }
+  androidRunCrashScenario(roomId: string, input: AndroidRunCrashScenarioInput) {
+    return this.req<AndroidCrashScenarioResult>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/crash-scenario`,
+      input
     )
   }
   pullFile(roomId: string, path: string) {

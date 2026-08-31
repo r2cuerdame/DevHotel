@@ -4,7 +4,7 @@ import { isIP } from 'node:net'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { AndroidDevice, DeviceConnection, DeviceHealth } from '@devhotel/shared'
-import type { ExecResult } from '../backend/types'
+import type { ExecOutputChunk, ExecResult } from '../backend/types'
 
 /** One line of `adb devices -l`, already parsed. */
 export interface AdbDeviceLine {
@@ -47,10 +47,16 @@ export interface AdbBinaryResult {
 
 export interface AdbExecOptions {
   timeoutMs?: number
+  /** Internal lease fence. Aborting kills the owned Host adb process. */
+  signal?: AbortSignal
   /** Internal/test override. Public callers never choose the Host buffer cap. */
   maxStdoutBytes?: number
   /** Internal/test override. Public callers never choose the Host buffer cap. */
   maxStderrBytes?: number
+  /** Internal high-level evidence stream; accepted bytes are still Host-capped. */
+  onStdout?: (chunk: ExecOutputChunk) => void
+  /** Internal high-level evidence stream; accepted bytes are still Host-capped. */
+  onStderr?: (chunk: ExecOutputChunk) => void
 }
 
 /**
@@ -230,10 +236,17 @@ interface RunBinaryOptions {
   timeoutMs: number
   maxStdoutBytes: number
   maxStderrBytes: number
+  signal?: AbortSignal
+  onStdout?: (chunk: ExecOutputChunk) => void
+  onStderr?: (chunk: ExecOutputChunk) => void
 }
 
 function runBinary(executable: string, args: string[], opts: RunBinaryOptions): Promise<AdbBinaryResult> {
   return new Promise((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(opts.signal.reason instanceof Error ? opts.signal.reason : new Error('Host ADB operation was aborted'))
+      return
+    }
     const child = spawn(executable, args, { windowsHide: true })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
@@ -241,6 +254,18 @@ function runBinary(executable: string, args: string[], opts: RunBinaryOptions): 
     let stderrBytes = 0
     let outputLimit: { stream: 'stdout' | 'stderr'; limit: number } | null = null
     let timedOut = false
+    let aborted = false
+
+    const removeAbortListener = (): void => opts.signal?.removeEventListener('abort', abort)
+    const abort = (): void => {
+      aborted = true
+      child.kill('SIGKILL')
+    }
+    opts.signal?.addEventListener('abort', abort, { once: true })
+    // Abort may race the synchronous spawn/listener-registration window. An
+    // AbortSignal does not replay an event that fired before registration, so
+    // re-check after the listener is installed before allowing adb to run.
+    if (opts.signal?.aborted) abort()
 
     const stopForLimit = (stream: 'stdout' | 'stderr', limit: number): void => {
       if (outputLimit) return
@@ -253,6 +278,7 @@ function runBinary(executable: string, args: string[], opts: RunBinaryOptions): 
         const captured = chunk.subarray(0, remaining)
         stdout.push(captured)
         stdoutBytes += captured.length
+        opts.onStdout?.(captured)
       }
       if (chunk.length > remaining) stopForLimit('stdout', opts.maxStdoutBytes)
     })
@@ -262,6 +288,7 @@ function runBinary(executable: string, args: string[], opts: RunBinaryOptions): 
         const captured = chunk.subarray(0, remaining)
         stderr.push(captured)
         stderrBytes += captured.length
+        opts.onStderr?.(captured)
       }
       if (chunk.length > remaining) stopForLimit('stderr', opts.maxStderrBytes)
     })
@@ -271,10 +298,20 @@ function runBinary(executable: string, args: string[], opts: RunBinaryOptions): 
     }, opts.timeoutMs)
     child.on('error', () => {
       clearTimeout(timer)
+      removeAbortListener()
+      if (aborted) {
+        reject(opts.signal?.reason instanceof Error ? opts.signal.reason : new Error('Host ADB operation was aborted'))
+        return
+      }
       reject(new Error('Host ADB process could not be launched; inspect Host diagnostics locally'))
     })
     child.on('close', (code) => {
       clearTimeout(timer)
+      removeAbortListener()
+      if (aborted) {
+        reject(opts.signal?.reason instanceof Error ? opts.signal.reason : new Error('Host ADB operation was aborted'))
+        return
+      }
       let stderrText = Buffer.concat(stderr, stderrBytes).toString('utf8')
       if (timedOut) stderrText += `\nadb ${args[0] ?? ''} timed out after ${opts.timeoutMs}ms`
       if (outputLimit) {
@@ -294,7 +331,10 @@ async function run(executable: string, args: string[], opts: AdbExecOptions = {}
   const result = await runBinary(executable, args, {
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     maxStdoutBytes: opts.maxStdoutBytes ?? DEFAULT_TEXT_STDOUT_LIMIT_BYTES,
-    maxStderrBytes: opts.maxStderrBytes ?? DEFAULT_STDERR_LIMIT_BYTES
+    maxStderrBytes: opts.maxStderrBytes ?? DEFAULT_STDERR_LIMIT_BYTES,
+    onStdout: opts.onStdout,
+    onStderr: opts.onStderr,
+    signal: opts.signal
   })
   return { code: result.code, stdout: result.stdout.toString('utf8'), stderr: result.stderr }
 }
@@ -424,7 +464,10 @@ export class SpawnedAdbHost implements AdbHost, AdbPairingHost {
     return run(this.executable, this.argv(['-s', serial, ...args]), {
       timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxStdoutBytes: Math.min(opts.maxStdoutBytes ?? this.textStdoutLimitBytes, this.textStdoutLimitBytes),
-      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes)
+      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes),
+      onStdout: opts.onStdout,
+      onStderr: opts.onStderr,
+      signal: opts.signal
     })
   }
 
@@ -432,7 +475,10 @@ export class SpawnedAdbHost implements AdbHost, AdbPairingHost {
     return runBinary(this.executable, this.argv(['-s', serial, ...args]), {
       timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxStdoutBytes: Math.min(opts.maxStdoutBytes ?? this.binaryStdoutLimitBytes, this.binaryStdoutLimitBytes),
-      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes)
+      maxStderrBytes: Math.min(opts.maxStderrBytes ?? this.stderrLimitBytes, this.stderrLimitBytes),
+      onStdout: opts.onStdout,
+      onStderr: opts.onStderr,
+      signal: opts.signal
     })
   }
 }

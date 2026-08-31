@@ -5,6 +5,7 @@ import type { ChangesRepo } from '../store/changesRepo'
 import type { RoomsRepo } from '../store/roomsRepo'
 import type { SettingsRepo } from '../store/settingsRepo'
 import { connectRelay } from '../relayProtocol'
+import type { SealedAndroidArtifactRef } from './definitions/androidBuild'
 
 export interface ChangeCtx {
   roomId: string
@@ -32,10 +33,27 @@ export interface ChangeCtx {
   /** Present while this Android Room owns a physical-device lease; exec fails closed when the target is unhealthy. */
   physicalAndroidDevice?: {
     nickname: string
-    exec(args: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
     /** Keep the lease alive while a long build prepares the next device action. */
     keepAlive<T>(run: () => Promise<T>): Promise<T>
   }
+  /** Execute one bounded target probe through the physical broker or controlled emulator helper. */
+  execFencedAndroidTarget?: (args: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>
+  /** Resolve one sealed Host artifact capability, stage once, install, prove, and atomically persist its receipt. */
+  installTrackedAndroidArtifact: (
+    applicationId: string,
+    artifact: SealedAndroidArtifactRef,
+    changeId: string
+  ) => Promise<void>
+  /** Revoke a receipt created by a failed or interrupted Android run. */
+  removeTrackedAndroidInstall: (applicationId: string, changeId: string) => void
+  /** Transactionally revoke every receipt owned by one failed Android run, independent of target lease state. */
+  removeTrackedAndroidInstalls: (changeId: string) => void
+  /** Launch only through the exact tracked receipt/user/lease session. */
+  launchTrackedAndroidApp?: (applicationId: string) => Promise<void>
+  /** Verify foreground state through the same exact tracked session. */
+  isTrackedAndroidAppForeground?: (applicationId: string) => Promise<boolean>
+  /** Recreating a Room emulator invalidates every receipt for its old OS instance. */
+  clearAndroidEmulatorInstalls?: () => void
 }
 
 export interface ChangePlanned {

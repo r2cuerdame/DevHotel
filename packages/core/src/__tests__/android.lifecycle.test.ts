@@ -61,17 +61,36 @@ describe('Android room lifecycle', () => {
       android: { device: 'Pixel 6', version: '15.0' }
     })
     orch.rooms.create(room)
+    orch.androidInstalls.record({
+      roomId: room.id,
+      target: { kind: 'emulator', targetId: room.id, deviceId: null },
+      applicationId: 'com.example.old',
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: '2026-08-31T00:00:00.000Z',
+      packageIncarnation: '0'.repeat(64),
+      logFence: null,
+      installUserId: 0,
+      installUserSerial: 42
+    })
 
     await orch.startRoom(room.id, 'user')
 
     expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: backend.hostPort })
-    expect(backend.calls).toContain(`recreateAnchor:${room.id}:6080`)
-    const removeAt = backend.calls.indexOf(`removeEmulator:${room.id}`)
+    expect(backend.lastAnchorSpec).toEqual({
+      roomId: room.id,
+      internalPort: 6080,
+      androidRuntimeIsolation: true
+    })
+    const anchorAt = backend.calls.indexOf(`recreateAnchor:${room.id}:6080`)
     const createAt = backend.calls.indexOf(`createEmulator:${room.id}:Pixel 6:15.0`)
-    expect(removeAt).toBeGreaterThanOrEqual(0)
-    expect(createAt).toBeGreaterThan(removeAt)
+    expect(anchorAt).toBeGreaterThanOrEqual(0)
+    expect(createAt).toBeGreaterThan(anchorAt)
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(true)
     expect(backend.calls.some((call) => call.startsWith('createService:'))).toBe(false)
+    expect(orch.androidInstalls.list(room.id, {
+      kind: 'emulator', targetId: room.id, deviceId: null
+    })).toEqual([])
     expect(gateway.status().routes).toEqual([{ domain: room.domain, roomId: room.id, https: false }])
 
     const callsAfterWake = [...backend.calls]

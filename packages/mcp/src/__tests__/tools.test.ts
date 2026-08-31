@@ -174,8 +174,15 @@ describe('makeTools', () => {
       [
         'android_device_adb',
         'android_devices',
+        'android_dump_ui',
+        'android_force_stop',
+        'android_launch_app',
+        'android_logcat',
         'android_run',
+        'android_run_crash_scenario',
         'android_screenshot',
+        'android_tap_text',
+        'android_wait_for_text',
         'attach_android_device',
         'cancel_android_device_request',
         'apply_quick_change',
@@ -239,7 +246,7 @@ describe('makeTools', () => {
   it('run_in_room forwards the bounded-output selection to the control API', async () => {
     await byName.run_in_room!.handler({
       roomId: 'abc12345',
-      cmd: ['adb', 'logcat', '-d'],
+      cmd: ['pnpm', 'test'],
       maxBytes: 4096,
       mode: 'head',
       include: 'FATAL',

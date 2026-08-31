@@ -4,7 +4,18 @@ import path from 'node:path'
 import type { ExecOutputChunk, ExecResult } from './types'
 
 export interface RunDockerOpts {
-  timeoutMs?: number
+  /** `null` reserves a non-cancellable control-plane critical section. */
+  timeoutMs?: number | null
+  /** Cancel the CLI and wait for mandatory abort cleanup before rejecting. */
+  signal?: AbortSignal
+  /** Kill the docker CLI immediately when stdout crosses this byte count. */
+  maxStdoutBytes?: number
+  /** Kill the docker CLI immediately when stderr crosses this byte count. */
+  maxStderrBytes?: number
+  /** Keep draining but never kill a definitive-create critical section on overflow. */
+  killOnOutputLimit?: boolean
+  /** Caller-owned, identity-safe cleanup invoked when timeout/output caps abort `docker run`. */
+  onAbort?: () => Promise<void>
   onLine?: (line: string) => void
   input?: string
   /** Stream this host file to docker stdin without loading it into JS memory. */
@@ -22,6 +33,13 @@ export interface RunDockerOpts {
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
+
+function abortSignalError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason
+  const error = new Error('Docker command was aborted')
+  error.name = 'AbortError'
+  return error
+}
 
 export interface ResolveDockerExecutableOptions {
   env?: NodeJS.ProcessEnv
@@ -157,6 +175,22 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
   if ((opts.onStdout || opts.onStderr) && (opts.outputFile || opts.onLine)) {
     return Promise.reject(new Error('runDocker accepts either chunk sinks or outputFile/onLine, not both'))
   }
+  if (opts.outputFile && opts.maxStdoutBytes !== undefined) {
+    return Promise.reject(new Error('runDocker cannot apply an in-memory stdout cap to outputFile streaming'))
+  }
+  for (const [name, value] of [['maxStdoutBytes', opts.maxStdoutBytes], ['maxStderrBytes', opts.maxStderrBytes]] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      return Promise.reject(new Error(`runDocker ${name} must be a non-negative safe integer`))
+    }
+  }
+  if (
+    opts.timeoutMs !== undefined &&
+    opts.timeoutMs !== null &&
+    (!Number.isSafeInteger(opts.timeoutMs) || opts.timeoutMs < 1)
+  ) {
+    return Promise.reject(new Error('runDocker timeoutMs must be a positive safe integer or null'))
+  }
+  if (opts.signal?.aborted) return Promise.reject(abortSignalError(opts.signal))
   return new Promise((resolve, reject) => {
     const child = spawnDockerProcess(args)
     let stdout = ''
@@ -168,19 +202,50 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
     let childClosed = false
     let outputFinished = opts.outputFile === undefined
     let closeCode = -1
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let outputLimitExceeded = false
+    let abortRequested = false
+    let abortCleanup: Promise<void> | null = null
+    let terminalError: Error | null = null
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let abortListener: (() => void) | undefined
+
+    const abort = (): void => {
+      if (timer) clearTimeout(timer)
+      abortRequested = true
+      child.kill('SIGKILL')
+    }
 
     const fail = (err: Error): void => {
       if (settled) return
-      settled = true
-      clearTimeout(timer)
-      child.kill('SIGKILL')
-      reject(err)
+      terminalError ??= err
+      outputFinished = true
+      abort()
+      finish()
     }
 
     const finish = (): void => {
       if (settled || !childClosed || !outputFinished) return
       settled = true
-      resolve({ code: closeCode, stdout, stderr })
+      if (timer) clearTimeout(timer)
+      if (opts.signal && abortListener) {
+        opts.signal.removeEventListener('abort', abortListener)
+        abortListener = undefined
+      }
+      if (!abortCleanup) {
+        abortCleanup = abortRequested && opts.onAbort
+          ? Promise.resolve().then(opts.onAbort)
+          : Promise.resolve()
+      }
+      void abortCleanup.then(
+        () => terminalError
+          ? reject(terminalError)
+          : resolve({ code: closeCode, stdout, stderr, ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}) }),
+        (cleanupError: unknown) => terminalError
+          ? reject(new AggregateError([terminalError, cleanupError], 'docker command and abort cleanup both failed'))
+          : reject(cleanupError)
+      )
     }
 
     const feed = (rest: string, chunk: string): string => {
@@ -192,6 +257,28 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
         }
       }
       return next
+    }
+
+    const stopForOutputLimit = (): void => {
+      if (outputLimitExceeded) return
+      outputLimitExceeded = true
+      if (opts.killOnOutputLimit !== false) abort()
+    }
+
+    const boundedChunk = (
+      chunk: string | Buffer,
+      stream: 'stdout' | 'stderr'
+    ): { data: Buffer; exceeded: boolean } => {
+      if (outputLimitExceeded) return { data: Buffer.alloc(0), exceeded: false }
+      const data = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk)
+      const limit = stream === 'stdout' ? opts.maxStdoutBytes : opts.maxStderrBytes
+      if (limit === undefined) return { data, exceeded: false }
+      const used = stream === 'stdout' ? stdoutBytes : stderrBytes
+      const remaining = Math.max(0, limit - used)
+      const captured = data.subarray(0, remaining)
+      if (stream === 'stdout') stdoutBytes += captured.byteLength
+      else stderrBytes += captured.byteLength
+      return { data: captured, exceeded: data.byteLength > remaining }
     }
 
     if (opts.outputFile) {
@@ -208,58 +295,76 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
     if (!opts.onStderr) child.stderr.setEncoding('utf8')
     if (!opts.outputFile) {
       child.stdout.on('data', (chunk: string | Buffer) => {
+        const bounded = boundedChunk(chunk, 'stdout')
+        if (bounded.data.byteLength === 0 && !bounded.exceeded) return
         if (opts.onStdout) {
-          opts.onStdout(chunk)
-          return
+          if (bounded.data.byteLength > 0) opts.onStdout(bounded.data)
+        } else {
+          const text = bounded.data.toString('utf8')
+          stdout += text
+          outRest = feed(outRest, text)
         }
-        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
-        stdout += text
-        outRest = feed(outRest, text)
+        if (bounded.exceeded) stopForOutputLimit()
       })
     }
     child.stderr.on('data', (chunk: string | Buffer) => {
+      const bounded = boundedChunk(chunk, 'stderr')
+      if (bounded.data.byteLength === 0 && !bounded.exceeded) return
       if (opts.onStderr) {
-        opts.onStderr(chunk)
-        return
+        if (bounded.data.byteLength > 0) opts.onStderr(bounded.data)
+      } else {
+        const text = bounded.data.toString('utf8')
+        stderr += text
+        errRest = feed(errRest, text)
       }
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
-      stderr += text
-      errRest = feed(errRest, text)
+      if (bounded.exceeded) stopForOutputLimit()
     })
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-    }, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
-
-    child.stdin.on('error', () => {})
-    if (opts.inputFile) {
-      const input = createReadStream(opts.inputFile)
-      input.on('error', fail)
-      input.pipe(child.stdin)
-    } else {
-      if (opts.input !== undefined) child.stdin.write(opts.input)
-      child.stdin.end()
-    }
 
     child.on('error', fail)
 
     child.on('close', (code) => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       if (opts.onLine) {
         if (outRest.length > 0) opts.onLine(outRest)
         if (errRest.length > 0) opts.onLine(errRest)
       }
-      if (timedOut) {
+      if (timedOut && !outputLimitExceeded) {
         // The timeout notice is the one line a caller must never lose, so it
         // follows the same path the rest of stderr took.
         const notice = `\ndocker ${args[0] ?? ''} timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`
         if (opts.onStderr) opts.onStderr(notice)
         else stderr += notice
       }
-      closeCode = code ?? -1
+      if (outputLimitExceeded && !opts.onStderr) {
+        stderr += '\ndocker output exceeded its configured safety limit'
+      }
+      closeCode = outputLimitExceeded ? -1 : (code ?? -1)
       childClosed = true
       finish()
     })
+
+    if (opts.signal) {
+      abortListener = () => fail(abortSignalError(opts.signal!))
+      opts.signal.addEventListener('abort', abortListener, { once: true })
+      if (opts.signal.aborted) abortListener()
+    }
+
+    if (!abortRequested && opts.timeoutMs !== null) {
+      timer = setTimeout(() => {
+        timedOut = true
+        abort()
+      }, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    }
+    if (!abortRequested) {
+      child.stdin.on('error', () => {})
+      if (opts.inputFile) {
+        const input = createReadStream(opts.inputFile)
+        input.on('error', fail)
+        input.pipe(child.stdin)
+      } else {
+        if (opts.input !== undefined) child.stdin.write(opts.input)
+        child.stdin.end()
+      }
+    }
   })
 }

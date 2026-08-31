@@ -4,6 +4,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from 'node:path'
 import {
   zAgentCloneBody,
+  zAndroidDumpUiBody,
+  zAndroidForceStopBody,
+  zAndroidLaunchAppBody,
+  zAndroidLogcatBody,
+  zAndroidRunCrashScenarioBody,
+  zAndroidTapTextBody,
+  zAndroidTargetSelector,
+  zAndroidWaitForTextBody,
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
@@ -26,7 +34,13 @@ import {
   DeviceLeaseError,
   type ControlInfo
 } from '@devhotel/shared'
-import { isDevHotelError, redactStructuredSecrets, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
+import {
+  DevHotelError,
+  isDevHotelError,
+  redactStructuredSecrets,
+  WorkspaceDriftError,
+  type RoomOrchestrator
+} from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
 
 /**
@@ -35,6 +49,36 @@ import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/
  * result can explicitly opt into a bounded wait.
  */
 const DEFAULT_START_WAIT_MS = 0
+const DEFAULT_BODY_LIMIT_BYTES = 24 * 1024 * 1024
+const ANDROID_AUTOMATION_BODY_LIMIT_BYTES = 64 * 1024
+
+interface InputSchema<T> {
+  safeParse(input: unknown): { success: true; data: T } | { success: false }
+}
+
+function parseRequestInput<T>(
+  schema: InputSchema<T>,
+  input: unknown,
+  error: { code: string; message: string; recoveryHint: string }
+): T {
+  const parsed = schema.safeParse(input)
+  if (parsed.success) return parsed.data
+  // Route input is untrusted and Zod's issues can echo caller-controlled
+  // values. Convert only this explicit inbound boundary to a stable 400;
+  // validation errors thrown later by Core/backend code remain internal 500s.
+  throw new DevHotelError(error.code, error.message, {
+    recoveryHint: error.recoveryHint,
+    httpStatus: 400
+  })
+}
+
+function parseAndroidBody<T>(schema: InputSchema<T>, input: unknown): T {
+  return parseRequestInput(schema, input, {
+    code: 'INVALID_ANDROID_REQUEST',
+    message: 'Android automation request fields are invalid.',
+    recoveryHint: 'Use only the documented bounded Android operation fields and value formats.'
+  })
+}
 
 /** Query `waitMs`, clamped by the shared bound; anything unusable waits not at all. */
 function parseWaitMs(raw: string | null): number {
@@ -67,7 +111,12 @@ export async function startControlApi(
         return
       }
       if (isDevHotelError(err)) {
-        sendJson(res, err.httpStatus, { error: err.message, code: err.code, recoveryHint: err.recoveryHint })
+        sendJson(res, err.httpStatus, {
+          error: err.message,
+          code: err.code,
+          recoveryHint: err.recoveryHint,
+          ...(err.evidence !== null ? { evidence: err.evidence } : {})
+        })
         return
       }
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) })
@@ -151,7 +200,13 @@ export async function startControlApi(
 
     if (parts[1] === 'rooms') {
       const roomId = parts[2]
-      const safeRoomId = roomId ? zRoomId.parse(roomId) : undefined
+      const safeRoomId = roomId
+        ? parseRequestInput(zRoomId, roomId, {
+            code: 'INVALID_ROOM_ID',
+            message: 'The Room ID in the request path is invalid.',
+            recoveryHint: 'Use the opaque Room ID returned by DevHotel.'
+          })
+        : undefined
       const op = parts[3]
 
       if (!roomId && req.method === 'GET') {
@@ -179,6 +234,63 @@ export async function startControlApi(
         }
         sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
         return
+      }
+      // High-level Android automation. Every body is strict and small, every
+      // package is checked against a target-scoped install receipt in Core.
+      if (safeRoomId && op === 'android') {
+        const action = parts[4]
+        if (action === 'status' && req.method === 'GET') {
+          const queryKeys = [...url.searchParams.keys()]
+          if (
+            queryKeys.some((key) => key !== 'target' && key !== 'deviceId') ||
+            url.searchParams.getAll('target').length > 1 ||
+            url.searchParams.getAll('deviceId').length > 1
+          ) {
+            throw new DevHotelError('INVALID_ANDROID_TARGET', 'Android status received an unsupported or repeated target field.', {
+              recoveryHint: 'Use only target=auto|emulator|physical and an optional opaque deviceId.',
+              httpStatus: 400
+            })
+          }
+          const kind = url.searchParams.get('target') ?? 'auto'
+          const deviceId = url.searchParams.get('deviceId') ?? undefined
+          const target = parseRequestInput(
+            zAndroidTargetSelector,
+            { kind, ...(deviceId ? { deviceId } : {}) },
+            {
+              code: 'INVALID_ANDROID_TARGET',
+              message: 'Android status target fields are invalid.',
+              recoveryHint: 'Use target=auto|emulator|physical and an optional opaque deviceId.'
+            }
+          )
+          sendJson(res, 200, await orch.androidAutomationStatus(safeRoomId, target))
+          return
+        }
+        if (req.method === 'POST') {
+          const body = await readBody(req, ANDROID_AUTOMATION_BODY_LIMIT_BYTES)
+          switch (action) {
+            case 'launch':
+              sendJson(res, 200, await orch.androidLaunchApp(safeRoomId, parseAndroidBody(zAndroidLaunchAppBody, body)))
+              return
+            case 'force-stop':
+              sendJson(res, 200, await orch.androidForceStop(safeRoomId, parseAndroidBody(zAndroidForceStopBody, body)))
+              return
+            case 'wait-for-text':
+              sendJson(res, 200, await orch.androidWaitForText(safeRoomId, parseAndroidBody(zAndroidWaitForTextBody, body)))
+              return
+            case 'tap-text':
+              sendJson(res, 200, await orch.androidTapText(safeRoomId, parseAndroidBody(zAndroidTapTextBody, body)))
+              return
+            case 'dump-ui':
+              sendJson(res, 200, await orch.androidDumpUi(safeRoomId, parseAndroidBody(zAndroidDumpUiBody, body)))
+              return
+            case 'logcat':
+              sendJson(res, 200, await orch.androidLogcat(safeRoomId, parseAndroidBody(zAndroidLogcatBody, body)))
+              return
+            case 'crash-scenario':
+              sendJson(res, 200, await orch.androidRunCrashScenario(safeRoomId, parseAndroidBody(zAndroidRunCrashScenarioBody, body)))
+              return
+          }
+        }
       }
       // /v1/rooms/:id/device/(attach|release|adb)
       if (safeRoomId && op === 'device' && req.method === 'POST') {
@@ -442,10 +554,35 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTES): Promise<unknown> {
+  const declared = Number(req.headers['content-length'])
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
+      recoveryHint: 'Send only the bounded fields accepted by this route.',
+      httpStatus: 413
+    })
+  }
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let bytes = 0
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    bytes += buffer.byteLength
+    if (bytes > maxBytes) {
+      throw new DevHotelError('REQUEST_BODY_TOO_LARGE', `Request body exceeds the ${maxBytes}-byte limit.`, {
+        recoveryHint: 'Send only the bounded fields accepted by this route.',
+        httpStatus: 413
+      })
+    }
+    chunks.push(buffer)
+  }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw) return {}
-  return JSON.parse(raw)
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new DevHotelError('INVALID_JSON_BODY', 'Request body is not valid JSON.', {
+      recoveryHint: 'Send one valid JSON value using UTF-8 encoding.',
+      httpStatus: 400
+    })
+  }
 }
