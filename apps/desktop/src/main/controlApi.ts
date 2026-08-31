@@ -7,6 +7,8 @@ import {
   zAndroidDumpUiBody,
   zAndroidForceStopBody,
   zAndroidLaunchAppBody,
+  zAbandonAndroidLocaleMatrixRecoveryBody,
+  zAndroidLocaleScreenshotMatrixBody,
   zAndroidLogcatBody,
   zAndroidRunCrashScenarioBody,
   zAndroidTapTextBody,
@@ -306,6 +308,19 @@ export async function startControlApi(
               return
             case 'crash-scenario':
               sendJson(res, 200, await orch.androidRunCrashScenario(safeRoomId, parseAndroidBody(zAndroidRunCrashScenarioBody, body)))
+              return
+            case 'locale-matrix':
+              sendJson(res, 200, await orch.androidLocaleScreenshotMatrix(
+                safeRoomId,
+                parseAndroidBody(zAndroidLocaleScreenshotMatrixBody, body),
+                'agent'
+              ))
+              return
+            case 'locale-recovery-abandon':
+              sendJson(res, 200, await orch.abandonAndroidLocaleMatrixRecovery(
+                safeRoomId,
+                parseAndroidBody(zAbandonAndroidLocaleMatrixRecoveryBody, body)
+              ))
               return
           }
         }

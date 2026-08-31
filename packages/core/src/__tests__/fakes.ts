@@ -497,6 +497,20 @@ export class FakeBackend implements IsolationBackend {
       stderr: opts?.onStderr ? '' : result.stderr
     }
   }
+  async execFencedEmulatorRecoveryAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {
+    this.calls.push(`execFencedEmulatorRecoveryAdb:${args.join(' ')}`)
+    this.fencedEmulatorExecCalls.push({ args, opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const result = await (this.fencedEmulatorExecHandler?.(args, opts) ?? this.execResult)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+    if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+    return {
+      ...result,
+      stdout: opts?.onStdout ? '' : result.stdout,
+      stderr: opts?.onStderr ? '' : result.stderr
+    }
+  }
   async installFencedEmulatorApk(_roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult> {
     this.calls.push(`installFencedEmulatorApk:${hostApkPath}`)
     const args = ['install', '-r', '[private-staged-apk]']
@@ -514,6 +528,11 @@ export class FakeBackend implements IsolationBackend {
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   emulatorScreenPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+  async startExistingEmulatorForRecovery(roomId: string) {
+    this.calls.push(`startExistingEmulatorForRecovery:${roomId}`)
+    if (this.emulatorStateValue === 'missing') throw new Error('exact retained emulator is missing')
+    this.emulatorStateValue = 'running'
+  }
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }

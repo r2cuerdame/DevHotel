@@ -320,6 +320,7 @@ export type DeviceDenialCode =
   | 'no-lease'
   | 'lease-held-by-another-room'
   | 'lease-expired'
+  | 'lease-recovery-protected'
   | 'device-unknown'
   | 'device-unhealthy'
   | 'adb-command-forbidden'

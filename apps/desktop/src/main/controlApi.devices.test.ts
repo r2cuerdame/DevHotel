@@ -313,7 +313,13 @@ describe('agent Android automation routes', () => {
     ['tap-text', { applicationId: 'com.example.app', text: '' }],
     ['dump-ui', { applicationId: 'com.example.app', maxNodes: 501 }],
     ['logcat', { applicationId: 'com.example.app', maxLines: 0 }],
-    ['crash-scenario', { applicationId: 'com.example.app', scenario: 'am-crash', runId: '' }]
+    ['crash-scenario', { applicationId: 'com.example.app', scenario: 'am-crash', runId: '' }],
+    ['locale-matrix', {
+      applicationId: 'com.example.app', locales: ['en-US', 'EN-us'], filenamePrefix: 'release'
+    }],
+    ['locale-recovery-abandon', {
+      applicationId: 'com.example.app', acknowledgeOutsideLocale: false
+    }]
   ])('returns a sanitized 400 before Core for an invalid %s body', async (action, body) => {
     const orchestratorCalls = {
       androidLaunchApp: vi.fn(),
@@ -322,7 +328,9 @@ describe('agent Android automation routes', () => {
       androidTapText: vi.fn(),
       androidDumpUi: vi.fn(),
       androidLogcat: vi.fn(),
-      androidRunCrashScenario: vi.fn()
+      androidRunCrashScenario: vi.fn(),
+      androidLocaleScreenshotMatrix: vi.fn(),
+      abandonAndroidLocaleMatrixRecovery: vi.fn()
     }
     await withApi(orchestratorCalls as unknown as Partial<RoomOrchestrator>, async (call) => {
       const result = await call(`/v1/rooms/room1abc/android/${action}`, {
@@ -397,6 +405,64 @@ describe('agent Android automation routes', () => {
           recoveryHint: 'Retry on the selected target.',
           evidence: { code: 1, stderr: 'permission denied', truncated: false }
         }
+      })
+    })
+  })
+
+  it('forwards one strict canonical locale matrix body to Core', async () => {
+    const androidLocaleScreenshotMatrix = vi.fn(async (
+      _roomId: string,
+      input: { applicationId: string }
+    ) => ({
+      applicationId: input.applicationId,
+      apiLevel: 34,
+      scope: 'app',
+      entries: [],
+      restoration: { localeTags: ['en-US'] }
+    }))
+    await withApi({ androidLocaleScreenshotMatrix } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/android/locale-matrix', {
+        method: 'POST',
+        body: JSON.stringify({
+          applicationId: 'com.example.app',
+          locales: ['ko-kr', 'EN-us'],
+          filenamePrefix: 'release-42',
+          readinessTimeoutMs: 30_000
+        })
+      })
+
+      expect(result.status).toBe(200)
+      expect(androidLocaleScreenshotMatrix).toHaveBeenCalledWith('room1abc', {
+        applicationId: 'com.example.app',
+        locales: ['ko-KR', 'en-US'],
+        filenamePrefix: 'release-42',
+        readinessTimeoutMs: 30_000
+      }, 'agent')
+    })
+  })
+
+  it('forwards only an explicit literal locale-recovery acknowledgement to Core', async () => {
+    const abandonAndroidLocaleMatrixRecovery = vi.fn(async (
+      _roomId: string,
+      input: { applicationId: string }
+    ) => ({
+      abandoned: true as const,
+      applicationId: input.applicationId,
+      target: { kind: 'emulator' as const, deviceId: null }
+    }))
+    await withApi({ abandonAndroidLocaleMatrixRecovery } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/android/locale-recovery-abandon', {
+        method: 'POST',
+        body: JSON.stringify({
+          applicationId: 'com.example.app',
+          acknowledgeOutsideLocale: true
+        })
+      })
+
+      expect(result).toMatchObject({ status: 200, body: { abandoned: true } })
+      expect(abandonAndroidLocaleMatrixRecovery).toHaveBeenCalledWith('room1abc', {
+        applicationId: 'com.example.app',
+        acknowledgeOutsideLocale: true
       })
     })
   })

@@ -8,6 +8,8 @@ import type {
   AndroidForceStopResult,
   AndroidForegroundInstallContext,
   AndroidInstallReceipt,
+  AndroidLocaleProcessTransition,
+  AndroidLocaleReadiness,
   AndroidLaunchResult,
   AndroidLogcatInput,
   AndroidLogcatResult,
@@ -25,6 +27,16 @@ import type { ExecOutputChunk, ExecResult } from '../backend/types'
 import { redactSecrets } from '../diagnostics/redact'
 import { DevHotelError } from '../errors'
 import type { AndroidAppInstallsRepo, AndroidInstallTarget } from '../store/androidAppInstallsRepo'
+import {
+  AndroidLocaleReadinessTracker,
+  androidAppLocaleCapability,
+  buildAndroidGetAppLocalesArgs,
+  buildAndroidSetAppLocalesArgs,
+  isExactAndroidDeviceState,
+  isExactAndroidLocaleMutationSuccess,
+  parseAndroidApiLevel,
+  parseAndroidAppLocales
+} from './androidLocales'
 
 const MAX_UI_XML_BYTES = 1024 * 1024
 const MAX_UI_SOURCE_NODES = 10_000
@@ -38,6 +50,9 @@ const MAX_USER_DUMP_BYTES = 256 * 1024
 const MAX_TARGET_CLOCK_RTT_MS = 2_000
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_INTERVAL_MS = 500
+const DEFAULT_LOCALE_READINESS_TIMEOUT_MS = 30_000
+const LOCALE_READINESS_POLL_INTERVAL_MS = 250
+const MAX_FINAL_LOCALE_PULSE_BYTES = 2 * 1024 * 1024
 const TARGET_CLOCK_FORMAT = '+%s.%3N'
 const INSTALL_FENCE_TAG = 'DEVHOTEL_INSTALL_FENCE'
 const CRASH_FENCE_TAG = 'DEVHOTEL_CRASH_FENCE'
@@ -60,6 +75,55 @@ const SCREEN_TRANSITION_EVENT_FILTERS = [
 const SCREEN_TRANSITION_EVENT_TAGS = new Set(
   SCREEN_TRANSITION_EVENT_FILTERS.map((filter) => filter.slice(0, filter.lastIndexOf(':')))
 )
+const FINAL_LOCALE_PULSE_KEYS = [
+  'api',
+  'activeUser',
+  'userDump',
+  'paths',
+  'stat',
+  'sha',
+  'uidRecord',
+  'uidOwners',
+  'locale',
+  'focus',
+  'pids',
+  'pgrepStatus'
+] as const
+const FINAL_LOCALE_PULSE_SCRIPT = [
+  'set -eu',
+  'app="$1"',
+  'user="$2"',
+  'uid="$3"',
+  'emit() { key="$1"; value="$2"; encoded="$(printf %s "$value" | base64 | tr -d "\\r\\n")"; printf "%s=%s\\n" "$key" "$encoded"; }',
+  'api="$(getprop ro.build.version.sdk)"',
+  'active_user="$(am get-current-user)"',
+  'user_dump="$(dumpsys user --user "$user")"',
+  'paths="$(pm path --user "$user" "$app")"',
+  'base_path="$(printf "%s\\n" "$paths" | sed -n "s/^package://p")"',
+  'case "$base_path" in /data/app/*/base.apk) ;; *) exit 41 ;; esac',
+  'stat_value="$(stat -c "%d:%i:%s:%Y:%Z" "$base_path")"',
+  'sha_value="$(sha256sum "$base_path")"',
+  'uid_record="$(pm list packages -U --user "$user" "$app")"',
+  'uid_owners="$(pm list packages -U --user "$user" --uid "$uid")"',
+  'locale_value="$(cmd locale get-app-locales "$app" --user "$user")"',
+  'focus_value="$(dumpsys window windows)"',
+  'set +e',
+  'pids_value="$(pgrep -u "$uid" 2>/dev/null)"',
+  'pgrep_status="$?"',
+  'set -e',
+  'emit api "$api"',
+  'emit activeUser "$active_user"',
+  'emit userDump "$user_dump"',
+  'emit paths "$paths"',
+  'emit stat "$stat_value"',
+  'emit sha "$sha_value"',
+  'emit uidRecord "$uid_record"',
+  'emit uidOwners "$uid_owners"',
+  'emit locale "$locale_value"',
+  'emit focus "$focus_value"',
+  'emit pids "$pids_value"',
+  'emit pgrepStatus "$pgrep_status"'
+].join('\n')
 const SCREEN_WITNESS_READER_SCRIPT = [
   'exec logcat -b main -b events -T 1 -m "$1" -D -v tag,printable',
   '-s DEVHOTEL_USER_FENCE:I am_switch_user:V am_resume_activity:V wm_resume_activity:V',
@@ -210,7 +274,7 @@ function automationError(
   message: string,
   recoveryHint: string,
   httpStatus = 409,
-  evidence?: AndroidCommandEvidence
+  evidence?: unknown
 ): DevHotelError {
   return new DevHotelError(code, message, { recoveryHint, httpStatus, evidence })
 }
@@ -273,6 +337,55 @@ function parsePids(value: string): number[] {
     .split(/\s+/)
     .map((part) => Number.parseInt(part, 10))
     .filter((pid) => Number.isSafeInteger(pid) && pid > 0))]
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+type SynchronousAndroidLocaleMutationHook = () => undefined
+
+function runSynchronousAndroidLocaleMutationHook(
+  hook: SynchronousAndroidLocaleMutationHook | undefined,
+  stage: 'before dispatch' | 'after acknowledgement'
+): void {
+  if (!hook) return
+  const result = (hook as () => unknown)()
+  if (result === undefined) return
+  if (
+    result !== null &&
+    (typeof result === 'object' || typeof result === 'function') &&
+    typeof (result as { then?: unknown }).then === 'function'
+  ) {
+    // Do not await a thenable at either linearization point. Absorb a later
+    // rejection so hostile/mistaken JavaScript cannot create an unhandled
+    // rejection after the synchronous contract has already been refused.
+    void Promise.resolve(result).catch(() => undefined)
+  }
+  throw new Error(`Android locale mutation hook ${stage} must complete synchronously`)
+}
+
+function sameAppLocaleRestoreFence(
+  left: AndroidAppLocaleRestoreFence,
+  right: AndroidAppLocaleRestoreFence
+): boolean {
+  return left.targetKind === right.targetKind &&
+    left.targetId === right.targetId &&
+    left.deviceId === right.deviceId &&
+    left.leaseId === right.leaseId &&
+    left.roomId === right.roomId &&
+    left.applicationId === right.applicationId &&
+    left.changeId === right.changeId &&
+    left.apkSha256 === right.apkSha256 &&
+    left.installedAt === right.installedAt &&
+    left.packageIncarnation === right.packageIncarnation &&
+    left.installUserId === right.installUserId &&
+    left.installUserSerial === right.installUserSerial &&
+    left.apiLevel === right.apiLevel
 }
 
 function componentForActivity(applicationId: string, activity: string): string {
@@ -405,6 +518,38 @@ export interface AndroidForegroundInstallEvidence {
     installUserId: number
     installUserSerial: number
   } | null
+}
+
+export interface AndroidAppLocaleSnapshot {
+  apiLevel: number
+  localeTags: string[]
+  pids: number[]
+  /** Host-private exact authority used only by orchestrated restore/recovery. */
+  restoreFence: AndroidAppLocaleRestoreFence
+}
+
+export interface AndroidAppLocaleRestoreFence {
+  targetKind: AndroidInstallTarget['kind']
+  targetId: string
+  deviceId: string | null
+  leaseId: string | null
+  roomId: string
+  applicationId: string
+  changeId: string
+  apkSha256: string
+  installedAt: string
+  packageIncarnation: string
+  installUserId: number
+  installUserSerial: number
+  apiLevel: number
+}
+
+export interface AndroidAppLocaleTransition extends AndroidAppLocaleSnapshot {
+  target: AndroidAutomationTarget
+  applicationId: string
+  previousLocaleTags: string[]
+  process: AndroidLocaleProcessTransition
+  readiness: AndroidLocaleReadiness
 }
 
 interface AndroidUserAuthority {
@@ -1001,6 +1146,724 @@ export class AndroidAutomationSession {
     }
   }
 
+  private localeDeadline(applicationId: string, timeoutMs: number): AndroidAutomationDeadline {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+      throw new RangeError('Android locale readiness timeout must be between 1000ms and 120000ms')
+    }
+    return { at: this.now() + timeoutMs, applicationId }
+  }
+
+  private appLocaleRestoreFence(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    apiLevel: number
+  ): AndroidAppLocaleRestoreFence {
+    if (tracked.packageIncarnation === null) {
+      throw automationError(
+        'ANDROID_APP_NOT_TRACKED',
+        'The tracked application has no exact installed-package incarnation for locale recovery.',
+        'Run android_run again before starting a locale screenshot matrix.',
+        409
+      )
+    }
+    const target = this.opts.installTarget
+    return {
+      targetKind: target.kind,
+      targetId: target.targetId,
+      deviceId: target.deviceId,
+      leaseId: target.kind === 'physical' ? target.leaseId : null,
+      roomId: tracked.receipt.roomId,
+      applicationId,
+      changeId: tracked.receipt.changeId,
+      apkSha256: tracked.apkSha256,
+      installedAt: tracked.receipt.installedAt,
+      packageIncarnation: tracked.packageIncarnation,
+      installUserId: tracked.installUserId,
+      installUserSerial: tracked.installUserSerial,
+      apiLevel
+    }
+  }
+
+  private assertAppLocaleRestoreFence(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    apiLevel: number,
+    expected: AndroidAppLocaleRestoreFence
+  ): AndroidAppLocaleRestoreFence {
+    const current = this.appLocaleRestoreFence(applicationId, tracked, apiLevel)
+    if (!sameAppLocaleRestoreFence(current, expected)) {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The exact Android target or tracked install changed before locale recovery.',
+        'Restore the original target, install, user and lease before retrying recovery.',
+        409
+      )
+    }
+    return current
+  }
+
+  private async liveAndroidApiLevel(
+    deadline: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<number> {
+    let result: ExecResult
+    try {
+      result = await this.command(
+        ['shell', 'getprop', 'ro.build.version.sdk'],
+        {
+          operation: 'Android live API level probe',
+          timeoutMs: 10_000,
+          stdoutLimit: 32,
+          deadline,
+          signal
+        }
+      )
+    } catch (error) {
+      if (error instanceof DeviceLeaseError) throw error
+      if (error instanceof DevHotelError && error.code === 'ANDROID_WAIT_TIMEOUT') throw error
+      throw automationError(
+        'ANDROID_LOCALE_API_UNKNOWN',
+        'DevHotel could not verify the selected target’s live Android API level.',
+        'Restore target connectivity and the property service, then retry.',
+        409,
+        { stage: 'capability', minimumApiLevel: 33 }
+      )
+    }
+    const apiLevel = result.code === 0 && result.stderr.length === 0 && !commandHitOutputLimit(result)
+      ? parseAndroidApiLevel(result.stdout)
+      : null
+    const capability = androidAppLocaleCapability(apiLevel)
+    if (!capability.supported) {
+      throw automationError(
+        capability.code,
+        capability.code === 'ANDROID_LOCALE_UNSUPPORTED'
+          ? `Safe app-scoped locale switching requires Android API 33 or newer; this target is API ${capability.apiLevel}.`
+          : 'DevHotel could not verify the selected target’s live Android API level.',
+        capability.code === 'ANDROID_LOCALE_UNSUPPORTED'
+          ? 'Use an Android 13 or newer target. DevHotel will not root or restart the Android framework.'
+          : 'Restore target connectivity and the property service, then retry.',
+        409,
+        {
+          stage: 'capability',
+          apiLevel: capability.apiLevel,
+          minimumApiLevel: capability.minimumApiLevel
+        }
+      )
+    }
+    return capability.apiLevel
+  }
+
+  private async queryAppLocales(
+    applicationId: string,
+    userId: number,
+    apiLevel: number,
+    deadline: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<string[]> {
+    let result: ExecResult
+    try {
+      result = await this.command(buildAndroidGetAppLocalesArgs(applicationId, userId), {
+        operation: 'Android app locale probe',
+        timeoutMs: 10_000,
+        stdoutLimit: 4 * 1024,
+        deadline,
+        signal
+      })
+    } catch (error) {
+      if (error instanceof DeviceLeaseError) throw error
+      if (error instanceof DevHotelError && error.code === 'ANDROID_WAIT_TIMEOUT') throw error
+      throw automationError(
+        'ANDROID_LOCALE_SERVICE_UNSUPPORTED',
+        'The selected Android target did not provide an exact app-scoped locale response.',
+        'Restore target connectivity and use an API 33+ target with the LocaleManager shell service.',
+        409,
+        { stage: 'locale-service', apiLevel }
+      )
+    }
+    const locales = result.code === 0 && result.stderr.length === 0 && !commandHitOutputLimit(result)
+      ? parseAndroidAppLocales(applicationId, userId, result.stdout)
+      : null
+    if (locales === null) {
+      throw automationError(
+        'ANDROID_LOCALE_SERVICE_UNSUPPORTED',
+        'The selected Android target did not provide an exact app-scoped locale response.',
+        'Use an API 33+ target with the LocaleManager shell service and verify the tracked app is installed for the active user.',
+        409,
+        { stage: 'locale-service', apiLevel }
+      )
+    }
+    return locales
+  }
+
+  private async localeProcessPids(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    deadline: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<number[]> {
+    const authority = await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
+    if (authority.userId !== tracked.installUserId) {
+      throw automationError(
+        'ANDROID_APP_USER_CHANGED',
+        'The tracked Android package no longer belongs to the expected active user.',
+        'Restore the user active during android_run and retry.'
+      )
+    }
+    const result = await this.runWithTrackedPostflight(
+      applicationId,
+      tracked,
+      () => this.pids(applicationId, authority, deadline, signal),
+      deadline,
+      signal
+    )
+    return result
+  }
+
+  private localeReadinessTimeout(
+    applicationId: string,
+    tracker: AndroidLocaleReadinessTracker,
+    primaryCode?: string
+  ): DevHotelError {
+    return automationError(
+      'ANDROID_LOCALE_READINESS_TIMEOUT',
+      'Android did not return the selected app and app locale to a stable ready state before the bounded deadline.',
+      'Keep the target unlocked, dismiss system overlays, and retry with a longer readiness timeout.',
+      408,
+      {
+        stage: 'readiness',
+        ...tracker.diagnostic(),
+        ...(primaryCode ? { primaryCode } : {})
+      }
+    )
+  }
+
+  private async waitForAppLocaleReady(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    expectedLocaleTags: readonly string[],
+    expectedApiLevel: number,
+    startedAt: number,
+    deadline: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<AndroidLocaleReadiness> {
+    const tracker = new AndroidLocaleReadinessTracker({
+      applicationId,
+      userId: tracked.installUserId,
+      localeTags: expectedLocaleTags
+    })
+    const maxAttempts = Math.ceil(Math.max(1, deadline.at - startedAt) / LOCALE_READINESS_POLL_INTERVAL_MS) + 1
+    for (let attempt = 0; attempt < maxAttempts && this.now() < deadline.at; attempt++) {
+      try {
+        await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+        const adb = await this.command(['get-state'], {
+          operation: 'ADB locale readiness probe',
+          timeoutMs: 10_000,
+          stdoutLimit: 64,
+          deadline,
+          signal
+        })
+        const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
+        if (apiLevel !== expectedApiLevel) {
+          throw automationError(
+            'ANDROID_LOCALE_TARGET_CHANGED',
+            'The live Android API changed during locale readiness.',
+            'Retry on one stable Android target.'
+          )
+        }
+        const localeTags = await this.queryAppLocales(
+          applicationId,
+          tracked.installUserId,
+          apiLevel,
+          deadline,
+          signal
+        )
+        const foreground = await this.foregroundPackage(deadline, signal)
+        const pids = await this.localeProcessPids(applicationId, tracked, deadline, signal)
+        await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+        const ready = tracker.observe({
+          adbState: adb.code === 0 && adb.stderr.length === 0 && isExactAndroidDeviceState(adb.stdout)
+            ? 'device'
+            : null,
+          localeTags,
+          foreground: foreground === undefined ? null : foreground,
+          pids,
+          elapsedMs: Math.max(0, this.now() - startedAt)
+        })
+        if (ready) return ready
+      } catch (error) {
+        if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_WAIT_TIMEOUT') throw error
+        throw this.localeReadinessTimeout(applicationId, tracker, error.code)
+      }
+      const remaining = deadline.at - this.now()
+      if (remaining <= 0) break
+      const waitMs = Math.min(LOCALE_READINESS_POLL_INTERVAL_MS, remaining)
+      if (signal) await this.pauseWithSignal(waitMs, signal)
+      else await this.pause(waitMs)
+    }
+    throw this.localeReadinessTimeout(applicationId, tracker)
+  }
+
+  /** Exact restorable app-scoped locale state for one tracked install/user. */
+  async appLocaleSnapshot(
+    applicationId: string,
+    timeoutMs = DEFAULT_LOCALE_READINESS_TIMEOUT_MS,
+    signal?: AbortSignal
+  ): Promise<AndroidAppLocaleSnapshot> {
+    const deadline = this.localeDeadline(applicationId, timeoutMs)
+    const tracked = await this.requireInstalled(applicationId, deadline, signal)
+    const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
+    const localeTagsBefore = await this.queryAppLocales(
+      applicationId,
+      tracked.installUserId,
+      apiLevel,
+      deadline,
+      signal
+    )
+    await this.requireForeground(applicationId, tracked.installUserId, deadline, signal)
+    const pids = (await this.localeProcessPids(applicationId, tracked, deadline, signal)).sort((a, b) => a - b)
+    if (pids.length === 0) {
+      throw automationError(
+        'ANDROID_APP_NOT_RUNNING',
+        `${applicationId} has no running process for the tracked Android user.`,
+        'Launch the tracked application before starting a locale screenshot matrix.'
+      )
+    }
+    await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+    if (await this.liveAndroidApiLevel(deadline, signal) !== apiLevel) {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The live Android API changed while the original app locale was being sealed.',
+        'Retry on one stable Android target.'
+      )
+    }
+    const localeTags = await this.queryAppLocales(
+      applicationId,
+      tracked.installUserId,
+      apiLevel,
+      deadline,
+      signal
+    )
+    if (!sameStrings(localeTagsBefore, localeTags)) {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The app locale changed while its original restorable state was being sealed.',
+        'Stop concurrent locale changes and retry the matrix.',
+        409
+      )
+    }
+    // The final locale command is itself an await. Re-prove the tracked APK
+    // incarnation after it so a reinstall during that last read cannot lend a
+    // stale restore fence to the caller's immediate CAS.
+    await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+    return {
+      apiLevel,
+      localeTags,
+      pids,
+      restoreFence: this.appLocaleRestoreFence(applicationId, tracked, apiLevel)
+    }
+  }
+
+  /**
+   * One bounded ADB helper pulse collects every release-critical Android fact.
+   * The remote commands are deliberately inside one shell invocation so the
+   * caller has one final await, rather than reusing foreground/PID observations
+   * across later Host awaits for locale or install authority.
+   */
+  private async finalAppLocalePulse(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall,
+    authority: AndroidPackageAuthority,
+    expectedFence: AndroidAppLocaleRestoreFence,
+    deadline: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<AndroidAppLocaleSnapshot> {
+    const result = await this.command(
+      [
+        'shell',
+        'sh',
+        '-c',
+        FINAL_LOCALE_PULSE_SCRIPT,
+        'devhotel-final-locale-pulse',
+        applicationId,
+        String(tracked.installUserId),
+        String(authority.uid)
+      ],
+      {
+        operation: 'Android final locale release pulse',
+        timeoutMs: 120_000,
+        stdoutLimit: MAX_FINAL_LOCALE_PULSE_BYTES,
+        deadline,
+        signal
+      }
+    )
+    const fail = (): never => {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The final Android locale, foreground process or exact tracked install could not be sealed.',
+        'Keep the exact target and tracked app stable, then retry retained locale recovery.',
+        409
+      )
+    }
+    if (result.code !== 0 || result.stderr.length > 0 || commandHitOutputLimit(result)) fail()
+    const lines = result.stdout.replace(/\r/g, '').split('\n').filter((line) => line.length > 0)
+    if (lines.length !== FINAL_LOCALE_PULSE_KEYS.length) fail()
+    const values = new Map<string, string>()
+    for (const [index, key] of FINAL_LOCALE_PULSE_KEYS.entries()) {
+      const match = new RegExp(`^${key}=([A-Za-z0-9+/]*={0,2})$`).exec(lines[index] ?? '')
+      if (!match) fail()
+      if (values.has(key)) fail()
+      const encoded = match![1]!
+      const decoded = Buffer.from(encoded, 'base64')
+      if (decoded.toString('base64') !== encoded) fail()
+      values.set(key, decoded.toString('utf8'))
+    }
+    const value = (key: typeof FINAL_LOCALE_PULSE_KEYS[number]): string => values.get(key) ?? fail()
+
+    const apiLevel = parseAndroidApiLevel(value('api'))
+    if (apiLevel !== expectedFence.apiLevel) fail()
+    if (value('activeUser') !== String(tracked.installUserId)) fail()
+    const userLines = value('userDump').split(/\r?\n/)
+    const userPattern = /^ UserInfo\{(0|[1-9]\d{0,4}):[^\r\n]*:[0-9a-fA-F]+\} serialNo=(0|[1-9]\d{0,9}) isPrimary=(?:true|false)(?: parentId=(?:0|[1-9]\d{0,4}))?(?: .*?)?$/
+    const users = userLines
+      .map((line, index) => ({ index, match: userPattern.exec(line) }))
+      .filter((entry): entry is { index: number; match: RegExpExecArray } => Boolean(entry.match))
+    if (
+      users.length !== 1 ||
+      users[0]!.index !== 0 ||
+      users[0]!.match[1] !== String(tracked.installUserId) ||
+      users[0]!.match[2] !== String(tracked.installUserSerial)
+    ) fail()
+
+    const pathMatch = /^package:([^\r\n]+)$/.exec(value('paths'))
+    const baseApk = pathMatch?.[1]
+    if (
+      !baseApk ||
+      !baseApk.startsWith('/data/app/') ||
+      !baseApk.endsWith('/base.apk') ||
+      Buffer.byteLength(baseApk, 'utf8') > 4096 ||
+      /[\p{C}\p{Zl}\p{Zp}]/u.test(baseApk) ||
+      baseApk.split('/').some((segment) => segment === '.' || segment === '..')
+    ) fail()
+    const stat = value('stat')
+    if (!/^\d+:\d+:\d+:-?\d+:-?\d+$/.test(stat)) fail()
+    const shaMatch = /^([a-fA-F0-9]{64})\s+([^\r\n]+)$/.exec(value('sha'))
+    if (
+      !shaMatch ||
+      shaMatch[1]!.toLowerCase() !== tracked.apkSha256 ||
+      shaMatch[2] !== baseApk ||
+      packageIncarnation(baseApk!, stat) !== tracked.packageIncarnation
+    ) fail()
+
+    const escaped = applicationId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const uidLine = new RegExp(`^package:${escaped}\\s+uid[:=](${authority.uid})$`)
+    if (!uidLine.test(value('uidRecord'))) fail()
+    const ownerLines = value('uidOwners').split(/\r?\n/).filter(Boolean)
+    if (ownerLines.length !== 1 || !uidLine.test(ownerLines[0]!)) fail()
+    const localeTags = parseAndroidAppLocales(applicationId, tracked.installUserId, value('locale'))
+    if (localeTags === null) fail()
+
+    const focusLines = value('focus').split(/\r?\n/).filter((line) => /^\s*mCurrentFocus=/.test(line))
+    const focus = focusLines.length === 1
+      ? /^\s*mCurrentFocus=Window\{[^\r\n}]*\bu(\d+)\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\/[A-Za-z0-9_.$]+[^\r\n}]*}\s*$/.exec(focusLines[0]!)
+      : null
+    if (
+      !focus ||
+      focus[1] !== String(tracked.installUserId) ||
+      focus[2] !== applicationId ||
+      value('pgrepStatus') !== '0'
+    ) fail()
+    const pids = parsePids(value('pids')).sort((left, right) => left - right)
+    const pidTokens = value('pids').trim().split(/\s+/).filter(Boolean)
+    if (pids.length === 0 || pids.length !== pidTokens.length || pids.length > MAX_PACKAGE_PROCESSES) fail()
+
+    return { apiLevel: apiLevel!, localeTags: localeTags!, pids, restoreFence: expectedFence }
+  }
+
+  /**
+   * Last release proof after a screen witness/helper has fully closed. Two
+   * complete snapshots must agree on locale, process set and every exact
+   * target/install/user/lease field. Callers perform their synchronous intent
+   * CAS immediately after this promise resolves; no later await may lend this
+   * proof to a changed target.
+   */
+  async proveAppLocaleFinalState(
+    applicationId: string,
+    expectedFence: AndroidAppLocaleRestoreFence,
+    timeoutMs = DEFAULT_LOCALE_READINESS_TIMEOUT_MS,
+    signal?: AbortSignal
+  ): Promise<AndroidAppLocaleSnapshot> {
+    const deadline = this.localeDeadline(applicationId, timeoutMs)
+    const tracked = await this.requireInstalled(applicationId, deadline, signal)
+    const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
+    this.assertAppLocaleRestoreFence(applicationId, tracked, apiLevel, expectedFence)
+    const authority = await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
+    const before = await this.finalAppLocalePulse(
+      applicationId,
+      tracked,
+      authority,
+      expectedFence,
+      deadline,
+      signal
+    )
+    const after = await this.finalAppLocalePulse(
+      applicationId,
+      tracked,
+      authority,
+      expectedFence,
+      deadline,
+      signal
+    )
+    if (
+      before.apiLevel !== after.apiLevel ||
+      before.apiLevel !== expectedFence.apiLevel ||
+      !sameStrings(before.localeTags, after.localeTags) ||
+      !sameNumbers(before.pids, after.pids) ||
+      !sameAppLocaleRestoreFence(before.restoreFence, expectedFence) ||
+      !sameAppLocaleRestoreFence(after.restoreFence, expectedFence)
+    ) {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The final Android locale, foreground process or exact tracked target changed during release proof.',
+        'Keep the exact target and tracked app stable, then retry retained locale recovery.',
+        409
+      )
+    }
+    return after
+  }
+
+  /** Apply one app-scoped locale list and prove exact-user readiness twice. */
+  async applyAppLocalesAndWait(
+    applicationId: string,
+    localeTags: readonly string[],
+    options: {
+      timeoutMs?: number
+      signal?: AbortSignal
+      expectedPreviousLocaleTags?: readonly string[]
+      restoreFence?: AndroidAppLocaleRestoreFence
+      /** Runs synchronously after the final precondition read and before the setter command is created. */
+      onBeforeMutation?: SynchronousAndroidLocaleMutationHook
+      /** Runs synchronously after an exact command acknowledgement, before any postflight or readiness await. */
+      onMutationAccepted?: SynchronousAndroidLocaleMutationHook
+    } = {}
+  ): Promise<AndroidAppLocaleTransition> {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
+    const startedAt = this.now()
+    const deadline = this.localeDeadline(applicationId, timeoutMs)
+    const tracked = await this.requireInstalled(applicationId, deadline, options.signal)
+    const apiLevel = await this.liveAndroidApiLevel(deadline, options.signal)
+    const restoreFence = options.restoreFence
+      ? this.assertAppLocaleRestoreFence(applicationId, tracked, apiLevel, options.restoreFence)
+      : this.appLocaleRestoreFence(applicationId, tracked, apiLevel)
+    const previousLocaleTagsBefore = await this.queryAppLocales(
+      applicationId,
+      tracked.installUserId,
+      apiLevel,
+      deadline,
+      options.signal
+    )
+    const beforePids = (await this.localeProcessPids(
+      applicationId,
+      tracked,
+      deadline,
+      options.signal
+    )).sort((a, b) => a - b)
+    await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
+    const previousLocaleTags = await this.queryAppLocales(
+      applicationId,
+      tracked.installUserId,
+      apiLevel,
+      deadline,
+      options.signal
+    )
+    if (
+      !sameStrings(previousLocaleTagsBefore, previousLocaleTags) ||
+      (options.expectedPreviousLocaleTags !== undefined &&
+        !sameStrings(options.expectedPreviousLocaleTags, previousLocaleTags))
+    ) {
+      throw automationError(
+        'ANDROID_LOCALE_PRECONDITION_CHANGED',
+        'The app locale changed before the guarded locale mutation could begin.',
+        'Stop concurrent locale changes and retry from a fresh locale snapshot.',
+        409
+      )
+    }
+    // This callback is the durable dispatch linearization point. If its exact
+    // CAS fails, it throws before this.command is called, so no helper or
+    // LocaleManager mutation can outlive the retained prepared record.
+    runSynchronousAndroidLocaleMutationHook(options.onBeforeMutation, 'before dispatch')
+    let mutation: ExecResult
+    try {
+      mutation = await this.command(buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags), {
+        operation: 'Android app locale change',
+        timeoutMs: 15_000,
+        stdoutLimit: 4 * 1024,
+        deadline,
+        signal: options.signal
+      })
+    } catch (error) {
+      await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
+      if (error instanceof DeviceLeaseError) throw error
+      if (error instanceof DevHotelError && error.code !== 'ANDROID_WAIT_TIMEOUT') throw error
+      throw automationError(
+        'ANDROID_LOCALE_MUTATION_REJECTED',
+        'Android did not acknowledge the app-scoped locale change exactly.',
+        'Restore target connectivity and retry; the matrix will not continue without an exact mutation acknowledgement.',
+        409,
+        { stage: 'mutation', apiLevel }
+      )
+    }
+    if (!isExactAndroidLocaleMutationSuccess(mutation)) {
+      await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
+      throw automationError(
+        'ANDROID_LOCALE_MUTATION_REJECTED',
+        'Android did not acknowledge the app-scoped locale change exactly.',
+        'Verify LocaleManager service health and retry; DevHotel will restore and re-prove the original app locale.',
+        409,
+        { stage: 'mutation', apiLevel }
+      )
+    }
+    // LocaleManagerShellCommand exposes neither its internal changed/no-op bit
+    // nor an expected-old-value CAS. Callers that own a durable recovery fence
+    // must record the exact accepted command before this method performs any
+    // further target/readiness await. A thrown callback deliberately escapes
+    // without a post-callback await; its operation-bound locale marker remains
+    // the only safe recovery authority.
+    runSynchronousAndroidLocaleMutationHook(options.onMutationAccepted, 'after acknowledgement')
+    await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
+    const readiness = await this.waitForAppLocaleReady(
+      applicationId,
+      tracked,
+      localeTags,
+      apiLevel,
+      startedAt,
+      deadline,
+      options.signal
+    )
+    const afterPids = [...readiness.pids].sort((a, b) => a - b)
+    return {
+      target: this.target,
+      applicationId,
+      apiLevel,
+      localeTags: [...localeTags],
+      previousLocaleTags,
+      pids: afterPids,
+      restoreFence,
+      process: {
+        beforePids,
+        afterPids,
+        restarted: beforePids.length > 0 && !sameNumbers(beforePids, afterPids)
+      },
+      readiness: { ...readiness, pids: afterPids }
+    }
+  }
+
+  /** Recover one interrupted matrix without crossing its exact target/install fence. */
+  async restoreAppLocalesFromFence(
+    applicationId: string,
+    localeTags: readonly string[],
+    restoreFence: AndroidAppLocaleRestoreFence,
+    expectedLocaleTags: readonly string[],
+    attemptedLocaleTags: readonly string[],
+    options: {
+      timeoutMs?: number
+      signal?: AbortSignal
+      onBeforeMutation?: SynchronousAndroidLocaleMutationHook
+      onMutationAccepted?: SynchronousAndroidLocaleMutationHook
+    } = {}
+  ): Promise<AndroidAppLocaleTransition> {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
+    const snapshot = await this.appLocaleSnapshot(applicationId, timeoutMs, options.signal)
+    if (!sameAppLocaleRestoreFence(snapshot.restoreFence, restoreFence)) {
+      throw automationError(
+        'ANDROID_LOCALE_TARGET_CHANGED',
+        'The exact Android target or tracked install changed before locale restoration.',
+        'Restore the original target, install, user and lease before retrying recovery.',
+        409
+      )
+    }
+    if (
+      !sameStrings(expectedLocaleTags, snapshot.localeTags) &&
+      !sameStrings(attemptedLocaleTags, snapshot.localeTags)
+    ) {
+      throw automationError(
+        'ANDROID_LOCALE_PRECONDITION_CHANGED',
+        'The current app locale is outside the exact interrupted matrix stage.',
+        'Do not overwrite the new locale; inspect the target and resolve the retained recovery intent explicitly.',
+        409
+      )
+    }
+    if (!sameStrings(snapshot.localeTags, localeTags)) {
+      return this.applyAppLocalesAndWait(applicationId, localeTags, {
+        timeoutMs,
+        signal: options.signal,
+        expectedPreviousLocaleTags: snapshot.localeTags,
+        restoreFence,
+        onBeforeMutation: options.onBeforeMutation,
+        onMutationAccepted: options.onMutationAccepted
+      })
+    }
+
+    const startedAt = this.now()
+    const deadline = this.localeDeadline(applicationId, timeoutMs)
+    const tracked = await this.requireInstalled(applicationId, deadline, options.signal)
+    const apiLevel = await this.liveAndroidApiLevel(deadline, options.signal)
+    this.assertAppLocaleRestoreFence(applicationId, tracked, apiLevel, restoreFence)
+    const readiness = await this.waitForAppLocaleReady(
+      applicationId,
+      tracked,
+      localeTags,
+      apiLevel,
+      startedAt,
+      deadline,
+      options.signal
+    )
+    const pids = [...readiness.pids].sort((a, b) => a - b)
+    return {
+      target: this.target,
+      applicationId,
+      apiLevel,
+      localeTags: [...localeTags],
+      previousLocaleTags: [...snapshot.localeTags],
+      pids,
+      restoreFence,
+      process: {
+        beforePids: [...snapshot.pids],
+        afterPids: pids,
+        restarted: snapshot.pids.length > 0 && !sameNumbers(snapshot.pids, pids)
+      },
+      readiness: { ...readiness, pids }
+    }
+  }
+
+  /** One exact pre/post-capture locale seal; no waiting or mutation occurs. */
+  async assertAppLocaleCaptureState(
+    applicationId: string,
+    expectedLocaleTags: readonly string[],
+    expectedApiLevel: number,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const deadline = this.localeDeadline(applicationId, 30_000)
+    const tracked = await this.requireInstalled(applicationId, deadline, signal)
+    const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
+    const localeTags = await this.queryAppLocales(
+      applicationId,
+      tracked.installUserId,
+      apiLevel,
+      deadline,
+      signal
+    )
+    await this.requireForeground(applicationId, tracked.installUserId, deadline, signal)
+    const pids = await this.localeProcessPids(applicationId, tracked, deadline, signal)
+    await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+    if (apiLevel !== expectedApiLevel || !sameStrings(localeTags, expectedLocaleTags) || pids.length === 0) {
+      throw automationError(
+        'ANDROID_LOCALE_CAPTURE_CHANGED',
+        'The exact app locale or live Android API changed while screenshot evidence was captured.',
+        'Retry the locale matrix while the target, app, and locale service are stable.'
+      )
+    }
+  }
+
   /**
    * Bracket one lock-held screen-sensitive Core action with a Host-private,
    * live Android user-switch witness. The callback receives no adb, lease, or
@@ -1009,12 +1872,12 @@ export class AndroidAutomationSession {
    */
   async withActiveUserScreenWitness<T>(
     action: (signal: AbortSignal) => Promise<T>,
-    opts: { actionTimeoutMs?: number } = {}
+    opts: { actionTimeoutMs?: number; allowApplicationIdTransitions?: string } = {}
   ): Promise<T> {
     return this.withActiveUserScreenWitnessDeadline(
       action,
       undefined,
-      undefined,
+      opts.allowApplicationIdTransitions,
       opts.actionTimeoutMs ?? DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS
     )
   }
@@ -1883,7 +2746,12 @@ export class AndroidAutomationSession {
     }
   }
 
-  private async packageUid(applicationId: string, userId: number): Promise<AndroidPackageAuthority> {
+  private async packageUid(
+    applicationId: string,
+    userId: number,
+    deadline?: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<AndroidPackageAuthority> {
     const completionFence = `devhotel-package-dump-${randomUUID()}`
     let packageDump: ExecResult
     try {
@@ -1896,7 +2764,9 @@ export class AndroidAutomationSession {
           operation: 'Android package shared-UID declaration probe',
           timeoutMs: 15_000,
           stdoutLimit: MAX_PACKAGE_DUMP_BYTES,
-          outputLimitRecovery: 'Use an app with a bounded package-manager record and rerun android_run.'
+          outputLimitRecovery: 'Use an app with a bounded package-manager record and rerun android_run.',
+          deadline,
+          signal
         }
       )
     } catch (error) {
@@ -1972,7 +2842,10 @@ export class AndroidAutomationSession {
 
     const uidResult = await this.command(
       ['shell', 'pm', 'list', 'packages', '-U', '--user', String(userId), applicationId],
-      { operation: 'Android package UID probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+      {
+        operation: 'Android package UID probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024,
+        deadline, signal
+      }
     )
     const match = new RegExp(`^package:${escaped}\\s+uid[:=](\\d+)$`, 'm').exec(uidResult.stdout)
     const uid = match ? Number.parseInt(match[1]!, 10) : Number.NaN
@@ -1996,7 +2869,10 @@ export class AndroidAutomationSession {
     }
     const owners = await this.command(
       ['shell', 'pm', 'list', 'packages', '-U', '--user', String(userId), '--uid', String(uid)],
-      { operation: 'Android shared UID probe', timeoutMs: 15_000, stdoutLimit: 64 * 1024 }
+      {
+        operation: 'Android shared UID probe', timeoutMs: 15_000, stdoutLimit: 64 * 1024,
+        deadline, signal
+      }
     )
     const ownerLines = owners.stdout
       .split(/\r?\n/)
@@ -2305,10 +3181,15 @@ export class AndroidAutomationSession {
     return this.readLogcat(input)
   }
 
-  private async pids(applicationId: string, authority: AndroidPackageAuthority): Promise<number[]> {
+  private async pids(
+    applicationId: string,
+    authority: AndroidPackageAuthority,
+    deadline?: AndroidAutomationDeadline,
+    signal?: AbortSignal
+  ): Promise<number[]> {
     const result = await this.command(
       ['shell', 'pgrep', '-u', String(authority.uid)],
-      { operation: 'Android app process probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024 }
+      { operation: 'Android app process probe', timeoutMs: 15_000, stdoutLimit: 16 * 1024, deadline, signal }
     )
     const parsed = parsePids(result.stdout)
     const tokens = result.stdout.trim() ? result.stdout.trim().split(/\s+/) : []

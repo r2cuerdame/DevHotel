@@ -15,7 +15,8 @@ export interface ReconcileResult {
 export async function reconcile(
   backend: IsolationBackend,
   rooms: RoomsRepo,
-  log: (line: string) => void
+  log: (line: string) => void,
+  options: { preserveAwakeRoomIds?: ReadonlySet<string> } = {}
 ): Promise<ReconcileResult> {
   const knownOciRooms = new Set(rooms.list().filter((room) => room.provider !== 'windows').map((room) => room.id))
   const straysRemoved: string[] = []
@@ -51,6 +52,15 @@ export async function reconcile(
     // Never hand one to the OCI backend just because it shares the Room table.
     if (room.provider === 'windows') continue
     if (room.status === 'sleeping') continue
+    if (
+      options.preserveAwakeRoomIds?.has(room.id) &&
+      (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
+    ) {
+      // A persistent Android mutation still needs this exact target. The
+      // durable gate rejects all ordinary Room work while recovery retries.
+      log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
+      continue
+    }
     if (room.status === 'preparing') {
       // Creation/clone is not resumable: its workspace or data volumes may be
       // only partly initialized. Keep that fact visible instead of presenting

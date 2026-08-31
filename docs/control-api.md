@@ -206,6 +206,8 @@ Automation POST bodies are strict and capped at 64 KiB.
 | `POST /v1/rooms/:id/android/dump-ui` | `{ applicationId, filter?, maxNodes?, target? }` | at most 500 sanitized nodes plus scan/truncation accounting |
 | `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines after the tracked install's clock-independent app-UID fence; a later explicit Host-clock `since` is translated by a bounded exact-target clock probe |
 | `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
+| `POST /v1/rooms/:id/android/locale-matrix` | `{ applicationId, locales, filenamePrefix, readinessTimeoutMs?, target?, association? }` | API 33+ app-scoped locale artifact receipts after two exact-user stable readiness probes per locale and a proven restoration of the original locale. Uses one Room lock/session and defaults to the emulator. |
+| `POST /v1/rooms/:id/android/locale-recovery-abandon` | `{ applicationId, acknowledgeOutsideLocale: true }` | Explicitly releases only an undispatched v4 emulator recovery record after two fresh read-only target/install/user/foreground/PID/locale proofs show a completely outside, marker-free locale. The exact Room emulator must already be awake/running; the action never starts a target, launches/stops an app, or sets/restores a locale. Legacy, dispatched, owned, original/expected/attempted, and any marker-bearing state is refused. |
 
 UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals
