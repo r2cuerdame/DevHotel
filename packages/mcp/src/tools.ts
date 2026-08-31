@@ -414,7 +414,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_locale_screenshot_matrix',
       description:
-        'On Android 13+, switch one exact tracked foreground app through 1–16 canonical app-scoped locales, wait for two stable exact-user readiness probes, capture each locale into an immutable Room artifact, and restore the original app locale before returning. Uses one Room lock and the managed Room emulator only: omit target or pass {kind:"emulator"}; auto and physical targets are rejected before any locale mutation. Returns durable artifact receipts only—use read_room_artifact when pixels are needed.',
+        'On Android 13+, switch one exact tracked foreground app through 1–16 canonical app-scoped locales, wait for two stable exact-user readiness probes, capture each locale into an immutable Room artifact, and restore the original app locale before returning. Each result entry exposes appliedLocaleTags: the requested primary locale plus a temporary same-language private-use ownership tag that is removed during restoration. Uses one Room lock and the managed Room emulator only: omit target or pass {kind:"emulator"}; auto and physical targets are rejected before any locale mutation. Returns durable artifact receipts only—use read_room_artifact when pixels are needed.',
       schema: androidLocaleScreenshotMatrixToolSchema,
       strictInputSchema: z.object(androidLocaleScreenshotMatrixToolSchema).strict(),
       handler: wrap(async (a) => {

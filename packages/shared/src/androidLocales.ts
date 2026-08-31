@@ -103,6 +103,13 @@ export interface AndroidLocaleProcessTransition {
 }
 
 export interface AndroidLocaleScreenshotMatrixEntry {
+  /**
+   * Exact temporary LocaleManager list used for the capture. The requested
+   * locale is first; the second private-use locale is a per-stage ownership
+   * capability that makes a coincidental external primary-locale selection
+   * distinguishable from DevHotel's mutation.
+   */
+  appliedLocaleTags: string[]
   locale: string
   readiness: AndroidLocaleReadiness
   process: AndroidLocaleProcessTransition

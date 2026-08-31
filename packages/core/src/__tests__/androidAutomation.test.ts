@@ -3086,8 +3086,12 @@ describe('tracked Android automation session', () => {
   it('reads and mutates app locales only for the tracked numeric Android user', async () => {
     let applied = ['en-US']
     let pgrepCalls = 0
+    let setterAcknowledged = false
+    let acceptedCallbackRan = false
+    let postAckProbeRanBeforeCallback = false
     const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') {
+        if (setterAcknowledged && !acceptedCallbackRan) postAckProbeRanBeforeCallback = true
         return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       }
       if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') {
@@ -3102,6 +3106,7 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'set-app-locales') {
         const index = args.indexOf('--locales')
         applied = index < 0 ? [] : [args[index + 1]!]
+        setterAcknowledged = true
         return { code: 0, stdout: '', stderr: '' }
       }
       if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
@@ -3116,7 +3121,11 @@ describe('tracked Android automation session', () => {
       return { code: 0, stdout: '', stderr: '' }
     }, { now: () => HOST_NOW_MS, sleep: async () => {} })
 
-    const result = await session.applyAppLocalesAndWait(APP_ID, ['ko-KR'])
+    const result = await session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      onMutationAccepted: () => {
+        acceptedCallbackRan = true
+      }
+    })
 
     expect(result).toMatchObject({
       apiLevel: 34,
@@ -3133,6 +3142,8 @@ describe('tracked Android automation session', () => {
     ])
     expect(calls.filter((args) => args[1] === 'pgrep').every((args) => args.at(-1) === '10123')).toBe(true)
     expect(calls.some((args) => args.includes('current'))).toBe(false)
+    expect(acceptedCallbackRan).toBe(true)
+    expect(postAckProbeRanBeforeCallback).toBe(false)
   })
 
   it('rejects an original locale that changes while the restorable snapshot is being sealed', async () => {

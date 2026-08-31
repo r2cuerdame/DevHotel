@@ -1618,6 +1618,8 @@ export class AndroidAutomationSession {
       signal?: AbortSignal
       expectedPreviousLocaleTags?: readonly string[]
       restoreFence?: AndroidAppLocaleRestoreFence
+      /** Runs synchronously after an exact command acknowledgement, before any postflight or readiness await. */
+      onMutationAccepted?: () => void
     } = {}
   ): Promise<AndroidAppLocaleTransition> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
@@ -1663,20 +1665,15 @@ export class AndroidAutomationSession {
     }
     let mutation: ExecResult
     try {
-      mutation = await this.runWithTrackedPostflight(
-        applicationId,
-        tracked,
-        () => this.command(buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags), {
-          operation: 'Android app locale change',
-          timeoutMs: 15_000,
-          stdoutLimit: 4 * 1024,
-          deadline,
-          signal: options.signal
-        }),
+      mutation = await this.command(buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags), {
+        operation: 'Android app locale change',
+        timeoutMs: 15_000,
+        stdoutLimit: 4 * 1024,
         deadline,
-        options.signal
-      )
+        signal: options.signal
+      })
     } catch (error) {
+      await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
       if (error instanceof DeviceLeaseError) throw error
       if (error instanceof DevHotelError && error.code !== 'ANDROID_WAIT_TIMEOUT') throw error
       throw automationError(
@@ -1688,6 +1685,7 @@ export class AndroidAutomationSession {
       )
     }
     if (!isExactAndroidLocaleMutationSuccess(mutation)) {
+      await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
       throw automationError(
         'ANDROID_LOCALE_MUTATION_REJECTED',
         'Android did not acknowledge the app-scoped locale change exactly.',
@@ -1696,6 +1694,14 @@ export class AndroidAutomationSession {
         { stage: 'mutation', apiLevel }
       )
     }
+    // LocaleManagerShellCommand exposes neither its internal changed/no-op bit
+    // nor an expected-old-value CAS. Callers that own a durable recovery fence
+    // must record the exact accepted command before this method performs any
+    // further target/readiness await. A thrown callback deliberately escapes
+    // without a post-callback await; its operation-bound locale marker remains
+    // the only safe recovery authority.
+    options.onMutationAccepted?.()
+    await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
     const readiness = await this.waitForAppLocaleReady(
       applicationId,
       tracked,
@@ -1730,7 +1736,7 @@ export class AndroidAutomationSession {
     restoreFence: AndroidAppLocaleRestoreFence,
     expectedLocaleTags: readonly string[],
     attemptedLocaleTags: readonly string[],
-    options: { timeoutMs?: number; signal?: AbortSignal } = {}
+    options: { timeoutMs?: number; signal?: AbortSignal; onMutationAccepted?: () => void } = {}
   ): Promise<AndroidAppLocaleTransition> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
     const snapshot = await this.appLocaleSnapshot(applicationId, timeoutMs, options.signal)
@@ -1758,7 +1764,8 @@ export class AndroidAutomationSession {
         timeoutMs,
         signal: options.signal,
         expectedPreviousLocaleTags: snapshot.localeTags,
-        restoreFence
+        restoreFence,
+        onMutationAccepted: options.onMutationAccepted
       })
     }
 
@@ -1797,7 +1804,7 @@ export class AndroidAutomationSession {
   /** One exact pre/post-capture locale seal; no waiting or mutation occurs. */
   async assertAppLocaleCaptureState(
     applicationId: string,
-    expectedLocaleTag: string,
+    expectedLocaleTags: readonly string[],
     expectedApiLevel: number,
     signal?: AbortSignal
   ): Promise<void> {
@@ -1814,7 +1821,7 @@ export class AndroidAutomationSession {
     await this.requireForeground(applicationId, tracked.installUserId, deadline, signal)
     const pids = await this.localeProcessPids(applicationId, tracked, deadline, signal)
     await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
-    if (apiLevel !== expectedApiLevel || localeTags.length !== 1 || localeTags[0] !== expectedLocaleTag || pids.length === 0) {
+    if (apiLevel !== expectedApiLevel || !sameStrings(localeTags, expectedLocaleTags) || pids.length === 0) {
       throw automationError(
         'ANDROID_LOCALE_CAPTURE_CHANGED',
         'The exact app locale or live Android API changed while screenshot evidence was captured.',

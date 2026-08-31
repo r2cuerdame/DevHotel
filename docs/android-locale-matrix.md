@@ -18,7 +18,7 @@ The tracked session uses only typed argv with an explicit numeric user:
 
 ```text
 shell cmd locale get-app-locales <applicationId> --user <userId>
-shell cmd locale set-app-locales <applicationId> --user <userId> --locales <tag>
+shell cmd locale set-app-locales <applicationId> --user <userId> --locales <requested-tag>,<ownership-tag>
 ```
 
 Omitting `--locales` restores the empty app override, which makes the app follow
@@ -38,8 +38,32 @@ Locales for <applicationId> for user <userId> are [<canonical-tags>]
 Any warning, extra line, wrong package/user, truncation, malformed tag, or
 ambiguous response fails closed.
 
+The shell command does not expose whether `LocaleManagerService` actually
+changed the list: its Binder setter returns `void`, while the service's internal
+`PackageConfigurationUpdater.commit()` changed/no-op boolean is consumed only
+for broadcasts and metrics. It also offers no expected-old-value compare-and-
+set. Consequently, a read followed by `set-app-locales` cannot attribute a
+plain requested locale that another actor selected in between. Each forward
+matrix stage instead writes an exact two-entry list:
+
+```text
+[<requested-tag>, <requested-language>-x-dh-<128-bit-stage-capability>]
+```
+
+The requested locale remains first. Android preserves `LocaleList` order and
+private-use extensions, so the secondary same-language tag is a temporary,
+stage-specific ownership capability rather than a competing primary UI locale.
+It is durably recorded before the setter, is different for every stage, and is
+verified byte-for-byte during readiness and capture. A coincidental external
+plain `[<requested-tag>]` selection therefore cannot be mistaken for the
+DevHotel-applied list. Matrix result entries expose the exact list as
+`appliedLocaleTags`; artifact locale metadata and the entry's `locale` retain
+the requested primary tag.
+
 The command/output contract is defined by AOSP's Android 13+
 [`LocaleManagerShellCommand`](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android13-release/services/core/java/com/android/server/locales/LocaleManagerShellCommand.java).
+The discarded changed/no-op result is visible in AOSP's
+[`LocaleManagerService`](https://android.googlesource.com/platform/frameworks/base/+/04abdedb553c127f998606c2a49ef2e215294c7f/services/core/java/com/android/server/locales/LocaleManagerService.java#276).
 
 ## Readiness and restoration
 
@@ -59,15 +83,17 @@ its target/install/user proof, then durably records that locale together with
 the exact managed-emulator target, package incarnation and user fence. The
 durable record has a random operation capability and advances by compare-and-
 swap before each set. A prepared stage owns only its expected prior locale; its
-attempted locale becomes owned only when the setter succeeds and that fact is
-immediately confirmed by a second compare-and-swap. A crash or precondition
-failure before confirmation remains attention-gated, even if an external actor
-coincidentally selected the attempted locale. A later unattempted matrix locale
-is never treated as DevHotel-owned. Every set checks the expected prior locale
+attempted locale becomes owned when the setter returns an exact acknowledgement;
+that fact is synchronously confirmed by a second compare-and-swap before any
+install postflight or readiness await. If the process dies in the tiny interval
+before that confirmation, only an exact operation-bound secondary marker match
+is recoverable; a plain requested locale and every legacy non-marker attempt
+remain attention-gated. A later unattempted matrix locale is never treated as
+DevHotel-owned. Every set checks the expected prior locale
 immediately before mutation, and a fresh post-witness snapshot re-proves locale,
 install, target, user, PID and lease identity before publication can advance.
-Success and failure paths restore that exact list and run the same readiness
-proof.
+Success and failure paths restore that exact list, prove that no temporary
+ownership marker remains, and run the same readiness proof.
 
 If the DevHotel process stops mid-matrix, startup attempts managed-emulator
 restoration only under the retained exact stage and fence. Before doing so it

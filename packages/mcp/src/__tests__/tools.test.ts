@@ -91,6 +91,7 @@ beforeAll(async () => {
           scope: 'app',
           entries: body.locales.map((locale: string, index: number) => ({
             locale,
+            appliedLocaleTags: [locale, `${locale.split('-')[0]}-x-dh-11111111-2222-3333-4444-55555555-6666`],
             readiness: { consecutiveReadyChecks: 2 },
             process: { beforePids: [100 + index], afterPids: [101 + index], restarted: true },
             artifact: { ...artifact, filename: `${body.filenamePrefix}-${locale.toLowerCase()}.png` }
@@ -355,6 +356,7 @@ describe('makeTools', () => {
     expect(result.content).toHaveLength(1)
     expect(result.content[0]).toMatchObject({ type: 'text' })
     expect(firstText(result)).toContain('release-42-ko-kr.png')
+    expect(firstText(result)).toContain('appliedLocaleTags')
     expect(seen.findLast((request) => request.url === '/v1/rooms/abc12345/android/locale-matrix'))
       .toMatchObject({
         body: {
