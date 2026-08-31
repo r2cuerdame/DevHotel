@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -880,7 +880,10 @@ function assertRoomArtifactPublishInput(
     Buffer.byteLength(relativePath, 'utf8') > 1024 ||
     relativePath.startsWith('/') ||
     relativePath.includes('\\') ||
-    /[\u0000-\u001f\u007f\u2028\u2029]/u.test(relativePath)
+    Array.from(relativePath).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 0x1f || codePoint === 0x7f || codePoint === 0x2028 || codePoint === 0x2029
+    })
   ) {
     throw new RoomArtifactPublicationError('invalid-input', 'Room artifact publication path is invalid')
   }
