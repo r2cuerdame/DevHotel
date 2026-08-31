@@ -2282,6 +2282,20 @@ export class RoomOrchestrator {
         }
         const { receipt, status } = evidence.context
         if (!receipt) throw new Error('tracked screenshot evidence lost its receipt')
+        // The in-process Room lock cannot exclude a second DevHotel process.
+        // Re-read after the screen witness, then let publishScreenshot prove
+        // this same revision again under its cross-process write transaction.
+        const currentRoom = this.mustGet(roomId)
+        if (
+          currentRoom.stateRevision !== room.stateRevision ||
+          currentRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision
+        ) {
+          throw new DevHotelError(
+            'SCREENSHOT_TARGET_CHANGED',
+            'Room state changed while screenshot evidence was captured.',
+            { recoveryHint: 'Capture a fresh artifact from the current Room state.' }
+          )
+        }
         const packageName = receipt.applicationId
         const locale = artifactLocale(status.locale)
         const metadata: AndroidScreenshotArtifactMetadata = {
@@ -2338,6 +2352,13 @@ export class RoomOrchestrator {
             throw new DevHotelError('ARTIFACT_QUOTA_REACHED', 'This Room’s screenshot artifact quota is full.', {
               recoveryHint: 'Delete the Room when its evidence is no longer needed, or capture in a fresh Room.'
             })
+          }
+          if (error instanceof Error && /Room revision changed before publication/.test(error.message)) {
+            throw new DevHotelError(
+              'SCREENSHOT_TARGET_CHANGED',
+              'Room state changed before screenshot artifact publication.',
+              { recoveryHint: 'Capture a fresh artifact from the current Room state.' }
+            )
           }
           throw new DevHotelError('ARTIFACT_STORE_FAILED', 'Screenshot artifact could not be published safely.', {
             recoveryHint: 'Retry the capture; no partial artifact was made visible.',

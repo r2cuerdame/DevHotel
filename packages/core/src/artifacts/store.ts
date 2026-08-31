@@ -126,6 +126,13 @@ export class RoomArtifactStore {
       // insert. A second publisher cannot use a stale quota snapshot, and a
       // reconciler cannot snapshot IDs while this directory is in flight.
       return this.repo.withWriteTransaction(() => {
+        if (!this.repo.hasRoomRevision(
+          input.roomId,
+          record.metadata.room.stateRevision,
+          record.metadata.room.workspaceVolumeRevision
+        )) {
+          throw new Error('Screenshot artifact Room revision changed before publication')
+        }
         const usage = this.repo.usageForRoom(input.roomId)
         if (
           usage.count >= SCREENSHOT_ARTIFACT_MAX_PER_ROOM ||

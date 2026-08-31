@@ -59,7 +59,9 @@ function setup() {
         domain: `${id}.dev.localhost`,
         sourceType: 'managed-git',
         sourceRef: `https://example.invalid/${id}.git`,
-        workspaceMode: 'hotel'
+        workspaceMode: 'hotel',
+        stateRevision: 3,
+        workspaceVolumeRevision: 2
       })
     )
   }
@@ -272,6 +274,21 @@ describe('Room screenshot artifact store', () => {
     })
 
     expect(transactionStates).toEqual([true, true])
+  })
+
+  it('rejects a stale Room revision inside the publication transaction', () => {
+    const { store, rooms, userData } = setup()
+    rooms.update('aaaa1111', { stateRevision: 4 })
+
+    expect(() => store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'stale-room.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111')
+    })).toThrow(/Room revision changed/)
+    expect(existsSync(join(userData, 'rooms', 'aaaa1111', 'artifacts'))).toBe(false)
   })
 
   it('cleans crash leftovers but never traverses into other artifact families', () => {

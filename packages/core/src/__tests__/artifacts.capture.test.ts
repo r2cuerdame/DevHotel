@@ -258,6 +258,38 @@ describe('Android screenshot artifact capture', () => {
     expect(orch.listRoomArtifacts(ROOM_ID)).toEqual([])
   })
 
+  it('withholds pixels when another process advances the Room revision during capture', async () => {
+    const { backend, orch } = setup()
+    const png = screenshotPng(3, 2, { text: 'room revision race' })
+    backend.fencedEmulatorExecHandler = () => ({
+      code: 0,
+      stdout: png.toString('base64'),
+      stderr: ''
+    })
+    let evidenceCalls = 0
+    const session = {
+      target: emulatorTarget,
+      async foregroundInstallEvidence() {
+        evidenceCalls += 1
+        if (evidenceCalls === 2) {
+          const current = orch.rooms.get(ROOM_ID)
+          if (!current) throw new Error('missing test Room')
+          orch.rooms.update(ROOM_ID, { stateRevision: current.stateRevision + 1 })
+        }
+        return evidence()
+      },
+      async withActiveUserScreenWitness<T>(action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+        return action(new AbortController().signal)
+      }
+    } as unknown as AndroidAutomationSession
+    vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
+
+    await expect(
+      orch.captureAndroidScreenshotArtifact(ROOM_ID, { filename: 'room-revision-race.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'SCREENSHOT_TARGET_CHANGED' })
+    expect(orch.listRoomArtifacts(ROOM_ID)).toEqual([])
+  })
+
   it('withholds pixels when the live screen witness observes an A-B-A user or focus transition', async () => {
     const { backend, orch } = setup()
     backend.fencedEmulatorExecHandler = () => ({

@@ -63,6 +63,7 @@ export interface ArtifactsRepo {
    */
   withWriteTransaction<T>(work: () => T): T
   insert(input: ArtifactInsert): RoomArtifact
+  hasRoomRevision(roomId: string, stateRevision: number, workspaceVolumeRevision: number): boolean
   getForRoom(roomId: string, artifactId: string): RoomArtifact | null
   listForRoom(roomId: string, limit?: number): RoomArtifact[]
   usageForRoom(roomId: string): { count: number; bytes: number }
@@ -114,6 +115,12 @@ export function artifactsRepo(db: Db): ArtifactsRepo {
         if (ownsTransaction && sqlite.isTransaction) sqlite.exec('ROLLBACK')
         throw error
       }
+    },
+    hasRoomRevision(roomId, stateRevision, workspaceVolumeRevision) {
+      return sqlite.prepare(
+        `SELECT 1 FROM rooms
+         WHERE id = ? AND state_revision = ? AND workspace_volume_revision = ?`
+      ).get(roomId, stateRevision, workspaceVolumeRevision) !== undefined
     },
     getForRoom(roomId, artifactId) {
       const row = sqlite
