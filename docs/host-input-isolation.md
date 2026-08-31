@@ -34,8 +34,8 @@ cannot remove. The contract is also expressed in code, in
 | --- | --- | --- |
 | `run_in_room` / `exec` / Room terminal | `docker exec` inside the Room's container | No |
 | Android phone strip (Back / Home / Recents / Rotate) | a closed typed Core action mapped to fixed argv in a disposable helper on the dedicated Android control bridge | No |
-| `android_run`, `android_screenshot` (Room emulator) | the same fenced helper or exact-ID emulator display capture; the mutable Room runtime cannot reach this control bridge | No |
-| `android_device_adb`, `android_screenshot` on a leased phone | Host-side `adb` from the Device Broker, addressed to a USB phone's own serial. It runs on the Host but injects only into that phone — no Host cursor, keys, or foreground window. Requires a live device lease ([Android Device Broker](./android-device-broker.md)) | No |
+| `android_run`, `android_screenshot`, `android_locale_screenshot_matrix` (Room emulator) | the same fenced helper or exact-ID emulator display capture; the mutable Room runtime cannot reach this control bridge | No |
+| `android_device_adb`, `android_screenshot`, `android_locale_screenshot_matrix` on a leased phone | Host-side `adb` from the Device Broker, addressed to a USB phone's own serial. It runs on the Host but injects only into that phone — no Host cursor, keys, or foreground window. Requires a live device lease ([Android Device Broker](./android-device-broker.md)) | No |
 | Android emulator display | Xvfb + openbox **inside** the emulator container; the window manager only ever moves the guest's own windows | No |
 | Room web preview | an Electron `WebContentsView` on a Room-scoped session with every permission denied | No |
 | Windows (VMware) Room lifecycle | `vmrun start … nogui` — the VM runs headless, with no console window | No |

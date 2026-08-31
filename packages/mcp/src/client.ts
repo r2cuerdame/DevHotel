@@ -14,6 +14,8 @@ import {
   type AndroidLaunchResult,
   type AndroidLogcatInput,
   type AndroidLogcatResult,
+  type AndroidLocaleScreenshotMatrixInput,
+  type AndroidLocaleScreenshotMatrixResult,
   type AndroidRunCrashScenarioInput,
   type AndroidTapTextInput,
   type AndroidTapTextResult,
@@ -324,6 +326,13 @@ export class ControlClient {
     return this.req<AndroidCrashScenarioResult>(
       'POST',
       `/v1/rooms/${encodeURIComponent(roomId)}/android/crash-scenario`,
+      input
+    )
+  }
+  androidLocaleScreenshotMatrix(roomId: string, input: AndroidLocaleScreenshotMatrixInput) {
+    return this.req<AndroidLocaleScreenshotMatrixResult>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/locale-matrix`,
       input
     )
   }

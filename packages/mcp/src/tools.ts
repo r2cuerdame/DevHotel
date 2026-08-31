@@ -4,6 +4,7 @@ import {
   zAndroidApplicationId,
   zAndroidCrashScenario,
   zAndroidExtras,
+  zAndroidLocaleScreenshotMatrixBody,
   zAndroidTargetSelector,
   zAndroidTextMatch,
   zArtifactFilename,
@@ -92,8 +93,21 @@ export interface ToolDef {
   name: string
   description: string
   schema: z.ZodRawShape
+  /** Full object schema used when unknown MCP arguments must be rejected, not stripped. */
+  strictInputSchema?: z.AnyZodObject
   handler: (args: any) => Promise<ToolResult>
 }
+
+const androidLocaleScreenshotMatrixToolSchema = {
+  roomId: zRoomId,
+  applicationId: zAndroidLocaleScreenshotMatrixBody.shape.applicationId,
+  locales: zAndroidLocaleScreenshotMatrixBody.shape.locales,
+  filenamePrefix: zAndroidLocaleScreenshotMatrixBody.shape.filenamePrefix,
+  readinessTimeoutMs: zAndroidLocaleScreenshotMatrixBody.shape.readinessTimeoutMs,
+  target: zAndroidLocaleScreenshotMatrixBody.shape.target,
+  changeId: zChangeId.optional().describe('optional verified change associated with every artifact'),
+  runId: z.string().uuid().optional().describe('optional retained run associated with every artifact')
+} satisfies z.ZodRawShape
 
 function ok(data: unknown): ToolResult {
   return { content: [{ type: 'text', text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] }
@@ -396,6 +410,26 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
         }
       }
+    },
+    {
+      name: 'android_locale_screenshot_matrix',
+      description:
+        'On Android 13+, switch one exact tracked foreground app through 1–16 canonical app-scoped locales, wait for two stable exact-user readiness probes, capture each locale into an immutable Room artifact, and restore the original app locale before returning. Uses one Room lock and the managed Room emulator only: omit target or pass {kind:"emulator"}; auto and physical targets are rejected before any locale mutation. Returns durable artifact receipts only—use read_room_artifact when pixels are needed.',
+      schema: androidLocaleScreenshotMatrixToolSchema,
+      strictInputSchema: z.object(androidLocaleScreenshotMatrixToolSchema).strict(),
+      handler: wrap(async (a) => {
+        const association = a.changeId || a.runId
+          ? { ...(a.changeId ? { changeId: a.changeId } : {}), ...(a.runId ? { runId: a.runId } : {}) }
+          : undefined
+        return (await getClient()).androidLocaleScreenshotMatrix(a.roomId, {
+          applicationId: a.applicationId,
+          locales: a.locales,
+          filenamePrefix: a.filenamePrefix,
+          ...(a.readinessTimeoutMs !== undefined ? { readinessTimeoutMs: a.readinessTimeoutMs } : {}),
+          ...(a.target !== undefined ? { target: a.target } : {}),
+          ...(association ? { association } : {})
+        })
+      })
     },
     {
       name: 'list_room_artifacts',

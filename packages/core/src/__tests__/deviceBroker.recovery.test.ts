@@ -24,6 +24,7 @@ function makeBroker(
     alive?: boolean | 'unknown'
     graceMs?: number
     ownerLiveness?: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
+    recoveryProtected?: (lease: DeviceLease) => boolean
   } = {}
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'devhotel-recovery-'))
@@ -38,12 +39,111 @@ function makeBroker(
     adb,
     now: () => now.value,
     ownerLiveness: opts.ownerLiveness ?? (() => liveness.alive),
+    recoveryProtected: opts.recoveryProtected,
     graceMs: opts.graceMs ?? 30_000
   })
   return { broker, adb, db, now, liveness }
 }
 
 describe('Android device broker — stale lease recovery', () => {
+  it('preserves an exact recovery lease across expiry, disconnect, and reconnect', async () => {
+    let protectedLeaseId: string | null = null
+    const { broker, adb, now } = makeBroker({
+      alive: false,
+      graceMs: 0,
+      recoveryProtected: (lease) => lease.id === protectedLeaseId
+    })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'Recovering',
+      purpose: 'other',
+      workerId: 'dead-worker',
+      ttlMs: 30_000
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    protectedLeaseId = granted.lease.id
+
+    now.value += 31_000
+    expect((await broker.reap()).recovered).toEqual([])
+    adb.phones = []
+    await broker.refreshInventory()
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(protectedLeaseId)
+    adb.phones = [{ serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' }]
+    await broker.refreshInventory()
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(protectedLeaseId)
+    expect(broker.renewRecoveryLease('aaaa1111', granted.lease.deviceId, granted.lease.id).id)
+      .toBe(granted.lease.id)
+    await expect(broker.release(granted.lease.id, 'must stay recoverable'))
+      .rejects.toMatchObject({ code: 'lease-recovery-protected' })
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+  })
+
+  it('rechecks recovery protection atomically after a disconnect preflight', async () => {
+    let armed = false
+    let protectionChecks = 0
+    const { broker, adb } = makeBroker({
+      recoveryProtected: () => {
+        if (!armed) return false
+        protectionChecks += 1
+        return protectionChecks >= 2
+      }
+    })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'Recovering',
+      purpose: 'other',
+      workerId: 'worker-a'
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    armed = true
+    adb.phones = []
+
+    await broker.refreshInventory()
+
+    expect(protectionChecks).toBe(2)
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+  })
+
+  it('rechecks recovery protection after an asynchronous reap liveness probe', async () => {
+    let finishProbe!: (alive: boolean) => void
+    let probeStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve
+    })
+    const probe = new Promise<boolean>((resolve) => {
+      finishProbe = resolve
+    })
+    let protectedLeaseId: string | null = null
+    const { broker, now } = makeBroker({
+      graceMs: 0,
+      ownerLiveness: () => {
+        probeStarted()
+        return probe
+      },
+      recoveryProtected: (lease) => lease.id === protectedLeaseId
+    })
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({
+      roomId: 'aaaa1111',
+      project: 'Recovering',
+      purpose: 'other',
+      workerId: 'worker-a',
+      ttlMs: 30_000
+    })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    now.value += 31_000
+
+    const sweeping = broker.reap()
+    await started
+    protectedLeaseId = granted.lease.id
+    finishProbe(false)
+
+    expect((await sweeping).recovered).toEqual([])
+    expect(broker.leaseForRoom('aaaa1111')?.id).toBe(granted.lease.id)
+  })
+
   it('reclaims the phone from a killed worker and hands it to the waiting Room', async () => {
     const { broker, now } = makeBroker({ alive: false })
     await broker.refreshInventory()

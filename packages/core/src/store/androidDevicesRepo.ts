@@ -198,6 +198,13 @@ export interface AndroidDevicesRepo {
   grantLease(input: LeaseInsert, queuedRequestId: string | null): LeaseGrant
   touchLease(id: string, heartbeatAt: string, activityAt: string | null): DeviceLease
   closeLease(id: string, state: 'released' | 'expired' | 'revoked', at: string, reason: string): DeviceLease
+  closeLeaseIf(
+    id: string,
+    state: 'released' | 'expired' | 'revoked',
+    at: string,
+    reason: string,
+    shouldClose: (lease: DeviceLease) => boolean
+  ): DeviceLease | null
   acknowledgeRevokedLease(id: string, at: string, reason: string): DeviceLease
   waiting(deviceId: string | null): DeviceQueueEntry[]
   waitingForRoom(roomId: string): DeviceQueueEntry | null
@@ -483,6 +490,30 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
         .run(state, at, reason, id)
       if (changed.changes === 0) throw new Error(`no active lease to close: ${id}`)
       return repo.getLease(id)!
+    },
+    closeLeaseIf(id, state, at, reason, shouldClose) {
+      const ownsTransaction = !sqlite.isTransaction
+      if (ownsTransaction) sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        const current = repo.getLease(id)
+        if (!current || current.state !== 'active' || !shouldClose(current)) {
+          if (ownsTransaction) sqlite.exec('COMMIT')
+          return null
+        }
+        const changed = sqlite
+          .prepare(
+            `UPDATE android_device_leases SET state = ?, released_at = ?, release_reason = ?
+             WHERE id = ? AND state = 'active'`
+          )
+          .run(state, at, reason, id)
+        if (changed.changes === 0) throw new Error(`no active lease to close: ${id}`)
+        const closed = repo.getLease(id)!
+        if (ownsTransaction) sqlite.exec('COMMIT')
+        return closed
+      } catch (error) {
+        if (ownsTransaction && sqlite.isTransaction) sqlite.exec('ROLLBACK')
+        throw error
+      }
     },
     acknowledgeRevokedLease(id, at, reason) {
       const changed = sqlite

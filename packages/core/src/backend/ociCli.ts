@@ -3009,6 +3009,11 @@ export class OciCliBackend implements IsolationBackend {
     return this.runFencedEmulatorAdb(roomId, args, opts)
   }
 
+  async execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
+    throwIfAborted(opts.signal)
+    return this.runFencedEmulatorAdb(roomId, args, opts, undefined, true)
+  }
+
   async installFencedEmulatorApk(roomId: string, hostApkPath: string, opts: ExecOpts = {}): Promise<ExecResult> {
     let canonicalApk: string | undefined
     try {
@@ -3067,7 +3072,8 @@ export class OciCliBackend implements IsolationBackend {
     roomId: string,
     args: string[],
     opts: ExecOpts,
-    hostApkPath?: string
+    hostApkPath?: string,
+    recoveryOnly = false
   ): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
@@ -3075,8 +3081,18 @@ export class OciCliBackend implements IsolationBackend {
     if (!hostApkPath && ['install', 'install-multiple', 'install-multi-package'].includes(args[0])) {
       throw new Error('fenced emulator installs require a private staged APK capability')
     }
-    const topology = await this.assertFencedEmulatorTopology(roomId)
-    const { emulatorId } = topology
+    let topology: FencedEmulatorTopology | undefined
+    let recoveryTopology: FencedEmulatorRecoveryTopology | undefined
+    if (recoveryOnly) recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId)
+    else topology = await this.assertFencedEmulatorTopology(roomId)
+    const emulatorId = (recoveryTopology ?? topology)!.emulatorId
+    const reproveTopology = async (): Promise<void> => {
+      if (recoveryOnly) {
+        recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId, recoveryTopology)
+      } else {
+        topology = await this.assertFencedEmulatorTopology(roomId, topology)
+      }
+    }
     await this.ensureImage(ANDROID_IMAGE)
     const id = randomUUID()
     const name = jobName(roomId, id)
@@ -3164,7 +3180,7 @@ export class OciCliBackend implements IsolationBackend {
       if (createdHelper.State?.Status !== 'created') {
         throw new Error('fenced emulator ADB helper was not inert before its controlled action')
       }
-      await this.assertFencedEmulatorTopology(roomId, topology)
+      await reproveTopology()
       throwIfAborted(opts.signal)
     } catch (error) {
       try {
@@ -3205,7 +3221,7 @@ export class OciCliBackend implements IsolationBackend {
       }
       throw cleanupError
     }
-    await this.assertFencedEmulatorTopology(roomId, topology)
+    await reproveTopology()
     if (executionError) throw executionError
     throwIfAborted(opts.signal)
     if (!result) throw new Error('fenced emulator helper did not return an execution result')
@@ -3302,6 +3318,85 @@ export class OciCliBackend implements IsolationBackend {
       }
     }
     return { anchorId, runtimeAnchorId, webId, emulatorId, controlSandboxId, runtimeSandboxId }
+  }
+
+  /**
+   * Recovery deliberately excludes the Room runtime/web workload. Those
+   * containers still participate as immutable topology evidence, but their
+   * state must not change while a control-only ADB helper runs.
+   */
+  private async assertFencedEmulatorRecoveryTopology(
+    roomId: string,
+    expected?: FencedEmulatorRecoveryTopology
+  ): Promise<FencedEmulatorRecoveryTopology> {
+    const participant = async (name: string, role: string, expectedId?: string): Promise<DockerContainerInspect> => {
+      const inspected = expectedId ? await this.inspectContainer(expectedId) : undefined
+      if (expectedId && !inspected) throw new Error(`Android recovery participant disappeared: ${role}`)
+      const owned = await this.assertRoomContainer(roomId, name, role, inspected ?? undefined)
+      if (expectedId && exactContainerId(owned, roomId) !== expectedId) {
+        throw new Error(`Android recovery participant changed immutable ID: ${role}`)
+      }
+      return owned
+    }
+    const anchor = await participant(anchorName(roomId), 'anchor', expected?.anchorId)
+    const runtimeAnchor = await participant(
+      androidRuntimeAnchorName(roomId),
+      'android-runtime-anchor',
+      expected?.runtimeAnchorId
+    )
+    const web = await participant(webName(roomId), 'web', expected?.webId)
+    const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    const anchorId = exactContainerId(anchor, roomId)
+    const runtimeAnchorId = exactContainerId(runtimeAnchor, roomId)
+    const webId = exactContainerId(web, roomId)
+    const emulatorId = exactContainerId(emulator, roomId)
+    const runtimeAnchorState = runtimeAnchor.State?.Status ?? ''
+    const webState = web.State?.Status ?? ''
+    if (
+      expected &&
+      (runtimeAnchorState !== expected.runtimeAnchorState || webState !== expected.webState)
+    ) {
+      throw new Error('Android recovery started or changed a retained Room workload')
+    }
+    const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android recovery control anchor')
+    if (this.exactRunningSandboxId(emulator, 'Android recovery emulator') !== controlSandboxId) {
+      throw new Error('Android recovery emulator left its exact control network namespace')
+    }
+    this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android recovery control anchor')
+    this.assertContainerNetworkMode(runtimeAnchor, roomNetworkName(roomId), 'Android recovery runtime anchor')
+    this.assertContainerNetworkNamespace(
+      web,
+      androidRuntimeAnchorName(roomId),
+      runtimeAnchorId,
+      'Android recovery web'
+    )
+    const emulatorNetworkMode = emulator.HostConfig?.NetworkMode ?? ''
+    if (emulatorNetworkMode !== `container:${anchorName(roomId)}` && emulatorNetworkMode !== `container:${anchorId}`) {
+      throw new Error('Android recovery emulator no longer names the exact control anchor')
+    }
+    const controlNetwork = await this.inspectNetwork(androidControlNetworkName(roomId))
+    const runtimeNetwork = await this.inspectNetwork(roomNetworkName(roomId))
+    if (!controlNetwork || !runtimeNetwork) throw new Error('Android recovery networks are missing')
+    assertRoomNetwork(controlNetwork, roomId, androidControlNetworkName(roomId))
+    assertRoomNetwork(runtimeNetwork, roomId, roomNetworkName(roomId))
+    assertAndroidRecoveryNetworkMembership(
+      controlNetwork,
+      runtimeNetwork,
+      roomId,
+      anchorId,
+      runtimeAnchorId,
+      anchor,
+      runtimeAnchor
+    )
+    return {
+      anchorId,
+      runtimeAnchorId,
+      webId,
+      emulatorId,
+      controlSandboxId,
+      runtimeAnchorState,
+      webState
+    }
   }
 
   private isOwnedFencedJob(
@@ -3494,6 +3589,97 @@ export class OciCliBackend implements IsolationBackend {
         throw new AggregateError([error, cleanupError], 'emulator creation and exact cleanup both failed')
       }
       throw error
+    }
+  }
+
+  /**
+   * Recovery may need to restart an emulator after a Host/app crash, but it
+   * must not run the ordinary wake path: that path deliberately recreates the
+   * emulator and clears its tracked-install authority. Capture every existing
+   * participant by immutable ID, start only those exact containers, then prove
+   * the complete isolated topology again. Missing or replacement participants
+   * remain a hard recovery failure.
+   */
+  async startExistingEmulatorForRecovery(roomId: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const participants = [
+      { name: anchorName(roomId), role: 'anchor' },
+      { name: androidRuntimeAnchorName(roomId), role: 'android-runtime-anchor' },
+      { name: webName(roomId), role: 'web' },
+      { name: emulatorName(roomId), role: 'svc-emulator' }
+    ] as const
+    const retained: Array<{
+      name: string
+      role: string
+      id: string
+      state: string | undefined
+      container: DockerContainerInspect
+    }> = []
+    for (const participant of participants) {
+      const inspected = await this.inspectContainer(participant.name)
+      if (!inspected) throw new Error(`Android locale recovery target is missing: ${participant.role}`)
+      const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, inspected)
+      retained.push({
+        ...participant,
+        id: exactContainerId(owned, roomId),
+        state: owned.State?.Status,
+        container: owned
+      })
+    }
+
+    const [anchor, runtimeAnchor, web, emulator] = retained
+    this.assertContainerNetworkMode(anchor!.container, androidControlNetworkName(roomId), 'Android control anchor')
+    this.assertContainerNetworkMode(runtimeAnchor!.container, roomNetworkName(roomId), 'Android runtime anchor')
+    this.assertContainerNetworkNamespace(
+      web!.container,
+      androidRuntimeAnchorName(roomId),
+      runtimeAnchor!.id,
+      'Android web'
+    )
+    const emulatorNetworkMode = emulator!.container.HostConfig?.NetworkMode ?? ''
+    if (emulatorNetworkMode !== `container:${anchorName(roomId)}` && emulatorNetworkMode !== `container:${anchor!.id}`) {
+      throw new Error('Retained Android emulator no longer names the exact control anchor')
+    }
+    const controlNetwork = await this.inspectNetwork(androidControlNetworkName(roomId))
+    const runtimeNetwork = await this.inspectNetwork(roomNetworkName(roomId))
+    if (!controlNetwork || !runtimeNetwork) throw new Error('Retained Android recovery networks are missing')
+    assertRoomNetwork(controlNetwork, roomId, androidControlNetworkName(roomId))
+    assertRoomNetwork(runtimeNetwork, roomId, roomNetworkName(roomId))
+    assertAndroidRecoveryNetworkMembership(
+      controlNetwork,
+      runtimeNetwork,
+      roomId,
+      anchor!.id,
+      runtimeAnchor!.id,
+      anchor!.container,
+      runtimeAnchor!.container
+    )
+
+    for (const participant of retained) {
+      if (participant.role !== 'anchor' && participant.role !== 'svc-emulator') continue
+      const current = await this.inspectContainer(participant.id)
+      if (!current) throw new Error(`Android locale recovery participant disappeared: ${participant.role}`)
+      const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, current)
+      if (exactContainerId(owned, roomId) !== participant.id) {
+        throw new Error(`Android locale recovery participant changed immutable ID: ${participant.role}`)
+      }
+      if (owned.State?.Status === 'running') continue
+      if (owned.State?.Status !== 'exited') {
+        throw new Error(`Android locale recovery participant is not restartable: ${participant.role}`)
+      }
+      must(await runDocker(['start', participant.id]), `start exact Android recovery ${participant.role}`)
+    }
+
+    const recovered = await this.assertFencedEmulatorRecoveryTopology(roomId)
+    if (
+      recovered.anchorId !== anchor!.id ||
+      recovered.runtimeAnchorId !== runtimeAnchor!.id ||
+      recovered.webId !== web!.id ||
+      recovered.emulatorId !== emulator!.id ||
+      recovered.runtimeAnchorState !== runtimeAnchor!.state ||
+      recovered.webState !== web!.state
+    ) {
+      throw new Error('Android locale recovery changed a retained Room workload or immutable participant')
     }
   }
 
@@ -5092,6 +5278,16 @@ interface FencedEmulatorTopology {
   runtimeSandboxId: string
 }
 
+interface FencedEmulatorRecoveryTopology {
+  anchorId: string
+  runtimeAnchorId: string
+  webId: string
+  emulatorId: string
+  controlSandboxId: string
+  runtimeAnchorState: string
+  webState: string
+}
+
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {
   const id = container.Id?.trim() ?? ''
   if (!/^[a-f0-9]{12,64}$/.test(id)) {
@@ -5229,19 +5425,62 @@ function assertAndroidNetworkMembership(
   controlAnchorId: string,
   runtimeAnchorId: string
 ): void {
-  const controlMembers = Object.entries(control.Containers ?? {})
-  if (
-    controlMembers.length !== 1 ||
-    controlMembers[0]?.[0] !== controlAnchorId ||
-    controlMembers[0]?.[1]?.Name !== anchorName(roomId)
-  ) {
-    throw new Error('Android control network must contain only the exact owned control anchor endpoint')
-  }
+  assertAndroidControlNetworkMembership(control, roomId, controlAnchorId, true)
   const runtimeMembers = runtime.Containers ?? {}
   if (
     runtimeMembers[controlAnchorId] !== undefined ||
     runtimeMembers[runtimeAnchorId]?.Name !== androidRuntimeAnchorName(roomId)
   ) {
     throw new Error('Android runtime and control network endpoint sets are not disjoint')
+  }
+}
+
+function assertAndroidControlNetworkMembership(
+  control: DockerNetworkInspect,
+  roomId: string,
+  controlAnchorId: string,
+  anchorRunning: boolean
+): void {
+  const controlMembers = Object.entries(control.Containers ?? {})
+  const exactRunningMembership = controlMembers.length === 1 &&
+    controlMembers[0]?.[0] === controlAnchorId &&
+    controlMembers[0]?.[1]?.Name === anchorName(roomId)
+  if ((anchorRunning && !exactRunningMembership) || (!anchorRunning && controlMembers.length !== 0)) {
+    throw new Error('Android control network must contain only the exact owned control anchor endpoint')
+  }
+}
+
+function assertAndroidRecoveryNetworkMembership(
+  control: DockerNetworkInspect,
+  runtime: DockerNetworkInspect,
+  roomId: string,
+  controlAnchorId: string,
+  runtimeAnchorId: string,
+  controlAnchor: DockerContainerInspect,
+  runtimeAnchor: DockerContainerInspect
+): void {
+  const controlAnchorRunning = controlAnchor.State?.Status === 'running'
+  assertAndroidControlNetworkMembership(control, roomId, controlAnchorId, controlAnchorRunning)
+
+  const runtimeMembers = runtime.Containers ?? {}
+  if (runtimeMembers[controlAnchorId] !== undefined) {
+    throw new Error('Android runtime and control network endpoint sets are not disjoint')
+  }
+  const runtimeNetworkId = exactDockerObjectId(runtime.Id, 'Android recovery runtime network')
+  const retainedRuntimeNetworkId = exactDockerObjectId(
+    runtimeAnchor.NetworkSettings?.Networks?.[roomNetworkName(roomId)]?.NetworkID,
+    'Android recovery runtime anchor network'
+  )
+  if (retainedRuntimeNetworkId !== runtimeNetworkId) {
+    throw new Error('Android recovery runtime anchor changed its exact retained network')
+  }
+
+  const runtimeAnchorRunning = runtimeAnchor.State?.Status === 'running'
+  const endpoint = runtimeMembers[runtimeAnchorId]
+  if (
+    (runtimeAnchorRunning && endpoint?.Name !== androidRuntimeAnchorName(roomId)) ||
+    (!runtimeAnchorRunning && endpoint !== undefined)
+  ) {
+    throw new Error('Android recovery runtime network does not match the retained runtime anchor state')
   }
 }

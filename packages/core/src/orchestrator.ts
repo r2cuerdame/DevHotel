@@ -35,6 +35,8 @@ import type {
   AndroidLaunchResult,
   AndroidLogcatInput,
   AndroidLogcatResult,
+  AndroidLocaleScreenshotMatrixInput,
+  AndroidLocaleScreenshotMatrixResult,
   AndroidRunCrashScenarioInput,
   AndroidTapTextInput,
   AndroidTapTextResult,
@@ -67,11 +69,15 @@ import type {
   SourceType
 } from '@devhotel/shared'
 import {
+  canonicalAndroidLocaleTags,
   hostInputCapability,
+  androidLocaleScreenshotFilename,
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   VMWARE_CONSOLE_CAPABILITY,
   zArtifactExportBody,
   zArtifactListLimit,
+  zAndroidApplicationId,
+  zAndroidLocaleScreenshotMatrixBody,
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
@@ -79,7 +85,11 @@ import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
-import { AndroidAutomationSession, type AndroidForegroundInstallEvidence } from './devices/androidAutomation'
+import {
+  AndroidAutomationSession,
+  type AndroidAppLocaleRestoreFence,
+  type AndroidForegroundInstallEvidence
+} from './devices/androidAutomation'
 import { artifactsRepo } from './store/artifactsRepo'
 import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
@@ -189,6 +199,7 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'an
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
+const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
 
 interface PendingArtifactExport {
   version: 1
@@ -238,6 +249,141 @@ function parsePendingArtifactExport(raw: string): PendingArtifactExport | null {
     relativePath: path.data.relativePath,
     expected: { sizeBytes: identity.sizeBytes as number, sha256: identity.sha256 },
     stageToken: record.stageToken
+  }
+}
+
+interface PendingAndroidLocaleRestore {
+  version: 1
+  operationId: string
+  stage: number
+  applicationId: string
+  originalLocaleTags: string[]
+  expectedLocaleTags: string[]
+  attemptedLocaleTags: string[]
+  fence: AndroidAppLocaleRestoreFence
+}
+
+function pendingAndroidLocaleRestoreKey(roomId: string): string {
+  return `${ANDROID_LOCALE_RESTORE_PENDING_PREFIX}${roomId}`
+}
+
+function sameStringValues(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function sameAndroidLocaleRestoreFence(
+  left: AndroidAppLocaleRestoreFence,
+  right: AndroidAppLocaleRestoreFence
+): boolean {
+  return left.targetKind === right.targetKind &&
+    left.targetId === right.targetId &&
+    left.deviceId === right.deviceId &&
+    left.leaseId === right.leaseId &&
+    left.roomId === right.roomId &&
+    left.applicationId === right.applicationId &&
+    left.changeId === right.changeId &&
+    left.apkSha256 === right.apkSha256 &&
+    left.installedAt === right.installedAt &&
+    left.packageIncarnation === right.packageIncarnation &&
+    left.installUserId === right.installUserId &&
+    left.installUserSerial === right.installUserSerial &&
+    left.apiLevel === right.apiLevel
+}
+
+function parsePersistedLocaleTags(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) return null
+  const canonical = canonicalAndroidLocaleTags(value as string[], { allowEmpty: true })
+  return canonical && sameStringValues(canonical, value as string[]) ? canonical : null
+}
+
+function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingAndroidLocaleRestore | null {
+  if (Buffer.byteLength(raw, 'utf8') > 16 * 1024) return null
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (
+    Object.keys(record).sort().join(',') !==
+      'applicationId,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version' ||
+    record.version !== 1 ||
+    typeof record.operationId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(record.operationId) ||
+    !Number.isSafeInteger(record.stage) ||
+    (record.stage as number) < 0
+  ) return null
+  const applicationId = zAndroidApplicationId.safeParse(record.applicationId)
+  const originalLocaleTags = parsePersistedLocaleTags(record.originalLocaleTags)
+  const expectedLocaleTags = parsePersistedLocaleTags(record.expectedLocaleTags)
+  const attemptedLocaleTags = parsePersistedLocaleTags(record.attemptedLocaleTags)
+  if (
+    !applicationId.success ||
+    originalLocaleTags === null ||
+    expectedLocaleTags === null ||
+    attemptedLocaleTags === null
+  ) return null
+
+  if (record.fence === null || typeof record.fence !== 'object' || Array.isArray(record.fence)) return null
+  const fence = record.fence as Record<string, unknown>
+  if (
+    Object.keys(fence).sort().join(',') !==
+      'apiLevel,apkSha256,applicationId,changeId,deviceId,installUserId,installUserSerial,installedAt,leaseId,packageIncarnation,roomId,targetId,targetKind' ||
+    (fence.targetKind !== 'emulator' && fence.targetKind !== 'physical') ||
+    typeof fence.targetId !== 'string' ||
+    fence.roomId !== roomId ||
+    fence.applicationId !== applicationId.data ||
+    typeof fence.changeId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(fence.changeId) ||
+    typeof fence.apkSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(fence.apkSha256) ||
+    typeof fence.packageIncarnation !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(fence.packageIncarnation) ||
+    typeof fence.installedAt !== 'string' ||
+    !Number.isFinite(Date.parse(fence.installedAt)) ||
+    new Date(fence.installedAt).toISOString() !== fence.installedAt ||
+    !Number.isSafeInteger(fence.installUserId) ||
+    (fence.installUserId as number) < 0 ||
+    !Number.isSafeInteger(fence.installUserSerial) ||
+    (fence.installUserSerial as number) < 0 ||
+    !Number.isSafeInteger(fence.apiLevel) ||
+    (fence.apiLevel as number) < 33 ||
+    (fence.apiLevel as number) > 100
+  ) return null
+  if (fence.targetKind === 'emulator') {
+    if (fence.targetId !== roomId || fence.deviceId !== null || fence.leaseId !== null) return null
+  } else if (
+    !/^d[a-f0-9]{32}$/.test(fence.targetId) ||
+    fence.deviceId !== fence.targetId ||
+    typeof fence.leaseId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(fence.leaseId)
+  ) return null
+
+  return {
+    version: 1,
+    operationId: record.operationId,
+    stage: record.stage as number,
+    applicationId: applicationId.data,
+    originalLocaleTags,
+    expectedLocaleTags,
+    attemptedLocaleTags,
+    fence: {
+      targetKind: fence.targetKind,
+      targetId: fence.targetId,
+      deviceId: fence.deviceId as string | null,
+      leaseId: fence.leaseId as string | null,
+      roomId,
+      applicationId: applicationId.data,
+      changeId: fence.changeId,
+      apkSha256: fence.apkSha256,
+      installedAt: fence.installedAt,
+      packageIncarnation: fence.packageIncarnation,
+      installUserId: fence.installUserId as number,
+      installUserSerial: fence.installUserSerial as number,
+      apiLevel: fence.apiLevel as number
+    }
   }
 }
 const SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
@@ -569,6 +715,14 @@ export class RoomOrchestrator {
         if (room === null || room.status === 'sleeping' || room.status === 'broken') return false
         return workerProcessLiveness(lease.workerId)
       },
+      recoveryProtected: (lease) => {
+        const raw = this.settings.get(pendingAndroidLocaleRestoreKey(lease.roomId))
+        if (raw === null) return false
+        const pending = parsePendingAndroidLocaleRestore(raw, lease.roomId)
+        return pending?.fence.targetKind === 'physical' &&
+          pending.fence.deviceId === lease.deviceId &&
+          pending.fence.leaseId === lease.id
+      },
       roomEligible: (roomId) => {
         const room = this.rooms.get(roomId)
         return room !== null && room.status !== 'sleeping' && room.status !== 'broken'
@@ -578,10 +732,17 @@ export class RoomOrchestrator {
   }
 
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
+    // A prior process may have died after Docker accepted a one-shot Android
+    // locale writer. No recovery proof is trustworthy until every such job is
+    // removed and the managed inventory proves the role absent.
+    const staleJobsAbsent = await this.removeStartupStaleJobs()
+    // Locale commands are persistent Android mutations. Recover or hard-gate
+    // an interrupted matrix before any unrelated startup dependency can fail.
+    const pendingAndroidLocaleRecoveryRooms = await this.reconcileInterruptedAndroidLocaleRestorations(staleJobsAbsent)
     // The desktop still exposes its control API when init fails. Fence and
     // stop an uncertain exported workspace before any unrelated startup work
     // can abort initialization and leave the old Room record admissible.
-    await this.reconcileInterruptedArtifactExports()
+    await this.reconcileInterruptedArtifactExports(staleJobsAbsent)
     // Callers must never keep polling work that died with the prior process.
     this.markInterruptedOperations()
     for (const room of this.rooms.list()) {
@@ -597,7 +758,12 @@ export class RoomOrchestrator {
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
     if (health.ok) {
-      reconciled = await reconcile(this.backend, this.rooms, (l) => this.olog('system', l))
+      reconciled = await reconcile(
+        this.backend,
+        this.rooms,
+        (l) => this.olog('system', l),
+        { preserveAwakeRoomIds: pendingAndroidLocaleRecoveryRooms }
+      )
     }
     await this.reconcileWindowsRooms()
     await this.markInterruptedChanges()
@@ -615,7 +781,141 @@ export class RoomOrchestrator {
     }
   }
 
-  private async reconcileInterruptedArtifactExports(): Promise<void> {
+  private async removeStartupStaleJobs(): Promise<boolean> {
+    try {
+      const staleJobs = (await this.backend.listManagedContainers()).filter((container) => container.role === 'job')
+      for (const job of staleJobs) await this.backend.removeManagedContainer(job.name)
+      return !(await this.backend.listManagedContainers()).some((container) => container.role === 'job')
+    } catch {
+      return false
+    }
+  }
+
+  private async reconcileInterruptedAndroidLocaleRestorations(staleJobsAbsent: boolean): Promise<Set<string>> {
+    const pendingRooms = this.rooms.list().flatMap((room) => {
+      const key = pendingAndroidLocaleRestoreKey(room.id)
+      const raw = this.settings.get(key)
+      return raw === null ? [] : [{ room, key, raw, pending: parsePendingAndroidLocaleRestore(raw, room.id) }]
+    })
+    const unresolved = new Set(pendingRooms.map(({ room }) => room.id))
+
+    for (const { room, key, raw, pending } of pendingRooms) {
+      let restored = false
+      if (
+        pending !== null &&
+        room.provider === 'android' &&
+        pending.fence.targetKind === 'emulator' &&
+        staleJobsAbsent
+      ) {
+        try {
+          await this.withRoomLock(room.id, async () => {
+            const selector: AndroidTargetSelector = { kind: 'emulator' }
+            const current = this.mustGet(room.id)
+            if (current.status !== 'running' && current.status !== 'ready' && current.status !== 'attention') {
+              // Recovery starts only the control anchor/emulator. Mark the
+              // Room awake first so a crash cannot hide those processes
+              // behind a persisted sleeping status; normal reconcile sleeps
+              // it again after a successful intent release.
+              this.rooms.update(room.id, { status: 'attention' })
+            }
+            await this.backend.startExistingEmulatorForRecovery(room.id)
+            const session = await this.openAndroidAutomationSessionLocked(
+              room.id,
+              selector,
+              { allowPendingRecovery: true }
+            )
+            const beforeRestore = await session.proveAppLocaleFinalState(
+              pending.applicationId,
+              pending.fence,
+              30_000
+            )
+            if (
+              beforeRestore.apiLevel !== pending.fence.apiLevel ||
+              !sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, pending.fence) ||
+              beforeRestore.pids.length === 0 ||
+              (
+                !sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags) &&
+                !sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
+              )
+            ) {
+              throw new Error('Interrupted Android locale stage no longer owns the exact current target')
+            }
+            const recoveryStage: PendingAndroidLocaleRestore = {
+              ...pending,
+              operationId: pending.stage === Number.MAX_SAFE_INTEGER ? randomUUID() : pending.operationId,
+              stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
+              expectedLocaleTags: [...beforeRestore.localeTags],
+              attemptedLocaleTags: [...pending.originalLocaleTags]
+            }
+            const recoveryValue = JSON.stringify(recoveryStage)
+            // No await separates the last exact observation above from this
+            // CAS. A crash after it can always recognize either the prior
+            // locale or the original locale that recovery is about to attempt.
+            if (!this.settings.setIfValue(key, raw, recoveryValue)) {
+              throw new Error('Interrupted Android locale restoration ownership changed before mutation')
+            }
+            const result = await session.withActiveUserScreenWitness(
+              (signal) => session.restoreAppLocalesFromFence(
+                recoveryStage.applicationId,
+                recoveryStage.originalLocaleTags,
+                recoveryStage.fence,
+                recoveryStage.expectedLocaleTags,
+                recoveryStage.attemptedLocaleTags,
+                { timeoutMs: 30_000, signal }
+              ),
+              { actionTimeoutMs: 30_000, allowApplicationIdTransitions: recoveryStage.applicationId }
+            )
+            const fresh = await session.proveAppLocaleFinalState(
+              recoveryStage.applicationId,
+              recoveryStage.fence,
+              30_000
+            )
+            if (
+              result.applicationId !== recoveryStage.applicationId ||
+              result.apiLevel !== recoveryStage.fence.apiLevel ||
+              !sameStringValues(result.localeTags, recoveryStage.originalLocaleTags) ||
+              !sameAndroidLocaleRestoreFence(result.restoreFence, recoveryStage.fence) ||
+              result.pids.length === 0 ||
+              result.readiness.application !== 'foreground' ||
+              result.readiness.localeService !== 'ready' ||
+              result.readiness.process !== 'running' ||
+              fresh.apiLevel !== recoveryStage.fence.apiLevel ||
+              !sameStringValues(fresh.localeTags, recoveryStage.originalLocaleTags) ||
+              !sameAndroidLocaleRestoreFence(fresh.restoreFence, recoveryStage.fence) ||
+              fresh.pids.length === 0
+            ) {
+              throw new Error('Interrupted Android locale restoration proof changed')
+            }
+            // Final proof returned after every helper closed. Keep release in
+            // this same JS turn so no awaited result can be reused later.
+            if (!this.deletePendingAndroidLocaleRestorationIfOwned(key, recoveryValue, recoveryStage)) {
+              throw new Error('Interrupted Android locale restoration ownership changed')
+            }
+            restored = true
+            unresolved.delete(room.id)
+          }, { allowPendingAndroidLocaleRestoration: true })
+        } catch {
+          // The retained value remains a hard mutation gate. Recovery can be
+          // retried only with the exact target/install/user/lease authority.
+        }
+      }
+      if (!restored) {
+        const current = this.rooms.get(room.id)
+        if (current && current.provider === 'android') {
+          this.rooms.update(room.id, { status: 'attention' })
+        }
+      }
+      this.olog(
+        room.id,
+        restored
+          ? 'interrupted Android locale matrix was restored under its exact retained fence'
+          : 'interrupted Android locale matrix still needs exact target recovery; private details were withheld'
+      )
+    }
+    return unresolved
+  }
+
+  private async reconcileInterruptedArtifactExports(staleJobsAbsent: boolean): Promise<void> {
     const interrupted: Array<{
       room: RoomRecord
       key: string
@@ -641,18 +941,8 @@ export class RoomOrchestrator {
       interrupted.push({ room, key, raw, pending, fenced })
     }
 
-    // A retained created/exited job is still a restartable write capability.
-    // Reap every startup-stale job and prove the role absent before deleting
-    // private input bytes or running any recovery finalizer.
-    let staleJobsAbsent = false
-    try {
-      const staleJobs = (await this.backend.listManagedContainers()).filter((container) => container.role === 'job')
-      for (const job of staleJobs) await this.backend.removeManagedContainer(job.name)
-      staleJobsAbsent = !(await this.backend.listManagedContainers()).some((container) => container.role === 'job')
-    } catch {
-      // Pending intents remain as hard mutation gates until exact job absence
-      // can be established during a later startup.
-    }
+    // The shared startup prepass already removed every retained job and proved
+    // the role absent before locale or artifact recovery was allowed to run.
     if (staleJobsAbsent) this.cleanupStaleArtifactExportStaging()
 
     for (const { room, key, raw, pending, fenced } of interrupted) {
@@ -890,6 +1180,17 @@ export class RoomOrchestrator {
     // all other lifecycle work is represented in roomOps. The global gate above
     // prevents new work; waiting for both sets makes the room list stable.
     await this.drainRoomMutations()
+    const localeRecoveryRooms = this.rooms.list().filter(
+      (room) => this.settings.get(pendingAndroidLocaleRestoreKey(room.id)) !== null
+    )
+    if (localeRecoveryRooms.length > 0) {
+      throw new AggregateError(
+        localeRecoveryRooms.map(() => new Error('An Android locale recovery fence still owns its exact target.')),
+        `DevHotel shutdown blocked by ${localeRecoveryRooms.length} pending Android locale restoration${
+          localeRecoveryRooms.length === 1 ? '' : 's'
+        }`
+      )
+    }
     for (const room of this.rooms.list()) {
       if (room.status === 'sleeping') continue
       try {
@@ -928,7 +1229,11 @@ export class RoomOrchestrator {
   private withRoomLock<T>(
     roomId: string,
     fn: () => Promise<T>,
-    opts: { admittedBeforeGate?: boolean; allowPendingArtifactExport?: boolean } = {}
+    opts: {
+      admittedBeforeGate?: boolean
+      allowPendingArtifactExport?: boolean
+      allowPendingAndroidLocaleRestoration?: boolean
+    } = {}
   ): Promise<T> {
     if (this.mutationGate !== 'open' && !opts.admittedBeforeGate) {
       return Promise.reject(this.mutationGateError())
@@ -936,6 +1241,7 @@ export class RoomOrchestrator {
     const prev = this.roomOps.get(roomId) ?? Promise.resolve()
     const next = prev.catch(() => undefined).then(async () => {
       if (!opts.allowPendingArtifactExport) this.assertNoPendingArtifactExport(roomId)
+      if (!opts.allowPendingAndroidLocaleRestoration) this.assertNoPendingAndroidLocaleRestoration(roomId)
       if (this.activeRoomLocks.has(roomId)) throw new Error(`Room ${roomId} lock ownership is ambiguous`)
       this.activeRoomLocks.add(roomId)
       try {
@@ -961,6 +1267,34 @@ export class RoomOrchestrator {
         httpStatus: 409
       }
     )
+  }
+
+  private assertNoPendingAndroidLocaleRestoration(roomId: string): void {
+    if (this.settings.get(pendingAndroidLocaleRestoreKey(roomId)) === null) return
+    throw new DevHotelError(
+      'ANDROID_LOCALE_RECOVERY_REQUIRED',
+      'This Room is fenced while an interrupted Android locale matrix is being restored.',
+      {
+        recoveryHint: 'Restore the exact target, install, Android user and lease, then restart DevHotel.',
+        httpStatus: 409
+      }
+    )
+  }
+
+  private deletePendingAndroidLocaleRestorationIfOwned(
+    key: string,
+    value: string,
+    pending: PendingAndroidLocaleRestore
+  ): boolean {
+    if (pending.fence.targetKind !== 'physical') {
+      return this.settings.deleteIfValue(key, value)
+    }
+    if (!pending.fence.deviceId || !pending.fence.leaseId) return false
+    return this.settings.deleteIfValueForActiveAndroidLease(key, value, {
+      id: pending.fence.leaseId,
+      deviceId: pending.fence.deviceId,
+      roomId: pending.fence.roomId
+    })
   }
 
   private assertRoomLockHeld(roomId: string): void {
@@ -2051,6 +2385,16 @@ export class RoomOrchestrator {
     // volume. Drain them before taking the one stable inventory used below.
     await this.drainRoomMutations()
     const inventory = this.rooms.list()
+    const localeRecoveryCount = inventory.filter(
+      (room) => this.settings.get(pendingAndroidLocaleRestoreKey(room.id)) !== null
+    ).length
+    if (localeRecoveryCount > 0) {
+      throw new Error(
+        `Could not remove Room data while ${localeRecoveryCount} exact Android locale restoration${
+          localeRecoveryCount === 1 ? ' is' : 's are'
+        } still pending`
+      )
+    }
     let deletedRooms = 0
     let reclaimedBytes = 0
     const failures: string[] = []
@@ -2201,25 +2545,7 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, async () => {
       const input = zCaptureScreenshotArtifactBody.parse(rawInput)
       const room = this.mustGet(roomId)
-      if (input.association?.changeId) {
-        const change = this.changes.get(input.association.changeId)
-        if (!change || change.roomId !== roomId) {
-          throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
-            recoveryHint: 'Use a change ID from this Room’s change journal.',
-            httpStatus: 404
-          })
-        }
-      }
-      if (
-        input.association?.runId &&
-        !this.runs.list(roomId).some((run) => run.runId === input.association?.runId)
-      ) {
-        throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
-          recoveryHint: 'Use a run ID currently returned by list_room_runs for this Room.',
-          httpStatus: 404
-        })
-      }
-
+      this.validateScreenshotArtifactAssociationLocked(roomId, input.association)
       // Resolve one exact target before capture. The session retains the
       // physical lease fence; its post-capture status call therefore aborts
       // publication if the phone was handed to a new lease mid-capture.
@@ -2227,144 +2553,452 @@ export class RoomOrchestrator {
       const releaseCapture = this.devices.beginCapturePermit()
       try {
         const session = await this.openAndroidAutomationSessionLocked(roomId, target)
-        const capture = await session.withActiveUserScreenWitness(async (signal) => {
-          const before = await session.foregroundInstallEvidence(signal)
-          if (before.seal === null) {
-            throw new DevHotelError(
-              'SCREENSHOT_APP_NOT_TRACKED',
-              'Screenshot artifacts require an exact tracked foreground Android application.',
-              {
-                recoveryHint: 'Install and launch the application with android_run, then capture a fresh artifact.',
-                httpStatus: 409
-              }
-            )
-          }
-          const shot = await this.androidScreenshotWithCapturePermit(
-            roomId,
-            input.mode ?? 'auto',
-            session.target,
-            signal,
-            before.seal.targetKind === 'physical' ? before.seal.leaseId : null
-          )
-          const capturedAt = new Date().toISOString()
-          const after = await session.foregroundInstallEvidence(signal)
-          return { before, after, capturedAt, shot }
-        }, { actionTimeoutMs: 120_000 })
-        const { after: evidence, before, capturedAt, shot } = capture
-        if (evidence.seal === null) {
+        return this.captureAndroidScreenshotArtifactWithSessionLocked(room, input, actor, session, undefined, true)
+      } finally {
+        releaseCapture()
+      }
+    })
+  }
+
+  private validateScreenshotArtifactAssociationLocked(
+    roomId: string,
+    association: CaptureScreenshotArtifactBody['association']
+  ): void {
+    if (association?.changeId) {
+      const change = this.changes.get(association.changeId)
+      if (!change || change.roomId !== roomId) {
+        throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
+          recoveryHint: 'Use a change ID from this Room’s change journal.',
+          httpStatus: 404
+        })
+      }
+    }
+    if (association?.runId && !this.runs.list(roomId).some((run) => run.runId === association.runId)) {
+      throw new DevHotelError('ARTIFACT_ASSOCIATION_NOT_FOUND', 'Screenshot association was not found in this Room.', {
+        recoveryHint: 'Use a run ID currently returned by list_room_runs for this Room.',
+        httpStatus: 404
+      })
+    }
+  }
+
+  private async captureAndroidScreenshotArtifactWithSessionLocked(
+    room: RoomRecord,
+    input: CaptureScreenshotArtifactBody,
+    actor: Actor,
+    session: AndroidAutomationSession,
+    expectedAppLocale?: { applicationId: string; locale: string; apiLevel: number },
+    capturePermitHeld = false
+  ): Promise<RoomArtifact> {
+    const releaseCapture = capturePermitHeld ? () => {} : this.devices.beginCapturePermit()
+    try {
+      const capture = await session.withActiveUserScreenWitness(async (signal) => {
+        const before = await session.foregroundInstallEvidence(signal)
+        if (
+          before.seal === null ||
+          (expectedAppLocale && before.seal.applicationId !== expectedAppLocale.applicationId)
+        ) {
           throw new DevHotelError(
-            'SCREENSHOT_APP_NOT_TRACKED',
-            'Screenshot artifacts require an exact tracked foreground Android application.',
+            expectedAppLocale ? 'ANDROID_LOCALE_CAPTURE_CHANGED' : 'SCREENSHOT_APP_NOT_TRACKED',
+            expectedAppLocale
+              ? 'The locale matrix app no longer owns the exact tracked foreground screen.'
+              : 'Screenshot artifacts require an exact tracked foreground Android application.',
             {
-              recoveryHint: 'Install and launch the application with android_run, then capture a fresh artifact.',
+              recoveryHint: expectedAppLocale
+                ? 'Return to the tracked matrix app and retry the matrix.'
+                : 'Install and launch the application with android_run, then capture a fresh artifact.',
               httpStatus: 409
             }
           )
         }
-        if (
-          !sameScreenshotInstallEvidence(before, evidence) ||
-          !screenshotInstallEvidenceIsConsistent(evidence) ||
-          evidence.context.receipt?.roomId !== roomId
-        ) {
-          throw new DevHotelError('SCREENSHOT_TARGET_CHANGED', 'Android app context changed while screenshot evidence was captured.', {
-            recoveryHint: 'Return to the intended app and capture a fresh artifact.'
+        if (expectedAppLocale) {
+          await session.assertAppLocaleCaptureState(
+            expectedAppLocale.applicationId,
+            expectedAppLocale.locale,
+            expectedAppLocale.apiLevel,
+            signal
+          )
+        }
+        const shot = await this.androidScreenshotWithCapturePermit(
+          room.id,
+          input.mode ?? 'auto',
+          session.target,
+          signal,
+          before.seal.targetKind === 'physical' ? before.seal.leaseId : null
+        )
+        const capturedAt = new Date().toISOString()
+        if (expectedAppLocale) {
+          await session.assertAppLocaleCaptureState(
+            expectedAppLocale.applicationId,
+            expectedAppLocale.locale,
+            expectedAppLocale.apiLevel,
+            signal
+          )
+        }
+        const after = await session.foregroundInstallEvidence(signal)
+        return { before, after, capturedAt, shot }
+      }, { actionTimeoutMs: 120_000 })
+      const { after: evidence, before, capturedAt, shot } = capture
+      if (evidence.seal === null) {
+        throw new DevHotelError(
+          expectedAppLocale ? 'ANDROID_LOCALE_CAPTURE_CHANGED' : 'SCREENSHOT_APP_NOT_TRACKED',
+          expectedAppLocale
+            ? 'The locale matrix app was no longer the exact tracked foreground app after capture.'
+            : 'Screenshot artifacts require an exact tracked foreground Android application.',
+          {
+            recoveryHint: expectedAppLocale
+              ? 'Return to the tracked matrix app and retry the matrix.'
+              : 'Install and launch the application with android_run, then capture a fresh artifact.',
+            httpStatus: 409
+          }
+        )
+      }
+      if (
+        !sameScreenshotInstallEvidence(before, evidence) ||
+        !screenshotInstallEvidenceIsConsistent(evidence) ||
+        evidence.context.receipt?.roomId !== room.id ||
+        (expectedAppLocale && evidence.seal.applicationId !== expectedAppLocale.applicationId)
+      ) {
+        throw new DevHotelError(
+          expectedAppLocale ? 'ANDROID_LOCALE_CAPTURE_CHANGED' : 'SCREENSHOT_TARGET_CHANGED',
+          'Android app context changed while screenshot evidence was captured.',
+          { recoveryHint: 'Return to the intended app and capture fresh evidence.' }
+        )
+      }
+      let validated: ReturnType<typeof validateAndSanitizeScreenshotPng>
+      try {
+        validated = validateAndSanitizeScreenshotPng(decodeScreenshotBase64(shot.png))
+      } catch (error) {
+        if (error instanceof DevHotelError) throw error
+        throw new DevHotelError('SCREENSHOT_INVALID', 'Android capture did not return a valid bounded PNG.', {
+          recoveryHint: 'Retry the capture after the Android target is fully ready.',
+          cause: error
+        })
+      }
+      const { receipt, status } = evidence.context
+      if (!receipt) throw new Error('tracked screenshot evidence lost its receipt')
+      // The in-process Room lock cannot exclude a second DevHotel process.
+      // Re-read after the screen witness, then let publishScreenshot prove
+      // this same revision again under its cross-process write transaction.
+      const currentRoom = this.mustGet(room.id)
+      if (
+        currentRoom.stateRevision !== room.stateRevision ||
+        currentRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision
+      ) {
+        throw new DevHotelError(
+          'SCREENSHOT_TARGET_CHANGED',
+          'Room state changed while screenshot evidence was captured.',
+          { recoveryHint: 'Capture a fresh artifact from the current Room state.' }
+        )
+      }
+      const systemLocale = artifactLocale(status.locale)
+      const metadata: AndroidScreenshotArtifactMetadata = {
+        schema: 1,
+        room: {
+          id: room.id,
+          stateRevision: room.stateRevision,
+          workspaceVolumeRevision: room.workspaceVolumeRevision
+        },
+        capture: {
+          source: shot.source,
+          capturedAt,
+          width: validated.width,
+          height: validated.height,
+          orientation: validated.orientation
+        },
+        device: {
+          kind: status.target.kind,
+          deviceId: status.target.deviceId,
+          model: artifactMetadataText(status.target.model, 200),
+          androidVersion: artifactMetadataText(status.target.androidVersion, 64),
+          apiLevel: expectedAppLocale?.apiLevel ?? status.target.apiLevel
+        },
+        app: {
+          status: 'tracked-active',
+          packageName: receipt.applicationId
+        },
+        locale: expectedAppLocale
+          ? { tag: expectedAppLocale.locale, scope: 'app' }
+          : { tag: systemLocale, scope: systemLocale ? 'system' : 'unknown' },
+        build: {
+          exact: true,
+          changeId: receipt.changeId,
+          apkSha256: receipt.apkSha256,
+          installedAt: receipt.installedAt
+        },
+        association: {
+          changeId: input.association?.changeId ?? null,
+          runId: input.association?.runId ?? null
+        }
+      }
+      try {
+        return this.artifacts.publishScreenshot({
+          roomId: room.id,
+          filename: input.filename,
+          png: validated.png,
+          actor,
+          createdAt: capturedAt,
+          metadata
+        })
+      } catch (error) {
+        if (error instanceof Error && /artifact quota reached/i.test(error.message)) {
+          throw new DevHotelError('ARTIFACT_QUOTA_REACHED', 'This Room’s screenshot artifact quota is full.', {
+            recoveryHint: 'Delete the Room when its evidence is no longer needed, or capture in a fresh Room.'
           })
         }
-        let validated: ReturnType<typeof validateAndSanitizeScreenshotPng>
-        try {
-          validated = validateAndSanitizeScreenshotPng(decodeScreenshotBase64(shot.png))
-        } catch (error) {
-          if (error instanceof DevHotelError) throw error
-          throw new DevHotelError('SCREENSHOT_INVALID', 'Android capture did not return a valid bounded PNG.', {
-            recoveryHint: 'Retry the capture after the Android target is fully ready.',
-            cause: error
-          })
-        }
-        const { receipt, status } = evidence.context
-        if (!receipt) throw new Error('tracked screenshot evidence lost its receipt')
-        // The in-process Room lock cannot exclude a second DevHotel process.
-        // Re-read after the screen witness, then let publishScreenshot prove
-        // this same revision again under its cross-process write transaction.
-        const currentRoom = this.mustGet(roomId)
-        if (
-          currentRoom.stateRevision !== room.stateRevision ||
-          currentRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision
-        ) {
+        if (error instanceof Error && /Room revision changed before publication/.test(error.message)) {
           throw new DevHotelError(
             'SCREENSHOT_TARGET_CHANGED',
-            'Room state changed while screenshot evidence was captured.',
+            'Room state changed before screenshot artifact publication.',
             { recoveryHint: 'Capture a fresh artifact from the current Room state.' }
           )
         }
-        const packageName = receipt.applicationId
-        const locale = artifactLocale(status.locale)
-        const metadata: AndroidScreenshotArtifactMetadata = {
-          schema: 1,
-          room: {
-            id: room.id,
-            stateRevision: room.stateRevision,
-            workspaceVolumeRevision: room.workspaceVolumeRevision
-          },
-          capture: {
-            source: shot.source,
-            capturedAt,
-            width: validated.width,
-            height: validated.height,
-            orientation: validated.orientation
-          },
-          device: {
-            kind: status.target.kind,
-            deviceId: status.target.deviceId,
-            model: artifactMetadataText(status.target.model, 200),
-            androidVersion: artifactMetadataText(status.target.androidVersion, 64),
-            apiLevel: status.target.apiLevel
-          },
-          app: {
-            status: 'tracked-active',
-            packageName
-          },
-          locale: {
-            tag: locale,
-            scope: locale ? 'system' : 'unknown'
-          },
-          build: {
-            exact: true,
-            changeId: receipt.changeId,
-            apkSha256: receipt.apkSha256,
-            installedAt: receipt.installedAt
-          },
-          association: {
-            changeId: input.association?.changeId ?? null,
-            runId: input.association?.runId ?? null
-          }
+        throw new DevHotelError('ARTIFACT_STORE_FAILED', 'Screenshot artifact could not be published safely.', {
+          recoveryHint: 'Retry the capture; no partial artifact was made visible.',
+          cause: error,
+          httpStatus: 500
+        })
+      }
+    } finally {
+      releaseCapture()
+    }
+  }
+
+  androidLocaleScreenshotMatrix(
+    roomId: string,
+    rawInput: AndroidLocaleScreenshotMatrixInput,
+    actor: Actor
+  ): Promise<AndroidLocaleScreenshotMatrixResult> {
+    return this.withRoomLock(roomId, async () => {
+      const input = zAndroidLocaleScreenshotMatrixBody.parse(rawInput)
+      const captures = input.locales.map((locale) => ({
+        locale,
+        input: zCaptureScreenshotArtifactBody.parse({
+          filename: androidLocaleScreenshotFilename(input.filenamePrefix, locale),
+          mode: 'auto',
+          ...(input.association ? { association: input.association } : {})
+        })
+      }))
+      const room = this.mustGet(roomId)
+      this.validateScreenshotArtifactAssociationLocked(roomId, input.association)
+      const timeoutMs = input.readinessTimeoutMs ?? 30_000
+      const releaseCapture = this.devices.beginCapturePermit()
+      try {
+        const session = await this.openAndroidAutomationSessionLocked(
+          roomId,
+          input.target ?? { kind: 'emulator' }
+        )
+        const original = await session.appLocaleSnapshot(input.applicationId, timeoutMs)
+        if (original.restoreFence.targetKind !== 'emulator') {
+          throw new DevHotelError(
+            'ANDROID_LOCALE_TARGET_CHANGED',
+            'Android locale matrices are restricted to the Room emulator.',
+            {
+              recoveryHint: 'Choose the managed Room emulator explicitly; physical and auto targets are not supported.',
+              httpStatus: 409
+            }
+          )
         }
-        try {
-          return this.artifacts.publishScreenshot({
-            roomId,
-            filename: input.filename,
-            png: validated.png,
-            actor,
-            createdAt: capturedAt,
-            metadata
-          })
-        } catch (error) {
-          if (error instanceof Error && /artifact quota reached/i.test(error.message)) {
-            throw new DevHotelError('ARTIFACT_QUOTA_REACHED', 'This Room’s screenshot artifact quota is full.', {
-              recoveryHint: 'Delete the Room when its evidence is no longer needed, or capture in a fresh Room.'
-            })
-          }
-          if (error instanceof Error && /Room revision changed before publication/.test(error.message)) {
+        const pendingKey = pendingAndroidLocaleRestoreKey(roomId)
+        let pending: PendingAndroidLocaleRestore = {
+          version: 1,
+          operationId: randomUUID(),
+          stage: 0,
+          applicationId: input.applicationId,
+          originalLocaleTags: [...original.localeTags],
+          expectedLocaleTags: [...original.localeTags],
+          attemptedLocaleTags: [captures[0]!.locale],
+          fence: original.restoreFence
+        }
+        let pendingValue = JSON.stringify(pending)
+        const inserted = this.settings.setIfAbsent(pendingKey, pendingValue)
+        if (!inserted) {
+          throw new DevHotelError(
+            'ANDROID_LOCALE_RECOVERY_REQUIRED',
+            'A prior Android locale matrix still owns this Room recovery fence.',
+            {
+              recoveryHint: 'Restore the exact target, install, Android user and lease, then restart DevHotel.',
+              httpStatus: 409
+            }
+          )
+        }
+        const entries: AndroidLocaleScreenshotMatrixResult['entries'] = []
+        let primaryFailure: unknown = null
+        let expectedLocaleTags: string[] = [...original.localeTags]
+        const assertFreshLocaleState = async (expected: readonly string[]) => {
+          const fresh = await session.proveAppLocaleFinalState(
+            input.applicationId,
+            original.restoreFence,
+            timeoutMs
+          )
+          if (
+            fresh.apiLevel !== original.apiLevel ||
+            !sameStringValues(fresh.localeTags, expected) ||
+            !sameAndroidLocaleRestoreFence(fresh.restoreFence, original.restoreFence) ||
+            fresh.pids.length === 0
+          ) {
             throw new DevHotelError(
-              'SCREENSHOT_TARGET_CHANGED',
-              'Room state changed before screenshot artifact publication.',
-              { recoveryHint: 'Capture a fresh artifact from the current Room state.' }
+              'ANDROID_LOCALE_TARGET_CHANGED',
+              'The exact Android locale or tracked install changed after the witnessed action.',
+              { recoveryHint: 'Recover only under the retained exact matrix stage; do not overwrite the new state.' }
             )
           }
-          throw new DevHotelError('ARTIFACT_STORE_FAILED', 'Screenshot artifact could not be published safely.', {
-            recoveryHint: 'Retry the capture; no partial artifact was made visible.',
-            cause: error,
-            httpStatus: 500
-          })
+          return fresh
+        }
+        const advancePendingStage = (
+          expected: readonly string[],
+          attempted: readonly string[]
+        ): void => {
+          const next: PendingAndroidLocaleRestore = {
+            ...pending,
+            operationId: pending.stage === Number.MAX_SAFE_INTEGER ? randomUUID() : pending.operationId,
+            stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
+            expectedLocaleTags: [...expected],
+            attemptedLocaleTags: [...attempted]
+          }
+          const nextValue = JSON.stringify(next)
+          if (!this.settings.setIfValue(pendingKey, pendingValue, nextValue)) {
+            throw new DevHotelError(
+              'ANDROID_LOCALE_RECOVERY_REQUIRED',
+              'The Android locale recovery stage changed before the next mutation.',
+              {
+                recoveryHint: 'Keep the exact target connected and restart DevHotel for retained recovery.',
+                httpStatus: 409
+              }
+            )
+          }
+          pending = next
+          pendingValue = nextValue
+        }
+        try {
+          for (const [index, capture] of captures.entries()) {
+            const { locale } = capture
+            if (index > 0) {
+              await assertFreshLocaleState(expectedLocaleTags)
+              advancePendingStage(expectedLocaleTags, [locale])
+            }
+            const transition = await session.withActiveUserScreenWitness(
+              (signal) => session.applyAppLocalesAndWait(
+                input.applicationId,
+                [locale],
+                {
+                  timeoutMs,
+                  signal,
+                  expectedPreviousLocaleTags: expectedLocaleTags,
+                  restoreFence: original.restoreFence
+                }
+              ),
+              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+            )
+            if (
+              transition.apiLevel !== original.apiLevel ||
+              !sameStringValues(transition.previousLocaleTags, expectedLocaleTags) ||
+              !sameStringValues(transition.localeTags, [locale]) ||
+              !sameAndroidLocaleRestoreFence(transition.restoreFence, original.restoreFence)
+            ) {
+              throw new DevHotelError(
+                'ANDROID_LOCALE_TARGET_CHANGED',
+                'The exact Android target, install, API or prior locale changed during the locale matrix.',
+                { recoveryHint: 'Recover the original target and let DevHotel restore its retained locale intent.' }
+              )
+            }
+            await assertFreshLocaleState([locale])
+            expectedLocaleTags = [locale]
+            const artifact = await this.captureAndroidScreenshotArtifactWithSessionLocked(
+              room,
+              capture.input,
+              actor,
+              session,
+              { applicationId: input.applicationId, locale, apiLevel: original.apiLevel },
+              true
+            )
+            entries.push({
+              locale,
+              readiness: transition.readiness,
+              process: transition.process,
+              artifact
+            })
+          }
+        } catch (error) {
+          primaryFailure = error
+        }
+
+        let restoration: AndroidLocaleScreenshotMatrixResult['restoration'] | null = null
+        try {
+          const beforeRestore = await session.proveAppLocaleFinalState(
+            input.applicationId,
+            original.restoreFence,
+            timeoutMs
+          )
+          if (
+            beforeRestore.apiLevel !== original.apiLevel ||
+            !sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, original.restoreFence) ||
+            beforeRestore.pids.length === 0 ||
+            (
+              !sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags) &&
+              !sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
+            )
+          ) {
+            throw new Error('Android locale is outside the exact retained matrix stage')
+          }
+          advancePendingStage(beforeRestore.localeTags, original.localeTags)
+          const restored = await session.withActiveUserScreenWitness(
+            (signal) => session.restoreAppLocalesFromFence(
+              input.applicationId,
+              original.localeTags,
+              original.restoreFence,
+              pending.expectedLocaleTags,
+              pending.attemptedLocaleTags,
+              { timeoutMs, signal }
+            ),
+            { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+          )
+          if (
+            restored.apiLevel !== original.apiLevel ||
+            !sameStringValues(restored.localeTags, original.localeTags) ||
+            !sameAndroidLocaleRestoreFence(restored.restoreFence, original.restoreFence) ||
+            restored.pids.length === 0 ||
+            restored.readiness.application !== 'foreground' ||
+            restored.readiness.localeService !== 'ready' ||
+            restored.readiness.process !== 'running'
+          ) {
+              throw new Error('Android locale restoration proof changed')
+          }
+          const finalRestored = await assertFreshLocaleState(original.localeTags)
+          restoration = {
+            localeTags: [...original.localeTags],
+            readiness: { ...restored.readiness, pids: [...finalRestored.pids] }
+          }
+          if (!this.deletePendingAndroidLocaleRestorationIfOwned(pendingKey, pendingValue, pending)) {
+            throw new Error('Android locale restoration intent ownership changed before completion')
+          }
+        } catch (restoreFailure) {
+          const current = this.rooms.get(roomId)
+          if (current && (current.status === 'running' || current.status === 'ready' || current.status === 'attention')) {
+            this.rooms.update(roomId, { status: 'attention' })
+          }
+          throw new DevHotelError(
+            'ANDROID_LOCALE_RESTORE_FAILED',
+            'The locale matrix did not prove and release the original app-locale ready state.',
+            {
+              recoveryHint: 'Keep the exact target connected and restart DevHotel so the retained recovery intent can run.',
+              cause: new AggregateError([primaryFailure, restoreFailure].filter(Boolean)),
+              evidence: {
+                stage: 'restore',
+                primaryFailureCode: primaryFailure instanceof DevHotelError ? primaryFailure.code : null,
+                restoreFailureCode: restoreFailure instanceof DevHotelError ? restoreFailure.code : null
+              }
+            }
+          )
+        }
+        if (primaryFailure) throw primaryFailure
+        if (!restoration) throw new Error('locale matrix completed without a restoration proof')
+        return {
+          target: session.target,
+          applicationId: input.applicationId,
+          apiLevel: original.apiLevel,
+          scope: 'app',
+          entries,
+          restoration
         }
       } finally {
         releaseCapture()
@@ -2982,7 +3616,8 @@ export class RoomOrchestrator {
    */
   private async openAndroidAutomationSessionLocked(
     roomId: string,
-    selector: AndroidTargetSelector
+    selector: AndroidTargetSelector,
+    options: { allowPendingRecovery?: boolean } = {}
   ): Promise<AndroidAutomationSession> {
     this.assertRoomLockHeld(roomId)
     const room = this.mustGet(roomId)
@@ -2992,7 +3627,7 @@ export class RoomOrchestrator {
       })
     }
     const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
-    if (!awake) {
+    if (!awake && !options.allowPendingRecovery) {
       throw new DevHotelError('ANDROID_ROOM_ASLEEP', 'Wake the Android Room before driving its target.', {
         recoveryHint: 'Start the Room, wait for the target to become ready, and retry.', httpStatus: 409
       })
@@ -3065,7 +3700,7 @@ export class RoomOrchestrator {
       })
     }
 
-    if ((await this.backend.emulatorState(roomId)) !== 'running') {
+    if (!options.allowPendingRecovery && (await this.backend.emulatorState(roomId)) !== 'running') {
       throw new DevHotelError('ANDROID_EMULATOR_NOT_RUNNING', 'The Room emulator is not running.', {
         recoveryHint: 'Restart the Android Room and wait for its emulator container.', httpStatus: 409
       })
@@ -3085,7 +3720,10 @@ export class RoomOrchestrator {
       installTarget: { kind: 'emulator', targetId: roomId, deviceId: null },
       installs: this.androidInstalls,
       exec: async (args, opts) => {
-        const result = await this.backend.execFencedEmulatorAdb(
+        const exec = options.allowPendingRecovery
+          ? this.backend.execFencedEmulatorRecoveryAdb.bind(this.backend)
+          : this.backend.execFencedEmulatorAdb.bind(this.backend)
+        const result = await exec(
           roomId,
           protectAndroidRemoteCommand(args),
           {

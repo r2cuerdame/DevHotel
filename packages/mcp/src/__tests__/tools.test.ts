@@ -82,6 +82,22 @@ beforeAll(async () => {
       if (req.url === '/v1/rooms/abc12345/artifacts/screenshots' && req.method === 'POST') {
         return void res.end(JSON.stringify({ ...artifact, filename: JSON.parse(raw).filename }))
       }
+      if (req.url === '/v1/rooms/abc12345/android/locale-matrix' && req.method === 'POST') {
+        const body = JSON.parse(raw)
+        return void res.end(JSON.stringify({
+          target: { kind: 'emulator', deviceId: null },
+          applicationId: body.applicationId,
+          apiLevel: 34,
+          scope: 'app',
+          entries: body.locales.map((locale: string, index: number) => ({
+            locale,
+            readiness: { consecutiveReadyChecks: 2 },
+            process: { beforePids: [100 + index], afterPids: [101 + index], restarted: true },
+            artifact: { ...artifact, filename: `${body.filenamePrefix}-${locale.toLowerCase()}.png` }
+          })),
+          restoration: { localeTags: ['en-US'], readiness: { consecutiveReadyChecks: 2 } }
+        }))
+      }
       if (req.url === '/v1/rooms/abc12345/artifacts?limit=5' && req.method === 'GET') {
         return void res.end(JSON.stringify({ artifacts: [artifact] }))
       }
@@ -237,6 +253,7 @@ describe('makeTools', () => {
         'android_dump_ui',
         'android_force_stop',
         'android_launch_app',
+        'android_locale_screenshot_matrix',
         'android_logcat',
         'android_run',
         'android_run_crash_scenario',
@@ -323,6 +340,49 @@ describe('makeTools', () => {
         association: { changeId: '11111111-2222-4333-8444-555555555555' }
       }
     })
+  })
+
+  it('runs the locale matrix as a receipts-only composite tool', async () => {
+    const result = await byName.android_locale_screenshot_matrix!.handler({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      locales: ['ko-KR', 'en-US'],
+      filenamePrefix: 'release-42',
+      changeId: '11111111-2222-4333-8444-555555555555'
+    })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0]).toMatchObject({ type: 'text' })
+    expect(firstText(result)).toContain('release-42-ko-kr.png')
+    expect(seen.findLast((request) => request.url === '/v1/rooms/abc12345/android/locale-matrix'))
+      .toMatchObject({
+        body: {
+          applicationId: 'com.example.app',
+          locales: ['ko-KR', 'en-US'],
+          filenamePrefix: 'release-42',
+          association: { changeId: '11111111-2222-4333-8444-555555555555' }
+        }
+      })
+
+    const schema = byName.android_locale_screenshot_matrix!.strictInputSchema!
+    expect(schema.parse({
+      roomId: 'abc12345', applicationId: 'com.example.app',
+      locales: ['ko-kr'], filenamePrefix: 'release'
+    }).locales).toEqual(['ko-KR'])
+    expect(schema.safeParse({
+      roomId: 'abc12345', applicationId: 'com.example.app',
+      locales: ['en-US'], filenamePrefix: 'release', serial: 'emulator-5554'
+    }).success).toBe(false)
+    expect(schema.safeParse({
+      roomId: 'abc12345', applicationId: 'com.example.app',
+      locales: ['en-US'], filenamePrefix: 'release', target: { kind: 'auto' }
+    }).success).toBe(false)
+    expect(schema.safeParse({
+      roomId: 'abc12345', applicationId: 'com.example.app',
+      locales: ['en-US'], filenamePrefix: 'release',
+      target: { kind: 'physical', deviceId: `d${'a'.repeat(32)}` }
+    }).success).toBe(false)
   })
 
   it('lists, reads and exports Room artifacts through bounded artifact routes', async () => {

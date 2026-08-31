@@ -39,6 +39,8 @@ export interface DeviceBrokerOptions {
    * only a heartbeat gap *and* a dead owner does.
    */
   ownerLiveness?: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
+  /** Exact durable recovery ownership that must survive sweeps and reconnects. */
+  recoveryProtected?: (lease: DeviceLease) => boolean
   /** Synchronous Room lifecycle fence used before a durable waiter is promoted. */
   roomEligible?: (roomId: string) => boolean
   graceMs?: number
@@ -75,6 +77,7 @@ export class AndroidDeviceBroker {
   private readonly adb: AdbHost
   private readonly now: () => number
   private readonly ownerLiveness: (lease: DeviceLease) => Promise<boolean | 'unknown'> | boolean | 'unknown'
+  private readonly recoveryProtected: (lease: DeviceLease) => boolean
   private readonly roomEligible: (roomId: string) => boolean
   private readonly graceMs: number
   private readonly pairing: AdbPairingCoordinator
@@ -91,6 +94,7 @@ export class AndroidDeviceBroker {
     this.adb = opts.adb
     this.now = opts.now ?? (() => Date.now())
     this.ownerLiveness = opts.ownerLiveness ?? (() => 'unknown')
+    this.recoveryProtected = opts.recoveryProtected ?? (() => false)
     this.roomEligible = opts.roomEligible ?? (() => true)
     this.graceMs = opts.graceMs ?? LEASE_DEFAULT_GRACE_MS
     this.pairing = new AdbPairingCoordinator({
@@ -313,8 +317,18 @@ export class AndroidDeviceBroker {
       // when health was already persisted as disconnected: a process can die
       // between the health update and lease revocation.
       const lease = this.repo.activeLease(device.id)
-      if (lease) {
-        this.repo.closeLease(lease.id, 'revoked', at, 'device disconnected')
+      if (lease && !this.recoveryProtected(lease)) {
+        const closed = this.repo.closeLeaseIf(
+          lease.id,
+          'revoked',
+          at,
+          'device disconnected',
+          (current) => !this.recoveryProtected(current)
+        )
+        if (!closed) {
+          this.deathObservedAt.delete(lease.id)
+          continue
+        }
         this.deathObservedAt.delete(lease.id)
         this.repo.recordEvent({
           deviceId: device.id,
@@ -629,6 +643,18 @@ export class AndroidDeviceBroker {
     return lease
   }
 
+  /** Renew only the exact lease retained by a durable recovery fence. */
+  renewRecoveryLease(roomId: string, deviceId: string, leaseId: string): DeviceLease {
+    const lease = this.repo.activeLease(deviceId)
+    if (!lease || lease.id !== leaseId || lease.roomId !== roomId || !this.recoveryProtected(lease)) {
+      throw new DeviceLeaseError(
+        'lease-expired',
+        'The physical-device lease no longer matches the retained recovery authority.'
+      )
+    }
+    return this.heartbeat(leaseId, { busy: true })
+  }
+
   async release(leaseId: string, reason = 'released'): Promise<{ lease: DeviceLease; promoted: DeviceLease | null }> {
     const lease = this.repo.getLease(leaseId)
     if (!lease) throw new DeviceLeaseError('device-unknown', `unknown lease: ${leaseId}`)
@@ -668,7 +694,19 @@ export class AndroidDeviceBroker {
     // Deliberately no `pm clear`, `uninstall`, or data wipe here. What the
     // previous project verified stays installed so a human can open it, and the
     // next lease inherits the phone as it was left.
-    const closed = this.repo.closeLease(lease.id, state, at, reason)
+    const closed = this.repo.closeLeaseIf(
+      lease.id,
+      state,
+      at,
+      reason,
+      (current) => !this.recoveryProtected(current)
+    )
+    if (!closed) {
+      throw new DeviceLeaseError(
+        'lease-recovery-protected',
+        'The exact physical-device lease is retained by an Android locale recovery operation.'
+      )
+    }
     this.deathObservedAt.delete(lease.id)
     this.repo.recordEvent({
       deviceId: lease.deviceId,
@@ -678,6 +716,22 @@ export class AndroidDeviceBroker {
       at
     })
     return { lease: closed, promoted: this.promote(lease.deviceId) }
+  }
+
+  private async closeAutomatically(
+    lease: DeviceLease,
+    state: 'expired' | 'revoked',
+    reason: string
+  ): Promise<{ lease: DeviceLease; promoted: DeviceLease | null } | null> {
+    try {
+      return await this.close(lease, state, reason)
+    } catch (error) {
+      if (error instanceof DeviceLeaseError && error.code === 'lease-recovery-protected') {
+        this.deathObservedAt.delete(lease.id)
+        return null
+      }
+      throw error
+    }
   }
 
   /** Give a just-freed phone to the best waiting request, if any. */
@@ -751,6 +805,10 @@ export class AndroidDeviceBroker {
         this.deathObservedAt.delete(snapshot.id)
         continue
       }
+      if (this.recoveryProtected(lease)) {
+        this.deathObservedAt.delete(lease.id)
+        continue
+      }
       const heartbeatAgeMs = now - Date.parse(lease.heartbeatAt)
 
       if (heartbeatAgeMs > lease.ttlMs) {
@@ -775,7 +833,8 @@ export class AndroidDeviceBroker {
             const reason = live === false
               ? `owner gone: no heartbeat for ${Math.round((now - Date.parse(lease.heartbeatAt)) / 1000)}s and the Room or worker is not running`
               : `owner silent: no heartbeat for ${Math.round((now - Date.parse(lease.heartbeatAt)) / 1000)}s and worker liveness is unavailable`
-            result.recovered.push({ ...(await this.close(lease, 'expired', reason)), reason })
+            const closed = await this.closeAutomatically(lease, 'expired', reason)
+            if (closed) result.recovered.push({ ...closed, reason })
             continue
           }
         } else {
@@ -811,8 +870,11 @@ export class AndroidDeviceBroker {
           continue
         }
         const reason = `maximum lease time of ${Math.round(lease.maxDurationMs / 60_000)}min exceeded with no device activity`
-        this.repo.recordEvent({ deviceId: lease.deviceId, roomId: lease.roomId, kind: 'max-duration-reclaimed', detail: reason, at })
-        result.recovered.push({ ...(await this.close(lease, 'expired', reason)), reason })
+        const closed = await this.closeAutomatically(lease, 'expired', reason)
+        if (closed) {
+          this.repo.recordEvent({ deviceId: lease.deviceId, roomId: lease.roomId, kind: 'max-duration-reclaimed', detail: reason, at })
+          result.recovered.push({ ...closed, reason })
+        }
         continue
       }
 

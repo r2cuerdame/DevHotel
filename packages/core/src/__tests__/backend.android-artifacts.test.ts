@@ -1109,43 +1109,71 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec')).toBe(false)
   })
 
-  it('refuses extra control endpoints and an emulator attached to a different anchor', async () => {
+  it('refuses crossed recovery endpoints and accepts absent endpoints for retained stopped workloads', async () => {
     const ids = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), runtime: 'c'.repeat(64), web: 'd'.repeat(64) }
+    const networkIds = { control: '1'.repeat(64), runtime: '2'.repeat(64) }
     let extraControlMember = true
+    let crossConnectedControl = false
+    let anchorState = 'running'
+    let emulatorState = 'running'
+    let runtimeAnchorState = 'running'
+    let webState = 'running'
     let emulatorNetworkMode = `container:${'f'.repeat(64)}`
     let emulatorSandboxId = 'e'.repeat(64)
     const container = (name: string, role: string, id: string, sandboxId: string, networkMode?: string) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
       Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
-      State: { Status: 'running' },
-      NetworkSettings: { SandboxID: sandboxId },
+      State: { Status: role === 'anchor'
+        ? anchorState
+        : role === 'svc-emulator'
+          ? emulatorState
+          : role === 'android-runtime-anchor'
+            ? runtimeAnchorState
+            : webState },
+      NetworkSettings: {
+        SandboxID: sandboxId,
+        ...(role === 'android-runtime-anchor'
+          ? { Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: networkIds.runtime } } }
+          : {})
+      },
       ...(networkMode ? { HostConfig: { NetworkMode: networkMode } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'start') {
+        if (args[1] === ids.anchor) anchorState = 'running'
+        if (args[1] === ids.emulator) emulatorState = 'running'
+        return ok
+      }
       if (args[0] === 'network' && args[1] === 'inspect') {
         const control = args[2] === androidControlNetworkName(ROOM_ID)
         return {
           code: 0,
           stdout: JSON.stringify([{
+            Id: control ? networkIds.control : networkIds.runtime,
             Name: args[2],
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control
               ? {
-                  [ids.anchor]: { Name: anchorName(ROOM_ID) },
+                  ...(anchorState === 'running' ? { [ids.anchor]: { Name: anchorName(ROOM_ID) } } : {}),
                   ...(extraControlMember ? { ['9'.repeat(64)]: { Name: androidRuntimeAnchorName(ROOM_ID) } } : {})
                 }
-              : { [ids.runtime]: { Name: androidRuntimeAnchorName(ROOM_ID) } }
+              : {
+                  ...(runtimeAnchorState === 'running'
+                    ? { [ids.runtime]: { Name: androidRuntimeAnchorName(ROOM_ID) } }
+                    : {}),
+                  ...(crossConnectedControl ? { [ids.anchor]: { Name: anchorName(ROOM_ID) } } : {})
+                }
           }]),
           stderr: ''
         }
       }
-      if (args[0] === 'inspect' && args[1] === anchorName(ROOM_ID)) {
+      if (args[0] === 'inspect' && (args[1] === anchorName(ROOM_ID) || args[1] === ids.anchor)) {
         return {
           code: 0,
           stdout: container(
-            args[1],
+            anchorName(ROOM_ID),
             'anchor',
             ids.anchor,
             'e'.repeat(64),
@@ -1154,18 +1182,27 @@ describe('OciCliBackend Android artifact export', () => {
           stderr: ''
         }
       }
-      if (args[0] === 'inspect' && args[1] === androidRuntimeAnchorName(ROOM_ID)) {
-        return {
-          code: 0,
-          stdout: container(args[1], 'android-runtime-anchor', ids.runtime, 'f'.repeat(64), roomNetworkName(ROOM_ID)),
-          stderr: ''
-        }
-      }
-      if (args[0] === 'inspect' && args[1] === webName(ROOM_ID)) {
+      if (
+        args[0] === 'inspect' &&
+        (args[1] === androidRuntimeAnchorName(ROOM_ID) || args[1] === ids.runtime)
+      ) {
         return {
           code: 0,
           stdout: container(
-            args[1],
+            androidRuntimeAnchorName(ROOM_ID),
+            'android-runtime-anchor',
+            ids.runtime,
+            'f'.repeat(64),
+            roomNetworkName(ROOM_ID)
+          ),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'inspect' && (args[1] === webName(ROOM_ID) || args[1] === ids.web)) {
+        return {
+          code: 0,
+          stdout: container(
+            webName(ROOM_ID),
             'web',
             ids.web,
             'f'.repeat(64),
@@ -1174,11 +1211,11 @@ describe('OciCliBackend Android artifact export', () => {
           stderr: ''
         }
       }
-      if (args[0] === 'inspect' && args[1] === emulatorName(ROOM_ID)) {
+      if (args[0] === 'inspect' && (args[1] === emulatorName(ROOM_ID) || args[1] === ids.emulator)) {
         return {
           code: 0,
           stdout: container(
-            args[1],
+            emulatorName(ROOM_ID),
             'svc-emulator',
             ids.emulator,
             emulatorSandboxId,
@@ -1206,6 +1243,43 @@ describe('OciCliBackend Android artifact export', () => {
     await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/not live in the exact control anchor/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    emulatorSandboxId = 'e'.repeat(64)
+    crossConnectedControl = true
+    await expect(new OciCliBackend().execFencedEmulatorRecoveryAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/endpoint sets are not disjoint/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/endpoint sets are not disjoint/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    runtimeAnchorState = 'exited'
+    webState = 'exited'
+    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/endpoint sets are not disjoint/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    crossConnectedControl = false
+    extraControlMember = true
+    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/only the exact owned control anchor endpoint/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    extraControlMember = false
+    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID)).resolves.toBeUndefined()
+    expect(mockedRunDocker.mock.calls
+      .filter(([args]) => args[0] === 'start')
+      .map(([args]) => args[1])).toEqual([ids.anchor, ids.emulator])
+    expect(runtimeAnchorState).toBe('exited')
+    expect(webState).toBe('exited')
   })
 
   it('aborted helper cleanup removes only the exact labeled container ID and ignores name reuse', async () => {

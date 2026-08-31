@@ -13,7 +13,15 @@ async function getClient(): Promise<ControlClient> {
 async function main(): Promise<void> {
   const server = new McpServer(MCP_METADATA)
   for (const tool of makeTools(getClient)) {
-    server.tool(tool.name, tool.description, tool.schema, tool.handler)
+    if (tool.strictInputSchema) {
+      server.registerTool(
+        tool.name,
+        { description: tool.description, inputSchema: tool.strictInputSchema },
+        tool.handler
+      )
+    } else {
+      server.tool(tool.name, tool.description, tool.schema, tool.handler)
+    }
   }
   const transport = new StdioServerTransport()
   await server.connect(transport)

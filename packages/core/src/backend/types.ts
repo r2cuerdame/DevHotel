@@ -294,9 +294,17 @@ export interface IsolationBackend {
   copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
   /** Controlled emulator ADB outside the user Room; acceptance callers separately require a pause fence. */
   execFencedEmulatorAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /** Recovery-only ADB through the retained control anchor; never starts the Room web workload. */
+  execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
   /** Install one Host-private staged APK without reopening the Room workspace. */
   installFencedEmulatorApk(roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult>
   /* --- android emulator sidecar (KVM) --- */
+  /**
+   * Restart only the already-existing control anchor and emulator for durable
+   * locale recovery. Implementations must prove the web/runtime identities but
+   * never start a stopped Room workload or substitute a container identity.
+   */
+  startExistingEmulatorForRecovery(roomId: string): Promise<void>
   createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }

@@ -3083,6 +3083,278 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args[1] === 'pidof')).toBe(false)
   })
 
+  it('reads and mutates app locales only for the tracked numeric Android user', async () => {
+    let applied = ['en-US']
+    let pgrepCalls = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') {
+        return { code: 0, stdout: '34\n', stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [${applied.join(',')}]\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'set-app-locales') {
+        const index = args.indexOf('--locales')
+        applied = index < 0 ? [] : [args[index + 1]!]
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (args[1] === 'pgrep') {
+        pgrepCalls += 1
+        const pid = pgrepCalls === 1 ? 100 : pgrepCalls === 2 ? 101 : 102
+        return { code: 0, stdout: `${pid}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => HOST_NOW_MS, sleep: async () => {} })
+
+    const result = await session.applyAppLocalesAndWait(APP_ID, ['ko-KR'])
+
+    expect(result).toMatchObject({
+      apiLevel: 34,
+      localeTags: ['ko-KR'],
+      previousLocaleTags: ['en-US'],
+      process: { beforePids: [100], afterPids: [102], restarted: true },
+      readiness: { attempts: 3, consecutiveReadyChecks: 2, pids: [102] }
+    })
+    expect(calls).toContainEqual([
+      'shell', 'cmd', 'locale', 'get-app-locales', APP_ID, '--user', '0'
+    ])
+    expect(calls).toContainEqual([
+      'shell', 'cmd', 'locale', 'set-app-locales', APP_ID, '--user', '0', '--locales', 'ko-KR'
+    ])
+    expect(calls.filter((args) => args[1] === 'pgrep').every((args) => args.at(-1) === '10123')).toBe(true)
+    expect(calls.some((args) => args.includes('current'))).toBe(false)
+  })
+
+  it('rejects an original locale that changes while the restorable snapshot is being sealed', async () => {
+    let localeReads = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        localeReads += 1
+        return {
+          code: 0,
+          stdout: `Locales for ${APP_ID} for user 0 are [${localeReads === 1 ? 'en-US' : 'ko-KR'}]\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.appLocaleSnapshot(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_LOCALE_TARGET_CHANGED'
+    })
+    expect(calls.some((args) => args[1] === 'cmd' && args[3] === 'set-app-locales')).toBe(false)
+  })
+
+  it('uses two complete release pulses and rejects a late foreground/PID drift', async () => {
+    let pulseCalls = 0
+    const releasePulse = (foregroundApplicationId: string, pids: string) => {
+      const values = {
+        api: '34',
+        activeUser: '0',
+        userDump: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true',
+        paths: `package:${BASE_APK_PATH}`,
+        stat: BASE_APK_STAT,
+        sha: `${'a'.repeat(64)}  ${BASE_APK_PATH}`,
+        uidRecord: `package:${APP_ID} uid:10123`,
+        uidOwners: `package:${APP_ID} uid:10123`,
+        locale: `Locales for ${APP_ID} for user 0 are [en-US]`,
+        focus: `mCurrentFocus=Window{1 u0 ${foregroundApplicationId}/.MainActivity}`,
+        pids,
+        pgrepStatus: pids.length > 0 ? '0' : '1'
+      }
+      return Object.entries(values)
+        .map(([key, value]) => `${key}=${Buffer.from(value).toString('base64')}`)
+        .join('\n') + '\n'
+    }
+    const { session } = setup((args) => {
+      if (args[1] === 'sh' && args[3]?.includes('emit pgrepStatus')) {
+        pulseCalls += 1
+        return {
+          code: 0,
+          stdout: pulseCalls === 1
+            ? releasePulse(APP_ID, '101')
+            : releasePulse('com.android.launcher', ''),
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const initial = await session.appLocaleSnapshot(APP_ID)
+
+    await expect(session.proveAppLocaleFinalState(APP_ID, initial.restoreFence))
+      .rejects.toMatchObject({ code: 'ANDROID_LOCALE_TARGET_CHANGED' })
+    expect(pulseCalls).toBe(2)
+  })
+
+  it('returns the stable PID set from the last complete release pulse', async () => {
+    let pulseCalls = 0
+    const values = {
+      api: '34',
+      activeUser: '0',
+      userDump: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true',
+      paths: `package:${BASE_APK_PATH}`,
+      stat: BASE_APK_STAT,
+      sha: `${'a'.repeat(64)}  ${BASE_APK_PATH}`,
+      uidRecord: `package:${APP_ID} uid:10123`,
+      uidOwners: `package:${APP_ID} uid:10123`,
+      locale: `Locales for ${APP_ID} for user 0 are [en-US]`,
+      focus: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}`,
+      pids: '101\n102',
+      pgrepStatus: '0'
+    }
+    const output = Object.entries(values)
+      .map(([key, value]) => `${key}=${Buffer.from(value).toString('base64')}`)
+      .join('\n') + '\n'
+    const { session } = setup((args) => {
+      if (args[1] === 'sh' && args[3]?.includes('emit pgrepStatus')) {
+        pulseCalls += 1
+        return { code: 0, stdout: output, stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const initial = await session.appLocaleSnapshot(APP_ID)
+
+    await expect(session.proveAppLocaleFinalState(APP_ID, initial.restoreFence))
+      .resolves.toMatchObject({ localeTags: ['en-US'], pids: [101, 102] })
+    expect(pulseCalls).toBe(2)
+  })
+
+  it('rejects a reinstall that lands during the final locale snapshot read', async () => {
+    let localeReads = 0
+    let reinstalled = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        localeReads += 1
+        if (localeReads === 2) reinstalled = true
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
+      }
+      if (args[1] === 'stat') {
+        return { code: 0, stdout: `${reinstalled ? '103:4242:123456:1788157200:1788157202' : BASE_APK_STAT}\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.appLocaleSnapshot(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_REPLACED' })
+  })
+
+  it('checks the expected previous locale immediately before mutation and normalizes PID order', async () => {
+    let localeReads = 0
+    let pgrepCalls = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        localeReads += 1
+        return {
+          code: 0,
+          stdout: `Locales for ${APP_ID} for user 0 are [${localeReads === 1 ? 'en-US' : 'fr-FR'}]\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pgrep') {
+        pgrepCalls += 1
+        return { code: 0, stdout: pgrepCalls === 1 ? '200\n100\n' : '100\n200\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      expectedPreviousLocaleTags: ['en-US']
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_PRECONDITION_CHANGED' })
+    expect(calls.some((args) => args[1] === 'cmd' && args[3] === 'set-app-locales')).toBe(false)
+
+    localeReads = 0
+    pgrepCalls = 0
+    let applied = false
+    const stable = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [${applied ? 'ko-KR' : 'en-US'}]\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'set-app-locales') {
+        applied = true
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (args[1] === 'pgrep') {
+        pgrepCalls += 1
+        return { code: 0, stdout: pgrepCalls === 1 ? '200\n100\n' : '100\n200\n', stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { now: () => HOST_NOW_MS, sleep: async () => {} })
+    const result = await stable.session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      expectedPreviousLocaleTags: ['en-US']
+    })
+    expect(result.process).toEqual({ beforePids: [100, 200], afterPids: [100, 200], restarted: false })
+  })
+
+  it('fails before locale mutation when the live API is unsupported', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') {
+        return { code: 0, stdout: '32\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.appLocaleSnapshot(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_LOCALE_UNSUPPORTED'
+    })
+    expect(calls.some((args) => args[1] === 'cmd' && args[3] === 'set-app-locales')).toBe(false)
+  })
+
   it('transfers one exact target/package receipt to the last installing Room', () => {
     const { db, installs } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
     roomsRepo(db).create(makeRoom({ id: 'bbbb2222', project: 'other', domain: 'other.localhost' }))

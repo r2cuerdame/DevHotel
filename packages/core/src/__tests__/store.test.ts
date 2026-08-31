@@ -8,6 +8,7 @@ import { checksRepo } from '../store/checksRepo'
 import { openDb, type Db } from '../store/db'
 import { roomsRepo } from '../store/roomsRepo'
 import { settingsRepo } from '../store/settingsRepo'
+import { androidDevicesRepo } from '../store/androidDevicesRepo'
 
 let dir: string
 let db: Db
@@ -271,6 +272,7 @@ describe('roomsRepo', () => {
     settings.set('workspaceSyncBase:room-1', 'snapshot')
     settings.set('retainedWorkspaceGen:room-1', '3')
     settings.set('artifactExportPending:room-1', 'intent')
+    settings.set('androidLocaleRestorePending:room-1', 'intent')
     settings.set('theme', 'dark')
     rooms.delete('room-1')
     expect(rooms.get('room-1')).toBeNull()
@@ -284,6 +286,7 @@ describe('roomsRepo', () => {
     expect(settings.get('workspaceSyncBase:room-1')).toBeNull()
     expect(settings.get('retainedWorkspaceGen:room-1')).toBeNull()
     expect(settings.get('artifactExportPending:room-1')).toBeNull()
+    expect(settings.get('androidLocaleRestorePending:room-1')).toBeNull()
     expect(settings.get('theme')).toBe('dark')
   })
 
@@ -370,9 +373,13 @@ describe('settingsRepo', () => {
     expect(settings.setIfAbsent('artifact-export', 'first')).toBe(true)
     expect(settings.setIfAbsent('artifact-export', 'second')).toBe(false)
     expect(settings.get('artifact-export')).toBe('first')
-    expect(settings.deleteIfValue('artifact-export', 'second')).toBe(false)
+    expect(settings.setIfValue('artifact-export', 'second', 'third')).toBe(false)
     expect(settings.get('artifact-export')).toBe('first')
-    expect(settings.deleteIfValue('artifact-export', 'first')).toBe(true)
+    expect(settings.setIfValue('artifact-export', 'first', 'advanced')).toBe(true)
+    expect(settings.get('artifact-export')).toBe('advanced')
+    expect(settings.deleteIfValue('artifact-export', 'second')).toBe(false)
+    expect(settings.get('artifact-export')).toBe('advanced')
+    expect(settings.deleteIfValue('artifact-export', 'advanced')).toBe(true)
     expect(settings.get('artifact-export')).toBeNull()
   })
 
@@ -388,6 +395,46 @@ describe('settingsRepo', () => {
     expect(settings.get('artifact-export')).toBe('owned')
     expect(settings.deleteIfValueAndRoomRevision('artifact-export', 'owned', 'room-1', 3, 7)).toBe(true)
     expect(settings.get('artifact-export')).toBeNull()
+  })
+
+  it('claims and releases recovery intent only while the exact physical lease is active', () => {
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom())
+    const devices = androidDevicesRepo(db)
+    const device = devices.upsertDevice({
+      id: `d${'a'.repeat(32)}`,
+      serial: 'R5CT30ABCDE',
+      physicalIdentity: 'b'.repeat(64),
+      nickname: 'USB phone',
+      model: 'Pixel',
+      androidVersion: '14',
+      apiLevel: 34,
+      connection: 'usb',
+      health: 'ready',
+      seenAt: '2026-08-31T00:00:00.000Z'
+    })
+    const lease = devices.grantLease({
+      deviceId: device.id,
+      roomId: 'room-1',
+      project: 'acme',
+      issueRef: null,
+      runId: null,
+      workerId: 'worker-a',
+      purpose: 'other',
+      at: '2026-08-31T00:00:00.000Z',
+      ttlMs: 60_000,
+      maxDurationMs: 120_000
+    }, null).lease
+    const settings = settingsRepo(db)
+    const key = 'androidLocaleRestorePending:room-1'
+
+    expect(settings.setIfAbsentForActiveAndroidLease(key, 'owned', lease)).toBe(true)
+    devices.closeLease(lease.id, 'released', '2026-08-31T00:01:00.000Z', 'done')
+    expect(settings.deleteIfValueForActiveAndroidLease(key, 'owned', lease)).toBe(false)
+    expect(settings.get(key)).toBe('owned')
+    settings.delete(key)
+    expect(settings.setIfAbsentForActiveAndroidLease(key, 'late', lease)).toBe(false)
+    expect(settings.get(key)).toBeNull()
   })
 })
 

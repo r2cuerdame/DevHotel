@@ -53,6 +53,27 @@ describe('reconcile interrupted preparation', () => {
     db.close()
   })
 
+  it('preserves an awake Room whose exact Android locale recovery is still gated', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'locale001', provider: 'android', status: 'attention', hostPort: 41004 }))
+    const backend = new FakeBackend()
+
+    const result = await reconcile(
+      backend,
+      rooms,
+      () => undefined,
+      { preserveAwakeRoomIds: new Set(['locale001']) }
+    )
+
+    expect(result.roomsSlept).toEqual([])
+    expect(rooms.get('locale001')).toMatchObject({ status: 'attention', hostPort: 41004 })
+    expect(backend.calls).not.toContain('stopRoomPod:locale001')
+    db.close()
+  })
+
   it('never sends Windows VM rooms through OCI reconciliation', async () => {
     const windows = makeRoom({
       id: 'windows1',
