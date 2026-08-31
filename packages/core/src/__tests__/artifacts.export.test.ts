@@ -88,6 +88,35 @@ describe('Room screenshot artifact export', () => {
     })
   }
 
+  function observeContainment({ backend, gateway, orch }: ReturnType<typeof setup>) {
+    const events: string[] = []
+    let managedContainerLists = 0
+    const removeRoute = gateway.removeRoute.bind(gateway)
+    gateway.removeRoute = (domain) => {
+      events.push('route')
+      removeRoute(domain)
+    }
+    const detach = orch.logs.detach.bind(orch.logs)
+    orch.logs.detach = (roomId) => {
+      events.push('logs')
+      detach(roomId)
+    }
+    const update = orch.rooms.update.bind(orch.rooms)
+    orch.rooms.update = (roomId, patch) => {
+      if (patch.status === 'broken' && patch.hostPort === null) events.push('state')
+      update(roomId, patch)
+    }
+    const listManagedContainers = backend.listManagedContainers.bind(backend)
+    backend.listManagedContainers = async () => {
+      managedContainerLists += 1
+      return listManagedContainers()
+    }
+    return {
+      events,
+      managedContainerListCount: () => managedContainerLists
+    }
+  }
+
   it('publishes a new repo-relative PNG and returns GitHub Markdown', async () => {
     const { backend, orch, userData } = setup()
     const artifact = publish(orch)
@@ -594,7 +623,208 @@ describe('Room screenshot artifact export', () => {
       code: 'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED',
       evidence: { committed: true, retrySafe: false, relativePath: 'docs/committed.png' }
     })
-    expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, syncStatus: 'modified', status: 'broken' })
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 6,
+      syncStatus: 'modified',
+      status: 'broken',
+      hostPort: null
+    })
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+  })
+
+  it('contains a committed runtime when recovery-intent release is rejected or fails', async () => {
+    for (const mode of ['ownership-changed', 'storage-error'] as const) {
+      const context = setup()
+      const { backend, gateway, orch } = context
+      const artifact = publish(orch)
+      const key = 'artifactExportPending:aaaa1111'
+      const replacement = JSON.stringify({ version: 'external-owner' })
+      const room = orch.rooms.get('aaaa1111')!
+      orch.rooms.update(room.id, { hostPort: 4321 })
+      await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+      const containment = observeContainment(context)
+      let ownedValue = ''
+      const deleteIfValue = orch.settings.deleteIfValue.bind(orch.settings)
+      orch.settings.deleteIfValue = (settingKey, value) => {
+        if (settingKey !== key) return deleteIfValue(settingKey, value)
+        ownedValue = value
+        if (mode === 'ownership-changed') {
+          orch.settings.set(key, replacement)
+          return false
+        }
+        throw new Error('settings CAS unavailable after publication')
+      }
+      backend.publishRoomArtifactHandler = () => {
+        backend.managedContainers = [{
+          roomId: 'aaaa1111',
+          role: 'job',
+          state: 'exited',
+          name: 'dh-aaaa1111-job-11111111-2222-4333-8444-666666666666'
+        }]
+      }
+      let actualRuntimeRunning = false
+      backend.unpauseWeb = async (roomId) => {
+        backend.calls.push(`unpauseWeb:${roomId}`)
+        actualRuntimeRunning = true
+        backend.webPausedValue = false
+        backend.webRunningUnpausedValue = true
+      }
+      backend.stopRoomPod = async (roomId) => {
+        containment.events.push('stop')
+        backend.calls.push(`stopRoomPod:${roomId}`)
+        actualRuntimeRunning = false
+        backend.webRunningUnpausedValue = false
+      }
+
+      await expect(
+        orch.exportRoomArtifact(
+          'aaaa1111',
+          artifact.id,
+          { relativePath: `docs/intent-${mode}.png` },
+          'agent'
+        )
+      ).rejects.toMatchObject({
+        code: 'ARTIFACT_EXPORT_COMMITTED_CLEANUP_FAILED',
+        evidence: { committed: true, retrySafe: false, relativePath: `docs/intent-${mode}.png` }
+      })
+
+      expect(ownedValue).not.toBe('')
+      expect(orch.settings.get(key)).toBe(mode === 'ownership-changed' ? replacement : ownedValue)
+      expect(gateway.routes.has(room.domain)).toBe(false)
+      expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+      expect(containment.managedContainerListCount()).toBe(2)
+      expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+      expect(backend.calls).toContain(
+        'removeManagedContainer:dh-aaaa1111-job-11111111-2222-4333-8444-666666666666'
+      )
+      expect(backend.managedContainers).toEqual([])
+      expect(backend.calls).toContain('unpauseWeb:aaaa1111')
+      expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+      expect(actualRuntimeRunning).toBe(false)
+      expect(orch.rooms.get('aaaa1111')).toMatchObject({
+        stateRevision: 6,
+        syncStatus: 'modified',
+        status: 'broken',
+        hostPort: null
+      })
+    }
+  })
+
+  it('contains an applied replacement when final runtime recovery proof is unavailable', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    let probes = 0
+    let actualRuntimeRunning = false
+    backend.webRunningUnpaused = async (roomId) => {
+      backend.calls.push(`webRunningUnpaused:${roomId}`)
+      probes += 1
+      if (probes === 1) return false
+      throw new Error('final exact runtime probe unavailable')
+    }
+    backend.unpauseWeb = async (roomId) => {
+      backend.calls.push(`unpauseWeb:${roomId}`)
+      actualRuntimeRunning = true
+      backend.webPausedValue = false
+      backend.webRunningUnpausedValue = true
+      throw new Error('unpause response was lost after apply')
+    }
+    backend.recreateWeb = async (spec) => {
+      backend.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
+      actualRuntimeRunning = true
+      backend.webPausedValue = false
+      backend.webRunningUnpausedValue = true
+      backend.managedContainers = [{
+        roomId: 'aaaa1111',
+        role: 'job',
+        state: 'created',
+        name: 'dh-aaaa1111-job-11111111-2222-4333-8444-777777777777'
+      }]
+      throw new Error('recreate response was lost after apply')
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+      actualRuntimeRunning = false
+      backend.webRunningUnpausedValue = false
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/recovery-unproven.png' }, 'agent')
+    ).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED',
+      evidence: { committed: true, retrySafe: false, relativePath: 'docs/recovery-unproven.png' }
+    })
+
+    expect(probes).toBe(2)
+    expect(actualRuntimeRunning).toBe(false)
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(containment.managedContainerListCount()).toBe(2)
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+    expect(backend.calls).toContain(
+      'removeManagedContainer:dh-aaaa1111-job-11111111-2222-4333-8444-777777777777'
+    )
+    expect(backend.managedContainers).toEqual([])
+    expect(backend.webRunningUnpausedValue).toBe(false)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 6,
+      syncStatus: 'modified',
+      status: 'broken',
+      hostPort: null
+    })
+  })
+
+  it('retains the hard recovery gate when runtime containment cannot persist its database fence', async () => {
+    const { backend, gateway, orch } = setup()
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const update = orch.rooms.update.bind(orch.rooms)
+    orch.rooms.update = (roomId, patch) => {
+      if (patch.status === 'broken') throw new Error('containment database fence unavailable')
+      update(roomId, patch)
+    }
+    backend.webRunningUnpaused = async (roomId) => {
+      backend.calls.push(`webRunningUnpaused:${roomId}`)
+      return false
+    }
+    backend.unpauseWeb = async (roomId) => {
+      backend.calls.push(`unpauseWeb:${roomId}`)
+      throw new Error('unpause failed')
+    }
+    backend.recreateWeb = async (spec) => {
+      backend.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
+      throw new Error('recreate failed')
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/fence-retained.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED' })
+
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 5,
+      syncStatus: 'modified',
+      status: 'ready',
+      hostPort: 4321
+    })
   })
 
   it('marks the Room broken when publication commits but its revision update fails', async () => {
@@ -637,10 +867,14 @@ describe('Room screenshot artifact export', () => {
     const committedError = captured as Error & { cause?: AggregateError }
     const outer = committedError.cause
     expect(outer).toBeInstanceOf(AggregateError)
-    expect(outer?.errors[0]).toBeInstanceOf(AggregateError)
-    expect((outer?.errors[0] as AggregateError).errors).toHaveLength(2)
+    expect(outer?.errors).toHaveLength(2)
+    expect(outer?.errors.map((error) => (error as Error).message)).toEqual([
+      'Room database writes unavailable',
+      'Room database writes unavailable'
+    ])
     expect(backend.calls).not.toContain('unpauseWeb:aaaa1111')
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
     expect(backend.webPausedValue).toBe(true)
   })
 

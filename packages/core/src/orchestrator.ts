@@ -2393,8 +2393,10 @@ export class RoomOrchestrator {
       let publicationAmbiguous = false
       let pendingIntentStored = false
       let runtimeRestoreUnsafe = false
+      let runtimeContained = false
       let primaryError: unknown
       let stagingCleanupError: unknown
+      const containmentErrors: unknown[] = []
       const pendingKey = pendingArtifactExportKey(roomId)
       const stageToken = randomUUID().replaceAll('-', '')
       const pendingValue = JSON.stringify({
@@ -2404,6 +2406,11 @@ export class RoomOrchestrator {
         expected: { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
         stageToken
       } satisfies PendingArtifactExport)
+      const containRuntime = async (): Promise<void> => {
+        if (runtimeContained) return
+        runtimeContained = true
+        containmentErrors.push(...await this.containArtifactExportRuntime(room))
+      }
       try {
         // Own the durable recovery fence before the first runtime mutation.
         // A second process that claimed it after this operation entered the
@@ -2463,42 +2470,14 @@ export class RoomOrchestrator {
           this.markWorkspaceModified(roomId)
         } catch (revisionError) {
           runtimeRestoreUnsafe = true
-          // Publication is already externally visible. If its new revision
-          // cannot be persisted, fail closed so no later operation can trust
-          // the stale workspace fence. A broken-state write can fail for the
-          // same storage reason, so preserve both failures for diagnosis.
-          try {
-            this.markWorkspaceAmbiguous(roomId)
-          } catch (brokenStateError) {
-            throw new AggregateError(
-              [revisionError, brokenStateError],
-              'Artifact publication committed but its workspace and broken-state fences could not be persisted'
-            )
-          }
           throw revisionError
-        }
-        try {
-          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
-            throw new Error('Artifact export recovery intent ownership changed before completion')
-          }
-          pendingIntentStored = false
-        } catch (intentError) {
-          runtimeRestoreUnsafe = true
-          try {
-            this.markWorkspaceAmbiguous(roomId)
-          } catch (brokenStateError) {
-            throw new AggregateError(
-              [intentError, brokenStateError],
-              'Artifact publication committed but its recovery intent and broken-state fence could not be persisted'
-            )
-          }
-          throw intentError
         }
       } catch (error) {
         publicationAmbiguous = error instanceof RoomArtifactPublicationError &&
           error.reason === 'publication-ambiguous'
         primaryError = error
       }
+      if (publicationAmbiguous || runtimeRestoreUnsafe) await containRuntime()
       try {
         if (!this.cleanupArtifactExportStagingDirectory(temporaryRoot, temporary)) {
           throw new Error('Private artifact staging directory could not be proven safe to remove')
@@ -2507,94 +2486,10 @@ export class RoomOrchestrator {
         stagingCleanupError = error
       }
 
-      if (pendingIntentStored && !publicationCommitted && !publicationAmbiguous) {
-        try {
-          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
-            throw new Error('Artifact export recovery intent ownership changed before rollback')
-          }
-          pendingIntentStored = false
-        } catch (intentError) {
-          publicationAmbiguous = true
-          primaryError = new AggregateError(
-            [...(primaryError ? [primaryError] : []), intentError],
-            'Artifact publication failed safely but its durable recovery intent could not be cleared'
-          )
-        }
-      }
-
-      if (publicationAmbiguous) {
-        let stateFenceError: unknown
-        let routeFenceError: unknown
-        let logDetachError: unknown
-        let workloadStopError: unknown
-        let helperCleanupError: unknown
-        try {
-          // Remove the in-memory ingress capability before any fallible backend
-          // containment. A replacement/unpaused web discovered by the backend
-          // must not remain reachable while only the API-level CAS gate exists.
-          this.gateway.removeRoute(room.domain)
-        } catch (error) {
-          routeFenceError = error
-        }
-        try {
-          this.logs.detach(roomId)
-        } catch (error) {
-          logDetachError = error
-        }
-        try {
-          // The helper may already have changed the workspace or may still do
-          // so after a lost engine response. Invalidate the stale generation
-          // and disable the Room atomically; resuming it would release an
-          // untrusted writer into a live project namespace.
-          this.markWorkspaceAmbiguous(roomId)
-        } catch (error) {
-          stateFenceError = error
-        }
-        try {
-          await this.backend.stopRoomPod(roomId)
-        } catch (error) {
-          workloadStopError = error
-        }
-        try {
-          // stopRoomPod intentionally treats created/exited jobs as stopped,
-          // but either state remains restartable with a RW workspace mount.
-          // Reap only this Room's jobs by their backend-validated immutable IDs
-          // and prove none remain before returning the failure.
-          const jobs = (await this.backend.listManagedContainers()).filter(
-            (container) => container.roomId === roomId && container.role === 'job'
-          )
-          for (const job of jobs) await this.backend.removeManagedContainer(job.name)
-          const retained = (await this.backend.listManagedContainers()).filter(
-            (container) => container.roomId === roomId && container.role === 'job'
-          )
-          if (retained.length > 0) throw new Error('Room artifact helper containment is incomplete')
-        } catch (error) {
-          helperCleanupError = error
-        }
-        throw new DevHotelError(
-          'ARTIFACT_EXPORT_PUBLICATION_AMBIGUOUS',
-          'Artifact export could not prove whether publication completed, so the Room was not resumed.',
-          {
-            recoveryHint: 'Do not retry the same path. Restart DevHotel, then inspect the Room before further work.',
-            cause: new AggregateError(
-              [
-                primaryError,
-                ...(stagingCleanupError ? [stagingCleanupError] : []),
-                ...(routeFenceError ? [routeFenceError] : []),
-                ...(logDetachError ? [logDetachError] : []),
-                ...(stateFenceError ? [stateFenceError] : []),
-                ...(workloadStopError ? [workloadStopError] : []),
-                ...(helperCleanupError ? [helperCleanupError] : [])
-              ],
-              'Artifact export publication could not be reconciled exactly'
-            ),
-            evidence: { committed: null, retrySafe: false, relativePath: input.relativePath }
-          }
-        )
-      }
+      if (publicationAmbiguous || runtimeRestoreUnsafe) await containRuntime()
 
       let runtimeRecoveryError: unknown
-      if (pauseAttempted && !runtimeRestoreUnsafe) {
+      if (pauseAttempted && !runtimeRestoreUnsafe && !publicationAmbiguous) {
         try {
           await this.restoreRoomAfterArtifactExport(room)
         } catch (error) {
@@ -2603,6 +2498,7 @@ export class RoomOrchestrator {
       }
 
       if (runtimeRecoveryError) {
+        await containRuntime()
         if (publicationCommitted) {
           throw new DevHotelError(
             'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED',
@@ -2610,7 +2506,12 @@ export class RoomOrchestrator {
             {
               recoveryHint: 'Do not retry the same path. Restart the Room, then inspect the committed repository-relative destination.',
               cause: new AggregateError(
-                [runtimeRecoveryError, ...(primaryError ? [primaryError] : []), ...(stagingCleanupError ? [stagingCleanupError] : [])],
+                [
+                  runtimeRecoveryError,
+                  ...(primaryError ? [primaryError] : []),
+                  ...(stagingCleanupError ? [stagingCleanupError] : []),
+                  ...containmentErrors
+                ],
                 'Artifact export committed before runtime recovery failed'
               ),
               evidence: { committed: true, retrySafe: false, relativePath: input.relativePath }
@@ -2623,10 +2524,61 @@ export class RoomOrchestrator {
           {
             recoveryHint: 'Restart the Room before retrying the export with a new destination path.',
             cause: new AggregateError(
-              [runtimeRecoveryError, ...(primaryError ? [primaryError] : []), ...(stagingCleanupError ? [stagingCleanupError] : [])],
+              [
+                runtimeRecoveryError,
+                ...(primaryError ? [primaryError] : []),
+                ...(stagingCleanupError ? [stagingCleanupError] : []),
+                ...containmentErrors
+              ],
               'Artifact export failed before runtime recovery'
             ),
             evidence: { committed: false, retrySafe: false }
+          }
+        )
+      }
+
+      if (pendingIntentStored && !runtimeRestoreUnsafe && !publicationAmbiguous) {
+        try {
+          // Keep the durable mutation gate until runtime recovery is proved.
+          // If the final CAS cannot release this exact ownership, contain the
+          // now-unpaused runtime while the retained value blocks new work.
+          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
+            throw new Error('Artifact export recovery intent ownership changed before completion')
+          }
+          pendingIntentStored = false
+        } catch (intentError) {
+          if (publicationCommitted) {
+            runtimeRestoreUnsafe = true
+            primaryError = new AggregateError(
+              [...(primaryError ? [primaryError] : []), intentError],
+              'Artifact publication committed but its durable recovery intent could not be released'
+            )
+          } else {
+            publicationAmbiguous = true
+            primaryError = new AggregateError(
+              [...(primaryError ? [primaryError] : []), intentError],
+              'Artifact publication failed safely but its durable recovery intent could not be cleared'
+            )
+          }
+        }
+      }
+      if (publicationAmbiguous || runtimeRestoreUnsafe) await containRuntime()
+
+      if (publicationAmbiguous) {
+        throw new DevHotelError(
+          'ARTIFACT_EXPORT_PUBLICATION_AMBIGUOUS',
+          'Artifact export could not prove whether publication completed, so the Room was not resumed.',
+          {
+            recoveryHint: 'Do not retry the same path. Restart DevHotel, then inspect the Room before further work.',
+            cause: new AggregateError(
+              [
+                primaryError,
+                ...(stagingCleanupError ? [stagingCleanupError] : []),
+                ...containmentErrors
+              ],
+              'Artifact export publication could not be reconciled exactly'
+            ),
+            evidence: { committed: null, retrySafe: false, relativePath: input.relativePath }
           }
         )
       }
@@ -2638,7 +2590,11 @@ export class RoomOrchestrator {
           {
             recoveryHint: 'Do not retry the same path. Inspect the committed repository-relative destination.',
             cause: new AggregateError(
-              [...(primaryError ? [primaryError] : []), ...(stagingCleanupError ? [stagingCleanupError] : [])],
+              [
+                ...(primaryError ? [primaryError] : []),
+                ...(stagingCleanupError ? [stagingCleanupError] : []),
+                ...containmentErrors
+              ],
               'Artifact export committed with a local cleanup failure'
             ),
             evidence: { committed: true, retrySafe: false, relativePath: input.relativePath }
@@ -2660,6 +2616,48 @@ export class RoomOrchestrator {
         markdown: `![${artifact.filename}](${input.relativePath})`
       }
     })
+  }
+
+  private async containArtifactExportRuntime(room: RoomRecord): Promise<unknown[]> {
+    const errors: unknown[] = []
+    try {
+      // Revoke ingress before any fallible backend or database containment.
+      this.gateway.removeRoute(room.domain)
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      this.logs.detach(room.id)
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      // Publication or recovery may already have exposed an untrusted writer.
+      // Invalidate the generation and disable the persisted Room before return.
+      this.markWorkspaceAmbiguous(room.id)
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      await this.backend.stopRoomPod(room.id)
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      // A created/exited helper remains restartable with a RW workspace mount.
+      // Remove only this Room's jobs and prove that the role is absent.
+      const jobs = (await this.backend.listManagedContainers()).filter(
+        (container) => container.roomId === room.id && container.role === 'job'
+      )
+      for (const job of jobs) await this.backend.removeManagedContainer(job.name)
+      const retained = (await this.backend.listManagedContainers()).filter(
+        (container) => container.roomId === room.id && container.role === 'job'
+      )
+      if (retained.length > 0) throw new Error('Room artifact helper containment is incomplete')
+    } catch (error) {
+      errors.push(error)
+    }
+    return errors
   }
 
   private roomArtifactExportError(primary: unknown, cleanup?: unknown): DevHotelError {
@@ -2753,7 +2751,6 @@ export class RoomOrchestrator {
       } catch {
         // Exact recovery proof remains unavailable.
       }
-      this.rooms.update(room.id, { status: 'broken' })
       throw new AggregateError([unpauseError, recreateError], 'Room runtime could not be resumed or recreated')
     }
   }
