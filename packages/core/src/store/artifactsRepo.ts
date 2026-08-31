@@ -56,6 +56,12 @@ export interface ArtifactInsert {
 }
 
 export interface ArtifactsRepo {
+  /**
+   * Serialize filesystem publication/reconciliation with every other process
+   * that shares this SQLite database. The callback is synchronous so the
+   * BEGIN IMMEDIATE lock cannot escape its lexical operation.
+   */
+  withWriteTransaction<T>(work: () => T): T
   insert(input: ArtifactInsert): RoomArtifact
   getForRoom(roomId: string, artifactId: string): RoomArtifact | null
   listForRoom(roomId: string, limit?: number): RoomArtifact[]
@@ -67,6 +73,18 @@ export interface ArtifactsRepo {
 export function artifactsRepo(db: Db): ArtifactsRepo {
   const { sqlite } = db
   return {
+    withWriteTransaction(work) {
+      if (sqlite.isTransaction) throw new Error('Artifact write transaction cannot be nested')
+      sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        const result = work()
+        sqlite.exec('COMMIT')
+        return result
+      } catch (error) {
+        if (sqlite.isTransaction) sqlite.exec('ROLLBACK')
+        throw error
+      }
+    },
     insert(input) {
       const metadata = sanitizeAndroidScreenshotArtifactMetadata(input.metadata)
       const ownsTransaction = !sqlite.isTransaction

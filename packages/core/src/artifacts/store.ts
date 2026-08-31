@@ -100,17 +100,6 @@ export class RoomArtifactStore {
       throw new Error('Screenshot metadata does not match the captured PNG or Room')
     }
 
-    const usage = this.repo.usageForRoom(input.roomId)
-    if (
-      usage.count >= SCREENSHOT_ARTIFACT_MAX_PER_ROOM ||
-      usage.bytes + validated.png.byteLength > SCREENSHOT_ARTIFACT_MAX_ROOM_BYTES
-    ) {
-      throw new Error(
-        `Room screenshot artifact quota reached (${SCREENSHOT_ARTIFACT_MAX_PER_ROOM} files / ` +
-          `${SCREENSHOT_ARTIFACT_MAX_ROOM_BYTES} bytes)`
-      )
-    }
-
     const id = randomUUID()
     // Metadata is the only prose-bearing portion of this receipt and was
     // redacted above. Keep the already validated filename byte-for-byte:
@@ -128,20 +117,40 @@ export class RoomArtifactStore {
       createdAt: input.createdAt,
       metadata
     })
-    const root = this.ensureRoot(input.roomId)
-    const temporary = join(root, `.tmp-${id}`)
-    const final = join(root, id)
-    if (existsSync(temporary) || existsSync(final)) throw new Error('Screenshot artifact ID collision')
-    mkdirSync(temporary, { recursive: false, mode: 0o700 })
-    let published = false
+    let root: string | null = null
+    let temporary: string | null = null
+    let final: string | null = null
+    let finalized = false
     try {
-      writeDurableExclusive(join(temporary, 'content.png'), validated.png)
-      writeDurableExclusive(join(temporary, 'receipt.json'), Buffer.from(`${JSON.stringify(record, null, 2)}\n`, 'utf8'))
-      syncDirectory(temporary)
-      renameSync(temporary, final)
-      syncDirectory(root)
-      published = true
-      try {
+      // BEGIN IMMEDIATE spans the quota proof, filesystem rename, and receipt
+      // insert. A second publisher cannot use a stale quota snapshot, and a
+      // reconciler cannot snapshot IDs while this directory is in flight.
+      return this.repo.withWriteTransaction(() => {
+        const usage = this.repo.usageForRoom(input.roomId)
+        if (
+          usage.count >= SCREENSHOT_ARTIFACT_MAX_PER_ROOM ||
+          usage.bytes + validated.png.byteLength > SCREENSHOT_ARTIFACT_MAX_ROOM_BYTES
+        ) {
+          throw new Error(
+            `Room screenshot artifact quota reached (${SCREENSHOT_ARTIFACT_MAX_PER_ROOM} files / ` +
+              `${SCREENSHOT_ARTIFACT_MAX_ROOM_BYTES} bytes)`
+          )
+        }
+
+        root = this.ensureRoot(input.roomId)
+        temporary = join(root, `.tmp-${id}`)
+        final = join(root, id)
+        if (existsSync(temporary) || existsSync(final)) throw new Error('Screenshot artifact ID collision')
+        mkdirSync(temporary, { recursive: false, mode: 0o700 })
+        writeDurableExclusive(join(temporary, 'content.png'), validated.png)
+        writeDurableExclusive(
+          join(temporary, 'receipt.json'),
+          Buffer.from(`${JSON.stringify(record, null, 2)}\n`, 'utf8')
+        )
+        syncDirectory(temporary)
+        renameSync(temporary, final)
+        finalized = true
+        syncDirectory(root)
         return this.repo.insert({
           id: record.id,
           roomId: record.roomId,
@@ -152,13 +161,15 @@ export class RoomArtifactStore {
           createdAt: record.createdAt,
           metadata: record.metadata
         })
-      } catch (error) {
+      })
+    } catch (error) {
+      if (finalized && final !== null && existsSync(final)) {
         rmSync(final, { recursive: true, force: true })
-        syncDirectory(root)
-        throw error
+        if (root !== null) syncDirectory(root)
+      } else if (temporary !== null && existsSync(temporary)) {
+        rmSync(temporary, { recursive: true, force: true })
       }
-    } finally {
-      if (!published && existsSync(temporary)) rmSync(temporary, { recursive: true, force: true })
+      throw error
     }
   }
 
@@ -223,13 +234,18 @@ export class RoomArtifactStore {
 
   /** Remove crash leftovers that were never made visible by a DB receipt. */
   reconcileRoom(roomId: string): void {
-    const root = this.ensureRoot(roomId)
-    const known = this.repo.idsForRoom(roomId)
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (TEMP_DIR.test(entry.name) || (UUID_DIR.test(entry.name) && !known.has(entry.name))) {
-        rmSync(join(root, entry.name), { recursive: true, force: true })
+    // Use the same cross-process write lock as publication. Therefore the ID
+    // snapshot and the destructive filesystem scan cannot straddle another
+    // process's final rename/receipt insert window.
+    this.repo.withWriteTransaction(() => {
+      const root = this.ensureRoot(roomId)
+      const known = this.repo.idsForRoom(roomId)
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (TEMP_DIR.test(entry.name) || (UUID_DIR.test(entry.name) && !known.has(entry.name))) {
+          rmSync(join(root, entry.name), { recursive: true, force: true })
+        }
       }
-    }
+    })
   }
 
   private ensureRoot(roomId: string): string {

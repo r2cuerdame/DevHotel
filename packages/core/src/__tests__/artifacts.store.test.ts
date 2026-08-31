@@ -198,8 +198,12 @@ describe('Room screenshot artifact store', () => {
   })
 
   it('refuses the Room quota before creating artifact storage', () => {
-    const { store, repo, userData } = setup()
-    repo.usageForRoom = () => ({ count: SCREENSHOT_ARTIFACT_MAX_PER_ROOM, bytes: 0 })
+    const { store, repo, db, userData } = setup()
+    let quotaCheckedInTransaction = false
+    repo.usageForRoom = () => {
+      quotaCheckedInTransaction = db.sqlite.isTransaction
+      return { count: SCREENSHOT_ARTIFACT_MAX_PER_ROOM, bytes: 0 }
+    }
 
     expect(() =>
       store.publishScreenshot({
@@ -211,7 +215,63 @@ describe('Room screenshot artifact store', () => {
         metadata: metadata('aaaa1111')
       })
     ).toThrow(/quota reached/)
+    expect(quotaCheckedInTransaction).toBe(true)
     expect(existsSync(join(userData, 'rooms', 'aaaa1111', 'artifacts'))).toBe(false)
+  })
+
+  it('excludes reconciliation from the final rename through receipt insertion', () => {
+    const { store, repo, userData } = setup()
+    const secondDb = openDb(join(userData, 'db'))
+    dbs.push(secondDb)
+    const secondStore = new RoomArtifactStore(userData, artifactsRepo(secondDb))
+    const insert = repo.insert.bind(repo)
+    let challengedPublishedDirectory = false
+    repo.insert = (input) => {
+      challengedPublishedDirectory = existsSync(
+        join(userData, 'rooms', input.roomId, 'artifacts', 'screenshots', input.id)
+      )
+      expect(() => secondStore.reconcileRoom(input.roomId)).toThrow(/locked|busy/i)
+      return insert(input)
+    }
+
+    const artifact = store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'publication-race.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111')
+    })
+
+    expect(challengedPublishedDirectory).toBe(true)
+    secondStore.reconcileRoom('aaaa1111')
+    expect(secondStore.readContent('aaaa1111', artifact.id).artifact).toEqual(artifact)
+  })
+
+  it('holds one quota proof through the matching receipt insert', () => {
+    const { store, repo, db } = setup()
+    const usageForRoom = repo.usageForRoom.bind(repo)
+    const insert = repo.insert.bind(repo)
+    const transactionStates: boolean[] = []
+    repo.usageForRoom = (roomId) => {
+      transactionStates.push(db.sqlite.isTransaction)
+      return usageForRoom(roomId)
+    }
+    repo.insert = (input) => {
+      transactionStates.push(db.sqlite.isTransaction)
+      return insert(input)
+    }
+
+    store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'atomic-quota.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111')
+    })
+
+    expect(transactionStates).toEqual([true, true])
   })
 
   it('cleans crash leftovers but never traverses into other artifact families', () => {
