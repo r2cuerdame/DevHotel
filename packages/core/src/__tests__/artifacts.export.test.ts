@@ -254,6 +254,40 @@ describe('Room screenshot artifact export', () => {
     })
   })
 
+  it('contains the paused old runtime when the durable Room revision advances before publication', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    backend.pauseRoomArtifactWebHandler = async () => {
+      backend.webPausedValue = true
+      backend.webRunningUnpausedValue = false
+      const current = orch.rooms.get(room.id)!
+      orch.rooms.update(room.id, { stateRevision: current.stateRevision + 1 })
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/revision-race.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_FENCE_CHANGED' })
+
+    expect(backend.publishRoomArtifactCalls).toEqual([])
+    expect(backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(backend.webPausedValue).toBe(true)
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(containment.managedContainerListCount()).toBe(2)
+    expect(orch.rooms.get(room.id)).toMatchObject({ stateRevision: 6, status: 'broken', hostPort: null })
+  })
+
   it('maps an unsafe atomic-publication parent without exposing helper diagnostics', async () => {
     const { backend, orch } = setup()
     const artifact = publish(orch)

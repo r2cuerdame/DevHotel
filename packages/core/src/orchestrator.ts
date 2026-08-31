@@ -2464,6 +2464,10 @@ export class RoomOrchestrator {
           fencedRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
           fencedRoom.stateRevision !== room.stateRevision
         ) {
+          // A concurrently admitted operation may have advanced the durable
+          // Room pointer while this exact old runtime was paused. Never resume
+          // that stale generation or release its recovery gate.
+          runtimeRestoreUnsafe = true
           throw new DevHotelError(
             'ARTIFACT_EXPORT_FENCE_CHANGED',
             'Room workspace generation changed before artifact publication.',
