@@ -58,11 +58,14 @@ Before the first mutation, the workflow double-reads the original locale around
 its target/install/user proof, then durably records that locale together with
 the exact managed-emulator target, package incarnation and user fence. The
 durable record has a random operation capability and advances by compare-and-
-swap before each set. One stage owns only its expected prior locale and the one
-locale it is about to attempt; a later unattempted matrix locale is never
-treated as DevHotel-owned. Every set checks the expected prior locale
+swap before each set. A prepared stage owns only its expected prior locale; its
+attempted locale becomes owned only when the setter succeeds and that fact is
+immediately confirmed by a second compare-and-swap. A crash or precondition
+failure before confirmation remains attention-gated, even if an external actor
+coincidentally selected the attempted locale. A later unattempted matrix locale
+is never treated as DevHotel-owned. Every set checks the expected prior locale
 immediately before mutation, and a fresh post-witness snapshot re-proves locale,
-install, target, user, PID and lease identity before the stage can advance.
+install, target, user, PID and lease identity before publication can advance.
 Success and failure paths restore that exact list and run the same readiness
 proof.
 

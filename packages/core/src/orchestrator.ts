@@ -253,13 +253,15 @@ function parsePendingArtifactExport(raw: string): PendingArtifactExport | null {
 }
 
 interface PendingAndroidLocaleRestore {
-  version: 1
+  version: 2
   operationId: string
   stage: number
   applicationId: string
   originalLocaleTags: string[]
   expectedLocaleTags: string[]
   attemptedLocaleTags: string[]
+  /** True only after the setter returned witnessed readiness and ownership was CASed before another await. */
+  attemptedLocaleOwned: boolean
   fence: AndroidAppLocaleRestoreFence
 }
 
@@ -306,10 +308,14 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort().join(',')
+  const legacyV1 = record.version === 1 && keys ===
+    'applicationId,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version'
+  const currentV2 = record.version === 2 && keys ===
+    'applicationId,attemptedLocaleOwned,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version' &&
+    typeof record.attemptedLocaleOwned === 'boolean'
   if (
-    Object.keys(record).sort().join(',') !==
-      'applicationId,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version' ||
-    record.version !== 1 ||
+    (!legacyV1 && !currentV2) ||
     typeof record.operationId !== 'string' ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(record.operationId) ||
     !Number.isSafeInteger(record.stage) ||
@@ -362,13 +368,17 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
   ) return null
 
   return {
-    version: 1,
+    // Legacy v1 recorded a merely intended locale as if it were owned. Treat
+    // that attempted side as unconfirmed; the expected side remains the last
+    // state proved before its stage CAS.
+    version: 2,
     operationId: record.operationId,
     stage: record.stage as number,
     applicationId: applicationId.data,
     originalLocaleTags,
     expectedLocaleTags,
     attemptedLocaleTags,
+    attemptedLocaleOwned: currentV2 && record.attemptedLocaleOwned === true,
     fence: {
       targetKind: fence.targetKind,
       targetId: fence.targetId,
@@ -829,23 +839,37 @@ export class RoomOrchestrator {
               pending.fence,
               30_000
             )
+            const isOriginal = sameStringValues(beforeRestore.localeTags, pending.originalLocaleTags)
+            const ownsCurrent = pending.attemptedLocaleOwned
+              ? sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
+              : sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags)
             if (
               beforeRestore.apiLevel !== pending.fence.apiLevel ||
               !sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, pending.fence) ||
               beforeRestore.pids.length === 0 ||
-              (
-                !sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags) &&
-                !sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
-              )
+              (!isOriginal && !ownsCurrent)
             ) {
               throw new Error('Interrupted Android locale stage no longer owns the exact current target')
             }
+            if (isOriginal) {
+              // The desired state is already present under a fresh composite
+              // target/install/user/PID proof. Release without issuing any
+              // locale setter, including for conservative legacy v1 records.
+              if (!this.deletePendingAndroidLocaleRestorationIfOwned(key, raw, pending)) {
+                throw new Error('Interrupted Android locale original-state ownership changed')
+              }
+              restored = true
+              unresolved.delete(room.id)
+              return
+            }
             const recoveryStage: PendingAndroidLocaleRestore = {
               ...pending,
+              version: 2,
               operationId: pending.stage === Number.MAX_SAFE_INTEGER ? randomUUID() : pending.operationId,
               stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
               expectedLocaleTags: [...beforeRestore.localeTags],
-              attemptedLocaleTags: [...pending.originalLocaleTags]
+              attemptedLocaleTags: [...pending.originalLocaleTags],
+              attemptedLocaleOwned: false
             }
             const recoveryValue = JSON.stringify(recoveryStage)
             // No await separates the last exact observation above from this
@@ -865,11 +889,6 @@ export class RoomOrchestrator {
               ),
               { actionTimeoutMs: 30_000, allowApplicationIdTransitions: recoveryStage.applicationId }
             )
-            const fresh = await session.proveAppLocaleFinalState(
-              recoveryStage.applicationId,
-              recoveryStage.fence,
-              30_000
-            )
             if (
               result.applicationId !== recoveryStage.applicationId ||
               result.apiLevel !== recoveryStage.fence.apiLevel ||
@@ -878,7 +897,26 @@ export class RoomOrchestrator {
               result.pids.length === 0 ||
               result.readiness.application !== 'foreground' ||
               result.readiness.localeService !== 'ready' ||
-              result.readiness.process !== 'running' ||
+              result.readiness.process !== 'running'
+            ) {
+              throw new Error('Interrupted Android locale restoration result changed')
+            }
+            const confirmedStage: PendingAndroidLocaleRestore = {
+              ...recoveryStage,
+              attemptedLocaleOwned: true
+            }
+            const confirmedValue = JSON.stringify(confirmedStage)
+            // No await may separate the successful setter result from this
+            // ownership CAS. Failure keeps the prepared record fail-closed.
+            if (!this.settings.setIfValue(key, recoveryValue, confirmedValue)) {
+              throw new Error('Interrupted Android locale restoration proof ownership changed')
+            }
+            const fresh = await session.proveAppLocaleFinalState(
+              recoveryStage.applicationId,
+              recoveryStage.fence,
+              30_000
+            )
+            if (
               fresh.apiLevel !== recoveryStage.fence.apiLevel ||
               !sameStringValues(fresh.localeTags, recoveryStage.originalLocaleTags) ||
               !sameAndroidLocaleRestoreFence(fresh.restoreFence, recoveryStage.fence) ||
@@ -888,7 +926,7 @@ export class RoomOrchestrator {
             }
             // Final proof returned after every helper closed. Keep release in
             // this same JS turn so no awaited result can be reused later.
-            if (!this.deletePendingAndroidLocaleRestorationIfOwned(key, recoveryValue, recoveryStage)) {
+            if (!this.deletePendingAndroidLocaleRestorationIfOwned(key, confirmedValue, confirmedStage)) {
               throw new Error('Interrupted Android locale restoration ownership changed')
             }
             restored = true
@@ -2800,13 +2838,14 @@ export class RoomOrchestrator {
         }
         const pendingKey = pendingAndroidLocaleRestoreKey(roomId)
         let pending: PendingAndroidLocaleRestore = {
-          version: 1,
+          version: 2,
           operationId: randomUUID(),
           stage: 0,
           applicationId: input.applicationId,
           originalLocaleTags: [...original.localeTags],
           expectedLocaleTags: [...original.localeTags],
           attemptedLocaleTags: [captures[0]!.locale],
+          attemptedLocaleOwned: false,
           fence: original.restoreFence
         }
         let pendingValue = JSON.stringify(pending)
@@ -2823,6 +2862,7 @@ export class RoomOrchestrator {
         }
         const entries: AndroidLocaleScreenshotMatrixResult['entries'] = []
         let primaryFailure: unknown = null
+        let preconditionLostBeforeMutation: DevHotelError | null = null
         let expectedLocaleTags: string[] = [...original.localeTags]
         const assertFreshLocaleState = async (expected: readonly string[]) => {
           const fresh = await session.proveAppLocaleFinalState(
@@ -2850,10 +2890,12 @@ export class RoomOrchestrator {
         ): void => {
           const next: PendingAndroidLocaleRestore = {
             ...pending,
+            version: 2,
             operationId: pending.stage === Number.MAX_SAFE_INTEGER ? randomUUID() : pending.operationId,
             stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
             expectedLocaleTags: [...expected],
-            attemptedLocaleTags: [...attempted]
+            attemptedLocaleTags: [...attempted],
+            attemptedLocaleOwned: false
           }
           const nextValue = JSON.stringify(next)
           if (!this.settings.setIfValue(pendingKey, pendingValue, nextValue)) {
@@ -2868,6 +2910,25 @@ export class RoomOrchestrator {
           }
           pending = next
           pendingValue = nextValue
+        }
+        const confirmPendingAttemptedLocale = (): void => {
+          const confirmed: PendingAndroidLocaleRestore = {
+            ...pending,
+            attemptedLocaleOwned: true
+          }
+          const confirmedValue = JSON.stringify(confirmed)
+          if (!this.settings.setIfValue(pendingKey, pendingValue, confirmedValue)) {
+            throw new DevHotelError(
+              'ANDROID_LOCALE_RECOVERY_REQUIRED',
+              'The Android locale recovery stage changed before attempted-locale ownership was confirmed.',
+              {
+                recoveryHint: 'Keep the exact target unchanged and restart DevHotel for retained recovery.',
+                httpStatus: 409
+              }
+            )
+          }
+          pending = confirmed
+          pendingValue = confirmedValue
         }
         try {
           for (const [index, capture] of captures.entries()) {
@@ -2901,6 +2962,11 @@ export class RoomOrchestrator {
                 { recoveryHint: 'Recover the original target and let DevHotel restore its retained locale intent.' }
               )
             }
+            // A prepared attempted locale is not durable ownership: an
+            // external actor may coincidentally select it before our setter.
+            // Confirm synchronously once the setter's witnessed result proves
+            // it ran; a later fresh-proof failure can then safely restore it.
+            confirmPendingAttemptedLocale()
             await assertFreshLocaleState([locale])
             expectedLocaleTags = [locale]
             const artifact = await this.captureAndroidScreenshotArtifactWithSessionLocked(
@@ -2920,6 +2986,35 @@ export class RoomOrchestrator {
           }
         } catch (error) {
           primaryFailure = error
+          if (error instanceof DevHotelError && error.code === 'ANDROID_LOCALE_PRECONDITION_CHANGED') {
+            // The stage CAS only records which locale DevHotel is about to
+            // attempt. A matching live locale does not prove DevHotel wrote it:
+            // another actor may have reached that value after the CAS but
+            // before the setter's exact previous-locale check. In that case
+            // the setter made no mutation, so treating attemptedLocaleTags as
+            // owned and restoring would overwrite the external actor.
+            preconditionLostBeforeMutation = error
+          }
+        }
+
+        if (preconditionLostBeforeMutation) {
+          const current = this.rooms.get(roomId)
+          if (current && (current.status === 'running' || current.status === 'ready' || current.status === 'attention')) {
+            this.rooms.update(roomId, { status: 'attention' })
+          }
+          throw new DevHotelError(
+            'ANDROID_LOCALE_RECOVERY_REQUIRED',
+            'The app locale changed before DevHotel could begin its fenced matrix mutation; no automatic restoration was attempted.',
+            {
+              recoveryHint: 'Do not overwrite the current locale; inspect the exact target and resolve the retained recovery intent explicitly.',
+              cause: preconditionLostBeforeMutation,
+              httpStatus: 409,
+              evidence: {
+                stage: 'precondition',
+                primaryFailureCode: preconditionLostBeforeMutation.code
+              }
+            }
+          )
         }
 
         let restoration: AndroidLocaleScreenshotMatrixResult['restoration'] | null = null
@@ -2929,47 +3024,83 @@ export class RoomOrchestrator {
             original.restoreFence,
             timeoutMs
           )
+          const isOriginal = sameStringValues(beforeRestore.localeTags, original.localeTags)
+          const ownsCurrent = pending.attemptedLocaleOwned
+            ? sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
+            : sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags)
           if (
             beforeRestore.apiLevel !== original.apiLevel ||
             !sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, original.restoreFence) ||
             beforeRestore.pids.length === 0 ||
-            (
-              !sameStringValues(beforeRestore.localeTags, pending.expectedLocaleTags) &&
-              !sameStringValues(beforeRestore.localeTags, pending.attemptedLocaleTags)
-            )
+            (!isOriginal && !ownsCurrent)
           ) {
             throw new Error('Android locale is outside the exact retained matrix stage')
           }
-          advancePendingStage(beforeRestore.localeTags, original.localeTags)
-          const restored = await session.withActiveUserScreenWitness(
-            (signal) => session.restoreAppLocalesFromFence(
-              input.applicationId,
-              original.localeTags,
-              original.restoreFence,
-              pending.expectedLocaleTags,
-              pending.attemptedLocaleTags,
-              { timeoutMs, signal }
-            ),
-            { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
-          )
-          if (
-            restored.apiLevel !== original.apiLevel ||
-            !sameStringValues(restored.localeTags, original.localeTags) ||
-            !sameAndroidLocaleRestoreFence(restored.restoreFence, original.restoreFence) ||
-            restored.pids.length === 0 ||
-            restored.readiness.application !== 'foreground' ||
-            restored.readiness.localeService !== 'ready' ||
-            restored.readiness.process !== 'running'
-          ) {
+          if (isOriginal) {
+            const restored = await session.withActiveUserScreenWitness(
+              (signal) => session.restoreAppLocalesFromFence(
+                input.applicationId,
+                original.localeTags,
+                original.restoreFence,
+                original.localeTags,
+                original.localeTags,
+                { timeoutMs, signal }
+              ),
+              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+            )
+            if (
+              restored.apiLevel !== original.apiLevel ||
+              !sameStringValues(restored.previousLocaleTags, original.localeTags) ||
+              !sameStringValues(restored.localeTags, original.localeTags) ||
+              !sameAndroidLocaleRestoreFence(restored.restoreFence, original.restoreFence) ||
+              restored.pids.length === 0 ||
+              restored.readiness.application !== 'foreground' ||
+              restored.readiness.localeService !== 'ready' ||
+              restored.readiness.process !== 'running'
+            ) {
+              throw new Error('Android locale original-state readiness proof changed')
+            }
+            const finalRestored = await assertFreshLocaleState(original.localeTags)
+            restoration = {
+              localeTags: [...original.localeTags],
+              readiness: { ...restored.readiness, pids: [...finalRestored.pids] }
+            }
+            if (!this.deletePendingAndroidLocaleRestorationIfOwned(pendingKey, pendingValue, pending)) {
+              throw new Error('Android locale original-state intent ownership changed before completion')
+            }
+          } else {
+            advancePendingStage(beforeRestore.localeTags, original.localeTags)
+            const restored = await session.withActiveUserScreenWitness(
+              (signal) => session.restoreAppLocalesFromFence(
+                input.applicationId,
+                original.localeTags,
+                original.restoreFence,
+                pending.expectedLocaleTags,
+                pending.attemptedLocaleTags,
+                { timeoutMs, signal }
+              ),
+              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+            )
+            if (
+              restored.apiLevel !== original.apiLevel ||
+              !sameStringValues(restored.localeTags, original.localeTags) ||
+              !sameAndroidLocaleRestoreFence(restored.restoreFence, original.restoreFence) ||
+              restored.pids.length === 0 ||
+              restored.readiness.application !== 'foreground' ||
+              restored.readiness.localeService !== 'ready' ||
+              restored.readiness.process !== 'running'
+            ) {
               throw new Error('Android locale restoration proof changed')
-          }
-          const finalRestored = await assertFreshLocaleState(original.localeTags)
-          restoration = {
-            localeTags: [...original.localeTags],
-            readiness: { ...restored.readiness, pids: [...finalRestored.pids] }
-          }
-          if (!this.deletePendingAndroidLocaleRestorationIfOwned(pendingKey, pendingValue, pending)) {
-            throw new Error('Android locale restoration intent ownership changed before completion')
+            }
+            confirmPendingAttemptedLocale()
+            const finalRestored = await assertFreshLocaleState(original.localeTags)
+            restoration = {
+              localeTags: [...original.localeTags],
+              readiness: { ...restored.readiness, pids: [...finalRestored.pids] }
+            }
+            if (!this.deletePendingAndroidLocaleRestorationIfOwned(pendingKey, pendingValue, pending)) {
+              throw new Error('Android locale restoration intent ownership changed before completion')
+            }
           }
         } catch (restoreFailure) {
           const current = this.rooms.get(roomId)
