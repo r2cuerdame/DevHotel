@@ -32,6 +32,7 @@ const MAX_UI_TAG_BYTES = 32 * 1024
 const MAX_UI_ATTRIBUTE_BYTES = 4 * 1024
 const MAX_EVIDENCE_BYTES = 4 * 1024
 const MAX_LOGCAT_BYTES = 64 * 1024
+const MAX_FOREGROUND_DUMP_BYTES = 1024 * 1024
 const MAX_PACKAGE_DUMP_BYTES = 1024 * 1024
 const MAX_USER_DUMP_BYTES = 256 * 1024
 const MAX_TARGET_CLOCK_RTT_MS = 2_000
@@ -815,11 +816,24 @@ export class AndroidAutomationSession {
     deadline?: AndroidAutomationDeadline,
     signal?: AbortSignal
   ): Promise<AndroidForegroundPackage | null | undefined> {
-    const result = await this.command(
-      ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 2 -E '^[[:space:]]*mCurrentFocus=' | head -c 2048"],
-      { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048, deadline, signal }
-    )
-    const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0)
+    let result: ExecResult
+    try {
+      result = await this.command(
+        ['shell', 'sh', '-c', 'exec dumpsys window windows'],
+        {
+          operation: 'Android foreground probe',
+          timeoutMs: 15_000,
+          stdoutLimit: MAX_FOREGROUND_DUMP_BYTES,
+          outputLimitRecovery: 'Dismiss system overlays and retry with a responsive Android window manager.',
+          deadline,
+          signal
+        }
+      )
+    } catch (error) {
+      if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_OUTPUT_LIMIT') throw error
+      return undefined
+    }
+    const lines = result.stdout.split(/\r?\n/).filter((line) => /^\s*mCurrentFocus=/.test(line))
     if (
       result.code !== 0 ||
       result.stderr.length > 0 ||

@@ -205,6 +205,7 @@ describe('tracked Android automation session', () => {
     const calls: string[][] = []
     const timeouts: Array<number | undefined> = []
     const signals: Array<AbortSignal | undefined> = []
+    const stdoutLimits: Array<number | undefined> = []
     let witnessBegin: string | null = null
     let witnessReader: {
       onStdout?: (chunk: string | Uint8Array) => void
@@ -263,6 +264,7 @@ describe('tracked Android automation session', () => {
         calls.push(args)
         timeouts.push(opts?.timeoutMs)
         signals.push(opts?.signal)
+        stdoutLimits.push(opts?.maxStdoutBytes)
         if (opts?.signal?.aborted) throw opts.signal.reason
         if (
           witnessFixture.readerStartupDelayMs !== undefined &&
@@ -414,7 +416,7 @@ describe('tracked Android automation session', () => {
       },
       ...timing
     })
-    return { db, installs, calls, session, signals, timeouts }
+    return { db, installs, calls, session, signals, stdoutLimits, timeouts }
   }
 
   it.each([
@@ -721,7 +723,7 @@ describe('tracked Android automation session', () => {
       state: 'tracked mFocusedApp behind a SystemUI current-focus window',
       stdout: `mFocusedApp=AppWindowToken{1 token=Token{2 ActivityRecord{3 u0 ${APP_ID}/.MainActivity}}}\n` +
         'mCurrentFocus=Window{4 u0 com.android.systemui/.SystemUI}\n',
-      code: 'ANDROID_FOREGROUND_UNKNOWN'
+      code: 'ANDROID_APP_NOT_FOREGROUND'
     },
     {
       state: 'mFocusedApp without any current-focus window',
@@ -840,15 +842,48 @@ describe('tracked Android automation session', () => {
       result: { code: 0, stdout: 'mCurrentFocus=null\n', stderr: '', outputLimitExceeded: true }
     }
   ])('rejects force-stop success when the foreground probe is $probe', async ({ result }) => {
-    const { calls, session } = setup((args) => {
+    const { calls, session, stdoutLimits } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) return result
       return { code: 0, stdout: '', stderr: '' }
     })
 
     await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
-    expect(calls.find((args) => args[1] === 'sh' && args[3]?.includes('dumpsys window'))?.[3])
-      .toContain('grep -m 2')
+    const foregroundProbeIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('dumpsys window'))
+    expect(calls[foregroundProbeIndex]).toEqual(['shell', 'sh', '-c', 'exec dumpsys window windows'])
+    expect(stdoutLimits[foregroundProbeIndex]).toBe(1024 * 1024)
+  })
+
+  it('rejects a second focus record after a first record that filled the old guest-side cap', async () => {
+    const suffix = ' u0 com.android.launcher/.Launcher}'
+    const prefix = 'mCurrentFocus=Window{'
+    const padding = 'x'.repeat(2048 - Buffer.byteLength(`${prefix}${suffix}\n`, 'utf8'))
+    const first = `${prefix}${padding}${suffix}`
+    expect(Buffer.byteLength(`${first}\n`, 'utf8')).toBe(2048)
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `${first}\nmCurrentFocus=null\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+  })
+
+  it('maps an oversized full foreground dump to unknown without exposing partial output', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: 'x'.repeat((1024 * 1024) + 1), stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_FORCE_STOP_FAILED',
+      evidence: { stdout: '' }
+    })
   })
 
   it.each([

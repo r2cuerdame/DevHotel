@@ -8,7 +8,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --maxWorkers=2"
+    "test": "vitest run --maxWorkers=1"
   },
   "dependencies": {
     "@devhotel/shared": "workspace:*",
