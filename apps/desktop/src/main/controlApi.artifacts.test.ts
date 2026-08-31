@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DevHotelError, type RoomOrchestrator } from '@devhotel/core'
+import { DevHotelError, registerSensitiveSecrets, type RoomOrchestrator } from '@devhotel/core'
 import type { RoomArtifact } from '@devhotel/shared'
 import { startControlApi } from './controlApi'
 
@@ -126,7 +126,15 @@ describe('screenshot artifact control API', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-artifact-filename-'))
     roots.push(userData)
     const filename = 'ghp_aaaaaaaaaaaaaaaaaaaa.png'
-    const tokenShapedArtifact = { ...artifact, filename }
+    const model = 'Pixel recovery-secret'
+    const tokenShapedArtifact: RoomArtifact = {
+      ...artifact,
+      filename,
+      metadata: {
+        ...artifact.metadata,
+        device: { ...artifact.metadata.device, model }
+      }
+    }
     const captureAndroidScreenshotArtifact = vi.fn(async () => tokenShapedArtifact)
     const listRoomArtifacts = vi.fn(() => [tokenShapedArtifact])
     const getRoomArtifact = vi.fn(() => tokenShapedArtifact)
@@ -157,13 +165,16 @@ describe('screenshot artifact control API', () => {
       'content-type': 'application/json'
     }
     const base = `http://127.0.0.1:${control.info.port}/v1/rooms/aaaa1111/artifacts`
+    const release = registerSensitiveSecrets([model])
     try {
       const captured = await fetch(`${base}/screenshots`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ filename })
       })
-      await expect(captured.json()).resolves.toMatchObject({ filename })
+      const capturedJson = await captured.json() as RoomArtifact
+      expect(capturedJson).toMatchObject({ filename })
+      expect(capturedJson.metadata.device.model).not.toContain('recovery-secret')
       await expect((await fetch(base, { headers })).json()).resolves.toMatchObject({
         artifacts: [{ filename }]
       })
@@ -179,6 +190,7 @@ describe('screenshot artifact control API', () => {
       })
       await expect(exported.json()).resolves.toEqual(exportResult)
     } finally {
+      release()
       control.stop()
     }
   })

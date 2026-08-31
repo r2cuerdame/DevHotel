@@ -106,7 +106,8 @@ describe('Room screenshot artifact export', () => {
     expect(backend.publishRoomArtifactCalls[0]).toMatchObject({
       roomId: 'aaaa1111',
       workspaceVolumeRevision: 2,
-      relativePath: 'docs/evidence/login-success.png'
+      relativePath: 'docs/evidence/login-success.png',
+      stageToken: expect.stringMatching(/^[a-f0-9]{32}$/)
     })
     const pauseAt = backend.calls.indexOf('pauseWeb:aaaa1111')
     const publishAt = backend.calls.indexOf('publishRoomArtifact:aaaa1111:r2:docs/evidence/login-success.png')
@@ -117,6 +118,7 @@ describe('Room screenshot artifact export', () => {
     expect(backend.execInRoomCalls).toEqual([])
     expect(backend.calls.some((call) => call.startsWith('copyIntoRoom:'))).toBe(false)
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, syncStatus: 'modified' })
+    expect(orch.settings.get('artifactExportPending:aaaa1111')).toBeNull()
     expect(privateStage).not.toBe('')
     expect(existsSync(privateStage)).toBe(false)
     const tmp = join(userData, 'tmp')
@@ -134,6 +136,7 @@ describe('Room screenshot artifact export', () => {
       orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/existing.png' }, 'agent')
     ).rejects.toMatchObject({ code: 'ARTIFACT_DESTINATION_EXISTS' })
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 4, syncStatus: expect.not.stringMatching(/^modified$/) })
+    expect(orch.settings.get('artifactExportPending:aaaa1111')).toBeNull()
     expect(backend.calls).toContain('unpauseWeb:aaaa1111')
     expect(backend.webPausedValue).toBe(false)
     expect(backend.execInRoomCalls).toEqual([])
@@ -217,6 +220,58 @@ describe('Room screenshot artifact export', () => {
       syncStatus: 'modified',
       status: 'broken'
     })
+    expect(orch.settings.get('artifactExportPending:aaaa1111')).not.toBeNull()
+  })
+
+  it('settles and fences a durable interrupted publication during startup', async () => {
+    const { backend, orch } = setup()
+    const pending = {
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/interrupted.png',
+      expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+      stageToken: 'b'.repeat(32)
+    }
+    orch.settings.set('artifactExportPending:aaaa1111', JSON.stringify(pending))
+    backend.reconcileRoomArtifactPublicationHandler = () => 'committed'
+
+    await orch.init()
+
+    expect(backend.reconcileRoomArtifactPublicationCalls).toEqual([{
+      roomId: 'aaaa1111',
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/interrupted.png',
+      expected: pending.expected,
+      stageToken: pending.stageToken
+    }])
+    expect(backend.calls.indexOf('stopRoomPod:aaaa1111')).toBeLessThan(
+      backend.calls.indexOf('reconcileRoomArtifactPublication:aaaa1111:r2:docs/interrupted.png')
+    )
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 5,
+      syncStatus: 'modified',
+      status: 'broken',
+      hostPort: null
+    })
+    expect(orch.settings.get('artifactExportPending:aaaa1111')).toBeNull()
+  })
+
+  it('keeps an unsettled startup intent while fencing the Room', async () => {
+    const { backend, orch } = setup()
+    const key = 'artifactExportPending:aaaa1111'
+    orch.settings.set(key, JSON.stringify({
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/unsettled.png',
+      expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+      stageToken: 'b'.repeat(32)
+    }))
+    backend.reconcileRoomArtifactPublicationHandler = () => 'incomplete'
+
+    await orch.init()
+
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, status: 'broken' })
+    expect(orch.settings.get(key)).not.toBeNull()
   })
 
   it('returns success after an unpause failure is recovered by one exact web recreation', async () => {

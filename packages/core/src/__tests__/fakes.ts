@@ -11,6 +11,7 @@ import type {
   ExportedArtifact,
   IsolationBackend,
   RoomArtifactExpectation,
+  RoomArtifactRecoveryOutcome,
   WebSpec
 } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
@@ -80,6 +81,14 @@ export class FakeBackend implements IsolationBackend {
     hostPngPath: string
     relativePath: string
     expected: RoomArtifactExpectation
+    stageToken?: string
+  }[] = []
+  reconcileRoomArtifactPublicationCalls: {
+    roomId: string
+    workspaceVolumeRevision: number
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string
   }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
@@ -99,7 +108,15 @@ export class FakeBackend implements IsolationBackend {
     hostPngPath: string
     relativePath: string
     expected: RoomArtifactExpectation
+    stageToken?: string
   }) => Promise<void> | void) | null = null
+  reconcileRoomArtifactPublicationHandler: ((input: {
+    roomId: string
+    workspaceVolumeRevision: number
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string
+  }) => Promise<RoomArtifactRecoveryOutcome> | RoomArtifactRecoveryOutcome) | null = null
   copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
   relayTokenValue = ''
@@ -227,12 +244,25 @@ export class FakeBackend implements IsolationBackend {
     workspaceVolumeRevision: number,
     hostPngPath: string,
     relativePath: string,
-    expected: RoomArtifactExpectation
+    expected: RoomArtifactExpectation,
+    stageToken?: string
   ) {
-    const input = { roomId, workspaceVolumeRevision, hostPngPath, relativePath, expected }
+    const input = { roomId, workspaceVolumeRevision, hostPngPath, relativePath, expected, ...(stageToken ? { stageToken } : {}) }
     this.calls.push(`publishRoomArtifact:${roomId}:r${workspaceVolumeRevision}:${relativePath}`)
     this.publishRoomArtifactCalls.push(input)
     await this.publishRoomArtifactHandler?.(input)
+  }
+  async reconcileRoomArtifactPublication(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    relativePath: string,
+    expected: RoomArtifactExpectation,
+    stageToken: string
+  ): Promise<RoomArtifactRecoveryOutcome> {
+    const input = { roomId, workspaceVolumeRevision, relativePath, expected, stageToken }
+    this.calls.push(`reconcileRoomArtifactPublication:${roomId}:r${workspaceVolumeRevision}:${relativePath}`)
+    this.reconcileRoomArtifactPublicationCalls.push(input)
+    return await this.reconcileRoomArtifactPublicationHandler?.(input) ?? 'absent'
   }
   async webState() {
     return this.webStateValue

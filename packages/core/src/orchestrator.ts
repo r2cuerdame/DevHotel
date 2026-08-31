@@ -83,7 +83,13 @@ import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { runDocker } from './backend/cli'
 import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
-import { RoomArtifactPublicationError, type ExecResult, type IsolationBackend, type WebSpec } from './backend/types'
+import {
+  RoomArtifactPublicationError,
+  type ExecResult,
+  type IsolationBackend,
+  type RoomArtifactExpectation,
+  type WebSpec
+} from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -178,6 +184,58 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'an
  */
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
+const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
+
+interface PendingArtifactExport {
+  version: 1
+  workspaceVolumeRevision: number
+  relativePath: string
+  expected: RoomArtifactExpectation
+  stageToken: string
+}
+
+function pendingArtifactExportKey(roomId: string): string {
+  return `${ARTIFACT_EXPORT_PENDING_PREFIX}${roomId}`
+}
+
+function parsePendingArtifactExport(raw: string): PendingArtifactExport | null {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (
+    Object.keys(record).sort().join(',') !== 'expected,relativePath,stageToken,version,workspaceVolumeRevision' ||
+    record.version !== 1 ||
+    !Number.isSafeInteger(record.workspaceVolumeRevision) ||
+    (record.workspaceVolumeRevision as number) < 0 ||
+    typeof record.stageToken !== 'string' ||
+    !/^[a-f0-9]{32}$/.test(record.stageToken)
+  ) return null
+  const path = zArtifactExportBody.safeParse({ relativePath: record.relativePath })
+  const expected = record.expected
+  if (expected === null || typeof expected !== 'object' || Array.isArray(expected)) return null
+  const identity = expected as Record<string, unknown>
+  if (
+    Object.keys(identity).sort().join(',') !== 'sha256,sizeBytes' ||
+    !Number.isSafeInteger(identity.sizeBytes) ||
+    (identity.sizeBytes as number) < 1 ||
+    (identity.sizeBytes as number) > SCREENSHOT_ARTIFACT_MAX_BYTES ||
+    typeof identity.sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(identity.sha256) ||
+    !path.success
+  ) return null
+  return {
+    version: 1,
+    workspaceVolumeRevision: record.workspaceVolumeRevision as number,
+    relativePath: path.data.relativePath,
+    expected: { sizeBytes: identity.sizeBytes as number, sha256: identity.sha256 },
+    stageToken: record.stageToken
+  }
+}
 const SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 const ADB_INSTALL_VERBS = new Set(['install', 'install-multiple', 'install-multi-package'])
 const ADB_UNSAFE_HOST_FILE_VERBS = new Set(['pull', 'push', 'restore', 'sideload', 'sync'])
@@ -534,6 +592,7 @@ export class RoomOrchestrator {
     if (health.ok) {
       reconciled = await reconcile(this.backend, this.rooms, (l) => this.olog('system', l))
     }
+    await this.reconcileInterruptedArtifactExports(health.ok)
     await this.reconcileWindowsRooms()
     await this.markInterruptedChanges()
     return { backendOk: health.ok, reconciled }
@@ -547,6 +606,52 @@ export class RoomOrchestrator {
   private markInterruptedOperations(): void {
     for (const operation of this.operations.recoverInterrupted()) {
       this.olog(operation.roomId, `interrupted ${operation.kind} operation ${operation.id} was ended by an app restart`)
+    }
+  }
+
+  private async reconcileInterruptedArtifactExports(backendOk: boolean): Promise<void> {
+    for (const room of this.rooms.list()) {
+      const key = pendingArtifactExportKey(room.id)
+      const raw = this.settings.get(key)
+      if (raw === null) continue
+      const pending = parsePendingArtifactExport(raw)
+      let settled = false
+      if (
+        backendOk &&
+        pending !== null &&
+        room.provider !== 'windows' &&
+        room.workspaceMode === 'hotel' &&
+        room.workspaceVolumeRevision === pending.workspaceVolumeRevision
+      ) {
+        try {
+          const outcome = await this.backend.reconcileRoomArtifactPublication(
+            room.id,
+            pending.workspaceVolumeRevision,
+            pending.relativePath,
+            pending.expected,
+            pending.stageToken
+          )
+          settled = outcome === 'committed' || outcome === 'absent' || outcome === 'destination-exists'
+        } catch {
+          // The durable intent remains for another startup. The Room fence is
+          // still invalidated below so no workload can use an uncertain tree.
+        }
+      }
+      let fenced = false
+      try {
+        this.markWorkspaceAmbiguous(room.id)
+        fenced = true
+      } catch {
+        // Keep the durable intent if the database fence itself could not land.
+      }
+      if (settled && fenced) {
+        try {
+          this.settings.delete(key)
+        } catch {
+          // A repeated recovery is conservative and identity-fenced.
+        }
+      }
+      this.olog(room.id, 'interrupted artifact export was fenced; private recovery details were withheld')
     }
   }
 
@@ -2063,9 +2168,12 @@ export class RoomOrchestrator {
       let pauseAttempted = false
       let publicationCommitted = false
       let publicationAmbiguous = false
+      let pendingIntentStored = false
       let runtimeRestoreUnsafe = false
       let primaryError: unknown
       let stagingCleanupError: unknown
+      const pendingKey = pendingArtifactExportKey(roomId)
+      const stageToken = randomUUID().replaceAll('-', '')
       try {
         pauseAttempted = true
         try {
@@ -2094,12 +2202,21 @@ export class RoomOrchestrator {
             { recoveryHint: 'Retry the export against the current Room state.' }
           )
         }
+        this.settings.set(pendingKey, JSON.stringify({
+          version: 1,
+          workspaceVolumeRevision: room.workspaceVolumeRevision,
+          relativePath: input.relativePath,
+          expected: { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
+          stageToken
+        } satisfies PendingArtifactExport))
+        pendingIntentStored = true
         await this.backend.publishRoomArtifact(
           roomId,
           room.workspaceVolumeRevision,
           hostFile,
           input.relativePath,
-          { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 }
+          { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
+          stageToken
         )
         publicationCommitted = true
         // The controlled helper resolves only after exact publication and
@@ -2123,6 +2240,21 @@ export class RoomOrchestrator {
           }
           throw revisionError
         }
+        try {
+          this.settings.delete(pendingKey)
+          pendingIntentStored = false
+        } catch (intentError) {
+          runtimeRestoreUnsafe = true
+          try {
+            this.markWorkspaceAmbiguous(roomId)
+          } catch (brokenStateError) {
+            throw new AggregateError(
+              [intentError, brokenStateError],
+              'Artifact publication committed but its recovery intent and broken-state fence could not be persisted'
+            )
+          }
+          throw intentError
+        }
       } catch (error) {
         publicationAmbiguous = error instanceof RoomArtifactPublicationError &&
           error.reason === 'publication-ambiguous'
@@ -2132,6 +2264,19 @@ export class RoomOrchestrator {
         rmSync(temporary, { recursive: true, force: true })
       } catch (error) {
         stagingCleanupError = error
+      }
+
+      if (pendingIntentStored && !publicationCommitted && !publicationAmbiguous) {
+        try {
+          this.settings.delete(pendingKey)
+          pendingIntentStored = false
+        } catch (intentError) {
+          publicationAmbiguous = true
+          primaryError = new AggregateError(
+            [...(primaryError ? [primaryError] : []), intentError],
+            'Artifact publication failed safely but its durable recovery intent could not be cleared'
+          )
+        }
       }
 
       if (publicationAmbiguous) {

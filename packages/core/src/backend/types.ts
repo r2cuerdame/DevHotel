@@ -95,6 +95,13 @@ export type RoomArtifactPublicationFailureReason =
   | 'publication-ambiguous'
   | 'helper-failed'
 
+export type RoomArtifactRecoveryOutcome =
+  | 'committed'
+  | 'absent'
+  | 'destination-exists'
+  | 'unsafe-parent'
+  | 'incomplete'
+
 /** Stable cross-backend failure contract; callers must not infer security outcomes from text. */
 export class RoomArtifactPublicationError extends Error {
   constructor(
@@ -164,8 +171,17 @@ export interface IsolationBackend {
     workspaceVolumeRevision: number,
     hostPngPath: string,
     relativePath: string,
-    expected: RoomArtifactExpectation
+    expected: RoomArtifactExpectation,
+    stageToken?: string
   ): Promise<void>
+  /** Settle one durable interrupted artifact publication after all Room workloads are stopped. */
+  reconcileRoomArtifactPublication(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    relativePath: string,
+    expected: RoomArtifactExpectation,
+    stageToken: string
+  ): Promise<RoomArtifactRecoveryOutcome>
   webState(roomId: string): Promise<'running' | 'exited' | 'missing'>
   listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]>
   /** Remove a container after re-validating exact DevHotel ownership metadata. */

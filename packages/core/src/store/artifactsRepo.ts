@@ -23,7 +23,10 @@ interface ArtifactRow {
 function rowToArtifact(row: ArtifactRow): RoomArtifact {
   let metadata: unknown
   try {
-    metadata = sanitizeAndroidScreenshotArtifactMetadata(JSON.parse(row.metadata_json))
+    // Keep the persisted receipt exact here. Dynamic secret registrations may
+    // change over time; response-boundary sanitization must not change the
+    // database side of the immutable disk-receipt comparison.
+    metadata = JSON.parse(row.metadata_json)
   } catch {
     throw new Error(`Artifact ${row.id} has invalid metadata JSON`)
   }

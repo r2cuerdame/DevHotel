@@ -3,6 +3,7 @@ import type { Db } from './db'
 export interface SettingsRepo {
   get(k: string): string | null
   set(k: string, v: string): void
+  delete(k: string): void
 }
 
 export function settingsRepo(db: Db): SettingsRepo {
@@ -21,6 +22,9 @@ export function settingsRepo(db: Db): SettingsRepo {
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         )
         .run(k, v)
+    },
+    delete(k) {
+      sqlite.prepare('DELETE FROM settings WHERE key = ?').run(k)
     },
   }
 }

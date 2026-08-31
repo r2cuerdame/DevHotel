@@ -51,6 +51,7 @@ import type {
   IsolationBackend,
   ManagedNetwork,
   RoomArtifactExpectation,
+  RoomArtifactRecoveryOutcome,
   WebSpec
 } from './types'
 
@@ -852,18 +853,14 @@ function sha256File(path: string): Promise<string> {
   })
 }
 
-function assertRoomArtifactPublishInput(
+function assertRoomArtifactCoordinates(
   roomId: string,
   workspaceVolumeRevision: number,
-  hostPngPath: string,
   relativePath: string,
   expected: RoomArtifactExpectation
 ): void {
   if (!/^[a-z0-9]{8}$/.test(roomId) || !Number.isSafeInteger(workspaceVolumeRevision) || workspaceVolumeRevision < 0) {
     throw new RoomArtifactPublicationError('invalid-input', 'Room artifact publication input is invalid')
-  }
-  if (typeof hostPngPath !== 'string' || !isAbsolute(hostPngPath) || hostPngPath.includes('\0')) {
-    throw new RoomArtifactPublicationError('invalid-source', 'Room artifact publication refused an invalid [private screenshot stage]')
   }
   if (
     !expected ||
@@ -902,6 +899,25 @@ function assertRoomArtifactPublishInput(
     !/\.png$/i.test(segments.at(-1) ?? '')
   ) {
     throw new RoomArtifactPublicationError('invalid-input', 'Room artifact publication path is invalid')
+  }
+}
+
+function assertRoomArtifactPublishInput(
+  roomId: string,
+  workspaceVolumeRevision: number,
+  hostPngPath: string,
+  relativePath: string,
+  expected: RoomArtifactExpectation
+): void {
+  assertRoomArtifactCoordinates(roomId, workspaceVolumeRevision, relativePath, expected)
+  if (typeof hostPngPath !== 'string' || !isAbsolute(hostPngPath) || hostPngPath.includes('\0')) {
+    throw new RoomArtifactPublicationError('invalid-source', 'Room artifact publication refused an invalid [private screenshot stage]')
+  }
+}
+
+function assertRoomArtifactStageToken(stageToken: string): void {
+  if (!/^[a-f0-9]{32}$/.test(stageToken)) {
+    throw new RoomArtifactPublicationError('invalid-input', 'Room artifact publication input is invalid')
   }
 }
 
@@ -1725,10 +1741,13 @@ export class OciCliBackend implements IsolationBackend {
     workspaceVolumeRevision: number,
     hostPngPath: string,
     relativePath: string,
-    expected: RoomArtifactExpectation
+    expected: RoomArtifactExpectation,
+    requestedStageToken?: string
   ): Promise<void> {
     try {
       assertRoomArtifactPublishInput(roomId, workspaceVolumeRevision, hostPngPath, relativePath, expected)
+      const stageToken = requestedStageToken ?? randomUUID().replaceAll('-', '')
+      assertRoomArtifactStageToken(stageToken)
       const privateInput = await privateRoomArtifactIdentity(hostPngPath, expected)
       const workspaceVolume = srcVolume(roomId, workspaceVolumeRevision)
       assertExpectedRoomVolumeName(roomId, workspaceVolume)
@@ -1751,7 +1770,6 @@ export class OciCliBackend implements IsolationBackend {
       const jobId = randomUUID()
       const helperName = jobName(roomId, jobId)
       const publishToken = randomUUID()
-      const stageToken = publishToken.replaceAll('-', '')
       const createArgs = [
         'create',
         '--name',
@@ -1950,6 +1968,40 @@ export class OciCliBackend implements IsolationBackend {
         throw new RoomArtifactPublicationError('helper-failed', 'Room artifact helper returned unexpected diagnostics')
       }
       throw new RoomArtifactPublicationError('helper-failed', 'Room artifact helper did not publish an exact transaction')
+    } catch (error) {
+      throw sanitizedRoomArtifactPublicationError(error)
+    }
+  }
+
+  async reconcileRoomArtifactPublication(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    relativePath: string,
+    expected: RoomArtifactExpectation,
+    stageToken: string
+  ): Promise<RoomArtifactRecoveryOutcome> {
+    try {
+      assertRoomArtifactCoordinates(roomId, workspaceVolumeRevision, relativePath, expected)
+      assertRoomArtifactStageToken(stageToken)
+      const workspaceVolume = srcVolume(roomId, workspaceVolumeRevision)
+      assertExpectedRoomVolumeName(roomId, workspaceVolume)
+      await this.assertPinnedEngineIdentity()
+      const volume = await this.inspectVolume(workspaceVolume)
+      if (!volume) throw new RoomArtifactPublicationError('fence-changed', 'Room artifact workspace generation is missing')
+      try {
+        await this.assertRoomVolumeOwnership(volume, roomId, workspaceVolume)
+      } catch {
+        throw new RoomArtifactPublicationError('fence-changed', 'Room artifact workspace ownership is invalid')
+      }
+      await this.ensureImage(ANDROID_IMAGE)
+      return await this.finalizeRoomArtifactPublication(
+        roomId,
+        workspaceVolume,
+        undefined,
+        relativePath,
+        expected,
+        stageToken
+      )
     } catch (error) {
       throw sanitizedRoomArtifactPublicationError(error)
     }
@@ -3817,12 +3869,12 @@ export class OciCliBackend implements IsolationBackend {
   private async finalizeRoomArtifactPublication(
     roomId: string,
     workspaceVolume: string,
-    webId: string,
+    webId: string | undefined,
     relativePath: string,
     expected: RoomArtifactExpectation,
     stageToken: string
   ): Promise<RoomArtifactFinalizeOutcome> {
-    await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
+    if (webId !== undefined) await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
     const helperName = jobName(roomId, randomUUID())
     const publishToken = randomUUID()
     const createArgs = [
@@ -3893,7 +3945,7 @@ export class OciCliBackend implements IsolationBackend {
         workspaceVolume
       )
       if (inert.State?.Status !== 'created') throw new Error('Room artifact finalizer was not inert before start')
-      await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
+      if (webId !== undefined) await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
       try {
         await runDocker(['start', '-a', helperId], {
           timeoutMs: 30_000,
@@ -3928,10 +3980,12 @@ export class OciCliBackend implements IsolationBackend {
     }
 
     let postFenceError: unknown
-    try {
-      await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
-    } catch (error) {
-      postFenceError = error
+    if (webId !== undefined) {
+      try {
+        await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
+      } catch (error) {
+        postFenceError = error
+      }
     }
 
     // Exit 0 is the irreversible commit boundary: the exact owned finalizer

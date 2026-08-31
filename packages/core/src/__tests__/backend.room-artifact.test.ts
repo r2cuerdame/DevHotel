@@ -18,6 +18,7 @@ const WORKSPACE = srcVolume(ROOM_ID, REVISION)
 const WEB_ID = 'a'.repeat(64)
 const PRIMARY_ID = 'b'.repeat(64)
 const FINALIZER_ID = 'c'.repeat(64)
+const STAGE_TOKEN = 'd'.repeat(32)
 const RELATIVE_PATH = 'docs/evidence/login-success.png'
 const ok = { code: 0, stdout: '', stderr: '' }
 
@@ -308,6 +309,26 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       expect(opts).toMatchObject({ maxStdoutBytes: 256, maxStderrBytes: 8 * 1024 })
       expect(opts?.timeoutMs).toEqual(expect.any(Number))
     }
+  })
+
+  it('settles a durable interrupted publication without requiring a live web container', async () => {
+    webRunning = false
+
+    await expect(new OciCliBackend().reconcileRoomArtifactPublication(
+      ROOM_ID,
+      REVISION,
+      RELATIVE_PATH,
+      expected,
+      STAGE_TOKEN
+    )).resolves.toBe('committed')
+
+    expect(createCalls).toHaveLength(1)
+    expect(createCalls[0]).toEqual(expect.arrayContaining([
+      'devhotel-room-artifact-finalize', '/workspace', RELATIVE_PATH,
+      String(expected.sizeBytes), expected.sha256, STAGE_TOKEN
+    ]))
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'inspect' && args[1] === webName(ROOM_ID))).toBe(false)
+    expect(workspaceResidue.size).toBe(0)
   })
 
   it.each([

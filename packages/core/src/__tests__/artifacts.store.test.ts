@@ -139,6 +139,27 @@ describe('Room screenshot artifact store', () => {
     }
   })
 
+  it('compares persisted receipts before applying newly registered prose redaction', () => {
+    const { store } = setup()
+    const model = 'Pixel recovery-secret'
+    const artifact = store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'dynamic-redaction.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111', {
+        device: { kind: 'emulator', deviceId: null, model, androidVersion: '15', apiLevel: 35 }
+      })
+    })
+    const release = registerSensitiveSecrets([model])
+    try {
+      expect(store.readContent('aaaa1111', artifact.id).artifact.metadata.device.model).toBe(model)
+    } finally {
+      release()
+    }
+  })
+
   it('refuses tampered content instead of serving it', () => {
     const { store, userData } = setup()
     const artifact = store.publishScreenshot({
