@@ -79,23 +79,27 @@ describe('reconcile stale one-shot jobs', () => {
     const backend = new FakeBackend()
     const runningJob = jobName(room.id, '11111111-2222-4333-8444-555555555555')
     const exitedJob = jobName(room.id, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+    const interruptedEmulator = `dh-${room.id}-svc-emulator`
     backend.managedContainers = [
       { roomId: room.id, role: 'anchor', state: 'running', name: `dh-${room.id}-anchor` },
       { roomId: room.id, role: 'web', state: 'running', name: `dh-${room.id}-web` },
       { roomId: room.id, role: 'svc-postgres', state: 'running', name: `dh-${room.id}-svc-postgres` },
       { roomId: room.id, role: 'job', state: 'running', name: runningJob },
-      { roomId: room.id, role: 'job', state: 'exited', name: exitedJob }
+      { roomId: room.id, role: 'job', state: 'exited', name: exitedJob },
+      { roomId: room.id, role: 'svc-emulator', state: 'created', name: interruptedEmulator }
     ]
     const logs: string[] = []
 
     const result = await reconcile(backend, rooms, (line) => logs.push(line))
 
-    expect(result.straysRemoved).toEqual([runningJob, exitedJob])
+    expect(result.straysRemoved).toEqual([runningJob, exitedJob, interruptedEmulator])
     expect(backend.managedContainers.map((container) => container.role)).toEqual(['anchor', 'web', 'svc-postgres'])
     expect(backend.calls).toEqual([
       `removeManagedContainer:${runningJob}`,
-      `removeManagedContainer:${exitedJob}`
+      `removeManagedContainer:${exitedJob}`,
+      `removeManagedContainer:${interruptedEmulator}`
     ])
-    expect(logs.every((line) => line.includes('stale job container'))).toBe(true)
+    expect(logs.slice(0, 2).every((line) => line.includes('stale job container'))).toBe(true)
+    expect(logs[2]).toContain('interrupted emulator create')
   })
 })

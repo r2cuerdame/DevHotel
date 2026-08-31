@@ -20,6 +20,8 @@ export interface WebSpec {
   imageOverride?: string
   /** standalone containers join the owned Room network directly: no anchor or published port */
   standalone?: boolean
+  /** Android keeps user workloads in a runtime namespace isolated from the emulator relay/control namespace. */
+  androidRuntimeIsolation?: boolean
   /** skip the /workspace/node_modules deps volume (non-node providers) */
   noDepsVolume?: boolean
   /** skip the persistent Room cache for a clean, disposable job */
@@ -35,6 +37,8 @@ export interface WebSpec {
 export interface AnchorSpec {
   roomId: string
   internalPort: number
+  /** Recreate the Android control relay and ensure its separate runtime namespace leader is running. */
+  androidRuntimeIsolation?: boolean
 }
 
 export interface ExecResult {
@@ -49,6 +53,8 @@ export type ExecOutputChunk = string | Uint8Array
 
 export interface ExecOpts {
   timeoutMs?: number
+  /** Cancel the command and complete its mandatory ownership-safe cleanup. */
+  signal?: AbortSignal
   /** Optional hard capture caps used by fenced helpers and high-level automation. */
   maxStdoutBytes?: number
   maxStderrBytes?: number
@@ -82,7 +88,10 @@ export interface IsolationBackend {
   ): Promise<{ hostPort: number | null }>
   /** Secret needed by the host gateway to cross this Room's published relay gate. */
   relayToken(roomId: string): Promise<string>
-  startRoomPod(roomId: string, opts?: { standalone?: boolean }): Promise<{ hostPort: number | null }>
+  startRoomPod(
+    roomId: string,
+    opts?: { standalone?: boolean; androidRuntimeIsolation?: boolean }
+  ): Promise<{ hostPort: number | null }>
   startWeb(roomId: string): Promise<void>
   stopRoomPod(roomId: string): Promise<void>
   /** Freeze/unfreeze the web container while taking a consistent volume copy. */

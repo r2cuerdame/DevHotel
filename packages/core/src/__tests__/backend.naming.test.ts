@@ -3,10 +3,15 @@ import {
   ANCHOR_IMAGE,
   RELAY_PORT,
   anchorName,
+  androidControlNetworkName,
+  androidRuntimeAnchorName,
+  buildAndroidControlNetworkCreateArgs,
+  buildAndroidRuntimeAnchorArgs,
   buildAnchorArgs,
   buildEmulatorArgs,
   buildOneShotArgs,
   buildRoomNetworkCreateArgs,
+  buildServiceArgs,
   buildWebCreateArgs,
   cacheVolume,
   depsVolume,
@@ -49,6 +54,8 @@ describe('names and images', () => {
   it('derives container, volume, and image names', () => {
     expect(anchorName('r1')).toBe('dh-r1-anchor')
     expect(roomNetworkName('r1')).toBe('dh-r1-net')
+    expect(androidControlNetworkName('r1')).toBe('dh-r1-android-control-net')
+    expect(androidRuntimeAnchorName('r1')).toBe('dh-r1-android-runtime-anchor')
     expect(webName('r1')).toBe('dh-r1-web')
     expect(srcVolume('r1')).toBe('dh-r1-src')
     expect(depsVolume('r1', '22')).toBe('dh-r1-deps-node22')
@@ -75,6 +82,24 @@ describe('buildRoomNetworkCreateArgs', () => {
       '--label',
       'devhotel.managed=1',
       'dh-r1-net',
+    ])
+  })
+
+  it('creates a separately owned Android control bridge', () => {
+    expect(buildAndroidControlNetworkCreateArgs('r1')).toEqual([
+      'network',
+      'create',
+      '--driver',
+      'bridge',
+      '--opt',
+      'com.docker.network.bridge.enable_icc=false',
+      '--label',
+      'devhotel.room=r1',
+      '--label',
+      'devhotel.role=network',
+      '--label',
+      'devhotel.managed=1',
+      'dh-r1-android-control-net'
     ])
   })
 })
@@ -116,6 +141,42 @@ describe('buildAnchorArgs', () => {
     expect(() => buildAnchorArgs({ roomId: 'r1', internalPort: 5173 }, 'not-a-digest')).toThrow(
       /relay verifier/
     )
+  })
+
+  it('places the Android relay anchor on the dedicated control bridge', () => {
+    const args = buildAnchorArgs(
+      { roomId: 'r1', internalPort: 6080, androidRuntimeIsolation: true },
+      'b'.repeat(64),
+      androidControlNetworkName('r1')
+    )
+    expect(args).toEqual(expect.arrayContaining(['--network', 'dh-r1-android-control-net']))
+    expect(args).not.toContain('dh-r1-net')
+  })
+})
+
+describe('Android runtime namespace', () => {
+  it('keeps the unpublished runtime leader and user workloads off the control bridge', () => {
+    const runtime = buildAndroidRuntimeAnchorArgs('r1')
+    expect(runtime).toEqual(expect.arrayContaining([
+      '--name', 'dh-r1-android-runtime-anchor',
+      '--network', 'dh-r1-net',
+      '--cap-drop', 'ALL',
+      '--read-only',
+      'devhotel.role=android-runtime-anchor'
+    ]))
+    expect(runtime).not.toContain('dh-r1-android-control-net')
+
+    const web = buildWebCreateArgs(spec({ androidRuntimeIsolation: true }))
+    expect(web).toEqual(expect.arrayContaining([
+      '--network', 'container:dh-r1-android-runtime-anchor'
+    ]))
+    expect(web).not.toContain('container:dh-r1-anchor')
+
+    const service = buildServiceArgs('r1', 'redis', '8', androidRuntimeAnchorName('r1'))
+    expect(service).toEqual(expect.arrayContaining([
+      '--network', 'container:dh-r1-android-runtime-anchor'
+    ]))
+    expect(service).not.toContain('container:dh-r1-anchor')
   })
 })
 

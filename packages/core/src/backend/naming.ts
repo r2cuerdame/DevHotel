@@ -12,6 +12,16 @@ export function roomNetworkName(roomId: string): string {
   return `dh-${roomId}-net`
 }
 
+/** Private bridge containing only the Android relay anchor; the emulator joins the anchor's netns. */
+export function androidControlNetworkName(roomId: string): string {
+  return `dh-${roomId}-android-control-net`
+}
+
+/** Unpublished namespace leader shared by Android web and managed service containers. */
+export function androidRuntimeAnchorName(roomId: string): string {
+  return `dh-${roomId}-android-runtime-anchor`
+}
+
 export function webName(roomId: string): string {
   return `dh-${roomId}-web`
 }
@@ -150,7 +160,11 @@ export function emulatorAvdOverride(
 }
 
 /** `docker create` args — the container is started only after the openbox rules are staged inside. */
-export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>): string[] {
+export function buildEmulatorArgs(
+  roomId: string,
+  opts?: Partial<EmulatorOpts>,
+  lifecycle: { networkNamespace?: string; abortToken?: string } = {}
+): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
   const screen = emulatorScreen(opts?.orientation)
@@ -159,7 +173,7 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     '--name',
     emulatorName(roomId),
     '--network',
-    `container:${anchorName(roomId)}`,
+    `container:${lifecycle.networkNamespace ?? anchorName(roomId)}`,
     '--cap-drop',
     'NET_RAW',
     '-l',
@@ -168,6 +182,7 @@ export function buildEmulatorArgs(roomId: string, opts?: Partial<EmulatorOpts>):
     'devhotel.role=svc-emulator',
     '-l',
     'devhotel.managed=1',
+    ...(lifecycle.abortToken ? ['-l', `devhotel.abort-token=${lifecycle.abortToken}`] : []),
     '--device',
     '/dev/kvm',
     '-e',
@@ -210,14 +225,19 @@ export function svcImage(svc: ServiceKind, version: string): string {
   return svc === 'postgres' ? `postgres:${version}-alpine` : `redis:${version}-alpine`
 }
 
-export function buildServiceArgs(roomId: string, svc: ServiceKind, version: string): string[] {
+export function buildServiceArgs(
+  roomId: string,
+  svc: ServiceKind,
+  version: string,
+  networkNamespace = anchorName(roomId)
+): string[] {
   const common = [
     'run',
     '-d',
     '--name',
     svcName(roomId, svc),
     '--network',
-    `container:${anchorName(roomId)}`,
+    `container:${networkNamespace}`,
     '--cap-drop',
     'NET_RAW',
     '-l',
@@ -249,6 +269,14 @@ function labelArgs(roomId: string, role: 'anchor' | 'web' | 'job'): string[] {
 }
 
 export function buildRoomNetworkCreateArgs(roomId: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, roomNetworkName(roomId))
+}
+
+export function buildAndroidControlNetworkCreateArgs(roomId: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, androidControlNetworkName(roomId))
+}
+
+function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string): string[] {
   return [
     'network',
     'create',
@@ -262,11 +290,15 @@ export function buildRoomNetworkCreateArgs(roomId: string): string[] {
     'devhotel.role=network',
     '--label',
     'devhotel.managed=1',
-    roomNetworkName(roomId),
+    name,
   ]
 }
 
-export function buildAnchorArgs(spec: AnchorSpec, relayTokenSha256: string): string[] {
+export function buildAnchorArgs(
+  spec: AnchorSpec,
+  relayTokenSha256: string,
+  networkName = roomNetworkName(spec.roomId)
+): string[] {
   if (!/^[a-f0-9]{64}$/.test(relayTokenSha256)) throw new Error('invalid DevHotel relay verifier')
   const relayGateScript = `IFS= read -r -t 2 line || exit 1; case "$line" in "${RELAY_PREAMBLE_PREFIX}"*) token=\${line#"${RELAY_PREAMBLE_PREFIX}"};; *) exit 1;; esac; [ "\${#token}" -eq 64 ] || exit 1; case "$token" in *[!0-9a-f]*) exit 1;; esac; actual=$(printf '%s' "$token" | sha256sum); actual=\${actual%% *}; expected=$DEVHOTEL_RELAY_TOKEN_SHA256; mismatch=0; i=0; while [ "$i" -lt 64 ]; do ac=\${actual%"\${actual#?}"}; ec=\${expected%"\${expected#?}"}; [ "$ac" = "$ec" ] || mismatch=1; actual=\${actual#?}; expected=\${expected#?}; i=$((i + 1)); done; [ "$mismatch" -eq 0 ] || exit 1; exec socat STDIO "TCP:127.0.0.1:$DEVHOTEL_INTERNAL_PORT"`
   return [
@@ -275,7 +307,7 @@ export function buildAnchorArgs(spec: AnchorSpec, relayTokenSha256: string): str
     '--name',
     anchorName(spec.roomId),
     '--network',
-    roomNetworkName(spec.roomId),
+    networkName,
     ...labelArgs(spec.roomId, 'anchor'),
     '-p',
     `127.0.0.1:0:${RELAY_PORT}`,
@@ -294,6 +326,33 @@ export function buildAnchorArgs(spec: AnchorSpec, relayTokenSha256: string): str
     `umask 077; printf '#!/bin/sh\n%s\n' "$DEVHOTEL_RELAY_GATE" > /tmp/devhotel-relay-gate; chmod 500 /tmp/devhotel-relay-gate; exec socat "$0" "$1"`,
     `TCP-LISTEN:${RELAY_PORT},fork,reuseaddr`,
     'EXEC:/tmp/devhotel-relay-gate',
+  ]
+}
+
+export function buildAndroidRuntimeAnchorArgs(roomId: string): string[] {
+  return [
+    'run',
+    '-d',
+    '--name',
+    androidRuntimeAnchorName(roomId),
+    '--network',
+    roomNetworkName(roomId),
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges',
+    '--read-only',
+    '-l',
+    `devhotel.room=${roomId}`,
+    '-l',
+    'devhotel.role=android-runtime-anchor',
+    '-l',
+    'devhotel.managed=1',
+    '--entrypoint',
+    '/bin/sh',
+    ANCHOR_IMAGE,
+    '-c',
+    'exec sleep 2147483647'
   ]
 }
 
@@ -357,7 +416,9 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
     '--name',
     webName(spec.roomId),
     '--network',
-    spec.standalone ? roomNetworkName(spec.roomId) : `container:${anchorName(spec.roomId)}`,
+    spec.standalone
+      ? roomNetworkName(spec.roomId)
+      : `container:${spec.androidRuntimeIsolation ? androidRuntimeAnchorName(spec.roomId) : anchorName(spec.roomId)}`,
     '--cap-drop',
     'NET_RAW',
     ...labelArgs(spec.roomId, 'web'),

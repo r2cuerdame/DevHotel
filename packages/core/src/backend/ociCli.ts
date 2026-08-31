@@ -1,7 +1,7 @@
 import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
@@ -12,6 +12,10 @@ import {
   EMULATOR_IMAGE,
   RELAY_PORT,
   anchorName,
+  androidControlNetworkName,
+  androidRuntimeAnchorName,
+  buildAndroidControlNetworkCreateArgs,
+  buildAndroidRuntimeAnchorArgs,
   buildAnchorArgs,
   buildEmulatorArgs,
   buildOneShotArgs,
@@ -85,6 +89,34 @@ function boundedCommandOutput(maxBytes: number): {
   }
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  const error = new Error('Fenced emulator operation was aborted')
+  error.name = 'AbortError'
+  throw error
+}
+
+function containsPrivateStageToken(
+  value: unknown,
+  tokens: readonly string[],
+  seen = new Set<object>()
+): boolean {
+  if (typeof value === 'string') return tokens.some((token) => token.length > 0 && value.includes(token))
+  if (value === null || typeof value !== 'object') return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (!(value instanceof Error)) return true
+  if (tokens.some((token) => token.length > 0 && `${value.name}\n${value.message}\n${value.stack ?? ''}`.includes(token))) {
+    return true
+  }
+  if ('cause' in value && containsPrivateStageToken(value.cause, tokens, seen)) return true
+  if (value instanceof AggregateError) {
+    return Array.from(value.errors).some((error) => containsPrivateStageToken(error, tokens, seen))
+  }
+  return false
+}
+
 const FENCED_EMULATOR_ADB_SCRIPT = `set -eu
 state=$1
 stdout_limit=$2
@@ -106,6 +138,10 @@ run_adb() {
     "$adb" -L "$socket" "$@"
 }
 cleanup() {
+  if [ -n "\${stdout_reader:-}" ]; then kill "$stdout_reader" >/dev/null 2>&1 || true; fi
+  if [ -n "\${stderr_reader:-}" ]; then kill "$stderr_reader" >/dev/null 2>&1 || true; fi
+  if [ -n "\${stdout_reader:-}" ]; then wait "$stdout_reader" >/dev/null 2>&1 || true; fi
+  if [ -n "\${stderr_reader:-}" ]; then wait "$stderr_reader" >/dev/null 2>&1 || true; fi
   run_adb kill-server >/dev/null 2>&1 || true
   rm -rf -- "$state"
 }
@@ -124,12 +160,10 @@ done
 [ "$ready" -eq 1 ] || exit 73
 stdout_pipe=$state/stdout.pipe
 stderr_pipe=$state/stderr.pipe
-stdout_file=$state/stdout
-stderr_file=$state/stderr
 mkfifo -m 600 "$stdout_pipe" "$stderr_pipe"
-head -c "$((stdout_limit + 1))" < "$stdout_pipe" > "$stdout_file" &
+head -c "$((stdout_limit + 1))" < "$stdout_pipe" &
 stdout_reader=$!
-head -c "$((stderr_limit + 1))" < "$stderr_pipe" > "$stderr_file" &
+head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &
 stderr_reader=$!
 set +e
 timeout -k 1 "$command_timeout" env -i \
@@ -141,13 +175,10 @@ timeout -k 1 "$command_timeout" env -i \
   "$adb" -L "$socket" -s emulator-5554 "$@" > "$stdout_pipe" 2> "$stderr_pipe"
 status=$?
 wait "$stdout_reader"
+stdout_reader=
 wait "$stderr_reader"
+stderr_reader=
 set -e
-stdout_size=$(wc -c < "$stdout_file")
-stderr_size=$(wc -c < "$stderr_file")
-head -c "$stdout_limit" "$stdout_file"
-head -c "$stderr_limit" "$stderr_file" >&2
-if [ "$stdout_size" -gt "$stdout_limit" ] || [ "$stderr_size" -gt "$stderr_limit" ]; then exit 97; fi
 exit "$status"`
 
 function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
@@ -595,41 +626,67 @@ export class OciCliBackend implements IsolationBackend {
     if (spec.sourceType === 'managed-git' && initializeManagedSource) {
       await this.cloneIntoVolume(spec.roomId, spec.sourceRef, spec.workspaceVolumeRevision)
     }
-    await this.ensureRoomNetwork(spec.roomId)
-    if (!spec.standalone) {
-      const relayToken = this.newRelayToken()
-      must(
-        await runDocker(
-          buildAnchorArgs(
-            { roomId: spec.roomId, internalPort: spec.internalPort },
-            createHash('sha256').update(relayToken).digest('hex')
-          )
-        ),
-        'run anchor container',
-      )
-      this.relayTokens.set(spec.roomId, relayToken)
+    let relayToken: string | null = null
+    try {
+      await this.ensureRoomNetwork(spec.roomId)
+      if (spec.androidRuntimeIsolation) await this.ensureAndroidControlNetwork(spec.roomId)
+      if (!spec.standalone) {
+        relayToken = this.newRelayToken()
+        must(
+          await runDocker(
+            buildAnchorArgs(
+              { roomId: spec.roomId, internalPort: spec.internalPort },
+              createHash('sha256').update(relayToken).digest('hex'),
+              spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId)
+            )
+          ),
+          'run anchor container',
+        )
+      }
+      if (spec.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(spec.roomId)
+      must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
+      if (startWeb) await this.startWeb(spec.roomId)
+      const hostPort = spec.standalone ? null : await this.readHostPort(spec.roomId)
+      if (relayToken) this.relayTokens.set(spec.roomId, relayToken)
+      return { hostPort }
+    } catch (error) {
+      this.relayTokens.delete(spec.roomId)
+      if (!spec.androidRuntimeIsolation) throw error
+      try {
+        await this.rollbackPartialAndroidTopology(spec.roomId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Android Room creation and topology rollback both failed')
+      }
+      throw error
     }
-    must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
-    if (startWeb) await this.startWeb(spec.roomId)
-    return { hostPort: spec.standalone ? null : await this.readHostPort(spec.roomId) }
   }
 
   async relayToken(roomId: string): Promise<string> {
     await this.assertPinnedEngineIdentity()
     const cached = this.relayTokens.get(roomId)
-    if (cached) return cached
+    if (cached) {
+      await this.assertRelayAnchorAuthority(roomId)
+      return cached
+    }
     // The raw capability deliberately never enters a Room container, mount,
     // manifest, or docker-inspectable value. App startup reconciliation
     // recreates anchors before routing them, issuing a fresh in-memory token.
     throw new Error(`Room ${roomId} relay credential is not available; recreate its anchor`)
   }
 
-  async startRoomPod(roomId: string, opts: { standalone?: boolean } = {}): Promise<{ hostPort: number | null }> {
+  async startRoomPod(
+    roomId: string,
+    opts: { standalone?: boolean; androidRuntimeIsolation?: boolean } = {}
+  ): Promise<{ hostPort: number | null }> {
     await this.assertPinnedEngineIdentity()
     if (!opts.standalone) {
-      await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+      const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+      if (opts.androidRuntimeIsolation) {
+        this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android control anchor')
+      }
       must(await runDocker(['start', anchorName(roomId)]), 'start anchor container')
     }
+    if (opts.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(roomId)
     await this.startWeb(roomId)
     return { hostPort: opts.standalone ? null : await this.readHostPort(roomId) }
   }
@@ -645,9 +702,21 @@ export class OciCliBackend implements IsolationBackend {
     const containers = await this.listRoomContainers(roomId)
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
     const web = active.filter((container) => container.role === 'web').map((container) => container.id)
-    const rest = active.filter((container) => container.role !== 'web').map((container) => container.id)
+    const leaves = active
+      .filter((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role))
+      .map((container) => container.id)
+    const runtimeAnchors = active
+      .filter((container) => container.role === 'android-runtime-anchor')
+      .map((container) => container.id)
+    const controlAnchors = active.filter((container) => container.role === 'anchor').map((container) => container.id)
     if (web.length > 0) must(await runDocker(['stop', '-t', '8', ...web]), `stop Room ${roomId} web container`)
-    if (rest.length > 0) must(await runDocker(['stop', '-t', '5', ...rest]), `stop Room ${roomId} containers`)
+    if (leaves.length > 0) must(await runDocker(['stop', '-t', '5', ...leaves]), `stop Room ${roomId} leaf containers`)
+    if (runtimeAnchors.length > 0) {
+      must(await runDocker(['stop', '-t', '5', ...runtimeAnchors]), `stop Room ${roomId} runtime anchor`)
+    }
+    if (controlAnchors.length > 0) {
+      must(await runDocker(['stop', '-t', '5', ...controlAnchors]), `stop Room ${roomId} control anchor`)
+    }
     const notStopped = (await this.listRoomContainers(roomId)).filter(
       (container) => !isStoppedContainerState(container.state)
     )
@@ -694,6 +763,7 @@ export class OciCliBackend implements IsolationBackend {
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
+    if (spec.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(spec.roomId)
     await this.removeRoomContainer(spec.roomId, webName(spec.roomId), 'web')
     must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
     await this.startWeb(spec.roomId)
@@ -701,18 +771,38 @@ export class OciCliBackend implements IsolationBackend {
 
   async recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }> {
     await this.assertPinnedEngineIdentity()
+    this.relayTokens.delete(spec.roomId)
     await this.adoptLegacyRoomVolumes(spec.roomId)
     await this.ensureImage(ANCHOR_IMAGE)
     await this.ensureRoomNetwork(spec.roomId)
+    if (spec.androidRuntimeIsolation) {
+      await this.ensureAndroidControlNetwork(spec.roomId)
+      await this.ensureAndroidRuntimeAnchor(spec.roomId)
+      await this.removeAndroidControlDependents(spec.roomId)
+    }
     await this.removeRoomContainer(spec.roomId, anchorName(spec.roomId), 'anchor')
     const relayToken = this.newRelayToken()
-    this.relayTokens.delete(spec.roomId)
-    must(
-      await runDocker(buildAnchorArgs(spec, createHash('sha256').update(relayToken).digest('hex'))),
-      'run anchor container'
-    )
-    this.relayTokens.set(spec.roomId, relayToken)
-    return { hostPort: await this.readHostPort(spec.roomId) }
+    try {
+      must(
+        await runDocker(buildAnchorArgs(
+          spec,
+          createHash('sha256').update(relayToken).digest('hex'),
+          spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId)
+        )),
+        'run anchor container'
+      )
+      const hostPort = await this.readHostPort(spec.roomId)
+      this.relayTokens.set(spec.roomId, relayToken)
+      return { hostPort }
+    } catch (error) {
+      this.relayTokens.delete(spec.roomId)
+      try {
+        await this.removeRoomContainer(spec.roomId, anchorName(spec.roomId), 'anchor')
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'relay recreation and authority rollback both failed')
+      }
+      throw error
+    }
   }
 
   async deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }> {
@@ -732,14 +822,26 @@ export class OciCliBackend implements IsolationBackend {
     }
     const containers = await this.listRoomContainers(roomId)
     const existingNetwork = await this.inspectNetwork(roomNetworkName(roomId))
-    if (existingNetwork) assertRoomNetwork(existingNetwork, roomId)
-    const anchorIds = containers.filter((container) => container.role === 'anchor').map((container) => container.id)
-    const dependentIds = containers.filter((container) => container.role !== 'anchor').map((container) => container.id)
-    if (dependentIds.length > 0) {
-      must(await runDocker(['rm', '-f', ...dependentIds]), `remove Room ${roomId} containers`)
+    if (existingNetwork) assertRoomNetwork(existingNetwork, roomId, roomNetworkName(roomId))
+    const existingControlNetwork = await this.inspectNetwork(androidControlNetworkName(roomId))
+    if (existingControlNetwork) {
+      assertRoomNetwork(existingControlNetwork, roomId, androidControlNetworkName(roomId))
     }
-    if (anchorIds.length > 0) {
-      must(await runDocker(['rm', '-f', ...anchorIds]), `remove Room ${roomId} anchor`)
+    const controlAnchorIds = containers.filter((container) => container.role === 'anchor').map((container) => container.id)
+    const runtimeAnchorIds = containers
+      .filter((container) => container.role === 'android-runtime-anchor')
+      .map((container) => container.id)
+    const leafIds = containers
+      .filter((container) => !['anchor', 'android-runtime-anchor'].includes(container.role))
+      .map((container) => container.id)
+    if (leafIds.length > 0) {
+      must(await runDocker(['rm', '-f', ...leafIds]), `remove Room ${roomId} leaf containers`)
+    }
+    if (runtimeAnchorIds.length > 0) {
+      must(await runDocker(['rm', '-f', ...runtimeAnchorIds]), `remove Room ${roomId} runtime anchor`)
+    }
+    if (controlAnchorIds.length > 0) {
+      must(await runDocker(['rm', '-f', ...controlAnchorIds]), `remove Room ${roomId} control anchor`)
     }
     const remainingContainers = await this.listRoomContainers(roomId)
     if (remainingContainers.length > 0) {
@@ -750,6 +852,7 @@ export class OciCliBackend implements IsolationBackend {
     // Networks are persistent Room resources, but never survive Room deletion.
     // Containers must go first so Docker can release the bridge endpoint.
     await this.removeRoomNetwork(roomId)
+    await this.removeAndroidControlNetwork(roomId)
     if (opts.volumes) {
       if (ownedVolumes.length > 0) {
         must(await runDocker(['volume', 'rm', '-f', ...ownedVolumes]), `remove Room ${roomId} volumes`)
@@ -985,13 +1088,17 @@ export class OciCliBackend implements IsolationBackend {
     const network = await this.inspectNetwork(name)
     if (!network) return
     const labels = network.Labels ?? {}
+    const roomId = labels['devhotel.room'] ?? ''
     if (
       network.Name !== name ||
       labels['devhotel.managed'] !== '1' ||
-      labels['devhotel.role'] !== 'network'
+      labels['devhotel.role'] !== 'network' ||
+      !roomId ||
+      (name !== roomNetworkName(roomId) && name !== androidControlNetworkName(roomId))
     ) {
       throw new Error(`refusing to remove network not owned by DevHotel: ${name}`)
     }
+    assertRoomNetwork(network, roomId, name)
     must(await runDocker(['network', 'rm', name]), `remove network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`network cleanup incomplete: ${name}`)
@@ -1378,11 +1485,72 @@ export class OciCliBackend implements IsolationBackend {
 
   async createService(roomId: string, svc: 'postgres' | 'redis', version: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
+    let networkNamespace = anchorName(roomId)
+    let androidRuntimeId: string | null = null
+    let androidRuntimeSandboxId: string | null = null
+    const androidRuntime = await this.inspectContainer(androidRuntimeAnchorName(roomId))
+    if (androidRuntime) {
+      const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
+      if (!androidControl) {
+        throw new Error('Android control network is missing; refusing to create a service in a partial topology')
+      }
+      assertRoomNetwork(androidControl, roomId, androidControlNetworkName(roomId))
+      await this.assertRoomContainer(
+        roomId,
+        androidRuntimeAnchorName(roomId),
+        'android-runtime-anchor',
+        androidRuntime
+      )
+      this.assertContainerNetworkMode(androidRuntime, roomNetworkName(roomId), 'Android runtime anchor')
+      if (androidRuntime.State?.Status !== 'running') {
+        throw new Error('Android runtime anchor must be running before a managed service is created')
+      }
+      androidRuntimeId = exactContainerId(androidRuntime, roomId)
+      androidRuntimeSandboxId = this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
+      networkNamespace = androidRuntimeId
+    } else {
+      const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
+      if (androidControl) {
+        assertRoomNetwork(androidControl, roomId, androidControlNetworkName(roomId))
+        throw new Error('Android runtime anchor is missing; refusing to attach a service to the control namespace')
+      }
+    }
     await this.ensureImage(svcImage(svc, version))
     await this.ensureRoomVolume(roomId, svcVolume(roomId, svc))
-    must(await runDocker(buildServiceArgs(roomId, svc, version)), `run ${svc} container`)
-    const created = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
-    exactContainerId(created, roomId)
+    const launched = must(
+      await runDocker(buildServiceArgs(roomId, svc, version, networkNamespace)),
+      `run ${svc} container`
+    )
+    const createdId = launched.stdout.trim()
+    if (!/^[a-f0-9]{64}$/.test(createdId)) {
+      throw new Error(`${svc} create did not return one immutable container ID`)
+    }
+    try {
+      const inspected = await this.inspectContainer(createdId)
+      if (!inspected) throw new Error(`${svc} immutable container disappeared during creation`)
+      const created = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`, inspected)
+      if (exactContainerId(created, roomId) !== createdId) {
+        throw new Error(`${svc} immutable container changed during creation`)
+      }
+      if (androidRuntimeId && androidRuntimeSandboxId) {
+        this.assertContainerNetworkNamespace(
+          created,
+          androidRuntimeAnchorName(roomId),
+          androidRuntimeId,
+          `Android ${svc} service`
+        )
+        if (this.exactRunningSandboxId(created, `Android ${svc} service`) !== androidRuntimeSandboxId) {
+          throw new Error(`Android ${svc} service was created outside the exact runtime namespace`)
+        }
+      }
+    } catch (error) {
+      try {
+        await this.removeFailedCreatedService(roomId, svc, createdId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `${svc} creation validation and exact cleanup both failed`)
+      }
+      throw error
+    }
   }
 
   async startService(roomId: string, svc: 'postgres' | 'redis'): Promise<void> {
@@ -1390,9 +1558,59 @@ export class OciCliBackend implements IsolationBackend {
     const name = svcName(roomId, svc)
     const existing = await this.assertRoomContainer(roomId, name, `svc-${svc}`)
     const id = exactContainerId(existing, roomId)
+    const androidRuntime = await this.inspectContainer(androidRuntimeAnchorName(roomId))
+    let runtimeSandboxId: string | null = null
+    if (androidRuntime) {
+      const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
+      if (!androidControl) {
+        throw new Error('Android control network is missing; refusing to start a service in a partial topology')
+      }
+      assertRoomNetwork(androidControl, roomId, androidControlNetworkName(roomId))
+      await this.assertRoomContainer(
+        roomId,
+        androidRuntimeAnchorName(roomId),
+        'android-runtime-anchor',
+        androidRuntime
+      )
+      const runtimeId = exactContainerId(androidRuntime, roomId)
+      if (androidRuntime.State?.Status !== 'running') {
+        throw new Error('Android runtime anchor must be running before a managed service is started')
+      }
+      this.assertContainerNetworkMode(androidRuntime, roomNetworkName(roomId), 'Android runtime anchor')
+      runtimeSandboxId = this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
+      this.assertContainerNetworkNamespace(
+        existing,
+        androidRuntimeAnchorName(roomId),
+        runtimeId,
+        `Android ${svc} service`
+      )
+    } else {
+      const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
+      if (androidControl) {
+        assertRoomNetwork(androidControl, roomId, androidControlNetworkName(roomId))
+        throw new Error('Android runtime anchor is missing; refusing to start a service in the control namespace')
+      }
+    }
     must(await runDocker(['start', id]), `start ${svc}`)
     const started = await this.inspectContainer(id)
     if (!started || started.State?.Status !== 'running') throw new Error(`${svc} start incomplete: ${name}`)
+    await this.assertRoomContainer(roomId, name, `svc-${svc}`, started)
+    if (exactContainerId(started, roomId) !== id) throw new Error(`${svc} immutable container changed during start`)
+    if (
+      runtimeSandboxId &&
+      this.exactRunningSandboxId(started, `Android ${svc} service`) !== runtimeSandboxId
+    ) {
+      const mismatch = new Error(`Android ${svc} service started outside the exact runtime namespace`)
+      try {
+        await this.removeMisboundStartedService(roomId, svc, id)
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [mismatch, cleanupError],
+          `Android ${svc} namespace validation and exact cleanup both failed`
+        )
+      }
+      throw mismatch
+    }
   }
 
   async stopService(roomId: string, svc: 'postgres' | 'redis'): Promise<void> {
@@ -1492,22 +1710,56 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async execFencedEmulatorAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
+    throwIfAborted(opts.signal)
     return this.runFencedEmulatorAdb(roomId, args, opts)
   }
 
   async installFencedEmulatorApk(roomId: string, hostApkPath: string, opts: ExecOpts = {}): Promise<ExecResult> {
-    const canonicalApk = realpathSync.native(hostApkPath)
-    const apkStat = lstatSync(canonicalApk)
-    if (
-      canonicalApk !== resolve(hostApkPath) ||
-      apkStat.isSymbolicLink() ||
-      !apkStat.isFile() ||
-      apkStat.size < 1 ||
-      apkStat.size > 512 * 1024 * 1024
-    ) {
-      throw new Error('fenced emulator install refused an invalid private APK stage')
+    let canonicalApk: string | undefined
+    try {
+      throwIfAborted(opts.signal)
+      canonicalApk = realpathSync.native(hostApkPath)
+      const apkStat = lstatSync(canonicalApk)
+      if (
+        canonicalApk !== resolve(hostApkPath) ||
+        apkStat.isSymbolicLink() ||
+        !apkStat.isFile() ||
+        apkStat.size < 1 ||
+        apkStat.size > 512 * 1024 * 1024
+      ) {
+        throw new Error('fenced emulator install refused an invalid private APK stage')
+      }
+      return await this.runFencedEmulatorAdb(
+        roomId,
+        ['install', '-r', '/devhotel-install/app.apk'],
+        opts,
+        canonicalApk
+      )
+    } catch (error) {
+      const privateTokens = Array.from(new Set([
+        resolve(hostApkPath),
+        basename(hostApkPath),
+        ...(canonicalApk ? [canonicalApk, basename(canonicalApk)] : [])
+      ]))
+      if (
+        opts.signal?.aborted &&
+        opts.signal.reason !== undefined &&
+        !containsPrivateStageToken(opts.signal.reason, privateTokens)
+      ) {
+        throw opts.signal.reason
+      }
+      // Docker mount/create/cleanup diagnostics can echo the canonical Host
+      // path. It is a private capability and must never cross this boundary,
+      // including through AggregateError.errors or Error.cause.
+      const cleanupFailed = error instanceof AggregateError
+      const sanitized = new Error(
+        `Fenced emulator APK install failed for [private APK stage]${
+          cleanupFailed ? '; exact helper cleanup also failed' : ''
+        }`
+      )
+      if (opts.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) sanitized.name = 'AbortError'
+      throw sanitized
     }
-    return this.runFencedEmulatorAdb(roomId, ['install', '-r', '/devhotel-install/app.apk'], opts, canonicalApk)
   }
 
   private async runFencedEmulatorAdb(
@@ -1516,25 +1768,14 @@ export class OciCliBackend implements IsolationBackend {
     opts: ExecOpts,
     hostApkPath?: string
   ): Promise<ExecResult> {
+    throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
     if (!args[0] || args[0].startsWith('-')) throw new Error('fenced emulator ADB requires a command without selectors')
     if (!hostApkPath && ['install', 'install-multiple', 'install-multi-package'].includes(args[0])) {
       throw new Error('fenced emulator installs require a private staged APK capability')
     }
-    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
-    const emulator = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
-    if (emulator.State?.Status !== 'running') throw new Error('Room emulator is not running under the execution fence')
-    const anchorId = exactContainerId(anchor, roomId)
-    const anchorSandboxId = anchor.NetworkSettings?.SandboxID?.trim() ?? ''
-    const emulatorSandboxId = emulator.NetworkSettings?.SandboxID?.trim() ?? ''
-    const networkMode = emulator.HostConfig?.NetworkMode ?? ''
-    if (
-      !/^[a-f0-9]{12,64}$/.test(anchorSandboxId) ||
-      emulatorSandboxId !== anchorSandboxId ||
-      (networkMode !== `container:${anchorName(roomId)}` && networkMode !== `container:${anchorId}`)
-    ) {
-      throw new Error('Room emulator is not attached to the exact owned anchor network namespace')
-    }
+    const topology = await this.assertFencedEmulatorTopology(roomId)
+    const { emulatorId } = topology
     await this.ensureImage(ANDROID_IMAGE)
     const id = randomUUID()
     const name = jobName(roomId, id)
@@ -1543,7 +1784,7 @@ export class OciCliBackend implements IsolationBackend {
     const mount = hostApkPath
       ? ['--mount', `type=bind,source=${hostApkPath},target=/devhotel-install/app.apk,readonly`]
       : []
-    const stdoutLimit = Math.min(opts.maxStdoutBytes ?? 1024 * 1024, 1024 * 1024)
+    const stdoutLimit = Math.min(opts.maxStdoutBytes ?? 1024 * 1024, SCREENSHOT_MAX_BASE64_BYTES)
     const stderrLimit = Math.min(opts.maxStderrBytes ?? 64 * 1024, 64 * 1024)
     if (
       !Number.isSafeInteger(stdoutLimit) || stdoutLimit < 1 ||
@@ -1555,20 +1796,21 @@ export class OciCliBackend implements IsolationBackend {
     }
     const stdout = boundedCommandOutput(stdoutLimit)
     const stderr = boundedCommandOutput(stderrLimit)
-    const result = await runDocker([
-      'run',
+    const tmpfsSizeMiB = Math.ceil((stdoutLimit + stderrLimit + 1024 * 1024) / (1024 * 1024))
+    const createArgs = [
+      'create',
       '--rm',
       '--name',
       name,
       '--network',
-      `container:${anchorId}`,
+      `container:${emulatorId}`,
       '--cap-drop',
       'ALL',
       '--security-opt',
       'no-new-privileges',
       '--read-only',
       '--tmpfs',
-      '/tmp:rw,nosuid,nodev,noexec,size=4m',
+      `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsSizeMiB}m`,
       '-l',
       `devhotel.room=${roomId}`,
       '-l',
@@ -1591,20 +1833,80 @@ export class OciCliBackend implements IsolationBackend {
       String(stderrLimit),
       String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       ...args
-    ], {
-      timeoutMs,
-      maxStdoutBytes: stdoutLimit,
-      maxStderrBytes: stderrLimit,
-      onAbort: () => this.removeAbortedFencedJob(roomId, name, abortToken),
-      onStdout: (chunk) => {
-        const accepted = stdout.push(chunk)
-        if (accepted) opts.onStdout?.(accepted)
-      },
-      onStderr: (chunk) => {
-        const accepted = stderr.push(chunk)
-        if (accepted) opts.onStderr?.(accepted)
+    ]
+    let helperId: string | undefined
+    try {
+      throwIfAborted(opts.signal)
+      const createResult = await runDocker(createArgs, {
+        timeoutMs: null,
+        maxStdoutBytes: 128,
+        maxStderrBytes: 8 * 1024,
+        killOnOutputLimit: false
+      })
+      const candidateId = createResult.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidateId)) helperId = candidateId
+      throwIfAborted(opts.signal)
+      must(createResult, 'create fenced emulator ADB helper')
+      if (!helperId) {
+        throw new Error('fenced emulator ADB helper create did not return one immutable container ID')
       }
-    })
+      const createdHelper = await this.inspectContainer(helperId)
+      if (!createdHelper || !this.isOwnedFencedJob(createdHelper, roomId, name, abortToken)) {
+        throw new Error('fenced emulator ADB helper ownership could not be verified before start')
+      }
+      if (exactContainerId(createdHelper, roomId) !== helperId) {
+        throw new Error('fenced emulator ADB helper immutable ID changed before start')
+      }
+      if (createdHelper.HostConfig?.NetworkMode !== `container:${emulatorId}`) {
+        throw new Error('fenced emulator ADB helper is not attached to the exact emulator network namespace')
+      }
+      if (createdHelper.State?.Status !== 'created') {
+        throw new Error('fenced emulator ADB helper was not inert before its controlled action')
+      }
+      await this.assertFencedEmulatorTopology(roomId, topology)
+      throwIfAborted(opts.signal)
+    } catch (error) {
+      try {
+        await this.removeAbortedFencedJob(roomId, name, abortToken, helperId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'fenced emulator helper create and cleanup both failed')
+      }
+      throw error
+    }
+    if (!helperId) throw new Error('fenced emulator ADB helper immutable ID was not retained')
+
+    let result: ExecResult | undefined
+    let executionError: unknown
+    try {
+      result = await runDocker(['start', '-a', helperId], {
+        timeoutMs,
+        signal: opts.signal,
+        maxStdoutBytes: stdoutLimit,
+        maxStderrBytes: stderrLimit,
+        onAbort: () => this.removeAbortedFencedJob(roomId, name, abortToken, helperId),
+        onStdout: (chunk) => {
+          const accepted = stdout.push(chunk)
+          if (accepted) opts.onStdout?.(accepted)
+        },
+        onStderr: (chunk) => {
+          const accepted = stderr.push(chunk)
+          if (accepted) opts.onStderr?.(accepted)
+        }
+      })
+    } catch (error) {
+      executionError = error
+    }
+    try {
+      await this.removeAbortedFencedJob(roomId, name, abortToken, helperId)
+    } catch (cleanupError) {
+      if (executionError) {
+        throw new AggregateError([executionError, cleanupError], 'fenced emulator helper execution and cleanup both failed')
+      }
+      throw cleanupError
+    }
+    if (executionError) throw executionError
+    throwIfAborted(opts.signal)
+    if (!result) throw new Error('fenced emulator helper did not return an execution result')
     const exceeded = result.outputLimitExceeded === true || result.code === 97 || stdout.exceeded || stderr.exceeded
     return {
       code: exceeded ? -1 : result.code,
@@ -1615,25 +1917,125 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  private async removeAbortedFencedJob(roomId: string, name: string, abortToken: string): Promise<void> {
-    await this.assertPinnedEngineIdentity()
-    const container = await this.inspectContainer(name)
-    if (!container) return
+  private async assertFencedEmulatorTopology(
+    roomId: string,
+    expected?: FencedEmulatorTopology
+  ): Promise<FencedEmulatorTopology> {
+    const participant = async (
+      name: string,
+      role: string,
+      expectedId?: string
+    ): Promise<DockerContainerInspect> => {
+      const inspected = expectedId ? await this.inspectContainer(expectedId) : undefined
+      if (expectedId && !inspected) {
+        throw new Error(`Android execution topology participant disappeared: ${name}`)
+      }
+      const owned = await this.assertRoomContainer(roomId, name, role, inspected ?? undefined)
+      const id = exactContainerId(owned, roomId)
+      if (expectedId && id !== expectedId) {
+        throw new Error(`Android execution topology participant changed immutable ID: ${name}`)
+      }
+      return owned
+    }
+    const anchor = await participant(anchorName(roomId), 'anchor', expected?.anchorId)
+    const runtimeAnchor = await participant(
+      androidRuntimeAnchorName(roomId),
+      'android-runtime-anchor',
+      expected?.runtimeAnchorId
+    )
+    const web = await participant(webName(roomId), 'web', expected?.webId)
+    const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    const anchorId = exactContainerId(anchor, roomId)
+    const runtimeAnchorId = exactContainerId(runtimeAnchor, roomId)
+    const webId = exactContainerId(web, roomId)
+    const emulatorId = exactContainerId(emulator, roomId)
+    const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
+    const runtimeSandboxId = this.exactRunningSandboxId(runtimeAnchor, 'Android runtime anchor')
+    const webSandboxId = this.exactRunningSandboxId(web, 'Android web')
+    const emulatorSandboxId = this.exactRunningSandboxId(emulator, 'Android emulator')
+    if (
+      expected &&
+      (controlSandboxId !== expected.controlSandboxId || runtimeSandboxId !== expected.runtimeSandboxId)
+    ) {
+      throw new Error('Android execution topology network namespace changed while the helper was created')
+    }
+    if (controlSandboxId === runtimeSandboxId) {
+      throw new Error('Android control and runtime workloads unexpectedly share one network namespace')
+    }
+    if (emulatorSandboxId !== controlSandboxId) {
+      throw new Error('Android emulator is not live in the exact control anchor network namespace')
+    }
+    if (webSandboxId !== runtimeSandboxId) {
+      throw new Error('Android web is not live in the exact runtime anchor network namespace')
+    }
+    const controlNetwork = await this.inspectNetwork(androidControlNetworkName(roomId))
+    if (!controlNetwork) throw new Error('Android control network is missing; recreate this legacy Room')
+    assertRoomNetwork(controlNetwork, roomId, androidControlNetworkName(roomId))
+    const runtimeNetwork = await this.inspectNetwork(roomNetworkName(roomId))
+    if (!runtimeNetwork) throw new Error('Android runtime network is missing')
+    assertRoomNetwork(runtimeNetwork, roomId, roomNetworkName(roomId))
+    assertAndroidNetworkMembership(controlNetwork, runtimeNetwork, roomId, anchorId, runtimeAnchorId)
+    this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android control anchor')
+    this.assertContainerNetworkNamespace(web, androidRuntimeAnchorName(roomId), runtimeAnchorId, 'Android web')
+    this.assertContainerNetworkMode(runtimeAnchor, roomNetworkName(roomId), 'Android runtime anchor')
+    const networkMode = emulator.HostConfig?.NetworkMode ?? ''
+    if (networkMode !== `container:${anchorName(roomId)}` && networkMode !== `container:${anchorId}`) {
+      throw new Error('Room emulator is not attached to the exact owned anchor network namespace')
+    }
+    for (const svc of ['postgres', 'redis'] as const) {
+      const service = await this.inspectContainer(svcName(roomId, svc))
+      if (!service) continue
+      await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`, service)
+      this.assertContainerNetworkNamespace(
+        service,
+        androidRuntimeAnchorName(roomId),
+        runtimeAnchorId,
+        `Android ${svc} service`
+      )
+      if (
+        service.State?.Status === 'running' &&
+        this.exactRunningSandboxId(service, `Android ${svc} service`) !== runtimeSandboxId
+      ) {
+        throw new Error(`Android ${svc} service is not live in the exact runtime anchor network namespace`)
+      }
+    }
+    return { anchorId, runtimeAnchorId, webId, emulatorId, controlSandboxId, runtimeSandboxId }
+  }
+
+  private isOwnedFencedJob(
+    container: DockerContainerInspect,
+    roomId: string,
+    name: string,
+    abortToken: string
+  ): boolean {
     const actualName = (container.Name ?? '').replace(/^\//, '')
     const labels = container.Config?.Labels ?? {}
-    if (
-      actualName !== name ||
-      labels['devhotel.room'] !== roomId ||
-      labels['devhotel.role'] !== 'job' ||
-      labels['devhotel.managed'] !== '1' ||
-      labels['devhotel.abort-token'] !== abortToken ||
-      !isJobName(roomId, name)
-    ) return
-    let id: string
-    try {
-      id = exactContainerId(container, roomId)
-    } catch {
+    return actualName === name &&
+      labels['devhotel.room'] === roomId &&
+      labels['devhotel.role'] === 'job' &&
+      labels['devhotel.managed'] === '1' &&
+      labels['devhotel.abort-token'] === abortToken &&
+      isJobName(roomId, name)
+  }
+
+  private async removeAbortedFencedJob(
+    roomId: string,
+    name: string,
+    abortToken: string,
+    expectedId?: string
+  ): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.inspectContainer(expectedId ?? name)
+    if (!container) return
+    if (!this.isOwnedFencedJob(container, roomId, name, abortToken)) {
+      if (expectedId) {
+        throw new Error('Refusing to clean up a fenced Android helper whose immutable ownership changed')
+      }
       return
+    }
+    const id = exactContainerId(container, roomId)
+    if (expectedId && id !== expectedId) {
+      throw new Error('Refusing to clean up a fenced Android helper with a different immutable ID')
     }
     const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
     if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
@@ -1644,40 +2046,153 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
+  private async assertAndroidControlAnchorForEmulator(roomId: string): Promise<DockerContainerInspect> {
+    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+    if (anchor.State?.Status !== 'running') throw new Error('Android control anchor is not running')
+    const anchorId = exactContainerId(anchor, roomId)
+    this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android control anchor')
+    const control = await this.inspectNetwork(androidControlNetworkName(roomId))
+    if (!control) throw new Error('Android control network is missing')
+    assertRoomNetwork(control, roomId, androidControlNetworkName(roomId))
+    const members = Object.entries(control.Containers ?? {})
+    if (
+      members.length !== 1 ||
+      members[0]?.[0] !== anchorId ||
+      members[0]?.[1]?.Name !== anchorName(roomId)
+    ) {
+      throw new Error('Android control network does not contain only the exact owned anchor')
+    }
+    return anchor
+  }
+
+  private assertOwnedEmulatorCreate(
+    container: DockerContainerInspect | null,
+    roomId: string,
+    name: string,
+    abortToken: string,
+    expectedId: string,
+    anchorId: string
+  ): void {
+    const labels = container?.Config?.Labels ?? {}
+    if (
+      !container ||
+      (container.Name ?? '').replace(/^\//, '') !== name ||
+      labels['devhotel.room'] !== roomId ||
+      labels['devhotel.role'] !== 'svc-emulator' ||
+      labels['devhotel.managed'] !== '1' ||
+      labels['devhotel.abort-token'] !== abortToken ||
+      exactContainerId(container, roomId) !== expectedId ||
+      container.HostConfig?.NetworkMode !== `container:${anchorId}`
+    ) {
+      throw new Error('emulator immutable ownership or control namespace changed during creation')
+    }
+  }
+
+  private async removeAbortedEmulatorCreate(
+    roomId: string,
+    name: string,
+    abortToken: string,
+    expectedId?: string
+  ): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const container = await this.inspectContainer(expectedId ?? name)
+    if (!container) return
+    const labels = container.Config?.Labels ?? {}
+    const owned = (container.Name ?? '').replace(/^\//, '') === name &&
+      labels['devhotel.room'] === roomId &&
+      labels['devhotel.role'] === 'svc-emulator' &&
+      labels['devhotel.managed'] === '1' &&
+      labels['devhotel.abort-token'] === abortToken
+    if (!owned) {
+      if (expectedId) throw new Error('Refusing to clean up an emulator whose immutable ownership changed')
+      return
+    }
+    const id = exactContainerId(container, roomId)
+    if (expectedId && id !== expectedId) {
+      throw new Error('Refusing to clean up a replacement emulator container')
+    }
+    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
+      throw new Error('Could not clean up the exact aborted emulator container')
+    }
+    if (await this.inspectContainer(id)) throw new Error('The exact aborted emulator still exists after cleanup')
+  }
+
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
   ): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
+    const anchor = await this.assertAndroidControlAnchorForEmulator(roomId)
+    const anchorId = exactContainerId(anchor, roomId)
+    const anchorSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
+    const abortToken = randomUUID()
+    const name = emulatorName(roomId)
+    let emulatorId: string | undefined
     // frameless fullscreen phone: rules, autostart, the fit daemon and the AVD
     // resolution override are copied into the *created* (not yet started)
     // container, so openbox can never win a race and map the emulator
     // decorated, and the AVD is born at the requested LCD size/orientation.
-    must(await runDocker(buildEmulatorArgs(roomId, opts)), 'create emulator container')
-    const screen = emulatorScreen(opts?.orientation)
-    const staging = mkdtempSync(join(tmpdir(), 'dh-openbox-'))
     try {
-      mkdirSync(join(staging, 'openbox'))
-      writeFileSync(join(staging, 'openbox', 'rc.xml'), openboxFramelessRc(screen.width, screen.height))
-      writeFileSync(join(staging, 'openbox', 'autostart'), OPENBOX_AUTOSTART)
-      writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), fitEmulatorPy(screen.width, screen.height))
-      writeFileSync(
-        join(staging, 'avd-override.ini'),
-        emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced', opts?.orientation ?? 'portrait')
+      const createResult = await runDocker(
+        buildEmulatorArgs(roomId, opts, { networkNamespace: anchorId, abortToken }),
+        {
+          timeoutMs: null,
+          maxStdoutBytes: 128,
+          maxStderrBytes: 8 * 1024,
+          killOnOutputLimit: false
+        }
       )
-      must(
-        await runDocker(['cp', join(staging, 'openbox'), `${emulatorName(roomId)}:/home/androidusr/.config/`]),
-        'install emulator window rules'
-      )
-      must(
-        await runDocker(['cp', join(staging, 'avd-override.ini'), `${emulatorName(roomId)}:${EMULATOR_AVD_OVERRIDE_PATH}`]),
-        'install emulator resolution override'
-      )
-    } finally {
-      rmSync(staging, { recursive: true, force: true })
+      const candidateId = createResult.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidateId)) emulatorId = candidateId
+      must(createResult, 'create emulator container')
+      if (!emulatorId) {
+        throw new Error('emulator create did not return one immutable container ID')
+      }
+      const inert = await this.inspectContainer(emulatorId)
+      this.assertOwnedEmulatorCreate(inert, roomId, name, abortToken, emulatorId, anchorId)
+      if (inert?.State?.Status !== 'created') {
+        throw new Error('emulator was not inert while its private configuration was installed')
+      }
+
+      const screen = emulatorScreen(opts?.orientation)
+      const staging = mkdtempSync(join(tmpdir(), 'dh-openbox-'))
+      try {
+        mkdirSync(join(staging, 'openbox'))
+        writeFileSync(join(staging, 'openbox', 'rc.xml'), openboxFramelessRc(screen.width, screen.height))
+        writeFileSync(join(staging, 'openbox', 'autostart'), OPENBOX_AUTOSTART)
+        writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), fitEmulatorPy(screen.width, screen.height))
+        writeFileSync(
+          join(staging, 'avd-override.ini'),
+          emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced', opts?.orientation ?? 'portrait')
+        )
+        must(
+          await runDocker(['cp', join(staging, 'openbox'), `${emulatorId}:/home/androidusr/.config/`]),
+          'install emulator window rules'
+        )
+        must(
+          await runDocker(['cp', join(staging, 'avd-override.ini'), `${emulatorId}:${EMULATOR_AVD_OVERRIDE_PATH}`]),
+          'install emulator resolution override'
+        )
+      } finally {
+        rmSync(staging, { recursive: true, force: true })
+      }
+      must(await runDocker(['start', emulatorId]), 'start emulator container')
+      const started = await this.inspectContainer(emulatorId)
+      this.assertOwnedEmulatorCreate(started, roomId, name, abortToken, emulatorId, anchorId)
+      if (started?.State?.Status !== 'running') throw new Error('emulator did not enter the running state')
+      if (this.exactRunningSandboxId(started, 'Android emulator') !== anchorSandboxId) {
+        throw new Error('emulator started outside the exact control anchor network namespace')
+      }
+    } catch (error) {
+      try {
+        await this.removeAbortedEmulatorCreate(roomId, name, abortToken, emulatorId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'emulator creation and exact cleanup both failed')
+      }
+      throw error
     }
-    must(await runDocker(['start', emulatorName(roomId)]), 'start emulator container')
   }
 
   async captureEmulatorScreen(roomId: string): Promise<string> {
@@ -1946,20 +2461,149 @@ export class OciCliBackend implements IsolationBackend {
     const name = roomNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
     if (existing) {
-      assertRoomNetwork(existing, roomId)
+      assertRoomNetwork(existing, roomId, name)
       return
     }
     must(await runDocker(buildRoomNetworkCreateArgs(roomId)), `create room network ${name}`)
+  }
+
+  private async ensureAndroidControlNetwork(roomId: string): Promise<void> {
+    const name = androidControlNetworkName(roomId)
+    const existing = await this.inspectNetwork(name)
+    if (existing) {
+      assertRoomNetwork(existing, roomId, name)
+      return
+    }
+    must(await runDocker(buildAndroidControlNetworkCreateArgs(roomId)), `create Android control network ${name}`)
+  }
+
+  private async ensureAndroidRuntimeAnchor(roomId: string): Promise<void> {
+    await this.ensureImage(ANCHOR_IMAGE)
+    await this.ensureRoomNetwork(roomId)
+    const name = androidRuntimeAnchorName(roomId)
+    const existing = await this.inspectContainer(name)
+    if (existing) {
+      const owned = await this.assertRoomContainer(roomId, name, 'android-runtime-anchor', existing)
+      this.assertContainerNetworkMode(owned, roomNetworkName(roomId), 'Android runtime anchor')
+      const id = exactContainerId(owned, roomId)
+      if (owned.State?.Status !== 'running') {
+        must(await runDocker(['start', id]), 'start Android runtime anchor')
+        const started = await this.inspectContainer(id)
+        if (!started || started.State?.Status !== 'running') {
+          throw new Error('Android runtime anchor start did not produce a running namespace leader')
+        }
+        await this.assertRoomContainer(roomId, name, 'android-runtime-anchor', started)
+        this.assertContainerNetworkMode(started, roomNetworkName(roomId), 'Android runtime anchor')
+      }
+      return
+    }
+    must(await runDocker(buildAndroidRuntimeAnchorArgs(roomId)), 'create Android runtime anchor')
+    const created = await this.assertRoomContainer(roomId, name, 'android-runtime-anchor')
+    exactContainerId(created, roomId)
+    this.assertContainerNetworkMode(created, roomNetworkName(roomId), 'Android runtime anchor')
+    if (created.State?.Status !== 'running') {
+      throw new Error('Android runtime anchor was not running after creation')
+    }
+  }
+
+  private async rollbackPartialAndroidTopology(roomId: string): Promise<void> {
+    const failures: unknown[] = []
+    for (const [name, role] of [
+      [webName(roomId), 'web'],
+      [androidRuntimeAnchorName(roomId), 'android-runtime-anchor'],
+      [anchorName(roomId), 'anchor']
+    ] as const) {
+      try {
+        await this.removeRoomContainer(roomId, name, role)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    try {
+      await this.removeAndroidControlNetwork(roomId)
+    } catch (error) {
+      failures.push(error)
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'partial Android topology cleanup was incomplete')
+    }
+  }
+
+  private async removeAndroidControlDependents(roomId: string): Promise<void> {
+    const anchor = await this.inspectContainer(anchorName(roomId))
+    let anchorId: string | null = null
+    if (anchor) {
+      await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor', anchor)
+      anchorId = exactContainerId(anchor, roomId)
+    }
+    for (const [name, role] of [
+      [webName(roomId), 'web'],
+      [svcName(roomId, 'postgres'), 'svc-postgres'],
+      [svcName(roomId, 'redis'), 'svc-redis'],
+      [emulatorName(roomId), 'svc-emulator']
+    ] as const) {
+      const container = await this.inspectContainer(name)
+      if (!container) continue
+      await this.assertRoomContainer(roomId, name, role, container)
+      const mode = container.HostConfig?.NetworkMode ?? ''
+      if (mode === `container:${anchorName(roomId)}` || (anchorId && mode === `container:${anchorId}`)) {
+        await this.removeRoomContainer(roomId, name, role)
+      }
+    }
+  }
+
+  private assertContainerNetworkMode(
+    container: DockerContainerInspect,
+    expectedNetwork: string,
+    what: string
+  ): void {
+    if (container.HostConfig?.NetworkMode !== expectedNetwork) {
+      throw new Error(`${what} is not attached to its exact owned bridge network`)
+    }
+  }
+
+  private assertContainerNetworkNamespace(
+    container: DockerContainerInspect,
+    expectedName: string,
+    expectedId: string,
+    what: string
+  ): void {
+    const mode = container.HostConfig?.NetworkMode ?? ''
+    if (mode !== `container:${expectedName}` && mode !== `container:${expectedId}`) {
+      throw new Error(`${what} is not attached to the exact Android runtime namespace`)
+    }
+  }
+
+  private exactRunningSandboxId(container: DockerContainerInspect, what: string): string {
+    if (container.State?.Status !== 'running') {
+      throw new Error(`${what} is not running in a live network namespace`)
+    }
+    const sandboxId = container.NetworkSettings?.SandboxID?.trim() ?? ''
+    if (!/^[a-f0-9]{64}$/.test(sandboxId)) {
+      throw new Error(`${what} did not report a valid live network namespace identity`)
+    }
+    return sandboxId
   }
 
   private async removeRoomNetwork(roomId: string): Promise<void> {
     const name = roomNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
     if (!existing) return
-    assertRoomNetwork(existing, roomId)
+    assertRoomNetwork(existing, roomId, name)
     must(await runDocker(['network', 'rm', name]), `remove room network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`Room ${roomId} network cleanup incomplete: ${name}`)
+    }
+  }
+
+  private async removeAndroidControlNetwork(roomId: string): Promise<void> {
+    const name = androidControlNetworkName(roomId)
+    const existing = await this.inspectNetwork(name)
+    if (!existing) return
+    assertRoomNetwork(existing, roomId, name)
+    must(await runDocker(['network', 'rm', name]), `remove Android control network ${name}`)
+    if (await this.inspectNetwork(name)) {
+      throw new Error(`Room ${roomId} Android control network cleanup incomplete: ${name}`)
     }
   }
 
@@ -2031,6 +2675,42 @@ export class OciCliBackend implements IsolationBackend {
     if (await this.inspectContainer(name)) throw new Error(`Room ${roomId} container cleanup incomplete: ${name}`)
   }
 
+  private async removeFailedCreatedService(
+    roomId: string,
+    svc: 'postgres' | 'redis',
+    expectedId: string
+  ): Promise<void> {
+    const name = svcName(roomId, svc)
+    const existing = await this.inspectContainer(expectedId)
+    if (!existing) return
+    await this.assertRoomContainer(roomId, name, `svc-${svc}`, existing)
+    if (exactContainerId(existing, roomId) !== expectedId) {
+      throw new Error(`Refusing to clean up a replacement ${svc} container`)
+    }
+    must(await runDocker(['rm', '-f', expectedId]), `remove failed ${svc} container`)
+    if (await this.inspectContainer(expectedId)) {
+      throw new Error(`The exact failed ${svc} container still exists after cleanup`)
+    }
+  }
+
+  private async removeMisboundStartedService(
+    roomId: string,
+    svc: 'postgres' | 'redis',
+    expectedId: string
+  ): Promise<void> {
+    const name = svcName(roomId, svc)
+    const existing = await this.inspectContainer(expectedId)
+    if (!existing) return
+    await this.assertRoomContainer(roomId, name, `svc-${svc}`, existing)
+    if (exactContainerId(existing, roomId) !== expectedId) {
+      throw new Error(`Refusing to clean up a replacement ${svc} container after namespace mismatch`)
+    }
+    must(await runDocker(['rm', '-f', expectedId]), `remove misbound ${svc} container`)
+    if (await this.inspectContainer(expectedId)) {
+      throw new Error(`The exact misbound ${svc} container still exists after cleanup`)
+    }
+  }
+
   private async listRoomContainers(roomId: string): Promise<ManagedRoomContainer[]> {
     const result = must(
       await runDocker([
@@ -2075,11 +2755,33 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   private async readHostPort(roomId: string): Promise<number> {
+    const anchor = await this.assertRelayAnchorAuthority(roomId)
     const result = must(
-      await runDocker(['port', anchorName(roomId), `${RELAY_PORT}/tcp`]),
+      await runDocker(['port', exactContainerId(anchor, roomId), `${RELAY_PORT}/tcp`]),
       'read anchor host port',
     )
     return parsePortOutput(result.stdout)
+  }
+
+  private async assertRelayAnchorAuthority(roomId: string): Promise<DockerContainerInspect> {
+    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+    if (anchor.State?.Status !== 'running') throw new Error(`Room ${roomId} relay control anchor is not running`)
+    const anchorId = exactContainerId(anchor, roomId)
+    const controlName = androidControlNetworkName(roomId)
+    const control = await this.inspectNetwork(controlName)
+    const networkName = control ? controlName : roomNetworkName(roomId)
+    const network = control ?? (await this.inspectNetwork(networkName))
+    if (!network) throw new Error(`Room ${roomId} relay network is missing`)
+    assertRoomNetwork(network, roomId, networkName)
+    this.assertContainerNetworkMode(anchor, networkName, 'Room relay control anchor')
+    const member = network.Containers?.[anchorId]
+    if (member?.Name !== anchorName(roomId)) {
+      throw new Error(`Room ${roomId} relay network does not contain the exact control anchor endpoint`)
+    }
+    if (control && Object.keys(control.Containers ?? {}).length !== 1) {
+      throw new Error('Android control network contains a workload outside the exact relay anchor endpoint')
+    }
+    return anchor
   }
 
   private newRelayToken(): string {
@@ -2134,6 +2836,7 @@ interface DockerNetworkInspect {
   Name?: string
   Driver?: string
   Labels?: Record<string, string> | null
+  Containers?: Record<string, { Name?: string } | null> | null
 }
 
 interface DockerContainerInspect {
@@ -2143,6 +2846,15 @@ interface DockerContainerInspect {
   State?: { Status?: string; Paused?: boolean } | null
   HostConfig?: { NetworkMode?: string } | null
   NetworkSettings?: { SandboxID?: string; SandboxKey?: string } | null
+}
+
+interface FencedEmulatorTopology {
+  anchorId: string
+  runtimeAnchorId: string
+  webId: string
+  emulatorId: string
+  controlSandboxId: string
+  runtimeSandboxId: string
 }
 
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {
@@ -2172,6 +2884,8 @@ function isExpectedRoomContainer(roomId: string, name: string, role: string): bo
   switch (role) {
     case 'anchor':
       return name === anchorName(roomId)
+    case 'android-runtime-anchor':
+      return name === androidRuntimeAnchorName(roomId)
     case 'web':
       return name === webName(roomId)
     case 'job':
@@ -2231,8 +2945,10 @@ function assertManagedNetworkName(name: string): void {
   }
 }
 
-function assertRoomNetwork(network: DockerNetworkInspect, roomId: string): void {
-  const name = roomNetworkName(roomId)
+function assertRoomNetwork(network: DockerNetworkInspect, roomId: string, name: string): void {
+  if (name !== roomNetworkName(roomId) && name !== androidControlNetworkName(roomId)) {
+    throw new Error(`invalid Room network identity: ${name}`)
+  }
   const labels = network.Labels ?? {}
   if (
     network.Name !== name ||
@@ -2242,5 +2958,29 @@ function assertRoomNetwork(network: DockerNetworkInspect, roomId: string): void 
     labels['devhotel.managed'] !== '1'
   ) {
     throw new Error(`network name collision or invalid ownership metadata: ${name}`)
+  }
+}
+
+function assertAndroidNetworkMembership(
+  control: DockerNetworkInspect,
+  runtime: DockerNetworkInspect,
+  roomId: string,
+  controlAnchorId: string,
+  runtimeAnchorId: string
+): void {
+  const controlMembers = Object.entries(control.Containers ?? {})
+  if (
+    controlMembers.length !== 1 ||
+    controlMembers[0]?.[0] !== controlAnchorId ||
+    controlMembers[0]?.[1]?.Name !== anchorName(roomId)
+  ) {
+    throw new Error('Android control network must contain only the exact owned control anchor endpoint')
+  }
+  const runtimeMembers = runtime.Containers ?? {}
+  if (
+    runtimeMembers[controlAnchorId] !== undefined ||
+    runtimeMembers[runtimeAnchorId]?.Name !== androidRuntimeAnchorName(roomId)
+  ) {
+    throw new Error('Android runtime and control network endpoint sets are not disjoint')
   }
 }

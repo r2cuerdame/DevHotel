@@ -94,7 +94,7 @@ export class FakeBackend implements IsolationBackend {
   async relayToken(_roomId: string) {
     return this.relayTokenValue
   }
-  async startRoomPod(roomId: string, opts?: { standalone?: boolean }) {
+  async startRoomPod(roomId: string, opts?: { standalone?: boolean; androidRuntimeIsolation?: boolean }) {
     this.calls.push(`startRoomPod:${roomId}`)
     return { hostPort: opts?.standalone ? null : this.hostPort }
   }
@@ -124,7 +124,7 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
   }
-  async recreateAnchor(spec: { roomId: string; internalPort: number }) {
+  async recreateAnchor(spec: { roomId: string; internalPort: number; androidRuntimeIsolation?: boolean }) {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
     return { hostPort: this.hostPort }
   }

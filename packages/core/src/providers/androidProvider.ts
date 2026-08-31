@@ -69,6 +69,7 @@ export class AndroidRoomProvider implements RoomProvider {
       startCommand: ANDROID_KEEPALIVE_COMMAND,
       env: { GRADLE_USER_HOME: '/cache/gradle' },
       imageOverride: ANDROID_IMAGE,
+      androidRuntimeIsolation: true,
       noDepsVolume: true,
       // persists AGP's auto-installed platforms/build-tools across container recreates;
       // docker seeds the volume from the image (cmdline-tools + pre-accepted licenses)

@@ -52,7 +52,7 @@ describe('OciCliBackend.deleteRoomPod', () => {
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'ps') return ok
       if (args[0] === 'network' && args[1] === 'inspect') {
-        return networkExists
+        return networkExists && args[2] === 'dh-r1-net'
           ? {
               code: 0,
               stdout: JSON.stringify([
@@ -98,7 +98,7 @@ describe('OciCliBackend.deleteRoomPod', () => {
     })
 
     await expect(new OciCliBackend().deleteRoomPod(ROOM_ID, { volumes: false })).rejects.toThrow(
-      /remove Room r1 containers failed/
+      /remove Room r1 leaf containers failed/
     )
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', 'aaa111'])
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'network' && args[1] === 'rm')).toBe(false)
