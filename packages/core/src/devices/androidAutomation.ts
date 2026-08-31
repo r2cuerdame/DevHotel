@@ -1678,10 +1678,9 @@ export class AndroidAutomationSession {
     const tracked = await this.requireInstalled(input.applicationId)
     await this.requireForeground(input.applicationId, tracked.installUserId)
     let tapped!: AndroidUiNode
-    const inputBoundary: { attempted: boolean; result: ExecResult | null; commandError: unknown } = {
+    const inputBoundary: { attempted: boolean; result: ExecResult | null } = {
       attempted: false,
-      result: null,
-      commandError: null
+      result: null
     }
     let result: ExecResult
     try {
@@ -1730,22 +1729,16 @@ export class AndroidAutomationSession {
         input.applicationId,
         tracked,
         async () => {
-          let commandResult: ExecResult
-          try {
-            commandResult = await this.command(
-              // InputShellCommand has no Android-user selector. Keep a same-shell
-              // current-user guard on both sides of input, while the outer live
-              // witness streams globally ordered switch evidence into Host memory.
-              [
-                'shell', 'sh', '-c', GUARDED_TAP_SCRIPT, 'devhotel-tap',
-                String(tracked.installUserId), String(tapped.center.x), String(tapped.center.y)
-              ],
-              { operation: 'Android text tap', timeoutMs: 15_000, stdoutLimit: 16 * 1024, signal }
-            )
-          } catch (error) {
-            inputBoundary.commandError = error
-            throw error
-          }
+          const commandResult = await this.command(
+            // InputShellCommand has no Android-user selector. Keep a same-shell
+            // current-user guard on both sides of input, while the outer live
+            // witness streams globally ordered switch evidence into Host memory.
+            [
+              'shell', 'sh', '-c', GUARDED_TAP_SCRIPT, 'devhotel-tap',
+              String(tracked.installUserId), String(tapped.center.x), String(tapped.center.y)
+            ],
+            { operation: 'Android text tap', timeoutMs: 15_000, stdoutLimit: 16 * 1024, signal }
+          )
           // Capture the Android command boundary before package postflight. A
           // later witness/identity failure must not turn an already committed,
           // non-idempotent tap into a generic retryable failure.
@@ -1779,14 +1772,7 @@ export class AndroidAutomationSession {
       // check before any tap result or command evidence crosses the boundary.
       await this.assertTrackedInstall(input.applicationId, tracked)
     } catch (error) {
-      if (
-        inputBoundary.attempted &&
-        (
-          inputBoundary.commandError === error ||
-          (error instanceof DevHotelError &&
-            (error.code === 'ANDROID_SCREEN_WITNESS_FAILED' || error.code === 'ANDROID_APP_NOT_FOREGROUND'))
-        )
-      ) {
+      if (inputBoundary.attempted) {
         return {
           target: this.target,
           applicationId: input.applicationId,

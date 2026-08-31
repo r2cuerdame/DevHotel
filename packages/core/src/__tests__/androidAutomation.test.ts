@@ -1334,7 +1334,7 @@ describe('tracked Android automation session', () => {
     expect(JSON.stringify(capturedError)).not.toContain('cross-user-private-ui')
   })
 
-  it('withholds tap success when the package is replaced during input', async () => {
+  it('returns committed when the package is replaced during input postflight', async () => {
     const replacementStat = '103:5252:123456:1788157200:1788157300'
     let replaced = false
     const { session } = setup((args) => {
@@ -1357,8 +1357,10 @@ describe('tracked Android automation session', () => {
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
-      code: 'ANDROID_APP_REPLACED'
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).resolves.toMatchObject({
+      outcome: 'committed',
+      retrySafe: false,
+      evidence: null
     })
   })
 
@@ -1741,7 +1743,7 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args.some((value) => value.includes('/data/local/tmp/devhotel-tap-')))).toBe(false)
   })
 
-  it('withholds tap evidence when the package is replaced during the final foreground probe', async () => {
+  it('returns committed when the package is replaced during the final foreground probe', async () => {
     const replacementStat = '103:5252:123456:1788157200:1788157300'
     let tapRan = false
     let replaced = false
@@ -1766,14 +1768,43 @@ describe('tracked Android automation session', () => {
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    let capturedError: unknown
-    try {
-      await session.tapText({ applicationId: APP_ID, text: 'Crash' })
-    } catch (error) {
-      capturedError = error
-    }
-    expect(capturedError).toMatchObject({ code: 'ANDROID_APP_REPLACED' })
-    expect(JSON.stringify(capturedError)).not.toContain('private-tap-evidence')
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).resolves.toMatchObject({
+      outcome: 'committed',
+      retrySafe: false,
+      evidence: null
+    })
+  })
+
+  it('returns committed when exact lease authorization is lost during tap postflight', async () => {
+    const leaseError = new DeviceLeaseError('lease-expired', 'exact physical lease expired')
+    let tapRan = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        if (tapRan) throw leaseError
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        tapRan = true
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).resolves.toMatchObject({
+      outcome: 'committed',
+      retrySafe: false,
+      evidence: null
+    })
   })
 
   it('applies the text predicate before the cap and refuses a truncated candidate dump', async () => {
