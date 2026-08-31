@@ -840,13 +840,15 @@ describe('tracked Android automation session', () => {
       result: { code: 0, stdout: 'mCurrentFocus=null\n', stderr: '', outputLimitExceeded: true }
     }
   ])('rejects force-stop success when the foreground probe is $probe', async ({ result }) => {
-    const { session } = setup((args) => {
+    const { calls, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) return result
       return { code: 0, stdout: '', stderr: '' }
     })
 
     await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+    expect(calls.find((args) => args[1] === 'sh' && args[3]?.includes('dumpsys window'))?.[3])
+      .toContain('grep -m 2')
   })
 
   it.each([

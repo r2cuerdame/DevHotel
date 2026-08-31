@@ -816,7 +816,7 @@ export class AndroidAutomationSession {
     signal?: AbortSignal
   ): Promise<AndroidForegroundPackage | null | undefined> {
     const result = await this.command(
-      ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 1 -E '^[[:space:]]*mCurrentFocus=' | head -c 2048"],
+      ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 2 -E '^[[:space:]]*mCurrentFocus=' | head -c 2048"],
       { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048, deadline, signal }
     )
     const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0)
