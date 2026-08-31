@@ -354,6 +354,8 @@ describe('OciCliBackend Android artifact export', () => {
     let createFailureStderr: string | null = null
     let cleanupFailureStderr: string | null = null
     let holdStartUntilAbort = false
+    let replaceEmulatorAfterStart = false
+    let emulatorReplaced = false
     let receivedBytes = 0
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
@@ -400,8 +402,12 @@ describe('OciCliBackend Android artifact export', () => {
             stderr: ''
           }
         }
+        if (args[1] === ids.emulator && emulatorReplaced) {
+          return { code: 1, stdout: '', stderr: 'No such container' }
+        }
         if (args[1] === emulatorName(ROOM_ID) || args[1] === ids.emulator) {
-          return { code: 0, stdout: inspect(emulatorName(ROOM_ID), 'svc-emulator', ids.emulator), stderr: '' }
+          const emulatorId = emulatorReplaced ? '9'.repeat(64) : ids.emulator
+          return { code: 0, stdout: inspect(emulatorName(ROOM_ID), 'svc-emulator', emulatorId), stderr: '' }
         }
         if (helper && (args[1] === ids.helper || args[1] === (helper.Name as string).slice(1))) {
           abortAfterHelperInspect?.abort()
@@ -453,6 +459,7 @@ describe('OciCliBackend Android artifact export', () => {
           })
         }
         opts?.onStdout?.(Buffer.alloc(SCREENSHOT_BASE64_LIMIT - 1, 0x61))
+        if (replaceEmulatorAfterStart) emulatorReplaced = true
         return ok
       }
       if (args[0] === 'rm') {
@@ -526,6 +533,25 @@ describe('OciCliBackend Android artifact export', () => {
       maxStderrBytes: 64,
       onAbort: expect.any(Function)
     })
+
+    mockedRunDocker.mockClear()
+    replaceEmulatorAfterStart = true
+    let replacementError = ''
+    try {
+      await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'])
+    } catch (error) {
+      replacementError = error instanceof Error ? error.message : String(error)
+    }
+    expect(replacementError).toMatch(/topology participant disappeared/)
+    expect(replacementError).not.toContain('a'.repeat(32))
+    expect(helper).toBeNull()
+    const replacementCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    const helperCleanupAt = replacementCalls.findIndex((args) => args[0] === 'rm' && args[2] === ids.helper)
+    const topologyPostflightAt = replacementCalls.findLastIndex((args) => args[0] === 'inspect' && args[1] === ids.emulator)
+    expect(helperCleanupAt).toBeGreaterThanOrEqual(0)
+    expect(topologyPostflightAt).toBeGreaterThan(helperCleanupAt)
+    replaceEmulatorAfterStart = false
+    emulatorReplaced = false
 
     mockedRunDocker.mockClear()
     holdStartUntilAbort = true

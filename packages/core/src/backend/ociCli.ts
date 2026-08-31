@@ -1947,6 +1947,7 @@ export class OciCliBackend implements IsolationBackend {
       }
       throw cleanupError
     }
+    await this.assertFencedEmulatorTopology(roomId, topology)
     if (executionError) throw executionError
     throwIfAborted(opts.signal)
     if (!result) throw new Error('fenced emulator helper did not return an execution result')
