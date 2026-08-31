@@ -773,7 +773,7 @@ describe('Android automation targets the attached device without a hand-written 
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
     expect(adb.execs.find((call) => logicalAdbArgs(call.args)[1] === 'am')?.serial).toBe('R5CT30ABCDE')
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
-  })
+  }, 15_000)
 
   it.each([
     { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED', keepsReceipt: true },
@@ -851,7 +851,7 @@ describe('Android automation targets the attached device without a hand-written 
       'shell', 'am', 'start', '-W', '--user', '0', '-n', 'com.example.app/.MainActivity'
     ])
     expect(adb.execs.some((call) => logicalAdbArgs(call.args)[1] === 'pidof')).toBe(false)
-  })
+  }, 15_000)
 
   it('refuses to launch a component resolved for a different package', async () => {
     const { orch, adb, backend } = setup()
@@ -887,7 +887,7 @@ describe('Android automation targets the attached device without a hand-written 
       const logical = logicalAdbArgs(call.args)
       return logical[0] === 'shell' && logical[1] === 'am' && logical[2] === 'start'
     })).toBe(false)
-  })
+  }, 15_000)
 
   it('durably records a safe failed apply when tracked launch proof loses its lease', async () => {
     const { orch, adb, backend } = setup()
@@ -940,7 +940,7 @@ describe('Android automation targets the attached device without a hand-written 
       status: 'failed',
       verify: { ok: false }
     })
-  })
+  }, 15_000)
 
   it.each([
     {

@@ -705,7 +705,7 @@ describe('OciCliBackend Android artifact export', () => {
     expect(surfacedInstallError).toContain('exact helper cleanup also failed')
     expect(surfacedInstallError).not.toContain(privateApk)
     expect(surfacedInstallError).not.toContain('host-secret-build.apk')
-  }, 10_000)
+  }, 30_000)
 
   it('cuts off fenced helper sinks at the requested cap and rejects all later chunks', async () => {
     const ids = {

@@ -1438,8 +1438,7 @@ export class AndroidAutomationSession {
     await this.assertTrackedInstall(applicationId, tracked)
     if (
       !stopped ||
-      !foreground ||
-      (foreground.applicationId === applicationId && foreground.userId === tracked.installUserId)
+      (foreground?.applicationId === applicationId && foreground.userId === tracked.installUserId)
     ) {
       throw automationError(
         'ANDROID_FORCE_STOP_FAILED',

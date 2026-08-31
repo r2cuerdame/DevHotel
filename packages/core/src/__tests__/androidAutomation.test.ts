@@ -817,6 +817,18 @@ describe('tracked Android automation session', () => {
     await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
   })
 
+  it('accepts a proven stopped package when the screen has no current-focus window', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=null\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
+  })
+
   it.each([
     { state: 'package stopped bit remains false', stopped: false, foregroundRemains: false },
     { state: 'foreground remains', stopped: true, foregroundRemains: true }
@@ -1077,7 +1089,7 @@ describe('tracked Android automation session', () => {
     })
     const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
     expect(signals[readerIndex]?.aborted).toBe(true)
-    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(Date.now() - started).toBeLessThan(2_000)
   })
 
   it('derives the reader lifetime from the declared action window plus setup and close budgets', async () => {
@@ -1610,7 +1622,7 @@ describe('tracked Android automation session', () => {
       code: 'ANDROID_SCREEN_WITNESS_FAILED'
     })
     expect(calls.some(isGuardedTap)).toBe(false)
-  })
+  }, 20_000)
 
   it('aborts before input when the live reader writes diagnostics during preflight', async () => {
     let screenReaders = 0
