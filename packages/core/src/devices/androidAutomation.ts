@@ -814,20 +814,27 @@ export class AndroidAutomationSession {
   private async foregroundPackage(
     deadline?: AndroidAutomationDeadline,
     signal?: AbortSignal
-  ): Promise<AndroidForegroundPackage | null> {
+  ): Promise<AndroidForegroundPackage | null | undefined> {
     const result = await this.command(
       ['shell', 'sh', '-c', "dumpsys window windows 2>/dev/null | grep -m 1 -E '^[[:space:]]*mCurrentFocus=' | head -c 2048"],
       { operation: 'Android foreground probe', timeoutMs: 15_000, stdoutLimit: 2048, deadline, signal }
     )
     const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0)
-    if (result.code !== 0 || result.stderr.length > 0 || lines.length !== 1) return null
+    if (
+      result.code !== 0 ||
+      result.stderr.length > 0 ||
+      result.outputLimitExceeded === true ||
+      commandHitOutputLimit(result) ||
+      lines.length !== 1
+    ) return undefined
+    if (/^\s*mCurrentFocus=null\s*$/.test(lines[0]!)) return null
     // mFocusedApp can remain the tracked Activity while a SystemUI/dialog
     // window owns actual input. Only the unique current-focus window is screen
     // authority; never fall back to the resumed-Activity bookkeeping field.
     const match = /^\s*mCurrentFocus=Window\{[^\r\n}]*\bu(\d+)\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\/[A-Za-z0-9_.$]+[^\r\n}]*}\s*$/.exec(lines[0]!)
-    if (!match) return null
+    if (!match) return undefined
     const userId = Number.parseInt(match[1]!, 10)
-    if (!Number.isSafeInteger(userId) || userId < 0 || userId > ANDROID_MAX_USER_ID) return null
+    if (!Number.isSafeInteger(userId) || userId < 0 || userId > ANDROID_MAX_USER_ID) return undefined
     return { userId, applicationId: match[2]! }
   }
 
@@ -1438,6 +1445,7 @@ export class AndroidAutomationSession {
     await this.assertTrackedInstall(applicationId, tracked)
     if (
       !stopped ||
+      foreground === undefined ||
       (foreground?.applicationId === applicationId && foreground.userId === tracked.installUserId)
     ) {
       throw automationError(

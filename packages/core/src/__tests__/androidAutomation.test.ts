@@ -830,6 +830,26 @@ describe('tracked Android automation session', () => {
   })
 
   it.each([
+    { probe: 'nonzero', result: { code: 1, stdout: 'mCurrentFocus=null\n', stderr: '' } },
+    { probe: 'stderr', result: { code: 0, stdout: 'mCurrentFocus=null\n', stderr: 'window probe warning' } },
+    { probe: 'missing', result: { code: 0, stdout: '', stderr: '' } },
+    { probe: 'duplicate', result: { code: 0, stdout: 'mCurrentFocus=null\nmCurrentFocus=null\n', stderr: '' } },
+    { probe: 'malformed', result: { code: 0, stdout: 'mCurrentFocus=Window{broken}\n', stderr: '' } },
+    {
+      probe: 'output-limit',
+      result: { code: 0, stdout: 'mCurrentFocus=null\n', stderr: '', outputLimitExceeded: true }
+    }
+  ])('rejects force-stop success when the foreground probe is $probe', async ({ result }) => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) return result
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+  })
+
+  it.each([
     { state: 'package stopped bit remains false', stopped: false, foregroundRemains: false },
     { state: 'foreground remains', stopped: true, foregroundRemains: true }
   ])('rejects code-zero force-stop when the $state', async ({ stopped, foregroundRemains }) => {
