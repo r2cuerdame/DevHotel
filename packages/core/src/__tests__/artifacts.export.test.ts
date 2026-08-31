@@ -199,10 +199,10 @@ describe('Room screenshot artifact export', () => {
     const artifact = publish(orch)
     const key = 'artifactExportPending:aaaa1111'
     const priorOwner = JSON.stringify({ version: 'external-owner' })
-    const claim = orch.settings.setIfAbsent.bind(orch.settings)
-    orch.settings.setIfAbsent = (settingKey, value) => {
+    const claim = orch.settings.setIfAbsentWhenKeysAbsent.bind(orch.settings)
+    orch.settings.setIfAbsentWhenKeysAbsent = (settingKey, value, mutuallyExclusiveKeys) => {
       orch.settings.set(key, priorOwner)
-      return claim(settingKey, value)
+      return claim(settingKey, value, mutuallyExclusiveKeys)
     }
 
     await expect(

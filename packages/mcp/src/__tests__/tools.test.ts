@@ -17,6 +17,16 @@ const ARTIFACT_PNG = Buffer.concat([
   Buffer.from('directly-reviewable-png')
 ])
 const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
+const ACCEPTANCE_REPORT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const acceptanceResult = {
+  report: {
+    id: ACCEPTANCE_REPORT_ID,
+    roomId: 'abc12345',
+    status: 'pass',
+    seal: { algorithm: 'hmac-sha256', keyVersion: 1, domain: 'report', value: 'a'.repeat(64) }
+  },
+  markdown: `## Android acceptance report \`${ACCEPTANCE_REPORT_ID}\`\n`
+}
 const artifact = {
   id: ARTIFACT_ID,
   roomId: 'abc12345',
@@ -140,6 +150,18 @@ beforeAll(async () => {
           markdown: `![login-success.png](${relativePath})`
         }))
       }
+      if (req.url === '/v1/rooms/abc12345/android/acceptance-reports' && req.method === 'POST') {
+        return void res.end(JSON.stringify(acceptanceResult))
+      }
+      if (req.url === '/v1/rooms/abc12345/android/acceptance-reports?limit=5' && req.method === 'GET') {
+        return void res.end(JSON.stringify({ reports: [acceptanceResult.report] }))
+      }
+      if (
+        req.url === `/v1/rooms/abc12345/android/acceptance-reports/${ACCEPTANCE_REPORT_ID}` &&
+        req.method === 'GET'
+      ) {
+        return void res.end(JSON.stringify(acceptanceResult))
+      }
       if (req.url === '/v1/rooms/abc12345/diagnostic') {
         return void res.end(JSON.stringify({ text: 'DevHotel Diagnostic Bundle\n...' }))
       }
@@ -257,6 +279,7 @@ describe('makeTools', () => {
   it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
+        'android_create_acceptance_report',
         'android_device_adb',
         'android_devices',
         'android_dump_ui',
@@ -284,7 +307,9 @@ describe('makeTools', () => {
         'hotel_status',
         'heartbeat_android_device',
         'inspect_room',
+        'get_android_acceptance_report',
         'list_changes',
+        'list_android_acceptance_reports',
         'list_room_artifacts',
         'list_rooms',
         'release_android_device',
@@ -441,6 +466,42 @@ describe('makeTools', () => {
       relativePath: 'docs/login-success.png'
     })
     expect(firstText(exported)).toContain('![login-success.png](docs/login-success.png)')
+  })
+
+  it('creates, lists, and reads bounded acceptance receipts as Markdown plus JSON', async () => {
+    const created = await byName.android_create_acceptance_report!.handler({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      steps: [{ id: 'login', status: 'pass', screenshotArtifactIds: [ARTIFACT_ID] }]
+    })
+    expect(created.isError).toBeUndefined()
+    expect(firstText(created)).toContain('Android acceptance report')
+    expect(created.content[1]).toMatchObject({ type: 'text' })
+    expect((created.content[1] as { text: string }).text).toContain(ACCEPTANCE_REPORT_ID)
+    expect(seen.findLast((request) =>
+      request.url === '/v1/rooms/abc12345/android/acceptance-reports' && request.method === 'POST'
+    )?.body).toMatchObject({ stage: 'development', applicationId: 'com.example.app' })
+
+    const listed = await byName.list_android_acceptance_reports!.handler({ roomId: 'abc12345', limit: 5 })
+    expect(firstText(listed)).toContain(ACCEPTANCE_REPORT_ID)
+    const fetched = await byName.get_android_acceptance_report!.handler({
+      roomId: 'abc12345',
+      reportId: ACCEPTANCE_REPORT_ID
+    })
+    expect(firstText(fetched)).toContain('Android acceptance report')
+  })
+
+  it('rejects final-physical acceptance without an explicit physical target', async () => {
+    const invalid = await byName.android_create_acceptance_report!.handler({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      stage: 'final-physical',
+      steps: [{ id: 'login', status: 'pass', screenshotArtifactIds: [ARTIFACT_ID] }]
+    })
+    expect(invalid.isError).toBe(true)
+    expect(seen.findLast((request) =>
+      request.url === '/v1/rooms/abc12345/android/acceptance-reports' && request.method === 'POST'
+    )?.body).not.toMatchObject({ stage: 'final-physical' })
   })
 
   it('run_in_room forwards the bounded-output selection to the control API', async () => {

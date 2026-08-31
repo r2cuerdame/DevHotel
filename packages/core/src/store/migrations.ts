@@ -314,6 +314,124 @@ export const migrations: Migration[] = [
       CREATE INDEX idx_room_artifacts_room_created
         ON room_artifacts(room_id, created_at DESC, id DESC);
     `
+  },
+  {
+    // Installation-local authentication for immutable Android acceptance
+    // reports. Public install receipts stay unchanged; only Core can read the
+    // additive source/build identities on tracked install rows.
+    version: 10,
+    sql: `
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_artifact_size_bytes INTEGER CHECK (
+          acceptance_artifact_size_bytes IS NULL OR
+          acceptance_artifact_size_bytes BETWEEN 1 AND 536870912
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_source_state_revision INTEGER CHECK (
+          acceptance_source_state_revision IS NULL OR acceptance_source_state_revision >= 0
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_source_workspace_revision INTEGER CHECK (
+          acceptance_source_workspace_revision IS NULL OR acceptance_source_workspace_revision >= 0
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_source_identity_hmac TEXT CHECK (
+          acceptance_source_identity_hmac IS NULL OR
+          (length(acceptance_source_identity_hmac) = 64 AND acceptance_source_identity_hmac NOT GLOB '*[^0-9a-f]*')
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_environment_identity_hmac TEXT CHECK (
+          acceptance_environment_identity_hmac IS NULL OR
+          (length(acceptance_environment_identity_hmac) = 64 AND acceptance_environment_identity_hmac NOT GLOB '*[^0-9a-f]*')
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_image_reference TEXT CHECK (
+          acceptance_image_reference IS NULL OR length(acceptance_image_reference) BETWEEN 1 AND 512
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN acceptance_image_sha256 TEXT CHECK (
+          acceptance_image_sha256 IS NULL OR
+          (length(acceptance_image_sha256) = 64 AND acceptance_image_sha256 NOT GLOB '*[^0-9a-f]*')
+        );
+
+      CREATE TABLE android_acceptance_secrets (
+        name TEXT PRIMARY KEY,
+        value BLOB NOT NULL CHECK (length(value) = 32)
+      );
+      INSERT INTO android_acceptance_secrets (name, value)
+        VALUES ('acceptance-hmac-v1', randomblob(32));
+
+      CREATE TABLE android_acceptance_reports (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL CHECK (stage IN ('development', 'final-physical')),
+        status TEXT NOT NULL CHECK (status IN ('pass', 'fail')),
+        application_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 1 AND 65536),
+        seal_hmac TEXT NOT NULL CHECK (length(seal_hmac) = 64 AND seal_hmac NOT GLOB '*[^0-9a-f]*'),
+        report_json TEXT NOT NULL CHECK (
+          length(CAST(report_json AS BLOB)) = size_bytes
+        ),
+        UNIQUE(id, room_id)
+      );
+      CREATE INDEX idx_android_acceptance_reports_room_created
+        ON android_acceptance_reports(room_id, created_at DESC, id DESC);
+
+      CREATE TABLE android_acceptance_run_snapshots (
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL,
+        identity_hmac TEXT NOT NULL CHECK (length(identity_hmac) = 64 AND identity_hmac NOT GLOB '*[^0-9a-f]*'),
+        size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 1 AND 4194304),
+        snapshot_json TEXT NOT NULL CHECK (
+          length(CAST(snapshot_json AS BLOB)) BETWEEN 1 AND 16384
+        ),
+        PRIMARY KEY (room_id, run_id)
+      );
+      CREATE TABLE android_acceptance_report_runs (
+        report_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        PRIMARY KEY (report_id, run_id),
+        FOREIGN KEY (report_id, room_id)
+          REFERENCES android_acceptance_reports(id, room_id) ON DELETE CASCADE,
+        FOREIGN KEY (room_id, run_id)
+          REFERENCES android_acceptance_run_snapshots(room_id, run_id) ON DELETE NO ACTION
+      );
+      CREATE INDEX idx_android_acceptance_report_runs_room
+        ON android_acceptance_report_runs(room_id, run_id);
+    `
+  },
+  {
+    // A Room lock is process-local, while a physical Android target and its
+    // Host ADB children are shared by every DevHotel process. Durable per-command
+    // intents prevent a final read-only proof from racing an already-spawned
+    // writer; the proof gate prevents any later writer until report publication.
+    // Writer intents intentionally survive process death and lease replacement:
+    // an orphan Host ADB child cannot be proven gone merely because its parent
+    // exited, so the device remains hard-gated for manual remediation.
+    version: 11,
+    sql: `
+      CREATE TABLE android_physical_operation_intents (
+        id TEXT PRIMARY KEY,
+        lease_id TEXT NOT NULL REFERENCES android_device_leases(id) ON DELETE RESTRICT,
+        device_id TEXT NOT NULL UNIQUE REFERENCES android_devices(id) ON DELETE RESTRICT,
+        room_id TEXT NOT NULL,
+        owner_worker_id TEXT NOT NULL,
+        started_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_android_physical_operation_intents_device
+        ON android_physical_operation_intents(device_id, started_at, id);
+
+      CREATE TABLE android_physical_acceptance_proof_gates (
+        token TEXT PRIMARY KEY,
+        lease_id TEXT NOT NULL UNIQUE REFERENCES android_device_leases(id) ON DELETE RESTRICT,
+        device_id TEXT NOT NULL UNIQUE REFERENCES android_devices(id) ON DELETE RESTRICT,
+        room_id TEXT NOT NULL,
+        owner_worker_id TEXT NOT NULL,
+        started_at TEXT NOT NULL
+      );
+    `
   }
 ]
 

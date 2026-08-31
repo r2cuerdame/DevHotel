@@ -383,6 +383,44 @@ describe('settingsRepo', () => {
     expect(settings.get('artifact-export')).toBeNull()
   })
 
+  it('serializes distinct Room recovery-intent claims across database connections', () => {
+    const first = settingsRepo(db)
+    const secondDb = openDb(dir)
+    try {
+      const second = settingsRepo(secondDb)
+      const keys = [
+        'androidLocaleRestorePending:room-1',
+        'androidAcceptanceRestorePending:room-1',
+        'artifactExportPending:room-1'
+      ] as const
+
+      // Both processes can complete their advisory preflight reads before
+      // either claim. The claims themselves must still have exactly one winner.
+      expect(keys.map((key) => first.get(key))).toEqual([null, null, null])
+      expect(keys.map((key) => second.get(key))).toEqual([null, null, null])
+      const localeWon = first.setIfAbsentWhenKeysAbsent(keys[0], 'locale-owner', keys)
+      const acceptanceWon = second.setIfAbsentWhenKeysAbsent(keys[1], 'acceptance-owner', keys)
+      expect([localeWon, acceptanceWon].filter(Boolean)).toHaveLength(1)
+      expect(first.get(keys[0])).toBe('locale-owner')
+      expect(second.get(keys[1])).toBeNull()
+
+      first.delete(keys[0])
+      expect(second.setIfAbsentWhenKeysAbsent(keys[2], 'artifact-owner', keys)).toBe(true)
+      expect(first.setIfAbsentWhenKeysAbsent(keys[0], 'late-locale-owner', keys)).toBe(false)
+      expect(first.get(keys[0])).toBeNull()
+      expect(second.get(keys[2])).toBe('artifact-owner')
+
+      second.delete(keys[2])
+      db.sqlite.exec('BEGIN IMMEDIATE')
+      expect(() => first.setIfAbsentWhenKeysAbsent(keys[0], 'uncommitted-owner', keys))
+        .toThrow('require their own autocommit write')
+      db.sqlite.exec('ROLLBACK')
+      expect(first.get(keys[0])).toBeNull()
+    } finally {
+      secondDb.close()
+    }
+  })
+
   it('releases an exact value only while the owning Room revision still matches', () => {
     const rooms = roomsRepo(db)
     const settings = settingsRepo(db)

@@ -8,6 +8,8 @@ import {
   type AbandonAndroidLocaleMatrixRecoveryInput,
   type AbandonAndroidLocaleMatrixRecoveryResult,
   type AndroidAutomationStatus,
+  type AndroidAcceptanceReportResult,
+  type AndroidAcceptanceReportSummary,
   type AndroidCrashScenarioResult,
   type AndroidDumpUiInput,
   type AndroidForceStopInput,
@@ -28,6 +30,7 @@ import {
   type ArtifactExportBody,
   type ArtifactExportResult,
   type CaptureScreenshotArtifactBody,
+  type CreateAndroidAcceptanceReportInput,
   type ControlInfo,
   type OperationRecord,
   type QuickChange,
@@ -343,6 +346,26 @@ export class ControlClient {
       'POST',
       `/v1/rooms/${encodeURIComponent(roomId)}/android/locale-recovery-abandon`,
       input
+    )
+  }
+  createAndroidAcceptanceReport(roomId: string, input: CreateAndroidAcceptanceReportInput) {
+    return this.req<AndroidAcceptanceReportResult>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/acceptance-reports`,
+      input
+    )
+  }
+  listAndroidAcceptanceReports(roomId: string, limit?: number) {
+    const suffix = limit === undefined ? '' : `?limit=${encodeURIComponent(String(limit))}`
+    return this.req<{ reports: AndroidAcceptanceReportSummary[] }>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/acceptance-reports${suffix}`
+    )
+  }
+  getAndroidAcceptanceReport(roomId: string, reportId: string) {
+    return this.req<AndroidAcceptanceReportResult>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/acceptance-reports/${encodeURIComponent(reportId)}`
     )
   }
   captureScreenshotArtifact(roomId: string, body: CaptureScreenshotArtifactBody) {

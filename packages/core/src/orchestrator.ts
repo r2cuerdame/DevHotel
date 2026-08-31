@@ -20,6 +20,7 @@ import {
   writeFileSync
 } from 'node:fs'
 import { isAbsolute, join, relative } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { customAlphabet } from 'nanoid'
 import type {
   Actor,
@@ -47,6 +48,9 @@ import type {
   AndroidWaitForTextInput,
   AndroidWaitForTextResult,
   AndroidScreenshotArtifactMetadata,
+  AndroidAcceptanceReport,
+  AndroidAcceptanceReportResult,
+  AndroidAcceptanceReportSummary,
   ArtifactExportResult,
   BackupInfo,
   ChangeEntry,
@@ -66,6 +70,7 @@ import type {
   RoomRuntimeStatus,
   RoomArtifact,
   CaptureScreenshotArtifactBody,
+  CreateAndroidAcceptanceReportInput,
   RuntimeRoomRecord,
   SafeHostResyncOutcome,
   SourceType
@@ -75,6 +80,10 @@ import {
   canonicalAndroidLocaleTags,
   hostInputCapability,
   androidLocaleScreenshotFilename,
+  ANDROID_ACCEPTANCE_LOG_MAX_BYTES,
+  ANDROID_ACCEPTANCE_LOGS_MAX_TOTAL_BYTES,
+  ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_BYTES,
+  ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_PIXELS,
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   VMWARE_CONSOLE_CAPABILITY,
   zArtifactExportBody,
@@ -82,6 +91,10 @@ import {
   zAndroidApplicationId,
   zAbandonAndroidLocaleMatrixRecoveryBody,
   zAndroidLocaleScreenshotMatrixBody,
+  zAndroidAcceptanceReportId,
+  zAndroidAcceptanceReportListLimit,
+  zAndroidAcceptanceScreenshotRef,
+  zCreateAndroidAcceptanceReportBody,
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
@@ -91,16 +104,36 @@ import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
 import {
   AndroidAutomationSession,
+  isPhysicalAcceptanceProofReadCommand,
+  isPhysicalAutomationReadCommand,
   type AndroidAppLocaleRestoreFence,
   type AndroidAppLocaleSnapshot,
-  type AndroidForegroundInstallEvidence
+  type AndroidAppLocaleTransition,
+  type AndroidForegroundInstallEvidence,
+  type AndroidTrackedInstallSeal
 } from './devices/androidAutomation'
+import { classifyAdbCommand } from './devices/adbOperations'
 import { artifactsRepo } from './store/artifactsRepo'
+import { androidAcceptanceReportsRepo, type AndroidAcceptanceReportsRepo } from './store/androidAcceptanceReportsRepo'
+import { AndroidAcceptanceIntegrity } from './androidAcceptanceIntegrity'
+import {
+  acceptanceReportSummary,
+  androidAcceptanceReportMarkdown,
+  sealAndroidAcceptanceReport
+} from './androidAcceptanceReport'
 import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
+import { ANDROID_IMAGE } from './providers/androidProvider'
 import { runDocker } from './backend/cli'
-import { EMULATOR_ADB_SERIAL, EMULATOR_DEFAULT_DEVICE, EMULATOR_DEFAULT_VERSION, srcVolume, svcVolume } from './backend/naming'
+import {
+  EMULATOR_ADB_SERIAL,
+  EMULATOR_DEFAULT_DEVICE,
+  EMULATOR_DEFAULT_VERSION,
+  srcVolume,
+  svcVolume,
+  workspaceSnapshotVolume
+} from './backend/naming'
 import {
   RoomArtifactPublicationError,
   type ExecResult,
@@ -114,6 +147,7 @@ import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
 import {
   cleanupAndroidBuildArtifacts,
+  androidBuildEnvironmentRevision,
   isSafeAndroidArtifactRelativePath,
   type SealedAndroidArtifactRef
 } from './changes/definitions/androidBuild'
@@ -205,6 +239,8 @@ const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
+const ANDROID_ACCEPTANCE_RESTORE_PENDING_PREFIX = 'androidAcceptanceRestorePending:'
+const ANDROID_ACCEPTANCE_RESTORE_MAX_BYTES = 8 * 1024
 
 interface PendingArtifactExport {
   version: 1
@@ -533,6 +569,155 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
     }
   }
 }
+
+type EmulatorAndroidTrackedInstallSeal = AndroidTrackedInstallSeal & {
+  targetKind: 'emulator'
+  deviceId: null
+  leaseId: null
+}
+
+interface PendingAndroidAcceptanceRestore {
+  version: 1
+  token: string
+  roomStateRevision: number
+  workspaceVolumeRevision: number
+  applicationId: string
+  timeoutMs: number
+  install: EmulatorAndroidTrackedInstallSeal
+  originalLocale: Pick<AndroidAppLocaleSnapshot, 'apiLevel' | 'localeTags' | 'pids'>
+  runtimeFence: RoomArtifactWebRuntimeFence
+}
+
+function pendingAndroidAcceptanceRestoreKey(roomId: string): string {
+  return `${ANDROID_ACCEPTANCE_RESTORE_PENDING_PREFIX}${roomId}`
+}
+
+function roomMutatingRecoveryKeys(roomId: string): readonly [string, string, string] {
+  return [
+    pendingAndroidLocaleRestoreKey(roomId),
+    pendingAndroidAcceptanceRestoreKey(roomId),
+    pendingArtifactExportKey(roomId)
+  ]
+}
+
+function exactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).sort().join(',') === [...keys].sort().join(',')
+}
+
+function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAcceptanceRestore | null {
+  if (Buffer.byteLength(raw, 'utf8') > ANDROID_ACCEPTANCE_RESTORE_MAX_BYTES) return null
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (!exactObjectKeys(record, [
+    'version', 'token', 'roomStateRevision', 'workspaceVolumeRevision',
+    'applicationId', 'timeoutMs', 'install', 'originalLocale', 'runtimeFence'
+  ])) return null
+  if (
+    record.version !== 1 ||
+    typeof record.token !== 'string' || !/^[a-f0-9]{32}$/.test(record.token) ||
+    !Number.isSafeInteger(record.roomStateRevision) || (record.roomStateRevision as number) < 0 ||
+    !Number.isSafeInteger(record.workspaceVolumeRevision) || (record.workspaceVolumeRevision as number) < 0 ||
+    !Number.isSafeInteger(record.timeoutMs) || (record.timeoutMs as number) < 1_000 ||
+    (record.timeoutMs as number) > 120_000 ||
+    typeof record.applicationId !== 'string' || !zAndroidApplicationId.safeParse(record.applicationId).success
+  ) return null
+
+  if (record.install === null || typeof record.install !== 'object' || Array.isArray(record.install)) return null
+  const install = record.install as Record<string, unknown>
+  if (!exactObjectKeys(install, [
+    'targetKind', 'targetId', 'deviceId', 'leaseId', 'roomId', 'applicationId',
+    'changeId', 'apkSha256', 'installedAt', 'packageIncarnation', 'logFence',
+    'installUserId', 'installUserSerial'
+  ])) return null
+  if (
+    install.targetKind !== 'emulator' ||
+    install.targetId !== install.roomId ||
+    install.deviceId !== null || install.leaseId !== null ||
+    typeof install.roomId !== 'string' || !/^[a-z0-9]{8}$/.test(install.roomId) ||
+    install.applicationId !== record.applicationId ||
+    typeof install.changeId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(install.changeId) ||
+    typeof install.apkSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(install.apkSha256) ||
+    typeof install.installedAt !== 'string' || install.installedAt.length > 40 ||
+    !Number.isFinite(Date.parse(install.installedAt)) ||
+    typeof install.packageIncarnation !== 'string' || !/^[a-f0-9]{64}$/.test(install.packageIncarnation) ||
+    (install.logFence !== null && (
+      typeof install.logFence !== 'string' || install.logFence.length > 160 ||
+      !/^devhotel-install-u\d+-uid\d+-[0-9a-f-]{36}$/.test(install.logFence)
+    )) ||
+    !Number.isSafeInteger(install.installUserId) || (install.installUserId as number) < 0 ||
+    !Number.isSafeInteger(install.installUserSerial) || (install.installUserSerial as number) < 0
+  ) return null
+
+  if (record.originalLocale === null || typeof record.originalLocale !== 'object' || Array.isArray(record.originalLocale)) {
+    return null
+  }
+  const locale = record.originalLocale as Record<string, unknown>
+  if (!exactObjectKeys(locale, ['apiLevel', 'localeTags', 'pids'])) return null
+  if (
+    !Number.isSafeInteger(locale.apiLevel) || (locale.apiLevel as number) < 33 || (locale.apiLevel as number) > 100 ||
+    !Array.isArray(locale.localeTags) || locale.localeTags.length > 16 ||
+    (locale.localeTags as unknown[]).some(
+      (tag) => typeof tag !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/.test(tag)
+    ) ||
+    new Set(locale.localeTags as unknown[]).size !== locale.localeTags.length ||
+    !Array.isArray(locale.pids) || locale.pids.length < 1 || locale.pids.length > 64 ||
+    (locale.pids as unknown[]).some((pid) => !Number.isSafeInteger(pid) || (pid as number) < 1) ||
+    (locale.pids as unknown[]).some(
+      (pid, index) => index > 0 && ((locale.pids as unknown[])[index - 1] as number) >= (pid as number)
+    )
+  ) return null
+
+  if (record.runtimeFence === null || typeof record.runtimeFence !== 'object' || Array.isArray(record.runtimeFence)) {
+    return null
+  }
+  const runtimeFence = record.runtimeFence as Record<string, unknown>
+  if (!exactObjectKeys(runtimeFence, [
+    'containerId', 'networkAuthorityId', 'networkId', 'networkSandboxId',
+    'runtimeSpecSha256', 'volumeSetSha256', 'workspaceVolume'
+  ])) return null
+  if (
+    typeof runtimeFence.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.containerId) ||
+    typeof runtimeFence.workspaceVolume !== 'string' || runtimeFence.workspaceVolume.length > 128 ||
+    !/^[a-z0-9][a-z0-9_.-]+$/.test(runtimeFence.workspaceVolume) ||
+    typeof runtimeFence.runtimeSpecSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.runtimeSpecSha256) ||
+    typeof runtimeFence.volumeSetSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.volumeSetSha256) ||
+    typeof runtimeFence.networkAuthorityId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkAuthorityId) ||
+    typeof runtimeFence.networkId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkId) ||
+    typeof runtimeFence.networkSandboxId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkSandboxId)
+  ) return null
+
+  return {
+    version: 1,
+    token: record.token,
+    roomStateRevision: record.roomStateRevision as number,
+    workspaceVolumeRevision: record.workspaceVolumeRevision as number,
+    applicationId: record.applicationId,
+    timeoutMs: record.timeoutMs as number,
+    install: install as unknown as EmulatorAndroidTrackedInstallSeal,
+    originalLocale: {
+      apiLevel: locale.apiLevel as number,
+      localeTags: [...locale.localeTags] as string[],
+      pids: [...locale.pids] as number[]
+    },
+    runtimeFence: runtimeFence as unknown as RoomArtifactWebRuntimeFence
+  }
+}
+
+function serializePendingAndroidAcceptanceRestore(value: PendingAndroidAcceptanceRestore): string {
+  const raw = JSON.stringify(value)
+  const parsed = parsePendingAndroidAcceptanceRestore(raw)
+  if (!parsed || !isDeepStrictEqual(parsed, value)) {
+    throw new Error('Android acceptance restore intent is invalid or exceeds its bounded size')
+  }
+  return raw
+}
 const SCREENSHOT_ARTIFACT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 const ADB_INSTALL_VERBS = new Set(['install', 'install-multiple', 'install-multi-package'])
 const ADB_UNSAFE_HOST_FILE_VERBS = new Set(['pull', 'push', 'restore', 'sideload', 'sync'])
@@ -596,6 +781,14 @@ function workerProcessLiveness(workerId: string): boolean | 'unknown' {
 interface AdbOutputReplacement {
   privateValue: string
   publicValue: string
+}
+
+interface PhysicalAcceptanceProofGate {
+  token: string
+  leaseId: string
+  deviceId: string
+  roomId: string
+  ownerWorkerId: string
 }
 
 function redactAdbText(value: string, serial: string, replacements: AdbOutputReplacement[] = []): string {
@@ -788,6 +981,12 @@ export interface OrchestratorOptions {
   adb?: AdbHost
 }
 
+type ExactRoomRuntimeFenceBackend = IsolationBackend & {
+  captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence>
+  pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
+  restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
+}
+
 interface PendingHostResyncConfirmation {
   token: string
   actor: Actor
@@ -810,6 +1009,8 @@ export class RoomOrchestrator {
   readonly runs: RunOutputStore
   readonly androidInstalls: AndroidAppInstallsRepo
   readonly artifacts: RoomArtifactStore
+  readonly androidAcceptanceReports: AndroidAcceptanceReportsRepo
+  private readonly androidAcceptanceIntegrity: AndroidAcceptanceIntegrity
   private readonly operations: OperationTracker
   private readonly pendingHostResyncConfirmations = new Map<string, PendingHostResyncConfirmation>()
   private readonly engine = new ChangeEngine()
@@ -849,9 +1050,26 @@ export class RoomOrchestrator {
     // every renderer view and rebuild the tray several times per wake.
     this.operations = new OperationTracker(this.operationRecords)
     this.logs = new LogHub(opts.userData, opts.backend)
-    this.runs = new RunOutputStore(opts.userData)
     this.androidInstalls = androidAppInstallsRepo(opts.db)
     this.artifacts = new RoomArtifactStore(opts.userData, artifactsRepo(opts.db))
+    this.androidAcceptanceIntegrity = new AndroidAcceptanceIntegrity(opts.db)
+    this.androidAcceptanceReports = androidAcceptanceReportsRepo(opts.db, this.androidAcceptanceIntegrity)
+    this.runs = new RunOutputStore(opts.userData, {
+      acceptanceIntegrity: this.androidAcceptanceIntegrity,
+      isPinned: (roomId, runId) => this.androidAcceptanceReports.isRunPinned(roomId, runId),
+      withRetentionTransaction: <T>(run: () => T): T => {
+        const ownsTransaction = !this.sqlite.isTransaction
+        if (ownsTransaction) this.sqlite.exec('BEGIN IMMEDIATE')
+        try {
+          const result = run()
+          if (ownsTransaction) this.sqlite.exec('COMMIT')
+          return result
+        } catch (error) {
+          if (ownsTransaction && this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+          throw error
+        }
+      }
+    })
     this.devices = new AndroidDeviceBroker({
       repo: androidDevicesRepo(opts.db),
       adb: opts.adb ?? new SpawnedAdbHost(),
@@ -879,6 +1097,10 @@ export class RoomOrchestrator {
   }
 
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
+    // A proof gate is read-only, so an exact dead owner can be released at
+    // startup. Durable writer intents are deliberately never cleared here:
+    // their Host ADB children may have survived the parent process.
+    this.reconcileInterruptedPhysicalAcceptanceProofGates()
     // A prior process may have died after Docker accepted a one-shot Android
     // locale writer. No recovery proof is trustworthy until every such job is
     // removed and the managed inventory proves the role absent.
@@ -886,6 +1108,14 @@ export class RoomOrchestrator {
     // Locale commands are persistent Android mutations. Recover or hard-gate
     // an interrupted matrix before any unrelated startup dependency can fail.
     const pendingAndroidLocaleRecoveryRooms = await this.reconcileInterruptedAndroidLocaleRestorations(staleJobsAbsent)
+    // Acceptance recovery is emulator-only. It may restore a paused Room
+    // runtime, so it runs only after the same stale-job absence proof.
+    await this.reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent)
+    const acceptanceRecoveryRooms = new Set(
+      this.rooms.list()
+        .filter((room) => this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null)
+        .map((room) => room.id)
+    )
     // The desktop still exposes its control API when init fails. Fence and
     // stop an uncertain exported workspace before any unrelated startup work
     // can abort initialization and leave the old Room record admissible.
@@ -909,7 +1139,12 @@ export class RoomOrchestrator {
         this.backend,
         this.rooms,
         (l) => this.olog('system', l),
-        { preserveAwakeRoomIds: pendingAndroidLocaleRecoveryRooms }
+        {
+          preserveAwakeRoomIds: new Set([
+            ...pendingAndroidLocaleRecoveryRooms,
+            ...acceptanceRecoveryRooms
+          ])
+        }
       )
     }
     await this.reconcileWindowsRooms()
@@ -1132,6 +1367,9 @@ export class RoomOrchestrator {
       fenced: boolean
     }> = []
     for (const room of this.rooms.list()) {
+      // Acceptance recovery owns the exact paused/live web runtime. Artifact
+      // recovery is intentionally deferred until that stronger fence clears.
+      if (this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null) continue
       const key = pendingArtifactExportKey(room.id)
       const raw = this.settings.get(key)
       if (raw === null) continue
@@ -1198,6 +1436,212 @@ export class RoomOrchestrator {
       }
       this.olog(room.id, 'interrupted artifact export was fenced; private recovery details were withheld')
     }
+  }
+
+  private async reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent: boolean): Promise<void> {
+    for (const room of this.rooms.list()) {
+      const key = pendingAndroidAcceptanceRestoreKey(room.id)
+      const raw = this.settings.get(key)
+      if (raw === null) continue
+      const pending = parsePendingAndroidAcceptanceRestore(raw)
+      try {
+        if (!staleJobsAbsent) {
+          throw new Error('Stale Android job absence was not proved before acceptance recovery')
+        }
+        if (!pending || pending.install.roomId !== room.id) {
+          throw new Error('Android acceptance restore intent is malformed or belongs to another Room')
+        }
+        await this.withRoomLock(
+          room.id,
+          () => this.recoverPendingAndroidAcceptanceRestore(room.id, key, raw, pending),
+          {
+            allowPendingAndroidAcceptanceRestore: true,
+            // Acceptance owns the exact live runtime and is startup priority.
+            // Once it clears, artifact recovery can safely settle its own
+            // workspace publication intent later in this same init pass.
+            allowPendingArtifactExport: true
+          }
+        )
+      } catch {
+        const current = this.rooms.get(room.id)
+        if (current && (current.status === 'running' || current.status === 'ready')) {
+          this.rooms.update(room.id, { status: 'attention' })
+        }
+        this.olog(
+          room.id,
+          'interrupted Android acceptance restoration still needs attention; target and install details were withheld'
+        )
+      }
+    }
+  }
+
+  private pendingAndroidAcceptanceInstallTarget(
+    pending: PendingAndroidAcceptanceRestore
+  ): AndroidInstallTarget {
+    return { kind: 'emulator', targetId: pending.install.targetId, deviceId: null }
+  }
+
+  private assertPendingAndroidAcceptanceInstall(
+    roomId: string,
+    pending: PendingAndroidAcceptanceRestore
+  ): AndroidInstallTarget {
+    const target = this.pendingAndroidAcceptanceInstallTarget(pending)
+    if (
+      pending.install.roomId !== roomId ||
+      (target.kind === 'emulator' && target.targetId !== roomId)
+    ) throw new Error('Android acceptance restore target does not belong to this Room')
+    const receipt = this.androidInstalls.get(roomId, target, pending.applicationId)
+    const user = this.androidInstalls.installUserAuthority(roomId, target, pending.applicationId)
+    if (
+      !receipt ||
+      receipt.roomId !== pending.install.roomId ||
+      receipt.applicationId !== pending.install.applicationId ||
+      receipt.changeId !== pending.install.changeId ||
+      receipt.apkSha256 !== pending.install.apkSha256 ||
+      receipt.installedAt !== pending.install.installedAt ||
+      receipt.target.kind !== pending.install.targetKind ||
+      receipt.target.deviceId !== pending.install.deviceId ||
+      this.androidInstalls.packageIncarnation(roomId, target, pending.applicationId) !==
+        pending.install.packageIncarnation ||
+      this.androidInstalls.logFence(roomId, target, pending.applicationId) !== pending.install.logFence ||
+      user?.userId !== pending.install.installUserId ||
+      user?.serial !== pending.install.installUserSerial
+    ) throw new Error('Android acceptance restore install identity changed')
+    return target
+  }
+
+  private validatePendingAndroidAcceptanceRestoreProof(
+    pending: PendingAndroidAcceptanceRestore,
+    session: AndroidAutomationSession,
+    proof: { transition: AndroidAppLocaleTransition; evidence: AndroidForegroundInstallEvidence }
+  ): void {
+    const transition = proof.transition
+    const evidence = proof.evidence
+    if (
+      !isDeepStrictEqual(evidence.seal, pending.install) ||
+      evidence.context.status.foregroundApplicationId !== pending.applicationId ||
+      !isDeepStrictEqual(evidence.context.status.target, session.target) ||
+      evidence.context.receipt?.roomId !== pending.install.roomId ||
+      evidence.context.receipt.applicationId !== pending.applicationId ||
+      evidence.context.receipt.changeId !== pending.install.changeId ||
+      evidence.context.receipt.apkSha256 !== pending.install.apkSha256 ||
+      evidence.context.receipt.installedAt !== pending.install.installedAt ||
+      transition.applicationId !== pending.applicationId ||
+      !isDeepStrictEqual(transition.target, session.target) ||
+      transition.apiLevel !== pending.originalLocale.apiLevel ||
+      transition.apiLevel !== session.target.apiLevel ||
+      !isDeepStrictEqual(transition.localeTags, pending.originalLocale.localeTags) ||
+      !isDeepStrictEqual(transition.previousLocaleTags, pending.originalLocale.localeTags) ||
+      transition.readiness.consecutiveReadyChecks !== 2 ||
+      transition.readiness.attempts < 2 ||
+      transition.pids.length < 1 ||
+      !isDeepStrictEqual(transition.pids, transition.readiness.pids) ||
+      !isDeepStrictEqual(transition.process.afterPids, transition.readiness.pids)
+    ) throw new Error('Android acceptance restore proof changed target, install, locale, foreground, or PID authority')
+  }
+
+  private async recoverPendingAndroidAcceptanceRestore(
+    roomId: string,
+    key: string,
+    raw: string,
+    pending: PendingAndroidAcceptanceRestore
+  ): Promise<void> {
+    const room = this.mustGet(roomId)
+    if (
+      room.provider !== 'android' ||
+      room.stateRevision !== pending.roomStateRevision ||
+      room.workspaceVolumeRevision !== pending.workspaceVolumeRevision ||
+      pending.runtimeFence.workspaceVolume !== srcVolume(roomId, pending.workspaceVolumeRevision)
+    ) throw new Error('Android acceptance restore Room generation changed')
+    // Older shutdown/reconcile paths may have persisted sleeping after the
+    // intent was written. The exact runtime fence, not that stale status bit,
+    // is the recovery authority; attention keeps normal work gated while
+    // allowing the exact target session to be reopened.
+    if (room.status === 'sleeping') this.rooms.update(roomId, { status: 'attention' })
+    const runtimeBackend = this.exactRoomRuntimeFenceBackend()
+    const runtimeSpec = this.webSpecFor(room)
+    let runtimeRestoreFailure: unknown = null
+    try {
+      await runtimeBackend.restoreRoomArtifactWeb(runtimeSpec, pending.runtimeFence)
+    } catch (error) {
+      runtimeRestoreFailure = error
+      this.containPendingAndroidAcceptanceRuntime(roomId)
+    }
+    let snapshotCleanupFailure: unknown = null
+    try {
+      await this.backend.removeWorkspaceSnapshot(roomId, pending.token)
+    } catch (error) {
+      snapshotCleanupFailure = error
+    }
+
+    // Runtime settlement above is the last non-device await. This target proof
+    // is intentionally last so its exact locale/foreground/PID/install/lease
+    // result remains fresh through the synchronous CAS below.
+    let deviceRestoreFailure: unknown = null
+    try {
+      this.assertPendingAndroidAcceptanceInstall(roomId, pending)
+      // As with #20 locale recovery, allowPendingRecovery bypasses the normal
+      // awake-state gate but does not start a stopped emulator. Recreate only
+      // the exact retained emulator topology after stale-job absence was proved.
+      await this.backend.startExistingEmulatorForRecovery(roomId)
+      const session = await this.openAndroidAutomationSessionLocked(
+        roomId,
+        { kind: 'emulator' },
+        { allowPendingRecovery: true }
+      )
+      if (
+        session.target.kind !== pending.install.targetKind ||
+        session.target.deviceId !== pending.install.deviceId ||
+        session.target.apiLevel !== pending.originalLocale.apiLevel ||
+        !isDeepStrictEqual(await session.trackedInstallSeal(pending.applicationId), pending.install)
+      ) throw new Error('Android acceptance restore session identity changed')
+
+      await session.launch(pending.applicationId)
+      const proof = await session.withActiveUserScreenWitness(async (signal) => {
+        const transition = await session.restoreAppLocalesFromFence(
+          pending.applicationId,
+          pending.originalLocale.localeTags,
+          {
+            targetKind: 'emulator',
+            targetId: pending.install.targetId,
+            deviceId: null,
+            leaseId: null,
+            roomId,
+            applicationId: pending.applicationId,
+            changeId: pending.install.changeId,
+            apkSha256: pending.install.apkSha256,
+            installedAt: pending.install.installedAt,
+            packageIncarnation: pending.install.packageIncarnation,
+            installUserId: pending.install.installUserId,
+            installUserSerial: pending.install.installUserSerial,
+            apiLevel: pending.originalLocale.apiLevel
+          },
+          pending.originalLocale.localeTags,
+          pending.originalLocale.localeTags,
+          { timeoutMs: pending.timeoutMs, signal }
+        )
+        const evidence = await session.foregroundInstallEvidence(signal)
+        return { transition, evidence }
+      }, {
+        actionTimeoutMs: pending.timeoutMs,
+        allowApplicationIdTransitions: pending.applicationId
+      })
+      this.validatePendingAndroidAcceptanceRestoreProof(pending, session, proof)
+      this.assertPendingAndroidAcceptanceInstall(roomId, pending)
+    } catch (error) {
+      deviceRestoreFailure = error
+    }
+
+    if (deviceRestoreFailure || runtimeRestoreFailure || snapshotCleanupFailure) {
+      throw new AggregateError(
+        [deviceRestoreFailure, runtimeRestoreFailure, snapshotCleanupFailure].filter((error) => error !== null),
+        'Interrupted Android acceptance restoration remains incomplete'
+      )
+    }
+    if (!this.settings.deleteIfValue(key, raw)) {
+      throw new Error('Android acceptance restore intent ownership changed before completion')
+    }
+    this.olog(roomId, 'interrupted Android acceptance state was restored under its exact target and install fence')
   }
 
   private artifactExportTemporaryRoot(create: boolean): string | null {
@@ -1399,9 +1843,23 @@ export class RoomOrchestrator {
         }`
       )
     }
+    const acceptanceRecoveryRooms = this.rooms.list().filter(
+      (room) => this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null
+    )
+    if (acceptanceRecoveryRooms.length > 0) {
+      throw new AggregateError(
+        acceptanceRecoveryRooms.map(() => new Error('An Android acceptance recovery fence still owns its emulator runtime.')),
+        `DevHotel shutdown blocked by ${acceptanceRecoveryRooms.length} pending Android acceptance restoration${
+          acceptanceRecoveryRooms.length === 1 ? '' : 's'
+        }`
+      )
+    }
     for (const room of this.rooms.list()) {
       if (room.status === 'sleeping') continue
       try {
+        // This is redundant with the all-Room preflight, but keeps the locked
+        // lifecycle implementation fail-closed if its caller changes later.
+        this.assertNoPendingAndroidAcceptanceRestore(room.id)
         if (room.status === 'broken') {
           // broken rooms may still own running containers — stop them but keep the status visible
           if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
@@ -1441,6 +1899,7 @@ export class RoomOrchestrator {
       admittedBeforeGate?: boolean
       allowPendingArtifactExport?: boolean
       allowPendingAndroidLocaleRestoration?: boolean
+      allowPendingAndroidAcceptanceRestore?: boolean
     } = {}
   ): Promise<T> {
     if (this.mutationGate !== 'open' && !opts.admittedBeforeGate) {
@@ -1450,6 +1909,7 @@ export class RoomOrchestrator {
     const next = prev.catch(() => undefined).then(async () => {
       if (!opts.allowPendingArtifactExport) this.assertNoPendingArtifactExport(roomId)
       if (!opts.allowPendingAndroidLocaleRestoration) this.assertNoPendingAndroidLocaleRestoration(roomId)
+      if (!opts.allowPendingAndroidAcceptanceRestore) this.assertNoPendingAndroidAcceptanceRestore(roomId)
       if (this.activeRoomLocks.has(roomId)) throw new Error(`Room ${roomId} lock ownership is ambiguous`)
       this.activeRoomLocks.add(roomId)
       try {
@@ -1484,6 +1944,18 @@ export class RoomOrchestrator {
       'This Room is fenced while an interrupted Android locale matrix is being restored.',
       {
         recoveryHint: 'Restore the exact target, install, Android user and lease, then restart DevHotel.',
+        httpStatus: 409
+      }
+    )
+  }
+
+  private assertNoPendingAndroidAcceptanceRestore(roomId: string): void {
+    if (this.settings.get(pendingAndroidAcceptanceRestoreKey(roomId)) === null) return
+    throw new DevHotelError(
+      'ANDROID_ACCEPTANCE_RESTORE_REQUIRED',
+      'This Room is fenced while interrupted Android acceptance state still requires exact restoration.',
+      {
+        recoveryHint: 'Keep the exact target and tracked install available, then restart DevHotel to retry fenced recovery.',
         httpStatus: 409
       }
     )
@@ -1538,6 +2010,435 @@ export class RoomOrchestrator {
     ) return 'refused'
 
     return this.settings.deleteIfValue(key, value) ? 'released' : 'cas-changed'
+  }
+
+  private containPendingAndroidAcceptanceRuntime(roomId: string): void {
+    const room = this.rooms.get(roomId)
+    if (!room) return
+    // Do not guess whether an ambiguous exact-runtime restore left a safe web
+    // process behind. Revoke ingress and log streaming synchronously while
+    // retaining the runtime/volume/lease identities needed by the next retry.
+    this.logs.detach(roomId)
+    this.gateway.removeRoute(room.domain)
+    if (room.status === 'running' || room.status === 'ready') {
+      this.rooms.update(roomId, { status: 'attention' })
+    }
+  }
+
+  private commitAndroidAcceptanceReportAndReleaseRestore(
+    key: string,
+    raw: string,
+    report: AndroidAcceptanceReport
+  ): AndroidAcceptanceReport {
+    if (this.sqlite.isTransaction) {
+      throw new Error('Android acceptance restore commit cannot join an unrelated transaction')
+    }
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      if (!this.settings.deleteIfValue(key, raw)) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_RESTORE_REQUIRED',
+          'The exact Android target and Room runtime were restored, but their durable mutation fence changed.',
+          {
+            recoveryHint: 'Do not run more Room or target mutations; restart DevHotel with the exact target and runtime available.',
+            httpStatus: 409
+          }
+        )
+      }
+      this.verifyAcceptanceLogsForPublication(report)
+      const stored = this.androidAcceptanceReports.insert(report)
+      this.sqlite.exec('COMMIT')
+      return stored
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private verifyAcceptanceLogsForPublication(report: AndroidAcceptanceReport): void {
+    if (!this.sqlite.isTransaction) {
+      throw new Error('Android acceptance final log verification requires the publication transaction')
+    }
+    for (const log of report.logs) {
+      try {
+        this.runs.verifyRetainedReference(report.roomId, log, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+      } catch (error) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_LOG_CHANGED',
+          'A retained log changed before its transactional report pin was committed.',
+          {
+            recoveryHint: 'Run the evidence command again and retry acceptance.',
+            httpStatus: 409,
+            cause: error
+          }
+        )
+      }
+    }
+  }
+
+  private removeDeadPhysicalAcceptanceProofGate(row: {
+    token: string
+    lease_id: string
+    device_id: string
+    room_id: string
+    owner_worker_id: string
+  }): boolean {
+    if (workerProcessLiveness(row.owner_worker_id) !== false) return false
+    return this.sqlite.prepare(
+      `DELETE FROM android_physical_acceptance_proof_gates
+        WHERE token = ? AND lease_id = ? AND device_id = ? AND room_id = ? AND owner_worker_id = ?`
+    ).run(row.token, row.lease_id, row.device_id, row.room_id, row.owner_worker_id).changes === 1
+  }
+
+  private reconcileInterruptedPhysicalAcceptanceProofGates(): void {
+    if (this.sqlite.isTransaction) throw new Error('Physical acceptance proof recovery cannot join a transaction')
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      const rows = this.sqlite.prepare(
+        `SELECT token, lease_id, device_id, room_id, owner_worker_id
+           FROM android_physical_acceptance_proof_gates`
+      ).all() as unknown as Array<{
+        token: string
+        lease_id: string
+        device_id: string
+        room_id: string
+        owner_worker_id: string
+      }>
+      for (const row of rows) this.removeDeadPhysicalAcceptanceProofGate(row)
+      this.sqlite.exec('COMMIT')
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private beginPhysicalDeviceOperation(
+    roomId: string,
+    deviceId: string,
+    leaseId: string
+  ): { id: string; ownerWorkerId: string } {
+    if (this.sqlite.isTransaction) throw new Error('Physical device operation cannot join a transaction')
+    const id = randomUUID()
+    const ownerWorkerId = `pid:${process.pid}`
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      const active = this.sqlite.prepare(
+        `SELECT 1 FROM android_device_leases
+          WHERE id = ? AND device_id = ? AND room_id = ? AND state = 'active'`
+      ).get(leaseId, deviceId, roomId)
+      if (!active) {
+        throw new DevHotelError(
+          'ANDROID_DEVICE_LEASE_CHANGED',
+          'The exact physical Android lease changed before the target command could start.',
+          { recoveryHint: 'Reacquire the intended device and retry.', httpStatus: 409 }
+        )
+      }
+      const proof = this.sqlite.prepare(
+        `SELECT token, lease_id, device_id, room_id, owner_worker_id
+           FROM android_physical_acceptance_proof_gates
+          WHERE device_id = ?`
+      ).get(deviceId) as {
+        token: string
+        lease_id: string
+        device_id: string
+        room_id: string
+        owner_worker_id: string
+      } | undefined
+      if (proof && !this.removeDeadPhysicalAcceptanceProofGate(proof)) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_PROOF_ACTIVE',
+          'A final read-only Android acceptance proof currently owns this physical target.',
+          { recoveryHint: 'Wait for that proof to finish before starting another device operation.', httpStatus: 409 }
+        )
+      }
+      const priorOperation = this.sqlite.prepare(
+        'SELECT 1 FROM android_physical_operation_intents WHERE device_id = ? LIMIT 1'
+      ).get(deviceId)
+      if (priorOperation) {
+        throw new DevHotelError(
+          'ANDROID_PHYSICAL_OPERATION_UNRESOLVED',
+          'A prior physical Android writer may still own this target.',
+          {
+            recoveryHint: 'Do not retry target writes until the device and any orphan Host ADB child are manually remediated.',
+            httpStatus: 409
+          }
+        )
+      }
+      this.sqlite.prepare(
+        `INSERT INTO android_physical_operation_intents
+           (id, lease_id, device_id, room_id, owner_worker_id, started_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(id, leaseId, deviceId, roomId, ownerWorkerId, new Date().toISOString())
+      this.sqlite.exec('COMMIT')
+      return { id, ownerWorkerId }
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private finishPhysicalDeviceOperation(
+    operation: { id: string; ownerWorkerId: string },
+    roomId: string,
+    deviceId: string,
+    leaseId: string
+  ): void {
+    const deleted = this.sqlite.prepare(
+      `DELETE FROM android_physical_operation_intents
+        WHERE id = ? AND lease_id = ? AND device_id = ? AND room_id = ? AND owner_worker_id = ?`
+    ).run(operation.id, leaseId, deviceId, roomId, operation.ownerWorkerId)
+    if (deleted.changes !== 1) {
+      throw new Error('The exact physical Android operation intent changed before child-process completion')
+    }
+  }
+
+  private assertNoPhysicalAcceptanceProofGate(deviceId: string): void {
+    const proof = this.sqlite.prepare(
+      `SELECT token, lease_id, device_id, room_id, owner_worker_id
+         FROM android_physical_acceptance_proof_gates
+        WHERE device_id = ?`
+    ).get(deviceId) as {
+      token: string
+      lease_id: string
+      device_id: string
+      room_id: string
+      owner_worker_id: string
+    } | undefined
+    if (!proof) return
+    if (workerProcessLiveness(proof.owner_worker_id) === false) {
+      if (this.removeDeadPhysicalAcceptanceProofGate(proof)) return
+    }
+    throw new DevHotelError(
+      'ANDROID_ACCEPTANCE_PROOF_ACTIVE',
+      'A final read-only Android acceptance proof currently owns this physical target.',
+      { recoveryHint: 'Wait for that proof to finish before reading or driving the device.', httpStatus: 409 }
+    )
+  }
+
+  private beginPhysicalAcceptanceProof(
+    lease: { id: string; deviceId: string; roomId: string }
+  ): PhysicalAcceptanceProofGate {
+    if (this.sqlite.isTransaction) throw new Error('Physical acceptance proof cannot join a transaction')
+    const gate: PhysicalAcceptanceProofGate = {
+      token: randomUUID(),
+      leaseId: lease.id,
+      deviceId: lease.deviceId,
+      roomId: lease.roomId,
+      ownerWorkerId: `pid:${process.pid}`
+    }
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      const active = this.sqlite.prepare(
+        `SELECT 1 FROM android_device_leases
+          WHERE id = ? AND device_id = ? AND room_id = ?
+            AND state = 'active' AND purpose = 'acceptance'`
+      ).get(gate.leaseId, gate.deviceId, gate.roomId)
+      const operation = this.sqlite.prepare(
+        'SELECT 1 FROM android_physical_operation_intents WHERE device_id = ? LIMIT 1'
+      ).get(gate.deviceId)
+      const priorProof = this.sqlite.prepare(
+        `SELECT token, lease_id, device_id, room_id, owner_worker_id
+           FROM android_physical_acceptance_proof_gates
+          WHERE device_id = ?`
+      ).get(gate.deviceId) as {
+        token: string
+        lease_id: string
+        device_id: string
+        room_id: string
+        owner_worker_id: string
+      } | undefined
+      const retainedProof = priorProof && !this.removeDeadPhysicalAcceptanceProofGate(priorProof)
+      if (!active || operation || retainedProof) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_TARGET_BUSY',
+          'Final physical acceptance could not exclusively fence the exact active acceptance lease.',
+          {
+            recoveryHint: operation
+              ? 'A prior physical command may still be active; remediate the target before retrying.'
+              : 'Finish the current proof or reacquire one exact acceptance lease.',
+            httpStatus: 409
+          }
+        )
+      }
+      this.sqlite.prepare(
+        `INSERT INTO android_physical_acceptance_proof_gates
+           (token, lease_id, device_id, room_id, owner_worker_id, started_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(
+        gate.token,
+        gate.leaseId,
+        gate.deviceId,
+        gate.roomId,
+        gate.ownerWorkerId,
+        new Date().toISOString()
+      )
+      this.sqlite.exec('COMMIT')
+      return gate
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private assertPhysicalAcceptanceProofGate(gate: PhysicalAcceptanceProofGate): void {
+    const active = this.sqlite.prepare(
+      `SELECT 1
+         FROM android_physical_acceptance_proof_gates proof
+         JOIN android_device_leases lease ON lease.id = proof.lease_id
+        WHERE proof.token = ? AND proof.lease_id = ? AND proof.device_id = ?
+          AND proof.room_id = ? AND proof.owner_worker_id = ?
+          AND lease.device_id = proof.device_id AND lease.room_id = proof.room_id
+          AND lease.state = 'active' AND lease.purpose = 'acceptance'`
+    ).get(gate.token, gate.leaseId, gate.deviceId, gate.roomId, gate.ownerWorkerId)
+    if (!active) {
+      throw new DevHotelError(
+        'ANDROID_ACCEPTANCE_PROOF_CHANGED',
+        'The exact final physical acceptance proof gate changed before its read command.',
+        { recoveryHint: 'Reacquire the intended acceptance lease and restart the read-only proof.', httpStatus: 409 }
+      )
+    }
+  }
+
+  private releasePhysicalAcceptanceProof(gate: PhysicalAcceptanceProofGate): void {
+    this.sqlite.prepare(
+      `DELETE FROM android_physical_acceptance_proof_gates
+        WHERE token = ? AND lease_id = ? AND device_id = ? AND room_id = ? AND owner_worker_id = ?`
+    ).run(gate.token, gate.leaseId, gate.deviceId, gate.roomId, gate.ownerWorkerId)
+  }
+
+  private async withPhysicalAcceptanceProof<T>(
+    lease: { id: string; deviceId: string; roomId: string },
+    run: (gate: PhysicalAcceptanceProofGate) => Promise<T>
+  ): Promise<T> {
+    const gate = this.beginPhysicalAcceptanceProof(lease)
+    try {
+      return await run(gate)
+    } finally {
+      this.releasePhysicalAcceptanceProof(gate)
+    }
+  }
+
+  private commitPhysicalAndroidAcceptanceReport(
+    report: AndroidAcceptanceReport,
+    lease: { id: string; deviceId: string; roomId: string },
+    fence: AndroidAppLocaleRestoreFence,
+    gate: PhysicalAcceptanceProofGate
+  ): AndroidAcceptanceReport {
+    if (this.sqlite.isTransaction) {
+      throw new Error('Physical Android acceptance publication cannot join an unrelated transaction')
+    }
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      const proof = this.sqlite.prepare(
+        `SELECT 1 FROM android_physical_acceptance_proof_gates
+          WHERE token = ? AND lease_id = ? AND device_id = ? AND room_id = ? AND owner_worker_id = ?`
+      ).get(gate.token, gate.leaseId, gate.deviceId, gate.roomId, gate.ownerWorkerId)
+      if (!proof) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_PROOF_CHANGED',
+          'The exact final physical acceptance proof gate changed before publication.',
+          { recoveryHint: 'Reacquire the intended acceptance lease and repeat the read-only proof.', httpStatus: 409 }
+        )
+      }
+      const active = this.sqlite.prepare(
+        `SELECT 1
+           FROM android_device_leases
+          WHERE id = ? AND device_id = ? AND room_id = ?
+            AND state = 'active' AND purpose = 'acceptance'`
+      ).get(lease.id, lease.deviceId, lease.roomId)
+      if (!active) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_LEASE_CHANGED',
+          'The exact physical acceptance lease closed before the report could be published.',
+          {
+            recoveryHint: 'Acquire a new USB acceptance lease and rerun the final physical proof.',
+            httpStatus: 409
+          }
+        )
+      }
+      const target: AndroidInstallTarget = {
+        kind: 'physical',
+        targetId: lease.deviceId,
+        deviceId: lease.deviceId,
+        leaseId: lease.id
+      }
+      const room = this.rooms.get(lease.roomId)
+      const receipt = this.androidInstalls.get(lease.roomId, target, report.applicationId)
+      const provenance = this.androidInstalls.acceptanceProvenance(lease.roomId, target, report.applicationId)
+      const installUser = this.androidInstalls.installUserAuthority(lease.roomId, target, report.applicationId)
+      const packageIncarnation = this.androidInstalls.packageIncarnation(lease.roomId, target, report.applicationId)
+      const change = this.changes.get(report.build.changeId)
+      if (
+        gate.leaseId !== lease.id ||
+        gate.deviceId !== lease.deviceId ||
+        gate.roomId !== lease.roomId ||
+        report.roomId !== lease.roomId ||
+        report.target.kind !== 'physical' ||
+        report.target.deviceId !== lease.deviceId ||
+        report.target.leaseIdentity === null ||
+        report.target.leaseIdentity.value !== this.androidAcceptanceIntegrity.identify('lease', lease.id).value ||
+        room === null ||
+        room.stateRevision !== report.room.stateRevision ||
+        room.workspaceVolumeRevision !== report.room.workspaceVolumeRevision ||
+        room.sourceType !== report.room.sourceType ||
+        receipt === null ||
+        receipt.roomId !== report.roomId ||
+        receipt.target.kind !== 'physical' ||
+        receipt.target.deviceId !== report.target.deviceId ||
+        receipt.applicationId !== report.applicationId ||
+        receipt.changeId !== report.build.changeId ||
+        receipt.apkSha256 !== report.build.apkSha256 ||
+        receipt.installedAt !== report.build.installedAt ||
+        provenance === null ||
+        provenance.artifactSizeBytes !== report.build.artifactSizeBytes ||
+        provenance.stateRevision !== report.build.stateRevision ||
+        provenance.workspaceVolumeRevision !== report.build.workspaceVolumeRevision ||
+        !isDeepStrictEqual(provenance.sourceIdentity, report.build.sourceIdentity) ||
+        !isDeepStrictEqual(provenance.environmentIdentity, report.build.environmentIdentity) ||
+        provenance.imageReference !== report.build.imageReference ||
+        provenance.imageSha256 !== report.build.imageSha256 ||
+        change === null ||
+        change.roomId !== report.roomId ||
+        change.kind !== 'android-run' ||
+        change.status !== 'verified' ||
+        change.verify?.ok !== true ||
+        Date.parse(report.build.installedAt) < Date.parse(change.createdAt) ||
+        packageIncarnation !== fence.packageIncarnation ||
+        installUser?.userId !== fence.installUserId ||
+        installUser.serial !== fence.installUserSerial ||
+        !sameAndroidLocaleRestoreFence(fence, {
+          ...fence,
+          targetKind: 'physical',
+          targetId: lease.deviceId,
+          deviceId: lease.deviceId,
+          leaseId: lease.id,
+          roomId: lease.roomId,
+          applicationId: report.applicationId,
+          changeId: report.build.changeId,
+          apkSha256: report.build.apkSha256,
+          installedAt: report.build.installedAt,
+          apiLevel: report.target.apiLevel
+        })
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+          'The exact Room generation, tracked physical install, or acceptance provenance changed before publication.',
+          { recoveryHint: 'Repeat final acceptance against one unchanged Room generation, install, and USB lease.', httpStatus: 409 }
+        )
+      }
+      this.verifyAcceptanceLogsForPublication(report)
+      const stored = this.androidAcceptanceReports.insert(report)
+      const released = this.sqlite.prepare(
+        `DELETE FROM android_physical_acceptance_proof_gates
+          WHERE token = ? AND lease_id = ? AND device_id = ? AND room_id = ? AND owner_worker_id = ?`
+      ).run(gate.token, gate.leaseId, gate.deviceId, gate.roomId, gate.ownerWorkerId)
+      if (released.changes !== 1) throw new Error('Physical acceptance proof gate changed during publication')
+      this.sqlite.exec('COMMIT')
+      return stored
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
+    }
   }
 
   private assertRoomLockHeld(roomId: string): void {
@@ -2482,6 +3383,7 @@ export class RoomOrchestrator {
   }
 
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
+    this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
     const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
@@ -2638,6 +3540,10 @@ export class RoomOrchestrator {
         } still pending`
       )
     }
+    // Preflight every Room before deleting any of them. Otherwise a later
+    // pending Room could lose emulator/runtime recovery authority after earlier
+    // Rooms have already been irreversibly removed.
+    for (const room of inventory) this.assertNoPendingAndroidAcceptanceRestore(room.id)
     let deletedRooms = 0
     let reclaimedBytes = 0
     const failures: string[] = []
@@ -2655,6 +3561,7 @@ export class RoomOrchestrator {
   }
 
   private async deleteRoomLocked(roomId: string, _actor: Actor): Promise<{ reclaimedBytes: number }> {
+    this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
@@ -3148,7 +4055,11 @@ export class RoomOrchestrator {
           fence: original.restoreFence
         }
         let pendingValue = JSON.stringify(pending)
-        const inserted = this.settings.setIfAbsent(pendingKey, pendingValue)
+        const inserted = this.settings.setIfAbsentWhenKeysAbsent(
+          pendingKey,
+          pendingValue,
+          roomMutatingRecoveryKeys(roomId)
+        )
         if (!inserted) {
           throw new DevHotelError(
             'ANDROID_LOCALE_RECOVERY_REQUIRED',
@@ -3553,7 +4464,11 @@ export class RoomOrchestrator {
         // A second process that claimed it after this operation entered the
         // in-process Room lock must remain byte-for-byte authoritative, and
         // this process must not pause or later restore that owner's runtime.
-        if (!this.settings.setIfAbsent(pendingKey, pendingValue)) {
+        if (!this.settings.setIfAbsentWhenKeysAbsent(
+          pendingKey,
+          pendingValue,
+          roomMutatingRecoveryKeys(roomId)
+        )) {
           throw new DevHotelError(
             'ARTIFACT_EXPORT_RECOVERY_REQUIRED',
             'A prior artifact export still owns this Room recovery fence.',
@@ -3919,6 +4834,1274 @@ export class RoomOrchestrator {
     )
   }
 
+  private async androidAcceptanceSourceFingerprint(room: RoomRecord): Promise<string> {
+    try {
+      const fingerprint = await this.backend.fingerprintWorkspace(room.id, room.workspaceVolumeRevision)
+      if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('invalid fingerprint')
+      return fingerprint
+    } catch (error) {
+      throw new DevHotelError(
+        'ANDROID_ACCEPTANCE_SOURCE_UNVERIFIED',
+        'DevHotel could not verify the bounded Room source fingerprint for this acceptance report.',
+        {
+          recoveryHint: 'Keep the Room workspace available and retry after source activity has settled.',
+          httpStatus: 409,
+          cause: error
+        }
+      )
+    }
+  }
+
+  private exactRoomRuntimeFenceBackend(): ExactRoomRuntimeFenceBackend {
+    const backend = this.backend as Partial<ExactRoomRuntimeFenceBackend>
+    if (
+      typeof backend.captureRoomArtifactWebFence !== 'function' ||
+      typeof backend.pauseRoomArtifactWeb !== 'function' ||
+      typeof backend.restoreRoomArtifactWeb !== 'function'
+    ) {
+      throw new DevHotelError(
+        'ANDROID_ACCEPTANCE_SOURCE_UNVERIFIED',
+        'The isolation backend cannot prove an exact paused Room workspace for acceptance.',
+        {
+          recoveryHint: 'Update the isolation backend, restart the Room runtime, and retry acceptance.',
+          httpStatus: 409
+        }
+      )
+    }
+    return backend as ExactRoomRuntimeFenceBackend
+  }
+
+  async createAndroidAcceptanceReport(
+    roomId: string,
+    rawInput: CreateAndroidAcceptanceReportInput,
+    actor: Actor
+  ): Promise<AndroidAcceptanceReportResult> {
+    return this.withRoomLock(roomId, async () => {
+      const input = zCreateAndroidAcceptanceReportBody.parse(rawInput)
+      const room = this.mustGet(roomId)
+      if (room.provider !== 'android') {
+        throw new DevHotelError('ANDROID_ACCEPTANCE_ROOM_REQUIRED', 'Android acceptance requires an Android Room.', {
+          recoveryHint: 'Use an Android Room with a verified android_run.',
+          httpStatus: 409
+        })
+      }
+      const acceptanceStartedAt = new Date().toISOString()
+      let selector: AndroidTargetSelector
+      let installTarget: AndroidInstallTarget
+      let capturedLeaseId: string | null = null
+      let leaseIdentity: AndroidAcceptanceReport['target']['leaseIdentity'] = null
+
+      if (input.stage === 'development') {
+        selector = { kind: 'emulator' }
+        installTarget = { kind: 'emulator', targetId: roomId, deviceId: null }
+      } else {
+        if (input.target?.kind !== 'physical' || !input.target.deviceId) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_REQUIRED',
+            'Final physical acceptance requires an explicit opaque physical target.',
+            { recoveryHint: 'Select the attached acceptance device by its opaque device ID.', httpStatus: 400 }
+          )
+        }
+        const lease = this.devices.leaseForRoom(roomId)
+        if (!lease || lease.deviceId !== input.target.deviceId || lease.purpose !== 'acceptance') {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LEASE_REQUIRED',
+            'Final physical acceptance requires the exact active lease whose purpose is acceptance.',
+            { recoveryHint: 'Attach the intended phone with purpose acceptance and retry.', httpStatus: 409 }
+          )
+        }
+        try {
+          const authorized = this.devices.authorizeInternalOperation(
+            roomId,
+            input.target.deviceId,
+            'final Android acceptance',
+            lease.id
+          )
+          if (authorized.leaseId !== lease.id) throw new Error('acceptance lease was not retained')
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LEASE_REQUIRED',
+            'Final physical acceptance could not prove its exact active acceptance lease.',
+            { recoveryHint: 'Reattach the intended phone with purpose acceptance and retry.', httpStatus: 409, cause: error }
+          )
+        }
+        capturedLeaseId = lease.id
+        leaseIdentity = this.androidAcceptanceIntegrity.identify('lease', lease.id)
+        selector = input.target
+        installTarget = {
+          kind: 'physical',
+          targetId: input.target.deviceId,
+          deviceId: input.target.deviceId,
+          leaseId: lease.id
+        }
+      }
+
+      const receipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+      const provenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
+      // Final physical acceptance authenticates the immutable android_run
+      // provenance itself. It must not start an OCI fingerprint helper against
+      // the live Room workspace. Development acceptance still snapshots and
+      // cross-checks the live emulator source below.
+      const sourceFingerprint = input.stage === 'development'
+        ? await this.androidAcceptanceSourceFingerprint(room)
+        : null
+      const sourceIdentity = sourceFingerprint === null
+        ? provenance?.sourceIdentity
+        : this.androidAcceptanceIntegrity.identify('source', sourceFingerprint)
+      const environmentIdentity = this.androidAcceptanceIntegrity.identify(
+        'environment',
+        androidBuildEnvironmentRevision(room)
+      )
+      const imageSha256 = /@sha256:([a-f0-9]{64})$/.exec(ANDROID_IMAGE)?.[1]
+      const change = receipt ? this.changes.get(receipt.changeId) : null
+      if (
+        !receipt || !provenance || !sourceIdentity || !imageSha256 ||
+        receipt.roomId !== roomId || receipt.applicationId !== input.applicationId ||
+        receipt.target.kind !== installTarget.kind || receipt.target.deviceId !== installTarget.deviceId ||
+        provenance.stateRevision !== room.stateRevision ||
+        provenance.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+        provenance.sourceIdentity.domain !== 'source' || provenance.sourceIdentity.value !== sourceIdentity.value ||
+        provenance.environmentIdentity.domain !== 'environment' ||
+        provenance.environmentIdentity.value !== environmentIdentity.value ||
+        provenance.imageReference !== ANDROID_IMAGE || provenance.imageSha256 !== imageSha256 ||
+        !change || change.roomId !== roomId || change.kind !== 'android-run' ||
+        change.status !== 'verified' || change.verify?.ok !== true ||
+        Date.parse(receipt.installedAt) < Date.parse(change.createdAt)
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_BUILD_UNVERIFIED',
+          'Acceptance requires a verified android_run whose source, image, environment, and APK provenance still match.',
+          {
+            recoveryHint: 'Run android_run successfully on this exact target without changing Room source, then retry.',
+            httpStatus: 409
+          }
+        )
+      }
+
+      const screenshotIds = [...new Set(input.steps.flatMap((step) => step.screenshotArtifactIds ?? []))]
+      const logRunIds = [...new Set(input.steps.flatMap((step) => step.logRunIds ?? []))]
+      const screenshotReceipts: RoomArtifact[] = []
+      let screenshotBytes = 0
+      let screenshotPixels = 0
+      for (const artifactId of screenshotIds) {
+        const artifact = this.artifacts.get(roomId, artifactId)
+        if (!artifact) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_UNAVAILABLE',
+            'A screenshot reference is not available in this Room.',
+            { recoveryHint: 'Capture a fresh screenshot artifact on the selected acceptance target.', httpStatus: 409 }
+          )
+        }
+        screenshotBytes += artifact.sizeBytes
+        if (screenshotBytes > ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_BYTES) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_LIMIT',
+            'Acceptance screenshot references exceed the aggregate byte or pixel budget.',
+            { recoveryHint: 'Reference fewer or smaller screenshot artifacts.', httpStatus: 413 }
+          )
+        }
+        screenshotReceipts.push(artifact)
+      }
+      const verifiedScreenshots = screenshotReceipts.map((expected) => {
+        try {
+          const { artifact: actual, content } = this.artifacts.readContent(roomId, expected.id)
+          if (!isDeepStrictEqual(actual, expected)) throw new Error('artifact receipt changed')
+          const validated = validateAndSanitizeScreenshotPng(content)
+          if (
+            actual.metadata.capture.width !== validated.width ||
+            actual.metadata.capture.height !== validated.height ||
+            actual.metadata.capture.orientation !== validated.orientation
+          ) throw new Error('artifact pixel metadata changed')
+          return { artifact: actual, pixels: validated.width * validated.height }
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_UNAVAILABLE',
+            'A screenshot reference failed its bounded immutable-content verification.',
+            { recoveryHint: 'Capture a fresh canonical screenshot artifact.', httpStatus: 409, cause: error }
+          )
+        }
+      })
+      screenshotPixels = verifiedScreenshots.reduce((total, item) => total + item.pixels, 0)
+      if (screenshotPixels > ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_PIXELS) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_SCREENSHOT_LIMIT',
+          'Acceptance screenshot references exceed the aggregate byte or pixel budget.',
+          { recoveryHint: 'Reference fewer or smaller screenshot artifacts.', httpStatus: 413 }
+        )
+      }
+      const screenshotArtifacts = verifiedScreenshots.map((item) => item.artifact)
+
+      let referencedLogBytes = 0
+      const logs = logRunIds.map((runId) => {
+        let reference: AndroidAcceptanceReport['logs'][number]
+        try {
+          reference = this.runs.retainedReference(roomId, runId, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LOG_UNAVAILABLE',
+            'A referenced Room run is not a completed, bounded retained log artifact.',
+            { recoveryHint: 'Use an exited run ID still returned by list_room_runs.', httpStatus: 409, cause: error }
+          )
+        }
+        if (
+          Date.parse(reference.startedAt) < Date.parse(receipt.installedAt) ||
+          Date.parse(reference.finishedAt) > Date.parse(acceptanceStartedAt)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LOG_STALE',
+            'A referenced run falls outside this installed build acceptance window.',
+            { recoveryHint: 'Run the evidence command after android_run and before creating acceptance.', httpStatus: 409 }
+          )
+        }
+        referencedLogBytes += reference.sizeBytes
+        if (referencedLogBytes > ANDROID_ACCEPTANCE_LOGS_MAX_TOTAL_BYTES) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LOG_LIMIT',
+            'Acceptance log references exceed the bounded total size.',
+            { recoveryHint: 'Reference fewer or smaller retained Room runs.', httpStatus: 413 }
+          )
+        }
+        return reference
+      })
+
+      if (input.stage === 'final-physical') {
+        if (
+          capturedLeaseId === null ||
+          leaseIdentity === null ||
+          installTarget.kind !== 'physical' ||
+          selector.kind !== 'physical'
+        ) throw new Error('Final physical acceptance lost its exact private lease setup')
+
+        const physicalLeaseId = capturedLeaseId
+        const physicalDeviceId = installTarget.deviceId
+        return this.withPhysicalAcceptanceProof({
+          id: physicalLeaseId,
+          deviceId: physicalDeviceId,
+          roomId
+        }, async (proofGate) => {
+
+        // This branch is intentionally external-state read-only. In particular,
+        // do not add a screen witness, launch, crash, locale setter, Room pause,
+        // source copy/fingerprint helper, or durable restore intent here.
+        const session = await this.openAndroidAutomationSessionLocked(roomId, selector, {
+          physicalAcceptanceProofGate: proofGate
+        })
+        if (
+          session.target.kind !== 'physical' ||
+          session.target.deviceId !== installTarget.deviceId ||
+          session.target.apiLevel === null
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+            'The exact physical acceptance target changed before read-only verification began.',
+            { recoveryHint: 'Reacquire the intended USB target and repeat final acceptance.', httpStatus: 409 }
+          )
+        }
+        const timeoutMs = input.timeoutMs ?? 30_000
+        const seed = await session.appLocaleSnapshot(input.applicationId, timeoutMs)
+        if (
+          seed.restoreFence.targetKind !== 'physical' ||
+          seed.restoreFence.targetId !== installTarget.targetId ||
+          seed.restoreFence.deviceId !== installTarget.deviceId ||
+          seed.restoreFence.leaseId !== capturedLeaseId ||
+          seed.restoreFence.roomId !== roomId ||
+          seed.restoreFence.applicationId !== input.applicationId ||
+          seed.restoreFence.changeId !== receipt.changeId ||
+          seed.restoreFence.apkSha256 !== receipt.apkSha256 ||
+          seed.restoreFence.installedAt !== receipt.installedAt ||
+          seed.apiLevel !== session.target.apiLevel
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+            'The physical target, acceptance lease, tracked APK, Android user, or API changed before the initial proof.',
+            { recoveryHint: 'Repeat acceptance under one unchanged USB lease and tracked install.', httpStatus: 409 }
+          )
+        }
+        const initial = await session.proveAppLocaleFinalState(
+          input.applicationId,
+          seed.restoreFence,
+          timeoutMs
+        )
+        if (
+          !sameAndroidLocaleRestoreFence(initial.restoreFence, seed.restoreFence) ||
+          !sameStringValues(initial.localeTags, seed.localeTags) ||
+          !isDeepStrictEqual(initial.pids, seed.pids)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+            'The initial two-pulse physical proof did not match its exact read-only seed.',
+            { recoveryHint: 'Stop concurrent app, user, locale, install, process, or lease changes and retry.', httpStatus: 409 }
+          )
+        }
+
+        const screenshots = screenshotArtifacts.map((artifact) => {
+          if (
+            artifact.metadata.room.stateRevision !== provenance.stateRevision ||
+            artifact.metadata.room.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
+            artifact.metadata.device.kind !== 'physical' ||
+            artifact.metadata.device.deviceId !== installTarget.deviceId ||
+            artifact.metadata.device.model !== artifactMetadataText(session.target.model, 200) ||
+            artifact.metadata.device.androidVersion !== artifactMetadataText(session.target.androidVersion, 64) ||
+            artifact.metadata.device.apiLevel !== session.target.apiLevel ||
+            artifact.metadata.app.packageName !== input.applicationId ||
+            artifact.metadata.build.changeId !== receipt.changeId ||
+            artifact.metadata.build.apkSha256 !== receipt.apkSha256 ||
+            artifact.metadata.build.installedAt !== receipt.installedAt ||
+            Date.parse(artifact.metadata.capture.capturedAt) < Date.parse(receipt.installedAt) ||
+            Date.parse(artifact.metadata.capture.capturedAt) > Date.parse(acceptanceStartedAt)
+          ) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_SCREENSHOT_MISMATCH',
+              'A screenshot does not prove this sealed build generation and exact physical target.',
+              { recoveryHint: 'Reference fresh physical screenshots captured for the same tracked android_run.', httpStatus: 409 }
+            )
+          }
+          try {
+            const reference = zAndroidAcceptanceScreenshotRef.parse({
+              artifactId: artifact.id,
+              filename: artifact.filename,
+              sha256: artifact.sha256,
+              sizeBytes: artifact.sizeBytes,
+              capturedAt: artifact.metadata.capture.capturedAt,
+              locale: artifact.metadata.locale,
+              retrieval: {
+                controlApiPath: `/v1/rooms/${roomId}/artifacts/${artifact.id}/content`,
+                mcpTool: 'read_room_artifact' as const
+              }
+            })
+            if (!isDeepStrictEqual(reference.locale, artifact.metadata.locale)) throw new Error('non-canonical locale')
+            return reference
+          } catch (error) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_SCREENSHOT_MISMATCH',
+              'A physical screenshot has no strict, canonical locale-bearing acceptance receipt.',
+              { recoveryHint: 'Capture a fresh screenshot through the current artifact API.', httpStatus: 409, cause: error }
+            )
+          }
+        })
+        const steps: AndroidAcceptanceReport['steps'] = [
+          { id: 'devhotel.source-fingerprint', status: 'pass', source: 'devhotel', evidence: { screenshotArtifactIds: [], logRunIds: [] } },
+          { id: 'devhotel.tracked-apk', status: 'pass', source: 'devhotel', evidence: { screenshotArtifactIds: [], logRunIds: [] } },
+          { id: 'devhotel.target-readiness', status: 'pass', source: 'devhotel', evidence: { screenshotArtifactIds: [], logRunIds: [] } },
+          ...input.steps.map((step) => ({
+            id: step.id,
+            status: step.status,
+            source: 'agent' as const,
+            evidence: {
+              screenshotArtifactIds: step.screenshotArtifactIds ?? [],
+              logRunIds: step.logRunIds ?? []
+            }
+          }))
+        ]
+
+        // Every Host/filesystem verification with an await has completed. The
+        // final composite proof is two complete #20 pulses; only synchronous
+        // identity checks, sealing, and the BEGIN IMMEDIATE publication follow.
+        const finalProofStartedAt = Date.now()
+        const finalProof = await session.proveAppLocaleFinalState(
+          input.applicationId,
+          seed.restoreFence,
+          timeoutMs
+        )
+        const finalProofElapsedMs = Date.now() - finalProofStartedAt
+        if (
+          finalProofElapsedMs < 0 || finalProofElapsedMs > 120_000 ||
+          !sameAndroidLocaleRestoreFence(finalProof.restoreFence, initial.restoreFence) ||
+          !sameStringValues(finalProof.localeTags, initial.localeTags) ||
+          !isDeepStrictEqual(finalProof.pids, initial.pids)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+            'The final physical locale, install, user, API, foreground, lease, or stable PID proof drifted.',
+            { recoveryHint: 'Repeat acceptance without concurrent target or app changes.', httpStatus: 409 }
+          )
+        }
+        const finalRoom = this.mustGet(roomId)
+        const finalReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+        const finalProvenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
+        if (
+          finalRoom.stateRevision !== provenance.stateRevision ||
+          finalRoom.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
+          !isDeepStrictEqual(finalReceipt, receipt) ||
+          !isDeepStrictEqual(finalProvenance, provenance)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+            'The sealed Room generation or tracked physical build provenance changed before publication.',
+            { recoveryHint: 'Repeat acceptance against one stable tracked android_run.', httpStatus: 409 }
+          )
+        }
+        for (const expected of screenshotArtifacts) {
+          const actual = this.artifacts.readContent(roomId, expected.id).artifact
+          if (!isDeepStrictEqual(actual, expected)) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_SCREENSHOT_CHANGED',
+              'A physical screenshot changed before the acceptance report could be published.',
+              { recoveryHint: 'Capture fresh immutable screenshot evidence and retry.', httpStatus: 409 }
+            )
+          }
+        }
+        for (const log of logs) this.runs.verifyRetainedReference(roomId, log, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+
+        const readiness: AndroidAcceptanceReport['locale']['readiness'] = {
+          adb: 'device',
+          localeService: 'ready',
+          application: 'foreground',
+          process: 'running',
+          attempts: 2,
+          consecutiveReadyChecks: 2,
+          elapsedMs: finalProofElapsedMs,
+          pids: [...finalProof.pids]
+        }
+        const report = sealAndroidAcceptanceReport({
+          schema: 1,
+          id: randomUUID(),
+          roomId,
+          stage: 'final-physical',
+          status: steps.every((step) => step.status === 'pass') ? 'pass' : 'fail',
+          applicationId: input.applicationId,
+          createdAt: new Date().toISOString(),
+          actor,
+          room: {
+            stateRevision: provenance.stateRevision,
+            workspaceVolumeRevision: provenance.workspaceVolumeRevision,
+            sourceType: room.sourceType,
+            sourceIdentity
+          },
+          image: { reference: provenance.imageReference, sha256: provenance.imageSha256 },
+          target: {
+            kind: 'physical',
+            deviceId: installTarget.deviceId,
+            model: artifactMetadataText(session.target.model, 200),
+            androidVersion: artifactMetadataText(session.target.androidVersion, 64),
+            apiLevel: finalProof.apiLevel,
+            leaseIdentity
+          },
+          build: {
+            changeId: receipt.changeId,
+            apkSha256: receipt.apkSha256,
+            artifactSizeBytes: provenance.artifactSizeBytes,
+            stateRevision: provenance.stateRevision,
+            workspaceVolumeRevision: provenance.workspaceVolumeRevision,
+            sourceIdentity: provenance.sourceIdentity,
+            environmentIdentity: provenance.environmentIdentity,
+            execution: {
+              lifecycle: 'isolated-snapshot',
+              cleanExecution: true,
+              persistentCacheVolumes: false
+            },
+            imageReference: provenance.imageReference,
+            imageSha256: provenance.imageSha256,
+            installedAt: receipt.installedAt
+          },
+          locale: {
+            scope: 'app',
+            apiLevel: finalProof.apiLevel,
+            localeTags: [...finalProof.localeTags],
+            systemTag: null,
+            restored: true,
+            readiness,
+            process: {
+              beforePids: [...initial.pids],
+              afterPids: [...finalProof.pids],
+              restarted: false
+            }
+          },
+          steps,
+          crash: null,
+          screenshots,
+          logs
+        }, this.androidAcceptanceIntegrity)
+        let stored: AndroidAcceptanceReport
+        try {
+          stored = this.commitPhysicalAndroidAcceptanceReport(report, {
+            id: physicalLeaseId,
+            deviceId: physicalDeviceId,
+            roomId
+          }, finalProof.restoreFence, proofGate)
+        } catch (error) {
+          if (error instanceof DevHotelError) throw error
+          if (error instanceof Error && /(?:report|retained-run) quota reached/i.test(error.message)) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_QUOTA_REACHED',
+              'This Room has reached its bounded Android acceptance report quota.',
+              { recoveryHint: 'Delete the Room when its retained evidence is no longer needed.', httpStatus: 409 }
+            )
+          }
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_STORE_FAILED',
+            'The physical Android acceptance report could not be committed atomically.',
+            { recoveryHint: 'Retry; no partial acceptance receipt was published.', httpStatus: 500, cause: error }
+          )
+        }
+        return { report: stored, markdown: androidAcceptanceReportMarkdown(stored) }
+        })
+      }
+
+      if (sourceFingerprint === null) throw new Error('Development acceptance lost its live source fingerprint')
+      // Development acceptance owns the emulator and may use a witnessed
+      // launch/crash/locale recovery protocol with a durable restore intent.
+      const session = await this.openAndroidAutomationSessionLocked(roomId, selector)
+      if (
+        session.target.kind !== installTarget.kind ||
+        session.target.deviceId !== installTarget.deviceId ||
+        session.target.apiLevel === null
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+          'The exact acceptance target changed before verification began.',
+          { recoveryHint: 'Reacquire the intended target and repeat acceptance.', httpStatus: 409 }
+        )
+      }
+      const timeoutMs = input.timeoutMs ?? 30_000
+      const validateForeground = (evidence: AndroidForegroundInstallEvidence): void => {
+        if (
+          evidence.seal === null || !screenshotInstallEvidenceIsConsistent(evidence) ||
+          !isDeepStrictEqual(evidence.context.receipt, receipt) ||
+          evidence.context.status.foregroundApplicationId !== input.applicationId ||
+          !isDeepStrictEqual(evidence.context.status.target, session.target) ||
+          evidence.context.status.target.kind !== installTarget.kind ||
+          evidence.context.status.target.deviceId !== installTarget.deviceId ||
+          evidence.context.status.target.apiLevel !== session.target.apiLevel ||
+          evidence.seal.targetId !== installTarget.targetId ||
+          evidence.seal.leaseId !== capturedLeaseId
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_APP_UNVERIFIED',
+            'Acceptance requires the exact tracked installed application to own the foreground.',
+            { recoveryHint: 'Run android_run, launch the tracked app on this target, and retry.', httpStatus: 409 }
+          )
+        }
+      }
+      const initial = await session.withActiveUserScreenWitness(async (signal) => {
+        const beforeEvidence = await session.foregroundInstallEvidence(signal)
+        const snapshot = await session.appLocaleSnapshot(input.applicationId, timeoutMs, signal)
+        const afterEvidence = await session.foregroundInstallEvidence(signal)
+        return { beforeEvidence, snapshot, afterEvidence }
+      }, { actionTimeoutMs: timeoutMs })
+      validateForeground(initial.beforeEvidence)
+      validateForeground(initial.afterEvidence)
+      if (
+        !sameScreenshotInstallEvidence(initial.beforeEvidence, initial.afterEvidence) ||
+        initial.snapshot.apiLevel !== session.target.apiLevel
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+          'The target, tracked install, active user, foreground app, or app locale changed during the initial proof.',
+          { recoveryHint: 'Repeat acceptance on one stable API 33+ target and foreground application.', httpStatus: 409 }
+        )
+      }
+      const initialEvidence = initial.afterEvidence
+      const originalLocale: AndroidAppLocaleSnapshot = initial.snapshot
+
+      const screenshots = screenshotArtifacts.map((artifact) => {
+        if (
+          artifact.metadata.room.stateRevision !== room.stateRevision ||
+          artifact.metadata.room.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+          artifact.metadata.device.kind !== installTarget.kind ||
+          artifact.metadata.device.deviceId !== installTarget.deviceId ||
+          artifact.metadata.device.model !== artifactMetadataText(session.target.model, 200) ||
+          artifact.metadata.device.androidVersion !== artifactMetadataText(session.target.androidVersion, 64) ||
+          artifact.metadata.device.apiLevel !== session.target.apiLevel ||
+          artifact.metadata.app.packageName !== input.applicationId ||
+          artifact.metadata.build.changeId !== receipt.changeId ||
+          artifact.metadata.build.apkSha256 !== receipt.apkSha256 ||
+          artifact.metadata.build.installedAt !== receipt.installedAt ||
+          Date.parse(artifact.metadata.capture.capturedAt) < Date.parse(receipt.installedAt) ||
+          Date.parse(artifact.metadata.capture.capturedAt) > Date.parse(acceptanceStartedAt)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_MISMATCH',
+            'A screenshot does not prove this Room generation, target, app, API, locale-bearing capture, and APK.',
+            { recoveryHint: 'Capture fresh screenshot artifacts on the selected target.', httpStatus: 409 }
+          )
+        }
+        try {
+          const reference = zAndroidAcceptanceScreenshotRef.parse({
+            artifactId: artifact.id,
+            filename: artifact.filename,
+            sha256: artifact.sha256,
+            sizeBytes: artifact.sizeBytes,
+            capturedAt: artifact.metadata.capture.capturedAt,
+            locale: artifact.metadata.locale,
+            retrieval: {
+              controlApiPath: `/v1/rooms/${roomId}/artifacts/${artifact.id}/content`,
+              mcpTool: 'read_room_artifact' as const
+            }
+          })
+          if (!isDeepStrictEqual(reference.locale, artifact.metadata.locale)) throw new Error('non-canonical locale')
+          return reference
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_MISMATCH',
+            'A screenshot has no strict, canonical locale-bearing acceptance receipt.',
+            { recoveryHint: 'Capture a fresh screenshot through the current artifact API.', httpStatus: 409, cause: error }
+          )
+        }
+      })
+
+      const steps: AndroidAcceptanceReport['steps'] = [
+        { id: 'devhotel.source-fingerprint', status: 'pass', source: 'devhotel', evidence: { screenshotArtifactIds: [], logRunIds: [] } },
+        { id: 'devhotel.tracked-apk', status: 'pass', source: 'devhotel', evidence: { screenshotArtifactIds: [], logRunIds: [] } },
+        ...input.steps.map((step) => ({
+          id: step.id,
+          status: step.status,
+          source: 'agent' as const,
+          evidence: {
+            screenshotArtifactIds: step.screenshotArtifactIds ?? [],
+            logRunIds: step.logRunIds ?? []
+          }
+        }))
+      ]
+
+      if (
+        !initialEvidence.seal ||
+        initialEvidence.seal.targetKind !== 'emulator' ||
+        initialEvidence.seal.deviceId !== null ||
+        initialEvidence.seal.leaseId !== null
+      ) throw new Error('Development acceptance initial emulator install seal was not retained')
+      const emulatorInstallSeal: EmulatorAndroidTrackedInstallSeal = {
+        ...initialEvidence.seal,
+        targetKind: 'emulator',
+        deviceId: null,
+        leaseId: null
+      }
+      const runtimeBackend = this.exactRoomRuntimeFenceBackend()
+      const runtimeSpec = this.webSpecFor(room)
+      const runtimeFence = await runtimeBackend.captureRoomArtifactWebFence(runtimeSpec)
+      if (runtimeFence.workspaceVolume !== srcVolume(roomId, room.workspaceVolumeRevision)) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+          'The exact Room runtime did not expose the expected workspace generation.',
+          { recoveryHint: 'Restart the Room runtime and repeat acceptance.', httpStatus: 409 }
+        )
+      }
+      const pendingRestoreKey = pendingAndroidAcceptanceRestoreKey(roomId)
+      const pendingRestoreToken = randomUUID().replaceAll('-', '')
+      const acceptanceSourceSnapshot = workspaceSnapshotVolume(roomId, pendingRestoreToken)
+      const pendingRestoreValue = serializePendingAndroidAcceptanceRestore({
+        version: 1,
+        token: pendingRestoreToken,
+        roomStateRevision: room.stateRevision,
+        workspaceVolumeRevision: room.workspaceVolumeRevision,
+        applicationId: input.applicationId,
+        timeoutMs,
+        install: emulatorInstallSeal,
+        originalLocale: {
+          apiLevel: originalLocale.apiLevel,
+          localeTags: [...originalLocale.localeTags],
+          pids: [...originalLocale.pids]
+        },
+        runtimeFence
+      })
+      if (!this.settings.setIfAbsentWhenKeysAbsent(
+        pendingRestoreKey,
+        pendingRestoreValue,
+        roomMutatingRecoveryKeys(roomId)
+      )) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_RESTORE_REQUIRED',
+          'A prior Android acceptance restoration still owns this Room mutation fence.',
+          {
+            recoveryHint: 'Keep the exact target and tracked install available, then restart DevHotel before retrying acceptance.',
+            httpStatus: 409
+          }
+        )
+      }
+
+      const proveRestoredLocale = async (): Promise<{
+        transition: AndroidAppLocaleTransition
+        evidence: AndroidForegroundInstallEvidence
+      }> => {
+        // Relaunch outside the transition witness: a real Activity launch can
+        // emit an InputDispatcher focus record, which this witness must reject
+        // rather than reinterpret. The witness below still re-proves the exact
+        // active user, app locale, stable PID set, foreground app and install.
+        if (input.includeCrashScenario) await session.launch(input.applicationId)
+        return session.withActiveUserScreenWitness(async (signal) => {
+          const transition = await session.applyAppLocalesAndWait(
+            input.applicationId,
+            originalLocale.localeTags,
+            { timeoutMs, signal, expectedPreviousLocaleTags: originalLocale.localeTags }
+          )
+          const evidence = await session.foregroundInstallEvidence(signal)
+          return { transition, evidence }
+        }, {
+          actionTimeoutMs: timeoutMs,
+          allowApplicationIdTransitions: input.applicationId
+        })
+      }
+
+      const validateRestoredLocale = (proof: {
+        transition: AndroidAppLocaleTransition
+        evidence: AndroidForegroundInstallEvidence
+      }): void => {
+        validateForeground(proof.evidence)
+        const { transition } = proof
+        if (
+          !sameScreenshotInstallEvidence(initialEvidence, proof.evidence) ||
+          transition.applicationId !== input.applicationId ||
+          !isDeepStrictEqual(transition.target, session.target) ||
+          transition.apiLevel !== originalLocale.apiLevel ||
+          transition.apiLevel !== session.target.apiLevel ||
+          !isDeepStrictEqual(transition.localeTags, originalLocale.localeTags) ||
+          !isDeepStrictEqual(transition.previousLocaleTags, originalLocale.localeTags) ||
+          transition.readiness.consecutiveReadyChecks !== 2 ||
+          transition.readiness.attempts < 2 ||
+          !isDeepStrictEqual(transition.pids, transition.readiness.pids) ||
+          !isDeepStrictEqual(transition.process.afterPids, transition.readiness.pids)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+            'The final app locale, stable process, target, tracked install, active user, or foreground proof changed.',
+            { recoveryHint: 'Repeat acceptance without concurrent target, process, app locale, or source changes.', httpStatus: 409 }
+          )
+        }
+      }
+
+      let deviceRestoreProven = true
+      let reportCandidate: AndroidAcceptanceReport | null = null
+      let markdownCandidate: string | null = null
+      let finalProof: { transition: AndroidAppLocaleTransition; evidence: AndroidForegroundInstallEvidence } | null = null
+      let acceptanceFailure: unknown = null
+      try {
+        await runtimeBackend.pauseRoomArtifactWeb(runtimeSpec, runtimeFence)
+        const pausedSourceFingerprint = await this.androidAcceptanceSourceFingerprint(this.mustGet(roomId))
+        // Copy the proved paused generation into an operation-token-owned
+        // volume. From this point the report seals the immutable copy, not a
+        // later observation of a live volume that an external writer can race.
+        await this.backend.copyVolume(
+          roomId,
+          runtimeFence.workspaceVolume,
+          roomId,
+          acceptanceSourceSnapshot
+        )
+        const immutableSourceFingerprint = await this.backend.fingerprintWorkspace(
+          roomId,
+          room.workspaceVolumeRevision,
+          acceptanceSourceSnapshot
+        )
+        const sourceFingerprintAfterSnapshot = await this.androidAcceptanceSourceFingerprint(this.mustGet(roomId))
+        await runtimeBackend.pauseRoomArtifactWeb(runtimeSpec, runtimeFence)
+        if (
+          pausedSourceFingerprint !== sourceFingerprint ||
+          immutableSourceFingerprint !== sourceFingerprint ||
+          sourceFingerprintAfterSnapshot !== sourceFingerprint
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+            'Room source changed while its immutable paused acceptance snapshot was captured.',
+            { recoveryHint: 'Stop concurrent edits and repeat acceptance against one stable generation.', httpStatus: 409 }
+          )
+        }
+
+        let crash: AndroidAcceptanceReport['crash'] = null
+        let crashResult: AndroidCrashScenarioResult | null = null
+        let primaryFailure: unknown = null
+        if (input.includeCrashScenario) {
+          deviceRestoreProven = false
+          try {
+            crashResult = await session.crashScenario({
+              applicationId: input.applicationId,
+              scenario: 'am-crash',
+              runId: randomUUID(),
+              target: selector
+            })
+          } catch (error) {
+            primaryFailure = error
+          }
+        }
+
+      // Finish the source await before the last device proof. The Room lock
+      // prevents internal source publication while the final proof runs.
+      let sourceFailure: unknown = null
+      try {
+        const sourceFenceRoom = this.mustGet(roomId)
+        const finalSourceFingerprint = await this.androidAcceptanceSourceFingerprint(sourceFenceRoom)
+        const sourceFenceReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+        const sourceFenceProvenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
+        if (
+          sourceFenceRoom.stateRevision !== room.stateRevision ||
+          sourceFenceRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+          finalSourceFingerprint !== sourceFingerprint ||
+          !isDeepStrictEqual(sourceFenceReceipt, receipt) ||
+          !isDeepStrictEqual(sourceFenceProvenance, provenance)
+        ) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+            'Room source or tracked build provenance changed while acceptance was being sealed.',
+            { recoveryHint: 'Stop concurrent edits and repeat acceptance against one stable generation.', httpStatus: 409 }
+          )
+        }
+      } catch (error) {
+        sourceFailure = error
+        if (!input.includeCrashScenario) throw error
+      }
+
+      deviceRestoreProven = false
+      let finalProofFailure: unknown = null
+      try {
+        finalProof = await proveRestoredLocale()
+        validateRestoredLocale(finalProof)
+      } catch (error) {
+        finalProofFailure = error
+      }
+      if (finalProofFailure) {
+        try {
+          const cleanupProof = await proveRestoredLocale()
+          validateRestoredLocale(cleanupProof)
+          deviceRestoreProven = true
+        } catch (restoreFailure) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_RESTORE_FAILED',
+            'Acceptance could not restore and prove the original app locale, foreground application, and stable process.',
+            {
+              recoveryHint: 'Keep the target connected, restore the app locale explicitly, and verify foreground/process readiness.',
+              httpStatus: 409,
+              cause: new AggregateError(
+                [primaryFailure, sourceFailure, finalProofFailure, restoreFailure].filter((error) => error !== null),
+                'Android acceptance restoration failed'
+              ),
+              evidence: {
+                stage: input.includeCrashScenario ? 'crash-restore' : 'locale-restore',
+                primaryFailureCode: primaryFailure instanceof DevHotelError ? primaryFailure.code : null
+              }
+            }
+          )
+        }
+        if (primaryFailure) throw primaryFailure
+        if (sourceFailure) throw sourceFailure
+        throw finalProofFailure
+      }
+      if (!finalProof) throw new Error('Android acceptance final proof returned no result')
+      deviceRestoreProven = true
+      if (primaryFailure) throw primaryFailure
+      if (sourceFailure) throw sourceFailure
+      if (
+        (!input.includeCrashScenario &&
+          !isDeepStrictEqual(finalProof.transition.process.beforePids, originalLocale.pids)) ||
+        (crashResult !== null && !isDeepStrictEqual(crashResult.pidsBefore, originalLocale.pids))
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_TARGET_CHANGED',
+          'The application process changed between the initial app-locale snapshot and the acceptance action.',
+          { recoveryHint: 'Repeat acceptance without concurrent application restarts.', httpStatus: 409 }
+        )
+      }
+
+      steps.splice(2, 0, {
+        id: 'devhotel.target-readiness',
+        status: 'pass',
+        source: 'devhotel',
+        evidence: { screenshotArtifactIds: [], logRunIds: [] }
+      })
+      if (input.includeCrashScenario) {
+        if (!crashResult) throw new Error('Android crash scenario returned no result')
+        crash = {
+          scenario: crashResult.scenario,
+          runId: crashResult.runId,
+          observed: crashResult.observed,
+          pidsBefore: crashResult.pidsBefore,
+          pidsAfter: crashResult.pidsAfter,
+          commandCode: crashResult.evidence.code,
+          log: {
+            sourceLines: crashResult.logcat.sourceLines,
+            returnedLines: crashResult.logcat.lines.length,
+            truncated: crashResult.logcat.truncated
+          }
+        }
+        steps.push({
+          id: 'devhotel.crash-scenario',
+          status: crashResult.observed ? 'pass' : 'fail',
+          source: 'devhotel',
+          evidence: { screenshotArtifactIds: [], logRunIds: [] }
+        })
+      }
+
+      // The target restore above is the final device await. Re-prove the exact
+      // paused runtime on both sides of a fresh live-volume fingerprint, then
+      // take one immediately fresh fingerprint before the synchronous seal.
+      await runtimeBackend.pauseRoomArtifactWeb(runtimeSpec, runtimeFence)
+      const postDeviceSourceFingerprint = await this.androidAcceptanceSourceFingerprint(this.mustGet(roomId))
+      const sealedSnapshotFingerprint = await this.backend.fingerprintWorkspace(
+        roomId,
+        room.workspaceVolumeRevision,
+        acceptanceSourceSnapshot
+      )
+      await runtimeBackend.pauseRoomArtifactWeb(runtimeSpec, runtimeFence)
+      const sealSourceFingerprint = await this.androidAcceptanceSourceFingerprint(this.mustGet(roomId))
+      const postDeviceRoom = this.mustGet(roomId)
+      const postDeviceReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+      const postDeviceProvenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
+      if (
+        postDeviceRoom.stateRevision !== room.stateRevision ||
+        postDeviceRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+        postDeviceSourceFingerprint !== sourceFingerprint ||
+        sealedSnapshotFingerprint !== sourceFingerprint ||
+        sealSourceFingerprint !== sourceFingerprint ||
+        !isDeepStrictEqual(postDeviceReceipt, receipt) ||
+        !isDeepStrictEqual(postDeviceProvenance, provenance)
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+          'Room source, exact runtime, or tracked build provenance changed before the acceptance seal.',
+          { recoveryHint: 'Stop concurrent edits and repeat acceptance against one stable generation.', httpStatus: 409 }
+        )
+      }
+
+      // No device/source await is permitted below this point. Revalidate all
+      // synchronous receipts and the exact private lease before atomic insert.
+      const finalRoom = this.mustGet(roomId)
+      const finalReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+      const finalProvenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
+      if (
+        finalRoom.stateRevision !== room.stateRevision ||
+        finalRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+        !isDeepStrictEqual(finalReceipt, receipt) ||
+        !isDeepStrictEqual(finalProvenance, provenance)
+      ) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+          'Room source or tracked build provenance changed after the final device proof.',
+          { recoveryHint: 'Stop concurrent edits and repeat acceptance against one stable generation.', httpStatus: 409 }
+        )
+      }
+      for (const expected of screenshotArtifacts) {
+        try {
+          const actual = this.artifacts.readContent(roomId, expected.id).artifact
+          if (!isDeepStrictEqual(actual, expected)) throw new Error('screenshot changed')
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_SCREENSHOT_CHANGED',
+            'A screenshot changed before the acceptance report could be sealed.',
+            { recoveryHint: 'Capture fresh immutable screenshot evidence and retry.', httpStatus: 409, cause: error }
+          )
+        }
+      }
+      for (const log of logs) {
+        try {
+          this.runs.verifyRetainedReference(roomId, log, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LOG_CHANGED',
+            'A retained log changed before its transactional report pin was committed.',
+            { recoveryHint: 'Run the evidence command again and retry acceptance.', httpStatus: 409, cause: error }
+          )
+        }
+      }
+      if (capturedLeaseId !== null) {
+        const lease = this.devices.leaseForRoom(roomId)
+        try {
+          const authorized = this.devices.authorizeInternalOperation(
+            roomId,
+            installTarget.deviceId!,
+            'sealing final Android acceptance',
+            capturedLeaseId
+          )
+          if (
+            !lease || lease.id !== capturedLeaseId || lease.purpose !== 'acceptance' ||
+            authorized.leaseId !== capturedLeaseId ||
+            this.androidAcceptanceIntegrity.identify('lease', capturedLeaseId).value !== leaseIdentity?.value
+          ) throw new Error('acceptance lease changed')
+        } catch (error) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_LEASE_CHANGED',
+            'Final physical acceptance lost its exact acceptance-purpose lease before sealing.',
+            { recoveryHint: 'Reattach the intended phone with purpose acceptance and rerun.', httpStatus: 409, cause: error }
+          )
+        }
+      }
+
+      const createdAt = new Date().toISOString()
+      const systemLocaleTag = artifactLocale(finalProof.evidence.context.status.locale)
+      reportCandidate = sealAndroidAcceptanceReport({
+        schema: 1,
+        id: randomUUID(),
+        roomId,
+        stage: input.stage,
+        status: steps.every((step) => step.status === 'pass') ? 'pass' : 'fail',
+        applicationId: input.applicationId,
+        createdAt,
+        actor,
+        room: {
+          stateRevision: room.stateRevision,
+          workspaceVolumeRevision: room.workspaceVolumeRevision,
+          sourceType: room.sourceType,
+          sourceIdentity
+        },
+        image: { reference: ANDROID_IMAGE, sha256: imageSha256 },
+        target: {
+          kind: session.target.kind,
+          deviceId: session.target.deviceId,
+          model: artifactMetadataText(session.target.model, 200),
+          androidVersion: artifactMetadataText(session.target.androidVersion, 64),
+          apiLevel: session.target.apiLevel,
+          leaseIdentity
+        },
+        build: {
+          changeId: receipt.changeId,
+          apkSha256: receipt.apkSha256,
+          artifactSizeBytes: provenance.artifactSizeBytes,
+          stateRevision: provenance.stateRevision,
+          workspaceVolumeRevision: provenance.workspaceVolumeRevision,
+          sourceIdentity: provenance.sourceIdentity,
+          environmentIdentity: provenance.environmentIdentity,
+          execution: {
+            lifecycle: 'isolated-snapshot',
+            cleanExecution: true,
+            persistentCacheVolumes: false
+          },
+          imageReference: provenance.imageReference,
+          imageSha256: provenance.imageSha256,
+          installedAt: receipt.installedAt
+        },
+        locale: {
+          scope: 'app',
+          apiLevel: finalProof.transition.apiLevel,
+          localeTags: [...finalProof.transition.localeTags],
+          systemTag: systemLocaleTag,
+          restored: true,
+          readiness: finalProof.transition.readiness,
+          process: finalProof.transition.process
+        },
+        steps,
+        crash,
+        screenshots,
+        logs
+      }, this.androidAcceptanceIntegrity)
+      markdownCandidate = androidAcceptanceReportMarkdown(reportCandidate)
+      } catch (error) {
+        acceptanceFailure = error
+      }
+
+      let runtimeRestoreFailure: unknown = null
+      try {
+        await runtimeBackend.restoreRoomArtifactWeb(runtimeSpec, runtimeFence)
+      } catch (error) {
+        runtimeRestoreFailure = error
+      }
+      if (runtimeRestoreFailure) this.containPendingAndroidAcceptanceRuntime(roomId)
+      let snapshotCleanupFailure: unknown = null
+      try {
+        await this.backend.removeWorkspaceSnapshot(roomId, pendingRestoreToken)
+      } catch (error) {
+        snapshotCleanupFailure = error
+      }
+
+      // Runtime restoration and snapshot cleanup both await external systems.
+      // Therefore the target proof above is no longer fresh enough to release
+      // the durable intent. Take one final exact proof now; everything from its
+      // completion through CAS/report commit is synchronous.
+      let completionProof: {
+        transition: AndroidAppLocaleTransition
+        evidence: AndroidForegroundInstallEvidence
+      } | null = null
+      let completionProofFailure: unknown = null
+      try {
+        completionProof = await proveRestoredLocale()
+        validateRestoredLocale(completionProof)
+        if (capturedLeaseId !== null) {
+          const lease = this.devices.leaseForRoom(roomId)
+          const authorized = this.devices.authorizeInternalOperation(
+            roomId,
+            installTarget.deviceId!,
+            'releasing final Android acceptance restoration fence',
+            capturedLeaseId
+          )
+          if (
+            !lease || lease.id !== capturedLeaseId || lease.deviceId !== installTarget.deviceId ||
+            lease.purpose !== 'acceptance' || authorized.leaseId !== capturedLeaseId ||
+            this.androidAcceptanceIntegrity.identify('lease', capturedLeaseId).value !== leaseIdentity?.value
+          ) throw new Error('acceptance lease changed after runtime restoration')
+        }
+        deviceRestoreProven = true
+      } catch (error) {
+        deviceRestoreProven = false
+        completionProofFailure = error
+      }
+      if (!deviceRestoreProven || runtimeRestoreFailure || snapshotCleanupFailure || completionProofFailure) {
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_RESTORE_FAILED',
+          'Acceptance could not restore and prove both the exact Android target state and Room runtime.',
+          {
+            recoveryHint: 'Keep the exact target, tracked install, and Room runtime available, then restart DevHotel for fenced recovery.',
+            httpStatus: 409,
+            cause: new AggregateError(
+              [acceptanceFailure, runtimeRestoreFailure, snapshotCleanupFailure, completionProofFailure]
+                .filter((error) => error !== null),
+              'Android acceptance target/runtime restoration failed'
+            )
+          }
+        )
+      }
+
+      if (!acceptanceFailure) {
+        try {
+          if (!completionProof || !reportCandidate) throw new Error('Android acceptance completion proof was not retained')
+          const completionRoom = this.mustGet(roomId)
+          const completionReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
+          const completionProvenance = this.androidInstalls.acceptanceProvenance(
+            roomId,
+            installTarget,
+            input.applicationId
+          )
+          if (
+            completionRoom.stateRevision !== room.stateRevision ||
+            completionRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+            !isDeepStrictEqual(completionReceipt, receipt) ||
+            !isDeepStrictEqual(completionProvenance, provenance)
+          ) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_SOURCE_CHANGED',
+              'Room generation or tracked build provenance changed before the atomic acceptance commit.',
+              { recoveryHint: 'Repeat acceptance against one stable Room generation and tracked install.', httpStatus: 409 }
+            )
+          }
+          for (const expected of screenshotArtifacts) {
+            const actual = this.artifacts.readContent(roomId, expected.id).artifact
+            if (!isDeepStrictEqual(actual, expected)) {
+              throw new DevHotelError(
+                'ANDROID_ACCEPTANCE_SCREENSHOT_CHANGED',
+                'A screenshot changed before the atomic acceptance commit.',
+                { recoveryHint: 'Capture fresh immutable screenshot evidence and retry.', httpStatus: 409 }
+              )
+            }
+          }
+          for (const log of logs) this.runs.verifyRetainedReference(roomId, log, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+
+          const { seal: _preRestoreSeal, ...candidateBody } = reportCandidate
+          reportCandidate = sealAndroidAcceptanceReport({
+            ...candidateBody,
+            locale: {
+              ...candidateBody.locale,
+              apiLevel: completionProof.transition.apiLevel,
+              localeTags: [...completionProof.transition.localeTags],
+              systemTag: artifactLocale(completionProof.evidence.context.status.locale),
+              readiness: completionProof.transition.readiness,
+              process: completionProof.transition.process
+            }
+          }, this.androidAcceptanceIntegrity)
+          markdownCandidate = androidAcceptanceReportMarkdown(reportCandidate)
+        } catch (error) {
+          acceptanceFailure = error
+        }
+      }
+
+      if (acceptanceFailure) {
+        if (!this.settings.deleteIfValue(pendingRestoreKey, pendingRestoreValue)) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_RESTORE_REQUIRED',
+            'The exact Android target and Room runtime were restored, but their durable mutation fence changed.',
+            {
+              recoveryHint: 'Do not run more Room or target mutations; restart DevHotel with the exact target and runtime available.',
+              httpStatus: 409
+            }
+          )
+        }
+        throw acceptanceFailure
+      }
+      if (!reportCandidate || markdownCandidate === null) throw new Error('Android acceptance report candidate was not sealed')
+
+      let stored: AndroidAcceptanceReport
+      try {
+        stored = this.commitAndroidAcceptanceReportAndReleaseRestore(
+          pendingRestoreKey,
+          pendingRestoreValue,
+          reportCandidate
+        )
+      } catch (error) {
+        if (error instanceof DevHotelError && error.code === 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED') throw error
+        // The report transaction rolled back both the candidate and CAS. The
+        // exact post-restore proof is still fresh and no report was published,
+        // so release our own unchanged intent before returning a storage error.
+        this.settings.deleteIfValue(pendingRestoreKey, pendingRestoreValue)
+        if (error instanceof Error && /(?:report|retained-run) quota reached/i.test(error.message)) {
+          throw new DevHotelError(
+            'ANDROID_ACCEPTANCE_QUOTA_REACHED',
+            'This Room has reached its bounded Android acceptance report quota.',
+            { recoveryHint: 'Delete the Room when its retained evidence is no longer needed.', httpStatus: 409 }
+          )
+        }
+        throw new DevHotelError(
+          'ANDROID_ACCEPTANCE_STORE_FAILED',
+          'The Android acceptance report could not be committed atomically.',
+          { recoveryHint: 'Retry; no partial acceptance receipt was published.', httpStatus: 500, cause: error }
+        )
+      }
+      return { report: stored, markdown: markdownCandidate }
+    })
+  }
+
+  listAndroidAcceptanceReports(roomId: string, limit = 20): AndroidAcceptanceReportSummary[] {
+    this.mustGet(roomId)
+    try {
+      return this.androidAcceptanceReports
+        .listReportsForRoom(roomId, zAndroidAcceptanceReportListLimit.parse(limit))
+        .map(acceptanceReportSummary)
+    } catch (error) {
+      throw new DevHotelError(
+        'ANDROID_ACCEPTANCE_EVIDENCE_CORRUPT',
+        'An Android acceptance report receipt failed its keyed integrity check.',
+        { recoveryHint: 'Treat the affected report as invalid and create a new one.', httpStatus: 409, cause: error }
+      )
+    }
+  }
+
+  getAndroidAcceptanceReport(roomId: string, reportId: string): AndroidAcceptanceReportResult {
+    this.mustGet(roomId)
+    let report: AndroidAcceptanceReport | null
+    try {
+      report = this.androidAcceptanceReports.getForRoom(roomId, zAndroidAcceptanceReportId.parse(reportId))
+      if (report) {
+        let bytes = 0
+        let pixels = 0
+        for (const expected of report.screenshots) {
+          const { artifact, content } = this.artifacts.readContent(roomId, expected.artifactId)
+          const validated = validateAndSanitizeScreenshotPng(content)
+          bytes += artifact.sizeBytes
+          pixels += validated.width * validated.height
+          if (
+            bytes > ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_BYTES ||
+            pixels > ANDROID_ACCEPTANCE_SCREENSHOTS_MAX_PIXELS ||
+            artifact.metadata.capture.width !== validated.width ||
+            artifact.metadata.capture.height !== validated.height ||
+            artifact.metadata.capture.orientation !== validated.orientation ||
+            artifact.filename !== expected.filename || artifact.sha256 !== expected.sha256 ||
+            artifact.sizeBytes !== expected.sizeBytes ||
+            artifact.metadata.capture.capturedAt !== expected.capturedAt ||
+            !isDeepStrictEqual(artifact.metadata.locale, expected.locale) ||
+            artifact.metadata.room.stateRevision !== report.room.stateRevision ||
+            artifact.metadata.room.workspaceVolumeRevision !== report.room.workspaceVolumeRevision ||
+            artifact.metadata.device.kind !== report.target.kind ||
+            artifact.metadata.device.deviceId !== report.target.deviceId ||
+            artifact.metadata.device.model !== report.target.model ||
+            artifact.metadata.device.androidVersion !== report.target.androidVersion ||
+            artifact.metadata.device.apiLevel !== report.target.apiLevel ||
+            artifact.metadata.app.packageName !== report.applicationId ||
+            artifact.metadata.build.changeId !== report.build.changeId ||
+            artifact.metadata.build.apkSha256 !== report.build.apkSha256 ||
+            artifact.metadata.build.installedAt !== report.build.installedAt
+          ) throw new Error('screenshot artifact no longer matches the acceptance receipt')
+        }
+        for (const log of report.logs) {
+          this.runs.verifyRetainedReference(roomId, log, ANDROID_ACCEPTANCE_LOG_MAX_BYTES)
+        }
+      }
+    } catch (error) {
+      throw new DevHotelError(
+        'ANDROID_ACCEPTANCE_EVIDENCE_CORRUPT',
+        'This acceptance report no longer has every immutable artifact and retained-log byte it authenticated.',
+        { recoveryHint: 'Treat the report as invalid and create a new one.', httpStatus: 409, cause: error }
+      )
+    }
+    if (!report) {
+      throw new DevHotelError('ANDROID_ACCEPTANCE_NOT_FOUND', 'Android acceptance report was not found in this Room.', {
+        recoveryHint: 'List this Room’s acceptance reports and use one of its opaque report IDs.',
+        httpStatus: 404
+      })
+    }
+    return { report, markdown: androidAcceptanceReportMarkdown(report) }
+  }
   /**
    * Phone screen as base64 PNG. 'auto' prefers the sharp guest-side screencap;
    * 'screen' grabs the X display instead, which also shows FLAG_SECURE apps
@@ -4095,7 +6278,10 @@ export class RoomOrchestrator {
   private async openAndroidAutomationSessionLocked(
     roomId: string,
     selector: AndroidTargetSelector,
-    options: { allowPendingRecovery?: boolean } = {}
+    options: {
+      allowPendingRecovery?: boolean
+      physicalAcceptanceProofGate?: PhysicalAcceptanceProofGate
+    } = {}
   ): Promise<AndroidAutomationSession> {
     this.assertRoomLockHeld(roomId)
     const room = this.mustGet(roomId)
@@ -4154,6 +6340,16 @@ export class RoomOrchestrator {
         },
         installs: this.androidInstalls,
         exec: async (args, opts) => {
+          const proofGate = options.physicalAcceptanceProofGate
+          const proofRead = isPhysicalAcceptanceProofReadCommand(args, opts?.operation)
+          const ordinaryRead = isPhysicalAutomationReadCommand(args, opts?.operation)
+          if (proofGate && !proofRead) {
+            throw new DevHotelError(
+              'ANDROID_ACCEPTANCE_PROOF_WRITE_REFUSED',
+              'The final physical acceptance proof refused a non-read-only Android command.',
+              { recoveryHint: 'Run final acceptance with the built-in unchanged-state proof only.', httpStatus: 409 }
+            )
+          }
           const authorized = this.devices.authorizeInternalOperation(
             roomId,
             attached.id,
@@ -4171,7 +6367,9 @@ export class RoomOrchestrator {
               onStderr: opts?.onStderr
             }),
             true,
-            opts?.signal
+            opts?.signal,
+            proofGate ? 'proof' : ordinaryRead ? 'read' : 'writer',
+            proofGate
           )
           return redactAdbResult(result, authorized.serial)
         }
@@ -4282,10 +6480,11 @@ export class RoomOrchestrator {
     if (!target.deviceId) {
       throw new Error('This Room has no physical Android device attached. Use run_in_room for its own emulator.')
     }
+    const deviceId = target.deviceId
     const authorize = (argv: string[], expectedLeaseId?: string | null): ReturnType<AndroidDeviceBroker['authorize']> =>
       internal
-        ? this.devices.authorizeInternalOperation(roomId, target.deviceId!, internal.reason, internal.expectedLeaseId)
-        : this.devices.authorize(roomId, target.deviceId!, argv, expectedLeaseId)
+        ? this.devices.authorizeInternalOperation(roomId, deviceId, internal.reason, internal.expectedLeaseId)
+        : this.devices.authorize(roomId, deviceId, argv, expectedLeaseId)
     // Refuse an unleased writer before copying any Room bytes into Host staging.
     const capturedAuthorization = authorize(args, internal?.expectedLeaseId)
     const capturedLeaseId = internal?.expectedLeaseId ?? capturedAuthorization.leaseId
@@ -4375,17 +6574,22 @@ export class RoomOrchestrator {
 
       // Re-check after staging: a short TTL may have expired while bytes moved.
       const authorized = authorize(executableArgs, capturedLeaseId)
-      // A raw install can replace one or several packages without producing a
-      // tracked receipt. Revoke every capability on this exact physical target
-      // before mutation, even when adb later reports an install failure.
-      if (ADB_INSTALL_VERBS.has(verb) && !internal) {
-        this.androidInstalls.invalidateTarget({ kind: 'physical', targetId: target.deviceId })
-      }
-      const result = await this.withDeviceHeartbeat(roomId, target.deviceId, authorized.leaseId, (signal) =>
-        this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs, signal }).catch((error: unknown) => {
+      const result = await this.withDeviceHeartbeat(roomId, deviceId, authorized.leaseId, (signal) =>
+        {
+          // The durable operation intent is already committed before this
+          // capability revocation. A proof gate therefore rejects the raw
+          // install without changing tracked-install metadata or spawning ADB.
+          if (ADB_INSTALL_VERBS.has(verb) && !internal) {
+            this.androidInstalls.invalidateTarget({ kind: 'physical', targetId: deviceId })
+          }
+          return this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs, signal }).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           throw new Error(redactAdbText(message, authorized.serial, outputReplacements))
-        })
+          })
+        },
+        true,
+        undefined,
+        classifyAdbCommand(executableArgs).interfering ? 'writer' : 'read'
       )
       // Defense in depth for read commands such as `cat`: even a vendor path
       // that happens to echo the transport serial cannot pierce the opaque ID.
@@ -4401,74 +6605,98 @@ export class RoomOrchestrator {
     expectedLeaseId: string | null,
     run: (signal: AbortSignal) => Promise<T>,
     busy = true,
-    callerSignal?: AbortSignal
+    callerSignal?: AbortSignal,
+    mode: 'writer' | 'read' | 'proof' = 'writer',
+    proofGate?: PhysicalAcceptanceProofGate
   ): Promise<T> {
-    if (!expectedLeaseId) return run(callerSignal ?? new AbortController().signal)
-    this.devices.authorizeInternalOperation(roomId, deviceId, 'starting the fenced device operation', expectedLeaseId)
-    const lease = this.devices.leaseForRoom(roomId)
-    if (!lease || lease.id !== expectedLeaseId || lease.deviceId !== deviceId) {
-      throw new Error('The captured Android device lease changed before execution')
+    if (mode === 'proof') {
+      if (
+        !proofGate ||
+        proofGate.roomId !== roomId ||
+        proofGate.deviceId !== deviceId ||
+        proofGate.leaseId !== expectedLeaseId
+      ) throw new Error('Physical acceptance proof command has no exact gate')
+      this.assertPhysicalAcceptanceProofGate(proofGate)
+    } else if (mode === 'read') {
+      this.assertNoPhysicalAcceptanceProofGate(deviceId)
     }
-    const controller = new AbortController()
-    const abortFromCaller = (): void => controller.abort(
-      callerSignal?.reason instanceof Error ? callerSignal.reason : new Error('Fenced Android operation was aborted')
-    )
-    if (callerSignal?.aborted) {
-      abortFromCaller()
-    } else if (callerSignal) {
-      callerSignal.addEventListener('abort', abortFromCaller, { once: true })
-      // Abort can race the precheck and listener registration. Re-read after
-      // registration so a state-changing Host ADB child cannot miss that edge.
-      if (callerSignal.aborted) abortFromCaller()
-    }
-    let fenceError: unknown
-    const pulse = (strict = false): void => {
+    const operation = mode === 'writer' && expectedLeaseId
+      ? this.beginPhysicalDeviceOperation(roomId, deviceId, expectedLeaseId)
+      : null
+    try {
+      if (!expectedLeaseId) return await run(callerSignal ?? new AbortController().signal)
+      this.devices.authorizeInternalOperation(roomId, deviceId, 'starting the fenced device operation', expectedLeaseId)
+      const lease = this.devices.leaseForRoom(roomId)
+      if (!lease || lease.id !== expectedLeaseId || lease.deviceId !== deviceId) {
+        throw new Error('The captured Android device lease changed before execution')
+      }
+      const controller = new AbortController()
+      const abortFromCaller = (): void => controller.abort(
+        callerSignal?.reason instanceof Error ? callerSignal.reason : new Error('Fenced Android operation was aborted')
+      )
+      if (callerSignal?.aborted) {
+        abortFromCaller()
+      } else if (callerSignal) {
+        callerSignal.addEventListener('abort', abortFromCaller, { once: true })
+        // Abort can race the precheck and listener registration. Re-read after
+        // registration so a state-changing Host ADB child cannot miss that edge.
+        if (callerSignal.aborted) abortFromCaller()
+      }
+      let fenceError: unknown
+      const pulse = (strict = false): void => {
+        try {
+          this.devices.authorizeInternalOperation(
+            roomId,
+            deviceId,
+            'continuing the fenced device operation',
+            expectedLeaseId
+          )
+          this.devices.heartbeat(expectedLeaseId, { busy })
+        } catch (error) {
+          fenceError ??= error
+          controller.abort(fenceError)
+          if (strict) throw error
+        }
+      }
+      pulse(true)
+      // This is an authorization fence, not only a TTL keepalive. A short pulse
+      // bounds how long an in-flight Host adb process may outlive lease loss.
+      const interval = Math.max(100, Math.min(1_000, Math.floor(lease.ttlMs / 6)))
+      const timer = setInterval(pulse, interval)
+      timer.unref?.()
+      let value!: T
+      let runError: unknown
+      let runFailed = false
       try {
-        this.devices.authorizeInternalOperation(
-          roomId,
-          deviceId,
-          'continuing the fenced device operation',
-          expectedLeaseId
-        )
-        this.devices.heartbeat(expectedLeaseId, { busy })
+        value = await run(controller.signal)
       } catch (error) {
-        fenceError ??= error
-        controller.abort(fenceError)
-        if (strict) throw error
+        runFailed = true
+        runError = error
+      } finally {
+        clearInterval(timer)
+        callerSignal?.removeEventListener('abort', abortFromCaller)
+      }
+      // No await may occur after this final exact-lease authorization. If lease
+      // loss aborted the process, its structured fence error takes precedence
+      // over the transport's AbortError or partial result.
+      pulse()
+      if (fenceError) throw fenceError
+      if (callerSignal?.aborted || controller.signal.aborted) {
+        throw callerSignal?.reason instanceof Error
+          ? callerSignal.reason
+          : controller.signal.reason instanceof Error
+            ? controller.signal.reason
+            : new Error('Fenced Android operation was aborted')
+      }
+      if (runFailed) throw runError
+      return value
+    } finally {
+      // Promise completion from the Host ADB runner is the child `close`
+      // boundary. Never remove a durable writer intent before that boundary.
+      if (operation && expectedLeaseId) {
+        this.finishPhysicalDeviceOperation(operation, roomId, deviceId, expectedLeaseId)
       }
     }
-    pulse(true)
-    // This is an authorization fence, not only a TTL keepalive. A short pulse
-    // bounds how long an in-flight Host adb process may outlive lease loss.
-    const interval = Math.max(100, Math.min(1_000, Math.floor(lease.ttlMs / 6)))
-    const timer = setInterval(pulse, interval)
-    timer.unref?.()
-    let value!: T
-    let runError: unknown
-    let runFailed = false
-    try {
-      value = await run(controller.signal)
-    } catch (error) {
-      runFailed = true
-      runError = error
-    } finally {
-      clearInterval(timer)
-      callerSignal?.removeEventListener('abort', abortFromCaller)
-    }
-    // No await may occur after this final exact-lease authorization. If lease
-    // loss aborted the process, its structured fence error takes precedence
-    // over the transport's AbortError or partial result.
-    pulse()
-    if (fenceError) throw fenceError
-    if (callerSignal?.aborted || controller.signal.aborted) {
-      throw callerSignal?.reason instanceof Error
-        ? callerSignal.reason
-        : controller.signal.reason instanceof Error
-          ? controller.signal.reason
-          : new Error('Fenced Android operation was aborted')
-    }
-    if (runFailed) throw runError
-    return value
   }
 
   androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
@@ -4535,9 +6763,10 @@ export class RoomOrchestrator {
             maxStdoutBytes: SCREENSHOT_ARTIFACT_MAX_BYTES,
             maxStderrBytes: 64 * 1024,
             signal: leaseSignal
-          }),
+        }),
         true,
-        signal
+        signal,
+        'read'
       )
       const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
       if (
@@ -5758,7 +7987,15 @@ export class RoomOrchestrator {
         physicalDevice
           ? {
               nickname: physicalDevice.nickname,
-              keepAlive: (run) => this.withDeviceHeartbeat(roomId, physicalDevice.id, capturePhysicalLease(), run, false)
+              keepAlive: (run) => this.withDeviceHeartbeat(
+                roomId,
+                physicalDevice.id,
+                capturePhysicalLease(),
+                run,
+                false,
+                undefined,
+                'read'
+              )
             }
           : undefined
     }
@@ -5782,7 +8019,16 @@ export class RoomOrchestrator {
       !/^[a-f0-9]{64}$/.test(artifact.apkSha256) ||
       !Number.isSafeInteger(artifact.sizeBytes) ||
       artifact.sizeBytes < 1 ||
-      artifact.sizeBytes > MAX_STAGED_APK_BYTES
+      artifact.sizeBytes > MAX_STAGED_APK_BYTES ||
+      !Number.isSafeInteger(artifact.acceptance.stateRevision) ||
+      artifact.acceptance.stateRevision < 0 ||
+      !Number.isSafeInteger(artifact.acceptance.workspaceVolumeRevision) ||
+      artifact.acceptance.workspaceVolumeRevision < 0 ||
+      !/^[a-f0-9]{64}$/.test(artifact.acceptance.sourceFingerprint) ||
+      !/^[a-f0-9]{64}$/.test(artifact.acceptance.environmentRevision) ||
+      !/^[a-f0-9]{64}$/.test(artifact.acceptance.imageSha256) ||
+      /@sha256:([a-f0-9]{64})$/.exec(artifact.acceptance.imageReference)?.[1] !==
+        artifact.acceptance.imageSha256
     ) {
       throw new Error('Android install refused invalid sealed artifact evidence')
     }
@@ -5832,9 +8078,6 @@ export class RoomOrchestrator {
       ) {
         throw new Error('Android sealed artifact changed while entering its private install stage')
       }
-      // Revoke immediately before the first target mutation. A failed or
-      // partially committed install must never leave the prior capability.
-      this.androidInstalls.invalidateTargetApplication(target, applicationId)
       let install: ExecResult
       if (target.kind === 'physical') {
         if (!expectedLeaseId) throw new Error('Physical Android install receipt has no captured lease')
@@ -5842,10 +8085,14 @@ export class RoomOrchestrator {
           roomId,
           target.deviceId,
           expectedLeaseId,
+          applicationId,
           stagedApk,
           '[sealed Android artifact]'
         )
       } else {
+        // Emulator isolation is process-owned. Physical receipt revocation is
+        // performed inside its durable operation intent below.
+        this.androidInstalls.invalidateTargetApplication(target, applicationId)
         install = await this.backend.installFencedEmulatorApk(roomId, stagedApk, {
           timeoutMs: 180_000,
           maxStdoutBytes: 64 * 1024,
@@ -5892,7 +8139,22 @@ export class RoomOrchestrator {
         packageIncarnation: evidence.packageIncarnation,
         logFence: evidence.logFence,
         installUserId: evidence.installUserId,
-        installUserSerial: evidence.installUserSerial
+        installUserSerial: evidence.installUserSerial,
+        acceptanceProvenance: {
+          artifactSizeBytes: artifact.sizeBytes,
+          stateRevision: artifact.acceptance.stateRevision,
+          workspaceVolumeRevision: artifact.acceptance.workspaceVolumeRevision,
+          sourceIdentity: this.androidAcceptanceIntegrity.identify(
+            'source',
+            artifact.acceptance.sourceFingerprint
+          ),
+          environmentIdentity: this.androidAcceptanceIntegrity.identify(
+            'environment',
+            artifact.acceptance.environmentRevision
+          ),
+          imageReference: artifact.acceptance.imageReference,
+          imageSha256: artifact.acceptance.imageSha256
+        }
       })
       try {
         // Close the evidence-return/SQLite-commit gap while the Room and exact
@@ -5951,6 +8213,7 @@ export class RoomOrchestrator {
     roomId: string,
     deviceId: string,
     expectedLeaseId: string,
+    applicationId: string,
     stagedApk: string,
     publicRoomPath: string
   ): Promise<ExecResult> {
@@ -5970,14 +8233,23 @@ export class RoomOrchestrator {
       'installing the tracked Android app',
       expectedLeaseId
     )
-    const result = await this.withDeviceHeartbeat(roomId, deviceId, expectedLeaseId, (signal) =>
-      this.devices.hostAdb.exec(authorized.serial, ['install', '-r', canonicalApk], {
+    const result = await this.withDeviceHeartbeat(roomId, deviceId, expectedLeaseId, (signal) => {
+      // The durable writer row is committed before invalidating the old
+      // install capability or spawning Host ADB. A live proof gate therefore
+      // produces zero target and receipt mutations.
+      this.androidInstalls.invalidateTargetApplication({
+        kind: 'physical',
+        targetId: deviceId,
+        deviceId,
+        leaseId: expectedLeaseId
+      }, applicationId)
+      return this.devices.hostAdb.exec(authorized.serial, ['install', '-r', canonicalApk], {
         timeoutMs: 180_000,
         signal,
         maxStdoutBytes: 64 * 1024,
         maxStderrBytes: 64 * 1024
       })
-    )
+    })
     return redactAdbResult(result, authorized.serial, [{ privateValue: canonicalApk, publicValue: publicRoomPath }])
   }
 

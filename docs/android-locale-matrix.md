@@ -87,6 +87,9 @@ serial, lease capability, or raw command output.
 Before the first mutation, the workflow double-reads the original locale around
 its target/install/user proof, then durably records that locale together with
 the exact managed-emulator target, package incarnation and user fence. The
+claim is one SQLite write that also requires the development-acceptance and
+artifact-export recovery keys for this Room to be absent, so two DevHotel
+processes cannot own distinct Room-mutating workflows concurrently. The
 durable record has a random operation capability and advances by compare-and-
 swap before each set. After the final previous-locale read and immediately
 before command creation, a synchronous compare-and-swap records that dispatch

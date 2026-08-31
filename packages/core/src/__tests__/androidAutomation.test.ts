@@ -5,6 +5,8 @@ import type { AndroidAutomationTarget } from '@devhotel/shared'
 import { DeviceLeaseError } from '@devhotel/shared'
 import {
   AndroidAutomationSession,
+  isPhysicalAcceptanceProofReadCommand,
+  isPhysicalAutomationReadCommand,
   parseAndroidUiHierarchy,
   type AndroidAutomationSessionOptions
 } from '../devices/androidAutomation'
@@ -206,6 +208,7 @@ describe('tracked Android automation session', () => {
     const timeouts: Array<number | undefined> = []
     const signals: Array<AbortSignal | undefined> = []
     const stdoutLimits: Array<number | undefined> = []
+    const operations: Array<string | undefined> = []
     let witnessBegin: string | null = null
     let witnessReader: {
       onStdout?: (chunk: string | Uint8Array) => void
@@ -262,6 +265,7 @@ describe('tracked Android automation session', () => {
       installs,
       exec: async (args, opts) => {
         calls.push(args)
+        operations.push(opts?.operation)
         timeouts.push(opts?.timeoutMs)
         signals.push(opts?.signal)
         stdoutLimits.push(opts?.maxStdoutBytes)
@@ -416,7 +420,7 @@ describe('tracked Android automation session', () => {
       },
       ...timing
     })
-    return { db, installs, calls, session, signals, stdoutLimits, timeouts }
+    return { db, installs, calls, operations, session, signals, stdoutLimits, timeouts }
   }
 
   it.each([
@@ -432,7 +436,7 @@ describe('tracked Android automation session', () => {
     userId
   }) => {
     let emittedFence = ''
-    const { calls, session } = setup((args) => {
+    const { calls, operations, session } = setup((args) => {
       if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: `${userId}\n`, stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
@@ -468,6 +472,13 @@ describe('tracked Android automation session', () => {
     expect(calls.find((args) => args[0] === 'logcat')).toEqual([
       'logcat', '-d', '-v', 'raw,printable', `--uid=${uid}`
     ])
+    const proofIndex = operations.indexOf('Android install log fence proof')
+    const proofArgs = calls[proofIndex]!
+    expect(isPhysicalAutomationReadCommand(proofArgs, operations[proofIndex])).toBe(true)
+    expect(isPhysicalAutomationReadCommand(
+      [...proofArgs, '--unexpected'],
+      operations[proofIndex]
+    )).toBe(false)
   })
 
   it('rejects install evidence when the active Android user changes during proof', async () => {
@@ -808,7 +819,7 @@ describe('tracked Android automation session', () => {
   })
 
   it('returns force-stop success only after exact-user foreground absence and the package stopped bit are proven', async () => {
-    const { session } = setup((args) => {
+    const { calls, operations, session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
@@ -817,6 +828,13 @@ describe('tracked Android automation session', () => {
     })
 
     await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
+    const proofIndex = operations.indexOf('Android force-stop state proof')
+    const proofArgs = calls[proofIndex]!
+    expect(isPhysicalAutomationReadCommand(proofArgs, operations[proofIndex])).toBe(true)
+    expect(isPhysicalAutomationReadCommand(
+      [...proofArgs.slice(0, 6), proofArgs[6]!.replace('devhotel-force-stop-', 'devhotel-force-stop-0')],
+      operations[proofIndex]
+    )).toBe(false)
   })
 
   it('accepts a proven stopped package when the screen has no current-focus window', async () => {
@@ -3324,7 +3342,7 @@ describe('tracked Android automation session', () => {
     const output = Object.entries(values)
       .map(([key, value]) => `${key}=${Buffer.from(value).toString('base64')}`)
       .join('\n') + '\n'
-    const { session } = setup((args) => {
+    const { calls, operations, session } = setup((args) => {
       if (args[1] === 'sh' && args[3]?.includes('emit pgrepStatus')) {
         pulseCalls += 1
         return { code: 0, stdout: output, stderr: '' }
@@ -3346,6 +3364,40 @@ describe('tracked Android automation session', () => {
     await expect(session.proveAppLocaleFinalState(APP_ID, initial.restoreFence))
       .resolves.toMatchObject({ localeTags: ['en-US'], pids: [101, 102] })
     expect(pulseCalls).toBe(2)
+    expect(calls.flatMap((args, index) =>
+      isPhysicalAcceptanceProofReadCommand(args, operations[index])
+        ? []
+        : [{ args, operation: operations[index] }]
+    )).toEqual([])
+    const packageDumpIndex = operations.indexOf('Android package shared-UID declaration probe')
+    const packageDump = calls[packageDumpIndex]!
+    expect(packageDump[6]).toMatch(/^devhotel-package-dump-/)
+    expect(isPhysicalAcceptanceProofReadCommand(
+      [...packageDump.slice(0, 6), packageDump[6]!.slice('devhotel-package-dump-'.length)],
+      operations[packageDumpIndex]
+    )).toBe(false)
+    expect(isPhysicalAcceptanceProofReadCommand(
+      [...packageDump.slice(0, 6), `devhotel-package-dump-${'0'.repeat(36)}`],
+      operations[packageDumpIndex]
+    )).toBe(false)
+    expect(isPhysicalAcceptanceProofReadCommand(
+      ['shell', 'cmd', 'locale', 'set-app-locales', APP_ID, '--user', '0', '--locales', 'ko-KR'],
+      'Android app locale mutation'
+    )).toBe(false)
+    expect(isPhysicalAcceptanceProofReadCommand(
+      ['shell', 'am', 'start', '-W', '--user', '0', '-n', `${APP_ID}/.MainActivity`],
+      'Android app launch'
+    )).toBe(false)
+    expect(isPhysicalAutomationReadCommand(
+      ['shell', 'getprop', 'persist.sys.locale'],
+      'Android locale probe'
+    )).toBe(true)
+    expect(isPhysicalAutomationReadCommand(['get-state'], 'ADB locale readiness probe')).toBe(true)
+    expect(isPhysicalAutomationReadCommand(['get-state', 'unexpected'], 'ADB locale readiness probe')).toBe(false)
+    expect(isPhysicalAutomationReadCommand(
+      ['shell', 'some-new-oem-tool', '--wipe'],
+      'new helper without an audited read contract'
+    )).toBe(false)
   })
 
   it('rejects a reinstall that lands during the final locale snapshot read', async () => {

@@ -1,12 +1,17 @@
 import { z } from 'zod'
 import {
   zAndroidActivityName,
+  zAndroidAcceptanceReportId,
+  zAndroidAcceptanceReportListLimit,
+  zAndroidAcceptanceStage,
+  zAndroidAcceptanceStepInput,
   zAndroidApplicationId,
   zAndroidCrashScenario,
   zAndroidExtras,
   zAndroidLocaleScreenshotMatrixBody,
   zAndroidTargetSelector,
   zAndroidTextMatch,
+  zCreateAndroidAcceptanceReportBody,
   zArtifactFilename,
   zArtifactExportBody,
   zArtifactId,
@@ -117,6 +122,24 @@ function wrap(fn: (args: any) => Promise<unknown>): (args: any) => Promise<ToolR
   return async (args) => {
     try {
       return ok(await fn(args))
+    } catch (err) {
+      return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+    }
+  }
+}
+
+function wrapAcceptance(
+  fn: (args: any) => Promise<{ report: unknown; markdown: string }>
+): (args: any) => Promise<ToolResult> {
+  return async (args) => {
+    try {
+      const result = await fn(args)
+      return {
+        content: [
+          { type: 'text', text: result.markdown },
+          { type: 'text', text: JSON.stringify(result.report, null, 2) }
+        ]
+      }
     } catch (err) {
       return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
     }
@@ -499,6 +522,41 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       },
       handler: wrap(async (a) =>
         (await getClient()).exportRoomArtifact(a.roomId, a.artifactId, { relativePath: a.relativePath })
+      )
+    },
+    {
+      name: 'android_create_acceptance_report',
+      description:
+        'Create one immutable keyed Android acceptance report from a verified android_run, exact Room source/build/target state, durable screenshot IDs, and completed retained run bytes. Development is emulator-only. Final physical acceptance requires an explicit opaque device ID and the exact active purpose=acceptance lease. Optional crash evidence restores and reproves locale, foreground, and tracked readiness before any report is committed. Returns bounded GitHub-ready Markdown and JSON without raw logs, commands, serials, lease capabilities, or Host paths.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        stage: zAndroidAcceptanceStage.optional(),
+        target: zAndroidTargetSelector.optional(),
+        steps: z.array(zAndroidAcceptanceStepInput).min(1).max(32),
+        includeCrashScenario: z.boolean().optional(),
+        timeoutMs: z.number().int().min(1_000).max(120_000).optional()
+      },
+      handler: wrapAcceptance(async (a) => {
+        const { roomId, ...rawInput } = a
+        const input = zCreateAndroidAcceptanceReportBody.parse(rawInput)
+        return (await getClient()).createAndroidAcceptanceReport(roomId, input)
+      })
+    },
+    {
+      name: 'list_android_acceptance_reports',
+      description:
+        'List keyed immutable Android acceptance receipt summaries for one Room. This never returns raw commands, logs, source, serials, lease capabilities, or Host paths.',
+      schema: { roomId: zRoomId, limit: zAndroidAcceptanceReportListLimit.optional() },
+      handler: wrap(async (a) => (await getClient()).listAndroidAcceptanceReports(a.roomId, a.limit))
+    },
+    {
+      name: 'get_android_acceptance_report',
+      description:
+        'Read and reverify one Room-scoped Android acceptance report, its screenshot artifacts, and pinned retained-log bytes. Returns bounded Markdown plus JSON; screenshots remain retrieval descriptors for read_room_artifact because export paths are not durable evidence.',
+      schema: { roomId: zRoomId, reportId: zAndroidAcceptanceReportId },
+      handler: wrapAcceptance(async (a) =>
+        (await getClient()).getAndroidAcceptanceReport(a.roomId, a.reportId)
       )
     },
     {

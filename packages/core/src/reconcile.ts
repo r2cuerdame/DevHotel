@@ -51,6 +51,9 @@ export async function reconcile(
     // Windows VMs have a separate ownership ledger and lifecycle reconciler.
     // Never hand one to the OCI backend just because it shares the Room table.
     if (room.provider === 'windows') continue
+    // Some startup recovery protocols retain an exact live runtime as durable
+    // restoration authority. Stopping or sleeping it here would turn their
+    // mutation gate into a permanent recovery deadlock.
     if (room.status === 'sleeping') continue
     if (
       options.preserveAwakeRoomIds?.has(room.id) &&
