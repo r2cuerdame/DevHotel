@@ -149,7 +149,7 @@ describe('Android acceptance orchestration', () => {
         installUserSerial: 42
       }
     }
-    const calls = { applyLocales: 0, launch: 0 }
+    const calls = { applyLocales: 0, launch: 0, screenWitness: 0, shellLogWriters: 0 }
     const restoreFence = {
       targetKind: 'emulator' as const,
       targetId: ROOM_ID,
@@ -199,6 +199,10 @@ describe('Android acceptance orchestration', () => {
       withActiveUserScreenWitness: async <T>(
         action: (signal: AbortSignal) => Promise<T>
       ): Promise<T> => {
+        calls.screenWitness += 1
+        // Model the production witness's first `adb shell log` marker so a
+        // zero-witness assertion is also an explicit zero-target-writer check.
+        calls.shellLogWriters += 1
         insideScreenWitness = true
         try {
           return await action(new AbortController().signal)
@@ -669,7 +673,9 @@ describe('Android acceptance orchestration', () => {
       expect(observedIntent).not.toBeNull()
       expect(Buffer.byteLength(observedIntent!, 'utf8')).toBeLessThanOrEqual(8 * 1024)
       expect(JSON.parse(observedIntent!)).toMatchObject({
-        version: 1,
+        version: 2,
+        phase: 'mutating',
+        ownerWorkerId: `pid:${process.pid}`,
         roomStateRevision: 7,
         workspaceVolumeRevision: 3,
         applicationId: APP_ID,
@@ -735,10 +741,105 @@ describe('Android acceptance orchestration', () => {
     expect(test.orch.settings.get(acceptanceKey)).toBeNull()
     expect(test.calls.launch).toBe(0)
     expect(test.calls.applyLocales).toBe(0)
+    expect(test.calls.screenWitness).toBe(0)
+    expect(test.calls.shellLogWriters).toBe(0)
+    expect(test.adb.execs).toEqual([])
+    expect(test.backend.captureRoomArtifactWebFenceCalls).toHaveLength(1)
     expect(test.backend.pauseRoomArtifactWebCalls).toEqual([])
     expect(test.backend.restoreRoomArtifactWebCalls).toEqual([])
     expect(test.backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
+    expect(test.backend.calls.some((call) => call.startsWith('removeWorkspaceSnapshot:'))).toBe(false)
     expect(test.orch.listAndroidAcceptanceReports(ROOM_ID)).toEqual([])
+  })
+
+  it('releases a dead pre-mutation reservation without starting target or runtime recovery', async () => {
+    const test = setup()
+    const key = `androidAcceptanceRestorePending:${ROOM_ID}`
+    const deleteOwned = test.orch.settings.deleteIfValue.bind(test.orch.settings)
+    const deleteSpy = vi.spyOn(test.orch.settings, 'deleteIfValue').mockImplementation(
+      (settingKey, value) => settingKey === key ? false : deleteOwned(settingKey, value)
+    )
+    test.session.proveAppLocaleFinalState = async () => {
+      throw new Error('simulated owner exit after the reservation commit')
+    }
+
+    await expect(test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      includeCrashScenario: true,
+      steps: [{ id: 'reserved-crash-window', status: 'pass', logRunIds: [test.runId] }]
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED' })
+
+    const retained = test.orch.settings.get(key)
+    expect(retained).not.toBeNull()
+    expect(JSON.parse(retained!)).toMatchObject({
+      version: 2,
+      phase: 'reserved',
+      ownerWorkerId: `pid:${process.pid}`
+    })
+    expect(test.calls.screenWitness).toBe(0)
+    expect(test.calls.shellLogWriters).toBe(0)
+    expect(test.calls.launch).toBe(0)
+    expect(test.calls.applyLocales).toBe(0)
+    expect(test.backend.pauseRoomArtifactWebCalls).toEqual([])
+    expect(test.backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(test.backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
+    expect(test.adb.execs).toEqual([])
+
+    deleteSpy.mockRestore()
+    const deadOwner = { ...JSON.parse(retained!), ownerWorkerId: 'pid:0' }
+    test.orch.settings.set(key, JSON.stringify(deadOwner))
+    test.backend.calls.length = 0
+    test.openSessionSpy.mockClear()
+    const internal = test.orch as unknown as {
+      reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent: boolean): Promise<void>
+    }
+    await internal.reconcileInterruptedAndroidAcceptanceRestores(true)
+
+    expect(test.orch.settings.get(key)).toBeNull()
+    expect(test.openSessionSpy).not.toHaveBeenCalled()
+    expect(test.calls.screenWitness).toBe(0)
+    expect(test.calls.shellLogWriters).toBe(0)
+    expect(test.calls.launch).toBe(0)
+    expect(test.calls.applyLocales).toBe(0)
+    expect(test.backend.pauseRoomArtifactWebCalls).toEqual([])
+    expect(test.backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(test.backend.calls.some((call) =>
+      call.startsWith('startExistingEmulatorForRecovery:') ||
+      call.startsWith('removeWorkspaceSnapshot:') ||
+      call.startsWith('copyVolume:')
+    )).toBe(false)
+  })
+
+  it('recovers an ambiguous mutating phase when the first pause fails before changing the runtime', async () => {
+    const test = setup()
+    const key = `androidAcceptanceRestorePending:${ROOM_ID}`
+    test.backend.pauseRoomArtifactWebHandler = async () => {
+      throw new Error('pause failed before changing the runtime')
+    }
+    test.backend.restoreRoomArtifactWebHandler = async () => {
+      throw new Error('simulated process loss before inline recovery completed')
+    }
+
+    await expect(test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      steps: [{ id: 'first-pause-crash-window', status: 'pass', logRunIds: [test.runId] }]
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_FAILED' })
+
+    const retained = test.orch.settings.get(key)
+    expect(retained).not.toBeNull()
+    expect(JSON.parse(retained!)).toMatchObject({ version: 2, phase: 'mutating' })
+    expect(test.backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
+    expect(test.backend.calls.filter((call) => call.startsWith('removeWorkspaceSnapshot:'))).toHaveLength(1)
+
+    test.backend.pauseRoomArtifactWebHandler = null
+    test.backend.restoreRoomArtifactWebHandler = null
+    await test.orch.init()
+
+    expect(test.orch.settings.get(key)).toBeNull()
+    expect(test.backend.restoreRoomArtifactWebCalls).toHaveLength(2)
+    expect(test.backend.calls.filter((call) => call.startsWith('removeWorkspaceSnapshot:'))).toHaveLength(2)
+    expect(test.backend.calls).toContain(`startExistingEmulatorForRecovery:${ROOM_ID}`)
+    expect(test.orch.rooms.get(ROOM_ID)?.status).not.toBe('attention')
   })
 
   it('retains a failed restore intent as a mutation gate and recovers it during startup', async () => {

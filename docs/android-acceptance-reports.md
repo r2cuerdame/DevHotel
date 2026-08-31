@@ -21,8 +21,15 @@ material without publishing those inputs. An empty app-locale list explicitly
 means the app follows the system locale.
 
 Development acceptance may launch and crash the managed Room emulator. It
-captures the original API 33+ app-locale list, owns a durable emulator-only
-restore intent before mutation, restores the exact locale and runtime, and
+captures a strictly read-only API 33+ app-locale/install/runtime seed, then
+atomically owns a durable emulator-only reservation before even the initial
+screen-witness log marker. After acquisition it re-proves every seed and fence
+before entering that witness. A synchronous `reserved` to `mutating` CAS lands
+immediately before the first recoverable runtime pause; only the latter phase
+requires locale/runtime recovery. A provably dead `reserved` owner is released
+after startup proves stale jobs absent, without launching, restoring, pausing,
+or otherwise writing the emulator/runtime. Development acceptance restores the
+exact locale and runtime after a `mutating` phase, and
 requires the same bounded foreground/install/user/API/PID proof before
 publication. Startup recovery restarts only the exact retained emulator and
 keeps an unproven intent attention-gated.
