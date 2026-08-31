@@ -80,6 +80,32 @@ export interface ExportedArtifact {
   sha256: string
 }
 
+/** Immutable identity the backend must prove before and after publishing a Room artifact. */
+export interface RoomArtifactExpectation {
+  sizeBytes: number
+  sha256: string
+}
+
+export type RoomArtifactPublicationFailureReason =
+  | 'invalid-source'
+  | 'invalid-input'
+  | 'unsafe-parent'
+  | 'destination-exists'
+  | 'fence-changed'
+  | 'publication-ambiguous'
+  | 'helper-failed'
+
+/** Stable cross-backend failure contract; callers must not infer security outcomes from text. */
+export class RoomArtifactPublicationError extends Error {
+  constructor(
+    readonly reason: RoomArtifactPublicationFailureReason,
+    message: string
+  ) {
+    super(message)
+    this.name = 'RoomArtifactPublicationError'
+  }
+}
+
 export interface IsolationBackend {
   health(): Promise<{ ok: boolean; detail: string }>
   createRoomPod(
@@ -99,6 +125,8 @@ export interface IsolationBackend {
   unpauseWeb(roomId: string): Promise<void>
   /** Exact execution fence state; acceptance code must not infer this from `running`. */
   webPaused(roomId: string): Promise<boolean>
+  /** One owned-container inspect proving the web workload is both running and not paused. */
+  webRunningUnpaused(roomId: string): Promise<boolean>
   restartWeb(roomId: string): Promise<void>
   recreateWeb(spec: WebSpec): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
@@ -126,6 +154,18 @@ export interface IsolationBackend {
     artifactsRoot: string,
     operationId: string
   ): Promise<ExportedArtifact[]>
+  /**
+   * Atomically publish one Host-private PNG into the active owned workspace.
+   * The production backend accepts only an exact paused web-container fence and
+   * independently proves both the private input and the final workspace file.
+   */
+  publishRoomArtifact(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    hostPngPath: string,
+    relativePath: string,
+    expected: RoomArtifactExpectation
+  ): Promise<void>
   webState(roomId: string): Promise<'running' | 'exited' | 'missing'>
   listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]>
   /** Remove a container after re-validating exact DevHotel ownership metadata. */

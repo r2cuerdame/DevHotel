@@ -1,27 +1,33 @@
+import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type {
-  AgentCreateRoomInput,
-  AndroidAutomationStatus,
-  AndroidCrashScenarioResult,
-  AndroidDumpUiInput,
-  AndroidForceStopInput,
-  AndroidForceStopResult,
-  AndroidLaunchAppInput,
-  AndroidLaunchResult,
-  AndroidLogcatInput,
-  AndroidLogcatResult,
-  AndroidRunCrashScenarioInput,
-  AndroidTapTextInput,
-  AndroidTapTextResult,
-  AndroidTargetSelector,
-  AndroidUiDumpResult,
-  AndroidWaitForTextInput,
-  AndroidWaitForTextResult,
-  ControlInfo,
-  OperationRecord,
-  QuickChange
+import {
+  SCREENSHOT_ARTIFACT_MAX_BYTES,
+  type AgentCreateRoomInput,
+  type AndroidAutomationStatus,
+  type AndroidCrashScenarioResult,
+  type AndroidDumpUiInput,
+  type AndroidForceStopInput,
+  type AndroidForceStopResult,
+  type AndroidLaunchAppInput,
+  type AndroidLaunchResult,
+  type AndroidLogcatInput,
+  type AndroidLogcatResult,
+  type AndroidRunCrashScenarioInput,
+  type AndroidTapTextInput,
+  type AndroidTapTextResult,
+  type AndroidTargetSelector,
+  type AndroidUiDumpResult,
+  type AndroidWaitForTextInput,
+  type AndroidWaitForTextResult,
+  type ArtifactExportBody,
+  type ArtifactExportResult,
+  type CaptureScreenshotArtifactBody,
+  type ControlInfo,
+  type OperationRecord,
+  type QuickChange,
+  type RoomArtifact
 } from '@devhotel/shared'
 
 /** Bounded-output selection understood by the control API's exec and run reads. */
@@ -125,6 +131,59 @@ export class ControlClient {
     }
     if (res.status === 204) return undefined as T
     return (await res.json()) as T
+  }
+
+  private async reqBytes(path: string): Promise<{ bytes: Buffer; sha256: string }> {
+    const url = `http://127.0.0.1:${this.info.port}${path}`
+    let res: Response
+    try {
+      res = await fetch(url, { headers: { authorization: `Bearer ${this.info.token}` } })
+    } catch (err) {
+      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`)
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new Error(`DevHotel control API ${res.status}: ${text || res.statusText}`)
+    }
+    if (res.headers.get('content-type')?.split(';', 1)[0] !== 'image/png') {
+      throw new Error('DevHotel control API returned a non-PNG artifact')
+    }
+    const declaredHeader = res.headers.get('content-length')
+    const declared = declaredHeader === null ? null : Number(declaredHeader)
+    if (
+      declared !== null &&
+      (!Number.isSafeInteger(declared) || declared < 1 || declared > SCREENSHOT_ARTIFACT_MAX_BYTES)
+    ) {
+      throw new Error('DevHotel control API artifact has an invalid length or exceeds the 16MB response limit')
+    }
+    if (!res.body) throw new Error('DevHotel control API returned an empty artifact response')
+    const reader = res.body.getReader()
+    const chunks: Uint8Array[] = []
+    let length = 0
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      length += value.byteLength
+      if (length > SCREENSHOT_ARTIFACT_MAX_BYTES) {
+        await reader.cancel()
+        throw new Error('DevHotel control API artifact exceeds the 16MB response limit')
+      }
+      chunks.push(value)
+    }
+    const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), length)
+    if (declared !== null && declared !== bytes.byteLength) {
+      throw new Error('DevHotel control API artifact content length does not match')
+    }
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    if (bytes.byteLength < pngSignature.byteLength || !bytes.subarray(0, pngSignature.byteLength).equals(pngSignature)) {
+      throw new Error('DevHotel control API artifact bytes are not a PNG')
+    }
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    const expected = res.headers.get('x-devhotel-sha256')
+    if (!expected || !/^[a-f0-9]{64}$/.test(expected) || expected !== sha256) {
+      throw new Error('DevHotel control API artifact checksum does not match')
+    }
+    return { bytes, sha256 }
   }
 
   ping() {
@@ -266,6 +325,35 @@ export class ControlClient {
       'POST',
       `/v1/rooms/${encodeURIComponent(roomId)}/android/crash-scenario`,
       input
+    )
+  }
+  captureScreenshotArtifact(roomId: string, body: CaptureScreenshotArtifactBody) {
+    return this.req<RoomArtifact>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/artifacts/screenshots`, body)
+  }
+  listRoomArtifacts(roomId: string, limit?: number) {
+    const query = limit === undefined ? '' : `?limit=${limit}`
+    return this.req<{ artifacts: RoomArtifact[] }>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/artifacts${query}`
+    )
+  }
+  getRoomArtifact(roomId: string, artifactId: string) {
+    return this.req<RoomArtifact>(
+      'GET',
+      `/v1/rooms/${encodeURIComponent(roomId)}/artifacts/${encodeURIComponent(artifactId)}`
+    )
+  }
+  async readRoomArtifactContent(roomId: string, artifactId: string) {
+    const { bytes, sha256 } = await this.reqBytes(
+      `/v1/rooms/${encodeURIComponent(roomId)}/artifacts/${encodeURIComponent(artifactId)}/content`
+    )
+    return { data: bytes.toString('base64'), mimeType: 'image/png' as const, sizeBytes: bytes.byteLength, sha256 }
+  }
+  exportRoomArtifact(roomId: string, artifactId: string, body: ArtifactExportBody) {
+    return this.req<ArtifactExportResult>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/artifacts/${encodeURIComponent(artifactId)}/export`,
+      body
     )
   }
   pullFile(roomId: string, path: string) {

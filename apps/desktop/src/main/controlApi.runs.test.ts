@@ -49,6 +49,28 @@ describe('agent control API bounded command output', () => {
     })
   })
 
+  it('preserves the existing exec request contract above the bounded artifact route limit', async () => {
+    const execInRoom = vi.fn(async () => ({ code: 0, stdout: '', stderr: '', output: { runId: RUN_ID } }))
+    const cmd = Array.from({ length: 8 }, (_, index) => `${index}-${'x'.repeat(10_000)}`)
+    const body = JSON.stringify({ cmd })
+    expect(Buffer.byteLength(body)).toBeGreaterThan(64 * 1024)
+
+    await withApi({ execInRoom } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {
+      const res = await fetch(`${base}/v1/rooms/room1abc/exec`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body
+      })
+      expect(res.status).toBe(200)
+      expect(execInRoom).toHaveBeenCalledWith(
+        'room1abc',
+        cmd,
+        { timeoutMs: undefined, output: undefined },
+        'agent'
+      )
+    })
+  })
+
   it('rejects an output selection the contract does not define', async () => {
     const execInRoom = vi.fn()
     await withApi({ execInRoom } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {

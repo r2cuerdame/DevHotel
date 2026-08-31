@@ -2523,6 +2523,39 @@ describe('tracked Android automation session', () => {
     expect(context.receipt).not.toHaveProperty('leaseId')
     expect(context.receipt).not.toHaveProperty('packageIncarnation')
     expect(context.receipt).not.toHaveProperty('logFence')
+
+    const evidence = await session.foregroundInstallEvidence()
+    expect(evidence.context).toEqual(context)
+    expect(evidence.seal).toMatchObject({
+      targetKind: 'emulator',
+      targetId: 'aaaa1111',
+      deviceId: null,
+      leaseId: null,
+      roomId: 'aaaa1111',
+      applicationId: APP_ID,
+      changeId: '11111111-2222-4333-8444-555555555555',
+      apkSha256: 'a'.repeat(64),
+      installedAt: INSTALLED_AT,
+      packageIncarnation: PACKAGE_INCARNATION,
+      logFence: INSTALL_LOG_FENCE,
+      installUserId: 0,
+      installUserSerial: INSTALL_USER_SERIAL
+    })
+  })
+
+  it('does not collapse an ambiguous foreground probe into durable no-app evidence', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
+      if (args[1] === 'sh' && args.at(-1)?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mFocusedApp=ActivityRecord{private stale value}\n', stderr: '' }
+      }
+      if (args[1] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.foregroundInstallEvidence()).rejects.toMatchObject({
+      code: 'ANDROID_FOREGROUND_UNKNOWN'
+    })
   })
 
   it('fails legacy receipts without user authority closed while preserving them for rerun', async () => {

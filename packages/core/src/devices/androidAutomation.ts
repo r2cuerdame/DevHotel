@@ -387,6 +387,26 @@ interface VerifiedTrackedInstall {
   installUserSerial: number
 }
 
+/** Core-only composition seal. Private lease/user/log authority must never be serialized. */
+export interface AndroidForegroundInstallEvidence {
+  context: AndroidForegroundInstallContext
+  seal: {
+    targetKind: AndroidInstallTarget['kind']
+    targetId: string
+    deviceId: string | null
+    leaseId: string | null
+    roomId: string
+    applicationId: string
+    changeId: string
+    apkSha256: string
+    installedAt: string
+    packageIncarnation: string
+    logFence: string | null
+    installUserId: number
+    installUserSerial: number
+  } | null
+}
+
 interface AndroidUserAuthority {
   userId: number
   serial: number
@@ -871,8 +891,8 @@ export class AndroidAutomationSession {
     )
   }
 
-  async status(): Promise<AndroidAutomationStatus> {
-    const activeUser = await this.currentUserAuthority()
+  async status(signal?: AbortSignal): Promise<AndroidAutomationStatus> {
+    const activeUser = await this.currentUserAuthority(undefined, signal)
     const installedApplicationIds: string[] = []
     const installed = new Map<string, VerifiedTrackedInstall>()
     for (const candidate of this.opts.installs.list(this.opts.roomId, this.opts.installTarget)) {
@@ -890,7 +910,7 @@ export class AndroidAutomationSession {
         candidateUser.serial !== activeUser.serial
       ) continue
       try {
-        const tracked = await this.requireInstalled(candidate.applicationId)
+        const tracked = await this.requireInstalled(candidate.applicationId, undefined, signal)
         installedApplicationIds.push(candidate.applicationId)
         installed.set(candidate.applicationId, tracked)
       } catch (error) {
@@ -902,23 +922,23 @@ export class AndroidAutomationSession {
     }
     const localeResult = await this.command(
       ['shell', 'getprop', 'persist.sys.locale'],
-      { operation: 'Android locale probe', timeoutMs: 10_000, stdoutLimit: 256 }
+      { operation: 'Android locale probe', timeoutMs: 10_000, stdoutLimit: 256, signal }
     )
     const locale = localeResult.code === 0 && /^[A-Za-z0-9_-]{2,35}$/.test(localeResult.stdout.trim())
       ? localeResult.stdout.trim()
       : null
-    const foreground = await this.foregroundPackage()
+    const foreground = await this.foregroundPackage(undefined, signal)
     for (const [applicationId, tracked] of installed) {
-      await this.assertTrackedInstall(applicationId, tracked)
+      await this.assertTrackedInstall(applicationId, tracked, undefined, signal)
     }
-    await this.assertActiveUser(activeUser)
+    await this.assertActiveUser(activeUser, undefined, signal)
     const foregroundTracked = foreground ? installed.get(foreground.applicationId) : undefined
     const foregroundApplicationId = foreground && foregroundTracked?.installUserId === foreground.userId
       ? foreground.applicationId
       : null
     if (foregroundApplicationId && foregroundTracked) {
-      await this.requireForeground(foregroundApplicationId, foregroundTracked.installUserId)
-      await this.assertTrackedInstall(foregroundApplicationId, foregroundTracked)
+      await this.requireForeground(foregroundApplicationId, foregroundTracked.installUserId, undefined, signal)
+      await this.assertTrackedInstall(foregroundApplicationId, foregroundTracked, undefined, signal)
     }
     return {
       target: this.target,
@@ -929,17 +949,56 @@ export class AndroidAutomationSession {
   }
 
   /** Safe metadata composition for lock-held artifact/acceptance workflows. */
-  async foregroundInstallContext(): Promise<AndroidForegroundInstallContext> {
-    const status = await this.status()
+  async foregroundInstallContext(signal?: AbortSignal): Promise<AndroidForegroundInstallContext> {
+    return (await this.foregroundInstallEvidence(signal)).context
+  }
+
+  /** Exact private seal for lock-held screenshot/report composition. */
+  async foregroundInstallEvidence(signal?: AbortSignal): Promise<AndroidForegroundInstallEvidence> {
+    const status = await this.status(signal)
+    if (status.foregroundApplicationId === null) {
+      const foreground = await this.foregroundPackage(undefined, signal)
+      if (foreground === undefined) {
+        throw automationError(
+          'ANDROID_FOREGROUND_UNKNOWN',
+          'DevHotel could not establish which application owns the foreground window.',
+          'Dismiss any system overlay, restore a responsive Android window manager, and retry the capture.',
+          409
+        )
+      }
+      return { context: { status, receipt: null }, seal: null }
+    }
     const tracked = status.foregroundApplicationId
-      ? await this.requireInstalled(status.foregroundApplicationId)
+      ? await this.requireInstalled(status.foregroundApplicationId, undefined, signal)
       : null
     if (tracked) {
-      await this.requireForeground(status.foregroundApplicationId!, tracked.installUserId)
-      await this.assertTrackedInstall(status.foregroundApplicationId!, tracked)
+      await this.requireForeground(status.foregroundApplicationId!, tracked.installUserId, undefined, signal)
+      await this.assertTrackedInstall(status.foregroundApplicationId!, tracked, undefined, signal)
     }
     const receipt = tracked?.receipt ?? null
-    return { status, receipt }
+    const context = { status, receipt }
+    if (!tracked || !status.foregroundApplicationId || tracked.packageIncarnation === null) {
+      return { context, seal: null }
+    }
+    const target = this.opts.installTarget
+    return {
+      context,
+      seal: {
+        targetKind: target.kind,
+        targetId: target.targetId,
+        deviceId: target.deviceId,
+        leaseId: target.kind === 'physical' ? target.leaseId : null,
+        roomId: receipt!.roomId,
+        applicationId: receipt!.applicationId,
+        changeId: receipt!.changeId,
+        apkSha256: receipt!.apkSha256,
+        installedAt: receipt!.installedAt,
+        packageIncarnation: tracked.packageIncarnation,
+        logFence: this.opts.installs.logFence(this.opts.roomId, target, status.foregroundApplicationId),
+        installUserId: tracked.installUserId,
+        installUserSerial: tracked.installUserSerial
+      }
+    }
   }
 
   /**

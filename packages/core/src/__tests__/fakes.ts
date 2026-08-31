@@ -4,7 +4,15 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
+import type {
+  AnchorSpec,
+  ExecOpts,
+  ExecResult,
+  ExportedArtifact,
+  IsolationBackend,
+  RoomArtifactExpectation,
+  WebSpec
+} from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type {
@@ -66,6 +74,13 @@ export class FakeBackend implements IsolationBackend {
   calls: string[] = []
   execInRoomCalls: { roomId: string; cmd: string[]; opts?: ExecOpts }[] = []
   oneShotCalls: { spec: WebSpec; cmd: string; opts?: ExecOpts }[] = []
+  publishRoomArtifactCalls: {
+    roomId: string
+    workspaceVolumeRevision: number
+    hostPngPath: string
+    relativePath: string
+    expected: RoomArtifactExpectation
+  }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
   webStateValue: 'running' | 'exited' | 'missing' = 'running'
@@ -78,6 +93,13 @@ export class FakeBackend implements IsolationBackend {
   execHandler: ((cmd: string[]) => ExecResult) | null = null
   oneShotHandler: ((spec: WebSpec, cmd: string, opts?: ExecOpts) => ExecResult) | null = null
   execInRoomHandler: ((roomId: string, cmd: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
+  publishRoomArtifactHandler: ((input: {
+    roomId: string
+    workspaceVolumeRevision: number
+    hostPngPath: string
+    relativePath: string
+    expected: RoomArtifactExpectation
+  }) => Promise<void> | void) | null = null
   copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
   relayTokenValue = ''
@@ -110,15 +132,22 @@ export class FakeBackend implements IsolationBackend {
   async pauseWeb(roomId: string) {
     this.calls.push(`pauseWeb:${roomId}`)
     this.webPausedValue = true
+    this.webRunningUnpausedValue = false
   }
   async unpauseWeb(roomId: string) {
     this.calls.push(`unpauseWeb:${roomId}`)
     this.webPausedValue = false
+    this.webRunningUnpausedValue = true
   }
   webPausedValue = false
   async webPaused(roomId: string) {
     this.calls.push(`webPaused:${roomId}`)
     return this.webPausedValue
+  }
+  webRunningUnpausedValue = true
+  async webRunningUnpaused(roomId: string) {
+    this.calls.push(`webRunningUnpaused:${roomId}`)
+    return this.webRunningUnpausedValue
   }
   async restartWeb(roomId: string) {
     this.calls.push(`restartWeb:${roomId}`)
@@ -126,6 +155,8 @@ export class FakeBackend implements IsolationBackend {
   async recreateWeb(spec: WebSpec) {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
+    this.webPausedValue = false
+    this.webRunningUnpausedValue = true
   }
   async recreateAnchor(spec: AnchorSpec) {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
@@ -190,6 +221,18 @@ export class FakeBackend implements IsolationBackend {
       })
     }
     return exported
+  }
+  async publishRoomArtifact(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    hostPngPath: string,
+    relativePath: string,
+    expected: RoomArtifactExpectation
+  ) {
+    const input = { roomId, workspaceVolumeRevision, hostPngPath, relativePath, expected }
+    this.calls.push(`publishRoomArtifact:${roomId}:r${workspaceVolumeRevision}:${relativePath}`)
+    this.publishRoomArtifactCalls.push(input)
+    await this.publishRoomArtifactHandler?.(input)
   }
   async webState() {
     return this.webStateValue
@@ -352,6 +395,7 @@ export class FakeBackend implements IsolationBackend {
     }
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
+  emulatorScreenPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
@@ -361,7 +405,7 @@ export class FakeBackend implements IsolationBackend {
   }
   async captureEmulatorScreen(roomId: string) {
     this.calls.push(`captureEmulatorScreen:${roomId}`)
-    return 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+    return this.emulatorScreenPng
   }
   async removeEmulator(roomId: string) {
     this.calls.push(`removeEmulator:${roomId}`)

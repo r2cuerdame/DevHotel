@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ControlClient, DevHotelNotRunningError, loadControlInfo, resilientClient } from '../client'
@@ -9,6 +10,25 @@ const TOKEN = 'test-token'
 const RUN_ID = '11111111-2222-3333-4444-555555555555'
 const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
 const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const ARTIFACT_ID = '99999999-8888-4777-8666-555555555555'
+const OVERSIZED_ARTIFACT_ID = '77777777-6666-4555-8444-333333333333'
+const ARTIFACT_PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from('directly-reviewable-png')
+])
+const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
+const artifact = {
+  id: ARTIFACT_ID,
+  roomId: 'abc12345',
+  kind: 'android-screenshot',
+  filename: 'login-success.png',
+  mediaType: 'image/png',
+  sizeBytes: ARTIFACT_PNG.byteLength,
+  sha256: ARTIFACT_SHA256,
+  actor: 'agent',
+  createdAt: '2026-08-31T00:00:00.000Z',
+  metadata: { schema: 1 }
+}
 const runningOperation = {
   id: OPERATION_ID,
   kind: 'room-start',
@@ -58,6 +78,42 @@ beforeAll(async () => {
       }
       if (req.url?.startsWith(`/v1/rooms/abc12345/runs/${RUN_ID}/output`)) {
         return void res.end(JSON.stringify({ runId: RUN_ID, stream: 'stderr', text: 'FATAL', eof: true }))
+      }
+      if (req.url === '/v1/rooms/abc12345/artifacts/screenshots' && req.method === 'POST') {
+        return void res.end(JSON.stringify({ ...artifact, filename: JSON.parse(raw).filename }))
+      }
+      if (req.url === '/v1/rooms/abc12345/artifacts?limit=5' && req.method === 'GET') {
+        return void res.end(JSON.stringify({ artifacts: [artifact] }))
+      }
+      if (req.url === `/v1/rooms/abc12345/artifacts/${ARTIFACT_ID}` && req.method === 'GET') {
+        return void res.end(JSON.stringify(artifact))
+      }
+      if (req.url === `/v1/rooms/abc12345/artifacts/${ARTIFACT_ID}/content` && req.method === 'GET') {
+        res.writeHead(200, {
+          'content-type': 'image/png',
+          'content-length': ARTIFACT_PNG.byteLength,
+          'x-devhotel-sha256': ARTIFACT_SHA256
+        })
+        return void res.end(ARTIFACT_PNG)
+      }
+      if (req.url === `/v1/rooms/abc12345/artifacts/${OVERSIZED_ARTIFACT_ID}/content` && req.method === 'GET') {
+        res.writeHead(200, {
+          'content-type': 'image/png',
+          'content-length': 16 * 1024 * 1024 + 1,
+          'x-devhotel-sha256': ARTIFACT_SHA256
+        })
+        return void res.end()
+      }
+      if (req.url === `/v1/rooms/abc12345/artifacts/${ARTIFACT_ID}/export` && req.method === 'POST') {
+        const relativePath = JSON.parse(raw).relativePath
+        return void res.end(JSON.stringify({
+          artifactId: ARTIFACT_ID,
+          path: `/workspace/${relativePath}`,
+          relativePath,
+          sizeBytes: ARTIFACT_PNG.byteLength,
+          sha256: ARTIFACT_SHA256,
+          markdown: `![login-success.png](${relativePath})`
+        }))
       }
       if (req.url === '/v1/rooms/abc12345/diagnostic') {
         return void res.end(JSON.stringify({ text: 'DevHotel Diagnostic Bundle\n...' }))
@@ -123,6 +179,10 @@ describe('ControlClient', () => {
 
   it('answers a start with the wake operation instead of a bare success', async () => {
     await expect(client().startRoom('abc12345')).resolves.toEqual({ operation: runningOperation })
+  })
+
+  it('rejects artifact content above the fixed response limit before buffering it', async () => {
+    await expect(client().readRoomArtifactContent('abc12345', OVERSIZED_ARTIFACT_ID)).rejects.toThrow(/16MB response limit/)
   })
 })
 
@@ -198,6 +258,7 @@ describe('makeTools', () => {
         'heartbeat_android_device',
         'inspect_room',
         'list_changes',
+        'list_room_artifacts',
         'list_rooms',
         'release_android_device',
         'rename_room',
@@ -208,6 +269,7 @@ describe('makeTools', () => {
         'room_logs',
         'list_room_runs',
         'read_run_output',
+        'read_room_artifact',
         'room_pull_file',
         'room_push_file',
         'run_in_room',
@@ -215,7 +277,8 @@ describe('makeTools', () => {
         'sleep_room',
         'start_room',
         'sync_from_host',
-        'undo_change'
+        'undo_change',
+        'export_room_artifact'
       ].sort()
     )
   })
@@ -241,6 +304,40 @@ describe('makeTools', () => {
     expect(firstText(res)).toContain('"code": 0')
     const req = seen.find((s) => s.url === '/v1/rooms/abc12345/exec')
     expect(req?.body.cmd).toEqual(['pnpm', 'install'])
+  })
+
+  it('captures a named screenshot as a durable artifact and returns a reviewable image', async () => {
+    const res = await byName.android_screenshot!.handler({
+      roomId: 'abc12345',
+      filename: 'login-success.png',
+      changeId: '11111111-2222-4333-8444-555555555555'
+    })
+
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]).toMatchObject({ type: 'text' })
+    expect(res.content[1]).toEqual({ type: 'image', data: ARTIFACT_PNG.toString('base64'), mimeType: 'image/png' })
+    expect(seen.find((request) => request.url === '/v1/rooms/abc12345/artifacts/screenshots')).toMatchObject({
+      body: {
+        filename: 'login-success.png',
+        mode: 'auto',
+        association: { changeId: '11111111-2222-4333-8444-555555555555' }
+      }
+    })
+  })
+
+  it('lists, reads and exports Room artifacts through bounded artifact routes', async () => {
+    const listed = await byName.list_room_artifacts!.handler({ roomId: 'abc12345', limit: 5 })
+    expect(firstText(listed)).toContain(ARTIFACT_ID)
+
+    const read = await byName.read_room_artifact!.handler({ roomId: 'abc12345', artifactId: ARTIFACT_ID })
+    expect(read.content[1]).toEqual({ type: 'image', data: ARTIFACT_PNG.toString('base64'), mimeType: 'image/png' })
+
+    const exported = await byName.export_room_artifact!.handler({
+      roomId: 'abc12345',
+      artifactId: ARTIFACT_ID,
+      relativePath: 'docs/login-success.png'
+    })
+    expect(firstText(exported)).toContain('![login-success.png](docs/login-success.png)')
   })
 
   it('run_in_room forwards the bounded-output selection to the control API', async () => {

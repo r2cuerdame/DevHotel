@@ -267,7 +267,12 @@ read-only into that helper.
 | `GET /v1/rooms/:id/operations` | `?limit=` | `{ operations }` — this Room's recent long operations, newest first |
 | `GET /v1/rooms/:id/logs` | `?kind=web\|orchestrator` | `{ lines[] }` tail |
 | `GET /v1/rooms/:id/diagnostic` | | `{ text }` secret-redacted bundle |
-| `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | `{ png: base64, source }` — Android rooms; `screen` captures the display (FLAG_SECURE included) |
+| `POST /v1/rooms/:id/artifacts/screenshots` | `{ filename: '*.png', mode?: 'auto'\|'screen', association?: { changeId?, runId? } }` | `201` plus an immutable screenshot artifact receipt. Filename is required; API 31+ and an exact tracked foreground install are required. Pixels and metadata are captured inside one active-screen witness; the response contains metadata, never image base64. |
+| `GET /v1/rooms/:id/artifacts` | `?limit=1..100` | `{ artifacts[] }`, newest first, metadata only |
+| `GET /v1/rooms/:id/artifacts/:artifactId` | | one metadata receipt; IDs are resolved only with the owning Room |
+| `GET /v1/rooms/:id/artifacts/:artifactId/content` | | bounded `image/png` bytes with `Content-Length` and `X-DevHotel-Sha256`; integrity is checked before any byte is served |
+| `POST /v1/rooms/:id/artifacts/:artifactId/export` | `{ relativePath: 'docs/evidence/shot.png' }` | atomically writes a new file only inside a Hotel-owned Room workspace and returns `{ path, relativePath, sizeBytes, sha256, markdown }`; every parent directory must already exist as a regular same-volume directory (create missing parents inside the Room before retrying). `markdown` is valid only from a repository-root Markdown document. Nested documents must rebase the returned `relativePath`, while issues/PRs need a repository/ref URL. Absolute/Host/backslash/`.`/`..`/`.git` paths and overwrites are refused |
+| `GET /v1/rooms/:id/screenshot` | `?mode=auto\|screen` | compatibility-only ephemeral `{ png: base64, source }`; use this for launcher, OS dialog, untracked-app, or API-before-31 captures that cannot satisfy the durable evidence contract |
 | `GET /v1/rooms/:id/file` | `?path=/workspace/…` | `{ path, size, contentBase64 }` (16MB cap) |
 | `PUT /v1/rooms/:id/file` | `{ path: '/workspace/…', contentBase64 }` | `{ path, size }` — creates parents, marks workspace modified |
 
@@ -280,6 +285,30 @@ rejected, as is any entry whose parent directory resolves outside the linked
 folder through a symlink. Included generated paths participate in the baseline
 and are copied during linked-folder import. A real conflict response has the shape
 `{ error: "workspace_drift", message, conflictReason: "room-source-modified", changedPaths: [{ path, reason }] }`.
+
+### Screenshot artifacts
+
+Screenshot bytes live in Hotel storage under their owning Room, not in a
+caller-selected Host path. Publication validates the complete PNG structure,
+CRC and bounded decoded dimensions, strips ancillary text/profile chunks, then
+atomically publishes `content.png` with a matching SQLite and on-disk receipt.
+Reads re-check size, SHA-256, receipt equality and PNG canonical form. A Room
+holds at most 500 screenshots and 1 GiB total; each image is at most 16 MiB.
+Crash-left temporary/unindexed screenshot directories are reconciled at startup,
+and deleting the Room removes both receipts and content.
+
+Durable publication is fail-closed: it requires API 31 or newer and an exact
+tracked foreground app. Pixels, capture time, active user, foreground app and
+install identity are sealed by one live screen witness; a user/focus/package,
+install, target, topology or physical-lease change withholds the artifact.
+Metadata always records the Room revisions, capture time/source/orientation,
+opaque device identity/API/model/version, tracked foreground package, locale,
+and exact install change/APK digest/time, plus an optional change/run
+association. Locale is reported as system scope when a validated system tag is
+available and as unknown otherwise. Raw device serials, lease capabilities,
+private user/log authority, Host paths and untracked foreground package names
+are never persisted. Structured metadata is passed through the same central
+secret redactor as diagnostics.
 
 ## Command output
 
