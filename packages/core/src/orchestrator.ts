@@ -1381,7 +1381,8 @@ export class RoomOrchestrator {
       report.begin('container-start', 'Start the Room containers')
       const { hostPort } = await this.backend.recreateAnchor({
         roomId,
-        internalPort: this.mustGet(roomId).internalPort
+        internalPort: this.mustGet(roomId).internalPort,
+        androidRuntimeIsolation: room.provider === 'android'
       })
       this.rooms.update(roomId, { hostPort, status: 'running' })
       let emulatorStarted = false

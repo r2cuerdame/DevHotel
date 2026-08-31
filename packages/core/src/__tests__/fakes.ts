@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
+import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type {
@@ -81,6 +81,7 @@ export class FakeBackend implements IsolationBackend {
   hostPort = 45000
   relayTokenValue = ''
   lastWebSpec: WebSpec | null = null
+  lastAnchorSpec: AnchorSpec | null = null
 
   async health() {
     return { ok: true, detail: 'fake docker' }
@@ -125,8 +126,9 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
   }
-  async recreateAnchor(spec: { roomId: string; internalPort: number; androidRuntimeIsolation?: boolean }) {
+  async recreateAnchor(spec: AnchorSpec) {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
+    this.lastAnchorSpec = spec
     return { hostPort: this.hostPort }
   }
   async deleteRoomPod(roomId: string) {

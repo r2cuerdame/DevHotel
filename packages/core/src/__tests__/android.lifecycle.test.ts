@@ -77,6 +77,11 @@ describe('Android room lifecycle', () => {
     await orch.startRoom(room.id, 'user')
 
     expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: backend.hostPort })
+    expect(backend.lastAnchorSpec).toEqual({
+      roomId: room.id,
+      internalPort: 6080,
+      androidRuntimeIsolation: true
+    })
     const anchorAt = backend.calls.indexOf(`recreateAnchor:${room.id}:6080`)
     const createAt = backend.calls.indexOf(`createEmulator:${room.id}:Pixel 6:15.0`)
     expect(anchorAt).toBeGreaterThanOrEqual(0)
