@@ -15,6 +15,7 @@ import type {
   RoomArtifactWebRuntimeFence,
   WebSpec
 } from '../backend/types'
+import { workspaceSnapshotVolume } from '../backend/naming'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type {
@@ -374,8 +375,18 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`importHostFolder:${hostPath}:r${revision}`)
   }
   workspaceFingerprintValue = 'fake-workspace-fingerprint'
-  async fingerprintWorkspace() {
-    return this.workspaceFingerprintValue
+  readonly workspaceVolumeFingerprints = new Map<string, string>()
+  fingerprintWorkspaceHandler:
+    ((workspaceVolumeOverride?: string) => Promise<string> | string) | null = null
+  async fingerprintWorkspace(
+    _roomId?: string,
+    _workspaceVolumeRevision?: number,
+    workspaceVolumeOverride?: string
+  ) {
+    if (this.fingerprintWorkspaceHandler) return this.fingerprintWorkspaceHandler(workspaceVolumeOverride)
+    return workspaceVolumeOverride
+      ? (this.workspaceVolumeFingerprints.get(workspaceVolumeOverride) ?? this.workspaceFingerprintValue)
+      : this.workspaceFingerprintValue
   }
   workspaceSnapshotEntries: import('../workspaceDrift').WorkspaceSnapshotEntry[] = []
   async snapshotWorkspace(_roomId: string, _workspaceVolumeRevision: number) {
@@ -398,12 +409,17 @@ export class FakeBackend implements IsolationBackend {
   }
   async removeWorkspaceSnapshot(_roomId: string, operationId: string) {
     this.calls.push(`removeWorkspaceSnapshot:${operationId}`)
+    this.workspaceVolumeFingerprints.delete(workspaceSnapshotVolume(_roomId, operationId))
   }
   async removeDependencyVolume(_roomId: string, nodeMajor: string, generation: number) {
     this.calls.push(`removeDependencyVolume:node${nodeMajor}:g${generation}`)
   }
   async copyVolume(_sourceRoomId: string, source: string, _targetRoomId: string, target: string) {
     this.calls.push(`copyVolume:${source}:${target}`)
+    this.workspaceVolumeFingerprints.set(
+      target,
+      this.workspaceVolumeFingerprints.get(source) ?? this.workspaceFingerprintValue
+    )
   }
   async volumeSizes() {
     return {}

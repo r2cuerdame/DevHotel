@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   zAgentCloneBody,
   zAndroidDumpUiBody,
+  zAndroidAcceptanceReportId,
+  zAndroidAcceptanceReportListLimit,
   zAndroidForceStopBody,
   zAndroidLaunchAppBody,
   zAbandonAndroidLocaleMatrixRecoveryBody,
@@ -14,6 +16,7 @@ import {
   zAndroidTapTextBody,
   zAndroidTargetSelector,
   zAndroidWaitForTextBody,
+  zCreateAndroidAcceptanceReportBody,
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
@@ -284,6 +287,52 @@ export async function startControlApi(
           )
           sendJson(res, 200, await orch.androidAutomationStatus(safeRoomId, target))
           return
+        }
+        if (action === 'acceptance-reports') {
+          const reportSegment = parts[5]
+          const queryKeys = [...url.searchParams.keys()]
+          if (!reportSegment && req.method === 'GET') {
+            if (queryKeys.some((key) => key !== 'limit') || url.searchParams.getAll('limit').length > 1) {
+              throw new DevHotelError(
+                'INVALID_ACCEPTANCE_QUERY',
+                'Acceptance report listing received an unsupported query field.',
+                { recoveryHint: 'Use only one optional limit between 1 and 20.', httpStatus: 400 }
+              )
+            }
+            const rawLimit = url.searchParams.get('limit')
+            const limit = rawLimit === null
+              ? undefined
+              : parseAndroidBody(zAndroidAcceptanceReportListLimit, Number(rawLimit))
+            sendJson(res, 200, { reports: orch.listAndroidAcceptanceReports(safeRoomId, limit) })
+            return
+          }
+          if (reportSegment && !parts[6] && req.method === 'GET') {
+            if (queryKeys.length > 0) {
+              throw new DevHotelError(
+                'INVALID_ACCEPTANCE_QUERY',
+                'Acceptance report reads do not accept query fields.',
+                { recoveryHint: 'Address the report only by its Room-scoped opaque report ID.', httpStatus: 400 }
+              )
+            }
+            const reportId = parseAndroidBody(zAndroidAcceptanceReportId, reportSegment)
+            sendJson(res, 200, orch.getAndroidAcceptanceReport(safeRoomId, reportId))
+            return
+          }
+          if (!reportSegment && req.method === 'POST') {
+            if (queryKeys.length > 0) {
+              throw new DevHotelError(
+                'INVALID_ACCEPTANCE_QUERY',
+                'Acceptance report creation does not accept query fields.',
+                { recoveryHint: 'Send only the documented strict JSON body.', httpStatus: 400 }
+              )
+            }
+            const body = parseAndroidBody(
+              zCreateAndroidAcceptanceReportBody,
+              await readBody(req, ANDROID_AUTOMATION_BODY_LIMIT_BYTES)
+            )
+            sendJson(res, 201, await orch.createAndroidAcceptanceReport(safeRoomId, body, 'agent'))
+            return
+          }
         }
         if (req.method === 'POST') {
           const body = await readBody(req, ANDROID_AUTOMATION_BODY_LIMIT_BYTES)

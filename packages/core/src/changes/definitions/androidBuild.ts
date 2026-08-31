@@ -55,6 +55,8 @@ export type AndroidBuildProvenance = z.infer<typeof provenanceSchema>
 export interface SealedAndroidBuild {
   provenance: AndroidBuildProvenance
   artifactHostDirectory: string
+  /** Exact transactional Room source copied into the immutable snapshot. */
+  sourceFingerprint: string
 }
 
 export interface SealedAndroidArtifactRef {
@@ -62,6 +64,15 @@ export interface SealedAndroidArtifactRef {
   relativePath: string
   sizeBytes: number
   apkSha256: string
+  /** Core-only material authenticated at install time; never enters the public install receipt. */
+  acceptance: {
+    stateRevision: number
+    workspaceVolumeRevision: number
+    sourceFingerprint: string
+    environmentRevision: string
+    imageReference: string
+    imageSha256: string
+  }
 }
 
 function sha256(value: string): string {
@@ -78,7 +89,7 @@ function sha256File(path: string): Promise<string> {
   })
 }
 
-function environmentRevision(room: RoomRecord): string {
+export function androidBuildEnvironmentRevision(room: RoomRecord): string {
   const env = Object.fromEntries(Object.entries(room.os.env).sort(([a], [b]) => a.localeCompare(b)))
   return sha256(JSON.stringify({
     provider: 'android',
@@ -276,7 +287,7 @@ export async function buildSealedAndroidArtifacts(
         stateRevision: room.stateRevision,
         workspaceVolumeRevision: room.workspaceVolumeRevision,
         buildInputSha256,
-        environmentRevision: environmentRevision(room)
+        environmentRevision: androidBuildEnvironmentRevision(room)
       },
       command: room.startCommand,
       artifactsDirectory: artifactRelativeDir,
@@ -297,7 +308,7 @@ export async function buildSealedAndroidArtifacts(
       throw new Error('Android build provenance could not be sealed')
     }
     steps.push(`Seal ${artifacts.length} Host-private APK artifact${artifacts.length === 1 ? '' : 's'} with SHA-256 provenance`)
-    sealed = { provenance, artifactHostDirectory: artifactHostDir }
+    sealed = { provenance, artifactHostDirectory: artifactHostDir, sourceFingerprint }
   } catch (error) {
     primaryError = error
     const artifactCleanupError = cleanupAndroidBuildArtifacts(ctx.userData, room.id, operation.id)
@@ -429,11 +440,21 @@ export function sealedAndroidArtifactRef(
   if (!build.provenance.artifacts.some((candidate) => isDeepStrictEqual(candidate, artifact))) {
     throw new Error('Android artifact is not part of the sealed build')
   }
+  const imageSha256 = /@sha256:([a-f0-9]{64})$/.exec(ANDROID_IMAGE)?.[1]
+  if (!imageSha256) throw new Error('Android build image is not digest-pinned')
   return {
     operationId: build.provenance.changeId,
     relativePath: artifact.relativePath,
     sizeBytes: artifact.size,
-    apkSha256: artifact.sha256
+    apkSha256: artifact.sha256,
+    acceptance: {
+      stateRevision: build.provenance.input.stateRevision,
+      workspaceVolumeRevision: build.provenance.input.workspaceVolumeRevision,
+      sourceFingerprint: build.sourceFingerprint,
+      environmentRevision: build.provenance.input.environmentRevision,
+      imageReference: ANDROID_IMAGE,
+      imageSha256
+    }
   }
 }
 

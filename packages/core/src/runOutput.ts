@@ -1,9 +1,13 @@
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   readSync,
   readdirSync,
   rmSync,
@@ -12,8 +16,10 @@ import {
   writeSync
 } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
-import type { Actor } from '@devhotel/shared'
+import { isAbsolute, join, relative } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
+import type { Actor, AndroidAcceptanceLogRef } from '@devhotel/shared'
+import type { AndroidAcceptanceIntegrity } from './androidAcceptanceIntegrity'
 
 /** Inline bytes returned per stream when the caller does not choose a budget. */
 export const DEFAULT_OUTPUT_BYTES = 64_000
@@ -24,6 +30,7 @@ export const MAX_OUTPUT_LINES = 1_000_000
 export const MAX_FILTER_LENGTH = 200
 /** One synchronous retained-file read is capped so it cannot freeze Electron on a huge log. */
 const MAX_SCAN_BYTES = 4 * 1024 * 1024
+const MAX_RUN_MANIFEST_BYTES = 64 * 1024
 const DEFAULT_RETAINED_RUNS = 20
 const DEFAULT_RETAINED_BYTES = 256 * 1024 * 1024
 
@@ -849,14 +856,26 @@ export class RunOutputStore {
   private readonly active = new Map<string, ActiveRun>()
   private readonly maxRetainedRuns: number
   private readonly maxRetainedBytes: number
+  private readonly acceptanceIntegrity?: AndroidAcceptanceIntegrity
+  private readonly isPinned?: (roomId: string, runId: string) => boolean
+  private readonly withRetentionTransaction?: <T>(run: () => T) => T
   private lastFinishedAtMs = 0
 
   constructor(
     private readonly userData: string,
-    opts: { maxRetainedRuns?: number; maxRetainedBytes?: number } = {}
+    opts: {
+      maxRetainedRuns?: number
+      maxRetainedBytes?: number
+      acceptanceIntegrity?: AndroidAcceptanceIntegrity
+      isPinned?: (roomId: string, runId: string) => boolean
+      withRetentionTransaction?: <T>(run: () => T) => T
+    } = {}
   ) {
     this.maxRetainedRuns = opts.maxRetainedRuns ?? DEFAULT_RETAINED_RUNS
     this.maxRetainedBytes = opts.maxRetainedBytes ?? DEFAULT_RETAINED_BYTES
+    this.acceptanceIntegrity = opts.acceptanceIntegrity
+    this.isPinned = opts.isPinned
+    this.withRetentionTransaction = opts.withRetentionTransaction
   }
 
   roomDir(roomId: string): string {
@@ -989,8 +1008,149 @@ export class RunOutputStore {
     }
   }
 
+  /** Authenticate one completed bounded run without returning commands or log bytes. */
+  retainedReference(roomId: string, runId: string, maxBytes: number): AndroidAcceptanceLogRef {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_SCAN_BYTES) {
+      throw new Error('invalid retained run reference limit')
+    }
+    if (!this.acceptanceIntegrity) throw new Error('Android acceptance integrity is unavailable')
+    const root = this.roomDir(roomId)
+    const directory = this.runDir(roomId, runId)
+    let canonicalRoot: string
+    let canonicalDirectory: string
+    let summary: RunSummary | null
+    try {
+      const rootStat = lstatSync(root)
+      const directoryStat = lstatSync(directory)
+      if (
+        !rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+        !directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+      ) throw new Error('retained run directory is not regular')
+      canonicalRoot = realpathSync.native(root)
+      canonicalDirectory = realpathSync.native(directory)
+      const rel = relative(canonicalRoot, canonicalDirectory)
+      if (rel !== runId || isAbsolute(rel)) throw new Error('retained run escaped its Room root')
+      const manifest = join(directory, 'run.json')
+      const manifestStat = lstatSync(manifest)
+      const canonicalManifest = realpathSync.native(manifest)
+      if (
+        !manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size < 1 ||
+        manifestStat.size > MAX_RUN_MANIFEST_BYTES ||
+        relative(canonicalDirectory, canonicalManifest) !== 'run.json'
+      ) throw new Error('retained run manifest is unsafe or oversized')
+      const noFollow = 'O_NOFOLLOW' in constants ? constants.O_NOFOLLOW : 0
+      const manifestFd = openSync(manifest, constants.O_RDONLY | noFollow)
+      try {
+        const opened = fstatSync(manifestFd)
+        if (
+          !opened.isFile() || opened.size !== manifestStat.size ||
+          opened.dev !== manifestStat.dev || opened.ino !== manifestStat.ino
+        ) throw new Error('retained run manifest identity changed before read')
+        const raw = Buffer.alloc(opened.size)
+        let offset = 0
+        while (offset < raw.byteLength) {
+          const read = readSync(manifestFd, raw, offset, raw.byteLength - offset, offset)
+          if (read <= 0) throw new Error('retained run manifest read made no progress')
+          offset += read
+        }
+        const after = fstatSync(manifestFd)
+        if (
+          after.size !== opened.size || after.dev !== opened.dev || after.ino !== opened.ino ||
+          after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+        ) throw new Error('retained run manifest changed during read')
+        summary = parseRetainedSummary(JSON.parse(raw.toString('utf8')), runId, roomId)
+      } finally {
+        closeSync(manifestFd)
+      }
+    } catch (error) {
+      throw new Error(`retained run storage is unsafe: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (!summary || summary.finishedAt === null || summary.code === null) {
+      throw new Error(`retained run ${runId} is not a completed Room log artifact`)
+    }
+
+    const mac = this.acceptanceIntegrity.create('retained-log')
+    mac.update(`${roomId}\0${runId}\0${summary.startedAt}\0${summary.finishedAt}\0${summary.code}\0`)
+    let sizeBytes = 0
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    for (const stream of ['stdout', 'stderr'] as const) {
+      const streamSummary = summary[stream]
+      mac.update(`${stream}\0${streamSummary.bytes}\0${streamSummary.lines}\0${streamSummary.retained}\0`)
+      if (!streamSummary.retained) continue
+      const path = join(directory, `${stream}.log`)
+      let fd: number | null = null
+      try {
+        const before = lstatSync(path)
+        const canonicalPath = realpathSync.native(path)
+        if (
+          !before.isFile() || before.isSymbolicLink() ||
+          relative(canonicalDirectory, canonicalPath) !== `${stream}.log` ||
+          before.size !== streamSummary.bytes
+        ) throw new Error('unsafe or mismatched log artifact')
+        const noFollow = 'O_NOFOLLOW' in constants ? constants.O_NOFOLLOW : 0
+        fd = openSync(path, constants.O_RDONLY | noFollow)
+        const opened = fstatSync(fd)
+        if (
+          !opened.isFile() || opened.size !== before.size || opened.dev !== before.dev || opened.ino !== before.ino
+        ) throw new Error('log identity changed before read')
+        sizeBytes += opened.size
+        if (sizeBytes > maxBytes) throw new Error('acceptance log reference limit exceeded')
+        let offset = 0
+        while (offset < opened.size) {
+          const read = readSync(fd, buffer, 0, Math.min(buffer.byteLength, opened.size - offset), offset)
+          if (read <= 0) throw new Error('log read made no progress')
+          mac.update(buffer.subarray(0, read))
+          offset += read
+        }
+        const after = fstatSync(fd)
+        if (
+          after.size !== opened.size || after.dev !== opened.dev || after.ino !== opened.ino ||
+          after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+        ) throw new Error('log changed during authentication')
+      } catch {
+        throw new Error(`retained run ${runId} log artifact is unavailable, unsafe, corrupt, or oversized`)
+      } finally {
+        if (fd !== null) closeSync(fd)
+      }
+    }
+    if (sizeBytes < 1) throw new Error(`retained run ${runId} has no durable log bytes`)
+    return {
+      runId,
+      identity: mac.digest(),
+      sizeBytes,
+      startedAt: summary.startedAt,
+      finishedAt: summary.finishedAt,
+      code: summary.code,
+      stdout: summary.stdout,
+      stderr: summary.stderr
+    }
+  }
+
+  verifyRetainedReference(roomId: string, expected: AndroidAcceptanceLogRef, maxBytes: number): void {
+    const actual = this.retainedReference(roomId, expected.runId, maxBytes)
+    if (!isDeepStrictEqual(actual, expected)) {
+      throw new Error(`retained run ${expected.runId} no longer matches its immutable acceptance reference`)
+    }
+  }
+
   /** Drop the oldest retained runs once a Room holds too many, or too much. */
   prune(roomId: string, protectedRunId?: string): void {
+    const prune = (): void => this.pruneWithRetentionFence(roomId, protectedRunId)
+    try {
+      if (this.withRetentionTransaction) {
+        this.withRetentionTransaction(prune)
+        return
+      }
+      prune()
+    } catch {
+      // Retention is best-effort. In particular, another process may hold the
+      // report publication transaction. Skipping this pass deletes nothing;
+      // the next completed run retries without turning a successful command
+      // into a failure or racing a newly pinned acceptance log.
+    }
+  }
+
+  private pruneWithRetentionFence(roomId: string, protectedRunId?: string): void {
     const root = this.roomDir(roomId)
     if (!existsSync(root)) return
     const summaries = this.retainedSummaries(roomId, true)
@@ -1004,6 +1164,17 @@ export class RunOutputStore {
     let bytes = 0
     let pruningSuffix = false
     for (const [index, entry] of summaries.entries()) {
+      let pinned = false
+      try {
+        pinned = this.isPinned?.(roomId, entry.summary.runId) ?? false
+      } catch {
+        pinned = true
+      }
+      if (pinned) {
+        kept++
+        bytes += entry.bytes
+        continue
+      }
       // The newest/just-finished run is the only recovery path promised in the
       // exec response. Keep it even when that one run alone exceeds the byte
       // budget, then evict every older run until the policy is satisfied.
@@ -1029,6 +1200,11 @@ export class RunOutputStore {
     // or account for them, so their logs must not escape the retention cap.
     for (const name of safeReaddir(root)) {
       if (this.active.has(name)) continue
+      try {
+        if (this.isPinned?.(roomId, name)) continue
+      } catch {
+        continue
+      }
       const directory = join(root, name)
       if (!readRetainedSummary(join(directory, 'run.json'), name, roomId)) {
         try {
@@ -1067,18 +1243,21 @@ function isStoredStreamSummary(value: unknown): value is RunSummary['stdout'] {
     typeof value.retained === 'boolean'
 }
 
+function parseRetainedSummary(value: unknown, runId: string, roomId: string): RunSummary | null {
+  if (!isRecord(value)) return null
+  if (value.runId !== runId || value.roomId !== roomId) return null
+  if (!Array.isArray(value.cmd) || !value.cmd.every((part) => typeof part === 'string')) return null
+  if (value.actor !== 'user' && value.actor !== 'devhotel' && value.actor !== 'agent') return null
+  if (typeof value.startedAt !== 'string' || !Number.isFinite(Date.parse(value.startedAt))) return null
+  if (typeof value.finishedAt !== 'string' || !Number.isFinite(Date.parse(value.finishedAt))) return null
+  if (value.status !== 'exited' || (value.code !== null && !Number.isInteger(value.code))) return null
+  if (!isStoredStreamSummary(value.stdout) || !isStoredStreamSummary(value.stderr)) return null
+  return value as unknown as RunSummary
+}
+
 function readRetainedSummary(file: string, runId: string, roomId: string): RunSummary | null {
   try {
-    const value: unknown = JSON.parse(readFileSync(file, 'utf8'))
-    if (!isRecord(value)) return null
-    if (value.runId !== runId || value.roomId !== roomId) return null
-    if (!Array.isArray(value.cmd) || !value.cmd.every((part) => typeof part === 'string')) return null
-    if (value.actor !== 'user' && value.actor !== 'devhotel' && value.actor !== 'agent') return null
-    if (typeof value.startedAt !== 'string' || !Number.isFinite(Date.parse(value.startedAt))) return null
-    if (typeof value.finishedAt !== 'string' || !Number.isFinite(Date.parse(value.finishedAt))) return null
-    if (value.status !== 'exited' || (value.code !== null && !Number.isInteger(value.code))) return null
-    if (!isStoredStreamSummary(value.stdout) || !isStoredStreamSummary(value.stderr)) return null
-    return value as unknown as RunSummary
+    return parseRetainedSummary(JSON.parse(readFileSync(file, 'utf8')), runId, roomId)
   } catch {
     return null
   }

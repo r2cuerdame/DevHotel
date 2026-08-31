@@ -208,6 +208,23 @@ Automation POST bodies are strict and capped at 64 KiB.
 | `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
 | `POST /v1/rooms/:id/android/locale-matrix` | `{ applicationId, locales, filenamePrefix, readinessTimeoutMs?, target?, association? }` | API 33+ app-scoped locale artifact receipts after two exact-user stable readiness probes per locale and a proven restoration of the original locale. Uses one Room lock/session and defaults to the emulator. |
 | `POST /v1/rooms/:id/android/locale-recovery-abandon` | `{ applicationId, acknowledgeOutsideLocale: true }` | Explicitly releases only an undispatched v4 emulator recovery record after two fresh read-only target/install/user/foreground/PID/locale proofs show a completely outside, marker-free locale. The exact Room emulator must already be awake/running; the action never starts a target, launches/stops an app, or sets/restores a locale. Legacy, dispatched, owned, original/expected/attempted, and any marker-bearing state is refused. |
+| `POST /v1/rooms/:id/android/acceptance-reports` | `{ applicationId, stage?, target?, steps, includeCrashScenario?, timeoutMs? }` | `201` plus one immutable HMAC-sealed JSON receipt and bounded GitHub-ready Markdown. Development is emulator-only and restores any owned locale/crash mutation. Final physical requires an explicit opaque device and exact active `purpose=acceptance` lease, rejects crash requests, and performs only initial/final unchanged-state composite read proofs (`process.restarted=false`). |
+| `GET /v1/rooms/:id/android/acceptance-reports` | `?limit=1..20` | `{ reports[] }`, newest keyed receipt summaries first |
+| `GET /v1/rooms/:id/android/acceptance-reports/:reportId` | | reverifies and returns one Room-scoped receipt plus Markdown; missing or changed screenshot/log evidence fails closed |
+
+Acceptance creation never performs an implicit build or install. It extends the
+exact private provenance sealed by the preceding successful `android_run` and
+accepts only immutable screenshots and completed retained Room runs from that
+install window. Final log verification, the report, and retained-run pins use
+the same SQLite exclusion as pruning. Final physical publication also
+atomically rechecks the exact lease, read-only proof nonce, Room revision, and
+tracked install provenance. The physical path does not pause/copy Room source
+or send target writers such as launch, crash, locale mutation, screen witness,
+or install. Responses
+contain no raw log text, commands, adb serials, lease capabilities, source/Host
+paths, or invented image links. See [Android acceptance
+reports](./android-acceptance-reports.md) for the complete stage and evidence
+contract.
 
 UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals

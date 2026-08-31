@@ -91,6 +91,22 @@ describe('reconcile interrupted preparation', () => {
     expect(result.roomsSlept).toEqual([])
     expect(backend.calls).toEqual([])
   })
+
+  it('preserves an exact runtime retained by a higher-priority startup recovery fence', async () => {
+    const room = makeRoom({ id: 'recover01', status: 'attention', hostPort: 41004 })
+    const rooms = { list: () => [room], update: () => undefined } as unknown as ReturnType<typeof roomsRepo>
+    const backend = new FakeBackend()
+
+    const result = await reconcile(
+      backend,
+      rooms,
+      () => undefined,
+      { preserveAwakeRoomIds: new Set([room.id]) }
+    )
+
+    expect(result.roomsSlept).toEqual([])
+    expect(backend.calls).toEqual([])
+  })
 })
 
 describe('reconcile stale one-shot jobs', () => {

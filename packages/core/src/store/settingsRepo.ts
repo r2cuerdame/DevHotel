@@ -4,6 +4,12 @@ export interface SettingsRepo {
   get(k: string): string | null
   set(k: string, v: string): void
   setIfAbsent(k: string, v: string): boolean
+  /** Claim one recovery intent only while every Room-mutating intent key is absent. */
+  setIfAbsentWhenKeysAbsent(
+    k: string,
+    v: string,
+    mutuallyExclusiveKeys: readonly [string, string, string]
+  ): boolean
   setIfAbsentForActiveAndroidLease(
     k: string,
     v: string,
@@ -48,6 +54,32 @@ export function settingsRepo(db: Db): SettingsRepo {
       const result = sqlite
         .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
         .run(k, v)
+      return result.changes === 1
+    },
+    setIfAbsentWhenKeysAbsent(k, v, mutuallyExclusiveKeys) {
+      if (sqlite.isTransaction) {
+        throw new Error('Room recovery intent claims require their own autocommit write')
+      }
+      if (
+        !mutuallyExclusiveKeys.includes(k) ||
+        new Set(mutuallyExclusiveKeys).size !== mutuallyExclusiveKeys.length
+      ) {
+        throw new Error('Room recovery intent keys must be distinct and include the claimed key')
+      }
+      // Keep this as one SQLite write statement. Separate reads followed by an
+      // insert let two desktop processes claim different recovery keys after
+      // both have observed the Room as idle. The write transaction serializes
+      // those claims, and the later statement observes the earlier winner.
+      const result = sqlite
+        .prepare(
+          `INSERT INTO settings (key, value)
+           SELECT ?, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM settings WHERE key IN (?, ?, ?)
+            )
+           ON CONFLICT(key) DO NOTHING`
+        )
+        .run(k, v, ...mutuallyExclusiveKeys)
       return result.changes === 1
     },
     setIfAbsentForActiveAndroidLease(k, v, lease) {

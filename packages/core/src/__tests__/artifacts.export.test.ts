@@ -33,12 +33,13 @@ describe('Room screenshot artifact export', () => {
     dbs.push(db)
     const backend = new FakeBackend()
     const gateway = new FakeGateway()
+    const adb = new FakeAdbHost()
     const orch = new RoomOrchestrator({
       userData,
       db,
       backend,
       gateway: gateway.asGateway(),
-      adb: new FakeAdbHost(),
+      adb,
       appVersion: 'test'
     })
     orch.rooms.create(
@@ -53,7 +54,7 @@ describe('Room screenshot artifact export', () => {
         workspaceVolumeRevision: 2
       })
     )
-    return { userData, backend, gateway, orch }
+    return { userData, backend, gateway, adb, orch }
   }
 
   function publish(orch: RoomOrchestrator) {
@@ -199,10 +200,10 @@ describe('Room screenshot artifact export', () => {
     const artifact = publish(orch)
     const key = 'artifactExportPending:aaaa1111'
     const priorOwner = JSON.stringify({ version: 'external-owner' })
-    const claim = orch.settings.setIfAbsent.bind(orch.settings)
-    orch.settings.setIfAbsent = (settingKey, value) => {
+    const claim = orch.settings.setIfAbsentWhenKeysAbsent.bind(orch.settings)
+    orch.settings.setIfAbsentWhenKeysAbsent = (settingKey, value, mutuallyExclusiveKeys) => {
       orch.settings.set(key, priorOwner)
-      return claim(settingKey, value)
+      return claim(settingKey, value, mutuallyExclusiveKeys)
     }
 
     await expect(
@@ -541,6 +542,73 @@ describe('Room screenshot artifact export', () => {
       hostPort: null
     })
     expect(orch.settings.get('artifactExportPending:aaaa1111')).toBeNull()
+  })
+
+  it('preserves legacy locale and artifact recovery owners without mutating their shared runtime', async () => {
+    const { adb, backend, orch } = setup()
+    const localeKey = 'androidLocaleRestorePending:aaaa1111'
+    const artifactKey = 'artifactExportPending:aaaa1111'
+    const localeRaw = JSON.stringify({
+      version: 1,
+      operationId: '11111111-2222-4333-8444-555555555555',
+      stage: 0,
+      applicationId: 'com.example.app',
+      originalLocaleTags: ['en-US'],
+      expectedLocaleTags: ['ko-KR'],
+      attemptedLocaleTags: [],
+      fence: {
+        targetKind: 'emulator',
+        targetId: 'aaaa1111',
+        deviceId: null,
+        leaseId: null,
+        roomId: 'aaaa1111',
+        applicationId: 'com.example.app',
+        changeId: '11111111-2222-4333-8444-555555555555',
+        apkSha256: 'a'.repeat(64),
+        installedAt: '2026-08-30T00:00:00.000Z',
+        packageIncarnation: 'b'.repeat(64),
+        installUserId: 0,
+        installUserSerial: 0,
+        apiLevel: 35
+      }
+    })
+    const artifactRaw = JSON.stringify({
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/legacy-dual-pending.png',
+      expected: { sizeBytes: 123, sha256: 'c'.repeat(64) },
+      stageToken: 'd'.repeat(32)
+    })
+    orch.settings.set(localeKey, localeRaw)
+    orch.settings.set(artifactKey, artifactRaw)
+    const deletedRecoveryKeys: string[] = []
+    const deleteIfValue = orch.settings.deleteIfValue.bind(orch.settings)
+    orch.settings.deleteIfValue = (key, value) => {
+      if (key === localeKey || key === artifactKey) deletedRecoveryKeys.push(key)
+      return deleteIfValue(key, value)
+    }
+
+    await orch.init()
+
+    expect(orch.settings.get(localeKey)).toBe(localeRaw)
+    expect(orch.settings.get(artifactKey)).toBe(artifactRaw)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ status: 'attention' })
+    expect(deletedRecoveryKeys).toEqual([])
+    expect(adb.execs).toEqual([])
+    expect(backend.pauseRoomArtifactWebCalls).toEqual([])
+    expect(backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(backend.reconcileRoomArtifactPublicationCalls).toEqual([])
+    expect(backend.publishRoomArtifactCalls).toEqual([])
+    expect(backend.calls.some((call) =>
+      call === 'startExistingEmulatorForRecovery:aaaa1111' ||
+      call === 'stopRoomPod:aaaa1111' ||
+      call.startsWith('captureRoomArtifactWebFence:aaaa1111:') ||
+      call.startsWith('pauseWeb:aaaa1111') ||
+      call.startsWith('unpauseWeb:aaaa1111') ||
+      call.startsWith('recreateWeb:aaaa1111:') ||
+      call.startsWith('copyIntoRoom:') ||
+      call.startsWith('removeWorkspaceSnapshot:')
+    )).toBe(false)
   })
 
   it('retains the hard recovery gate when stale helper removal cannot be proven', async () => {

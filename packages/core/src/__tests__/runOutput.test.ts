@@ -6,7 +6,12 @@ import { tempDir } from './fakes'
 
 const roots: string[] = []
 
-function store(opts?: { maxRetainedRuns?: number; maxRetainedBytes?: number }): { store: RunOutputStore; userData: string } {
+function store(opts?: {
+  maxRetainedRuns?: number
+  maxRetainedBytes?: number
+  isPinned?: (roomId: string, runId: string) => boolean
+  withRetentionTransaction?: <T>(run: () => T) => T
+}): { store: RunOutputStore; userData: string } {
   const userData = tempDir()
   roots.push(userData)
   return { store: new RunOutputStore(userData, opts), userData }
@@ -481,6 +486,58 @@ describe('RunOutputStore', () => {
 
     expect(runs.list('room1abc').map((run) => run.runId)).toEqual([completed[1]])
     expect(existsSync(join(userData, 'rooms', 'room1abc', 'runs', completed[0] ?? ''))).toBe(false)
+  })
+
+  it('rechecks pins and removes an unpinned suffix inside one retention transaction', () => {
+    let inTransaction = false
+    let transactionCalls = 0
+    const pinned = new Set<string>()
+    const { store: runs, userData } = store({
+      maxRetainedRuns: 1,
+      isPinned: (_roomId, runId) => {
+        expect(inTransaction).toBe(true)
+        return pinned.has(runId)
+      },
+      withRetentionTransaction: (run) => {
+        expect(inTransaction).toBe(false)
+        transactionCalls += 1
+        inTransaction = true
+        try {
+          return run()
+        } finally {
+          inTransaction = false
+        }
+      }
+    })
+    const first = runs.begin('room1abc', ['first'], 'agent', { maxBytes: 256 })
+    first.push('stdout', Buffer.alloc(2048, 0x61))
+    runs.complete(first, 0)
+    pinned.add(first.runId)
+    const second = runs.begin('room1abc', ['second'], 'agent', { maxBytes: 256 })
+    second.push('stdout', Buffer.alloc(2048, 0x62))
+    runs.complete(second, 0)
+
+    expect(transactionCalls).toBe(2)
+    expect(existsSync(join(userData, 'rooms', 'room1abc', 'runs', first.runId))).toBe(true)
+    expect(existsSync(join(userData, 'rooms', 'room1abc', 'runs', second.runId))).toBe(true)
+  })
+
+  it('skips pruning safely when another process owns the retention transaction', () => {
+    const { store: runs, userData } = store({
+      maxRetainedRuns: 1,
+      withRetentionTransaction: () => {
+        throw new Error('SQLITE_BUSY: database is locked')
+      }
+    })
+    const first = runs.begin('room1abc', ['first'], 'agent', { maxBytes: 256 })
+    first.push('stdout', Buffer.alloc(2048, 0x61))
+    expect(runs.complete(first, 0).retained).toBe(true)
+    const second = runs.begin('room1abc', ['second'], 'agent', { maxBytes: 256 })
+    second.push('stdout', Buffer.alloc(2048, 0x62))
+
+    expect(() => runs.complete(second, 0)).not.toThrow()
+    expect(existsSync(join(userData, 'rooms', 'room1abc', 'runs', first.runId))).toBe(true)
+    expect(existsSync(join(userData, 'rooms', 'room1abc', 'runs', second.runId))).toBe(true)
   })
 
   it('prunes one oldest-first suffix instead of filling byte-budget holes with older runs', () => {

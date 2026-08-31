@@ -164,6 +164,139 @@ const ANDROID_MAX_USER_ID = 21_474
 const ANDROID_MAX_USER_SERIAL = 2_147_483_647
 const MAX_PACKAGE_PROCESSES = 1_024
 
+const PROOF_APPLICATION_ID = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/
+const PROOF_UNSIGNED_INTEGER = /^(?:0|[1-9]\d{0,9})$/
+const PROOF_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const PROOF_PACKAGE_DUMP_FENCE = /^devhotel-package-dump-([0-9a-f-]+)$/
+const PROOF_FORCE_STOP_FENCE = /^devhotel-force-stop-([0-9a-f-]+)$/
+
+/**
+ * Exact typed argv emitted by appLocaleSnapshot/proveAppLocaleFinalState.
+ * The final physical acceptance session checks this before remote-shell argv
+ * protection, so a future call to launch, crash, locale set, screen witness or
+ * another helper cannot borrow the proof nonce and reach the target.
+ */
+export function isPhysicalAcceptanceProofReadCommand(
+  args: readonly string[],
+  operation: string | undefined
+): boolean {
+  const app = (value: string | undefined): value is string => Boolean(value && PROOF_APPLICATION_ID.test(value))
+  const number = (value: string | undefined): value is string => Boolean(value && PROOF_UNSIGNED_INTEGER.test(value))
+  const user = (value: string | undefined): value is string =>
+    number(value) && Number.parseInt(value, 10) <= ANDROID_MAX_USER_ID
+  const uid = (value: string | undefined): value is string =>
+    number(value) && Number.parseInt(value, 10) <= Number.MAX_SAFE_INTEGER
+  const apk = (value: string | undefined): value is string => Boolean(
+    value &&
+    value.startsWith('/data/app/') &&
+    value.endsWith('/base.apk') &&
+    Buffer.byteLength(value, 'utf8') <= 4096 &&
+    !/[\p{C}\p{Zl}\p{Zp}]/u.test(value) &&
+    !value.split('/').some((segment) => segment === '.' || segment === '..')
+  )
+  const packageDumpFence = (value: string | undefined): value is string => {
+    const match = value ? PROOF_PACKAGE_DUMP_FENCE.exec(value) : null
+    return Boolean(match?.[1] && PROOF_UUID.test(match[1]))
+  }
+
+  switch (operation) {
+    case 'Android active user probe':
+      return args.length === 3 && args[0] === 'shell' && args[1] === 'am' && args[2] === 'get-current-user'
+    case 'Android user incarnation probe':
+      return args.length === 5 && args[0] === 'shell' && args[1] === 'dumpsys' && args[2] === 'user' &&
+        args[3] === '--user' && user(args[4])
+    case 'Android package probe':
+      return args.length === 6 && args[0] === 'shell' && args[1] === 'pm' && args[2] === 'path' &&
+        args[3] === '--user' && user(args[4]) && app(args[5])
+    case 'Android package inventory probe':
+      return args.length === 7 && args[0] === 'shell' && args[1] === 'pm' && args[2] === 'list' &&
+        args[3] === 'packages' && args[4] === '--user' && user(args[5]) && app(args[6])
+    case 'Android installed APK incarnation probe':
+      return args.length === 5 && args[0] === 'shell' && args[1] === 'stat' && args[2] === '-c' &&
+        args[3] === '%d:%i:%s:%Y:%Z' && apk(args[4])
+    case 'Android installed APK identity probe':
+      return args.length === 3 && args[0] === 'shell' && args[1] === 'sha256sum' && apk(args[2])
+    case 'Android foreground probe':
+      return args.length === 4 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+        args[3] === 'exec dumpsys window windows'
+    case 'Android live API level probe':
+      return args.length === 3 && args[0] === 'shell' && args[1] === 'getprop' &&
+        args[2] === 'ro.build.version.sdk'
+    case 'Android app locale probe':
+      return args.length === 7 && args[0] === 'shell' && args[1] === 'cmd' && args[2] === 'locale' &&
+        args[3] === 'get-app-locales' && app(args[4]) && args[5] === '--user' && user(args[6])
+    case 'Android package shared-UID declaration probe':
+      return args.length === 7 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+        args[3] === PACKAGE_DUMP_SCRIPT && args[4] === 'devhotel-package-dump' && app(args[5]) &&
+        packageDumpFence(args[6])
+    case 'Android package UID probe':
+      return args.length === 8 && args[0] === 'shell' && args[1] === 'pm' && args[2] === 'list' &&
+        args[3] === 'packages' && args[4] === '-U' && args[5] === '--user' && user(args[6]) && app(args[7])
+    case 'Android shared UID probe':
+      return args.length === 9 && args[0] === 'shell' && args[1] === 'pm' && args[2] === 'list' &&
+        args[3] === 'packages' && args[4] === '-U' && args[5] === '--user' && user(args[6]) &&
+        args[7] === '--uid' && uid(args[8])
+    case 'Android app process probe':
+      return args.length === 4 && args[0] === 'shell' && args[1] === 'pgrep' && args[2] === '-u' && uid(args[3])
+    case 'Android final locale release pulse':
+      return args.length === 8 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+        args[3] === FINAL_LOCALE_PULSE_SCRIPT && args[4] === 'devhotel-final-locale-pulse' &&
+        app(args[5]) && user(args[6]) && uid(args[7])
+    default:
+      return false
+  }
+}
+
+/**
+ * Current high-level commands that are byte-for-byte target reads. Unknown
+ * operations remain writers so adding a new helper cannot silently evade the
+ * durable physical-operation fence. The acceptance proof uses the narrower
+ * allowlist above and never receives these extra ordinary-read capabilities.
+ */
+export function isPhysicalAutomationReadCommand(
+  args: readonly string[],
+  operation: string | undefined
+): boolean {
+  if (isPhysicalAcceptanceProofReadCommand(args, operation)) return true
+  if (operation === 'Android locale probe') {
+    return args.length === 3 && args[0] === 'shell' && args[1] === 'getprop' && args[2] === 'persist.sys.locale'
+  }
+  if (operation === 'ADB locale readiness probe') {
+    return args.length === 1 && args[0] === 'get-state'
+  }
+  if (operation === 'Android target clock probe') {
+    return args.length === 3 && args[0] === 'shell' && args[1] === 'date' && args[2] === TARGET_CLOCK_FORMAT
+  }
+  if (operation === 'Android package logcat') {
+    return args.length === 5 && args[0] === 'logcat' && args[1] === '-d' && args[2] === '-v' &&
+      args[3] === 'epoch,UTC,printable' && /^--uid=(?:0|[1-9]\d{0,15})$/.test(args[4] ?? '')
+  }
+  if (operation === 'Android install log fence proof') {
+    return args.length === 5 && args[0] === 'logcat' && args[1] === '-d' && args[2] === '-v' &&
+      args[3] === 'raw,printable' && /^--uid=(?:0|[1-9]\d{0,15})$/.test(args[4] ?? '')
+  }
+  if (operation === 'Android force-stop state proof') {
+    const match = args[6] ? PROOF_FORCE_STOP_FENCE.exec(args[6]) : null
+    return args.length === 7 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+      args[3] === PACKAGE_DUMP_SCRIPT && args[4] === 'devhotel-force-stop' &&
+      PROOF_APPLICATION_ID.test(args[5] ?? '') && Boolean(match?.[1] && PROOF_UUID.test(match[1]))
+  }
+  if (operation === 'Android active-user witness reader') {
+    return args.length === 6 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
+      args[3] === SCREEN_WITNESS_READER_SCRIPT && args[4] === 'devhotel-screen-witness' &&
+      PROOF_UNSIGNED_INTEGER.test(args[5] ?? '')
+  }
+  if (operation === 'Android launcher resolution') {
+    return args.length === 13 && args[0] === 'shell' && args[1] === 'cmd' && args[2] === 'package' &&
+      args[3] === 'resolve-activity' && args[4] === '--brief' && args[5] === '--components' &&
+      args[6] === '--user' && PROOF_UNSIGNED_INTEGER.test(args[7] ?? '') &&
+      args[8] === '-a' && args[9] === 'android.intent.action.MAIN' &&
+      args[10] === '-c' && args[11] === 'android.intent.category.LAUNCHER' &&
+      PROOF_APPLICATION_ID.test(args[12] ?? '')
+  }
+  return false
+}
+
 interface ScreenWitnessRecord {
   tag: string
   payload: string
@@ -239,6 +372,8 @@ function isAllowedAppTransition(record: ScreenWitnessRecord, applicationId: stri
 }
 
 export interface AndroidAutomationExecOptions {
+  /** Private discriminator used only by the final physical proof allowlist. */
+  operation?: string
   timeoutMs?: number
   signal?: AbortSignal
   maxStdoutBytes?: number
@@ -337,6 +472,7 @@ function parsePids(value: string): number[] {
     .split(/\s+/)
     .map((part) => Number.parseInt(part, 10))
     .filter((pid) => Number.isSafeInteger(pid) && pid > 0))]
+    .sort((left, right) => left - right)
 }
 
 function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
@@ -501,23 +637,25 @@ interface VerifiedTrackedInstall {
 }
 
 /** Core-only composition seal. Private lease/user/log authority must never be serialized. */
+export interface AndroidTrackedInstallSeal {
+  targetKind: AndroidInstallTarget['kind']
+  targetId: string
+  deviceId: string | null
+  leaseId: string | null
+  roomId: string
+  applicationId: string
+  changeId: string
+  apkSha256: string
+  installedAt: string
+  packageIncarnation: string
+  logFence: string | null
+  installUserId: number
+  installUserSerial: number
+}
+
 export interface AndroidForegroundInstallEvidence {
   context: AndroidForegroundInstallContext
-  seal: {
-    targetKind: AndroidInstallTarget['kind']
-    targetId: string
-    deviceId: string | null
-    leaseId: string | null
-    roomId: string
-    applicationId: string
-    changeId: string
-    apkSha256: string
-    installedAt: string
-    packageIncarnation: string
-    logFence: string | null
-    installUserId: number
-    installUserSerial: number
-  } | null
+  seal: AndroidTrackedInstallSeal | null
 }
 
 export interface AndroidAppLocaleSnapshot {
@@ -622,6 +760,7 @@ export class AndroidAutomationSession {
     let result: ExecResult
     try {
       result = await this.opts.exec(args, {
+        operation: opts.operation,
         timeoutMs,
         signal: opts.signal,
         maxStdoutBytes: opts.maxStdoutBytes ?? opts.stdoutLimit,
@@ -1098,6 +1237,47 @@ export class AndroidAutomationSession {
     return (await this.foregroundInstallEvidence(signal)).context
   }
 
+  private trackedInstallSealValue(
+    applicationId: string,
+    tracked: VerifiedTrackedInstall
+  ): AndroidTrackedInstallSeal {
+    const receipt = tracked.receipt
+    const target = this.opts.installTarget
+    return {
+      targetKind: target.kind,
+      targetId: target.targetId,
+      deviceId: target.deviceId,
+      leaseId: target.kind === 'physical' ? target.leaseId : null,
+      roomId: receipt.roomId,
+      applicationId,
+      changeId: receipt.changeId,
+      apkSha256: receipt.apkSha256,
+      installedAt: receipt.installedAt,
+      packageIncarnation: tracked.packageIncarnation!,
+      logFence: this.opts.installs.logFence(this.opts.roomId, target, applicationId),
+      installUserId: tracked.installUserId,
+      installUserSerial: tracked.installUserSerial
+    }
+  }
+
+  /** Exact tracked package/user/lease proof that does not require foreground ownership. */
+  async trackedInstallSeal(
+    applicationId: string,
+    signal?: AbortSignal
+  ): Promise<AndroidTrackedInstallSeal> {
+    const tracked = await this.requireInstalled(applicationId, undefined, signal)
+    if (tracked.packageIncarnation === null) {
+      throw automationError(
+        'ANDROID_APP_REPLACED',
+        `${applicationId} no longer has an exact tracked package incarnation.`,
+        'Run android_run again before recovering acceptance state.',
+        409
+      )
+    }
+    await this.assertTrackedInstall(applicationId, tracked, undefined, signal)
+    return this.trackedInstallSealValue(applicationId, tracked)
+  }
+
   /** Exact private seal for lock-held screenshot/report composition. */
   async foregroundInstallEvidence(signal?: AbortSignal): Promise<AndroidForegroundInstallEvidence> {
     const status = await this.status(signal)
@@ -1125,24 +1305,9 @@ export class AndroidAutomationSession {
     if (!tracked || !status.foregroundApplicationId || tracked.packageIncarnation === null) {
       return { context, seal: null }
     }
-    const target = this.opts.installTarget
     return {
       context,
-      seal: {
-        targetKind: target.kind,
-        targetId: target.targetId,
-        deviceId: target.deviceId,
-        leaseId: target.kind === 'physical' ? target.leaseId : null,
-        roomId: receipt!.roomId,
-        applicationId: receipt!.applicationId,
-        changeId: receipt!.changeId,
-        apkSha256: receipt!.apkSha256,
-        installedAt: receipt!.installedAt,
-        packageIncarnation: tracked.packageIncarnation,
-        logFence: this.opts.installs.logFence(this.opts.roomId, target, status.foregroundApplicationId),
-        installUserId: tracked.installUserId,
-        installUserSerial: tracked.installUserSerial
-      }
+      seal: this.trackedInstallSealValue(status.foregroundApplicationId, tracked)
     }
   }
 
@@ -2067,6 +2232,7 @@ export class AndroidAutomationSession {
           String(witnessRecordLimit)
         ],
         {
+          operation: 'Android active-user witness reader',
           timeoutMs: readerTimeoutMs,
           signal: state.controller.signal,
           maxStdoutBytes: MAX_USER_SWITCH_WITNESS_BYTES,
