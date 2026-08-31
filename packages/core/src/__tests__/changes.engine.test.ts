@@ -846,7 +846,7 @@ describe('android Build & Run line-ending preflight', () => {
       if (script === LINE_ENDING_SCAN_SCRIPT) {
         return { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
       }
-      if (script.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
+      if (script.includes("find . -xdev -depth") && script.includes("-path '*/build/outputs/apk/debug'")) {
         return { code: 0, stdout: '', stderr: '' }
       }
       if (script.startsWith('cd /workspace && ')) {

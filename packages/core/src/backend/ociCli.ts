@@ -874,6 +874,9 @@ export class OciCliBackend implements IsolationBackend {
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
     return runDocker(['exec', exactContainerId(container, roomId), ...cmd], {
       timeoutMs: opts?.timeoutMs,
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+      ...(opts?.maxStdoutBytes !== undefined ? { maxStdoutBytes: opts.maxStdoutBytes } : {}),
+      ...(opts?.maxStderrBytes !== undefined ? { maxStderrBytes: opts.maxStderrBytes } : {}),
       ...(opts?.onStdout ? { onStdout: opts.onStdout } : {}),
       ...(opts?.onStderr ? { onStderr: opts.onStderr } : {})
     })

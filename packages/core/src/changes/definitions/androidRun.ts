@@ -4,7 +4,15 @@ import { sleep } from '../types'
 
 const BUILD_TIMEOUT_MS = 15 * 60_000
 const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
-const CLEAR_DEBUG_APK_OUTPUTS = "cd /workspace && find . -xdev -type d -path '*/build/outputs/apk/debug' -prune -exec rm -rf -- {} +"
+const MAX_BUILT_APPS = 64
+const MAX_METADATA_PATH_BYTES = 4096
+const MAX_DISCOVERY_STDOUT_BYTES = MAX_BUILT_APPS * (MAX_METADATA_PATH_BYTES + 2)
+const MAX_METADATA_STDOUT_BYTES = 64 * 1024
+const MAX_COMMAND_DIAGNOSTIC_BYTES = 16 * 1024
+const CLEAR_DEBUG_APK_OUTPUTS =
+  "cd /workspace && find . -xdev -depth \\( -path '*/build/outputs/apk/debug' -o -path '*/build/outputs/apk/debug/*' \\) -delete"
+const DISCOVER_DEBUG_APK_METADATA =
+  "find /workspace -xdev -type f -path '*/build/outputs/apk/debug/output-metadata.json' -print0"
 
 interface BuiltApp {
   appId: string
@@ -31,7 +39,7 @@ function assertMetadataPath(metaPath: string): string {
   const suffix = '/build/outputs/apk/debug/output-metadata.json'
   const segments = metaPath.slice(prefix.length).split('/')
   if (
-    metaPath.length > 4096 ||
+    metaPath.length > MAX_METADATA_PATH_BYTES ||
     !metaPath.startsWith(prefix) ||
     !metaPath.endsWith(suffix) ||
     segments.some((segment) => !segment || segment === '.' || segment === '..' || !/^[A-Za-z0-9._+@ -]+$/.test(segment))
@@ -50,16 +58,17 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
   }
   if (!metadata || typeof metadata !== 'object') throw new Error('Android build returned invalid output metadata')
   const record = metadata as { applicationId?: unknown; elements?: unknown }
-  const element = Array.isArray(record.elements)
-    ? record.elements.find((candidate): candidate is { outputFile: string } =>
-        Boolean(candidate && typeof candidate === 'object' && typeof (candidate as { outputFile?: unknown }).outputFile === 'string')
-      )
+  const element = Array.isArray(record.elements) && record.elements.length === 1
+    ? record.elements[0]
     : null
   if (typeof record.applicationId !== 'string' || !element) {
     throw new Error('Android build output metadata is missing its applicationId or APK')
   }
+  if (typeof element !== 'object' || typeof (element as { outputFile?: unknown }).outputFile !== 'string') {
+    throw new Error('Android build output metadata is missing its applicationId or APK')
+  }
   const appId = assertApplicationId(record.applicationId, 'build metadata')
-  const outputFile = element.outputFile
+  const outputFile = (element as { outputFile: string }).outputFile
   const stem = outputFile.slice(0, -4)
   if (
     Buffer.byteLength(outputFile, 'utf8') > 255 ||
@@ -80,27 +89,63 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
 async function builtApps(ctx: ChangeCtx): Promise<BuiltApp[]> {
   const list = await ctx.backend.execInRoom(
     ctx.roomId,
-    ['sh', '-lc', "find /workspace -path '*/build/outputs/apk/debug/output-metadata.json'"],
-    { timeoutMs: 30_000 }
+    ['sh', '-lc', DISCOVER_DEBUG_APK_METADATA],
+    {
+      timeoutMs: 30_000,
+      maxStdoutBytes: MAX_DISCOVERY_STDOUT_BYTES,
+      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
+    }
   )
+  if (list.code !== 0 || list.stderr.length > 0 || list.outputLimitExceeded === true) {
+    throw new Error('Android build output metadata discovery failed its bounded provenance check')
+  }
+  if (list.stdout.length > 0 && !list.stdout.endsWith('\0')) {
+    throw new Error('Android build returned incomplete output metadata framing')
+  }
+  const discoveredPaths = list.stdout.length === 0 ? [] : list.stdout.slice(0, -1).split('\0')
+  if (discoveredPaths.length > MAX_BUILT_APPS || discoveredPaths.some((path) => path.length === 0)) {
+    throw new Error('Android build returned an invalid number of output metadata paths')
+  }
+  const metadataPaths = discoveredPaths.map(assertMetadataPath)
+  if (new Set(metadataPaths).size !== metadataPaths.length) {
+    throw new Error('Android build returned duplicate output metadata paths')
+  }
   const apps: BuiltApp[] = []
-  for (const discoveredPath of list.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
-    const metaPath = assertMetadataPath(discoveredPath)
-    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat ${shellQuote(metaPath)}`], { timeoutMs: 30_000 })
-    if (meta.code !== 0) throw new Error('Android build output metadata could not be read')
-    apps.push(builtAppFromMetadata(metaPath, meta.stdout))
+  const applicationIds = new Set<string>()
+  const apkPaths = new Set<string>()
+  for (const metaPath of metadataPaths) {
+    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat -- ${shellQuote(metaPath)}`], {
+      timeoutMs: 30_000,
+      maxStdoutBytes: MAX_METADATA_STDOUT_BYTES,
+      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
+    })
+    if (meta.code !== 0 || meta.stderr.length > 0 || meta.outputLimitExceeded === true) {
+      throw new Error('Android build output metadata could not be read safely')
+    }
+    const app = builtAppFromMetadata(metaPath, meta.stdout)
+    if (applicationIds.has(app.appId) || apkPaths.has(app.apkPath)) {
+      throw new Error('Android build returned ambiguous duplicate app metadata')
+    }
+    applicationIds.add(app.appId)
+    apkPaths.add(app.apkPath)
+    apps.push(app)
   }
   return apps
 }
 
 async function clearPriorDebugOutputs(ctx: ChangeCtx): Promise<void> {
-  // GNU find does not follow symlinks by default. Restrict deletion to real
-  // debug-output directories below the Room-local workspace and never accept
-  // partial cleanup diagnostics as build provenance.
+  // GNU find does not follow symlinks by default. `-xdev` keeps cleanup in the
+  // workspace root filesystem and `-delete` avoids a child `rm` crossing a
+  // mount inserted between discovery and deletion. A nested mount remains
+  // busy/non-empty, so find exits nonzero and the build fails closed.
   const cleared = await ctx.backend.execInRoom(
     ctx.roomId,
     ['sh', '-lc', CLEAR_DEBUG_APK_OUTPUTS],
-    { timeoutMs: 30_000, maxStdoutBytes: 16 * 1024, maxStderrBytes: 16 * 1024 }
+    {
+      timeoutMs: 30_000,
+      maxStdoutBytes: MAX_COMMAND_DIAGNOSTIC_BYTES,
+      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
+    }
   ).catch(() => {
     throw new Error('prior Android debug outputs could not be cleared safely')
   })

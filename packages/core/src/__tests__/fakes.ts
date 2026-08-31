@@ -64,7 +64,7 @@ const ok: ExecResult = { code: 0, stdout: '', stderr: '' }
 
 export class FakeBackend implements IsolationBackend {
   calls: string[] = []
-  execInRoomCalls: { roomId: string; cmd: string[] }[] = []
+  execInRoomCalls: { roomId: string; cmd: string[]; opts?: ExecOpts }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
   webStateValue: 'running' | 'exited' | 'missing' = 'running'
@@ -138,7 +138,7 @@ export class FakeBackend implements IsolationBackend {
   /** Chunks to emit instead of `execResult`, so streaming callers can be tested. */
   execChunks: { stdout?: string[]; stderr?: string[] } | null = null
   async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
-    this.execInRoomCalls.push({ roomId, cmd })
+    this.execInRoomCalls.push({ roomId, cmd, ...(opts ? { opts } : {}) })
     const result = this.execInRoomHandler
       ? await this.execInRoomHandler(roomId, cmd, opts)
       : (this.execHandler?.(cmd) ?? this.execResult)

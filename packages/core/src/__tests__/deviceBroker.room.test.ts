@@ -732,9 +732,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'My 앱-$&-debug.APK' }] }),
@@ -788,8 +788,11 @@ describe('Android automation targets the attached device without a hand-written 
     let discoveries = 0
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
-      if (command.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
+      if (command.includes('find . -xdev -depth') && command.includes("-path '*/build/outputs/apk/debug'")) {
         expect(buildRan).toBe(false)
+        expect(command).toContain("-path '*/build/outputs/apk/debug/*'")
+        expect(command).toContain('-delete')
+        expect(command).not.toMatch(/\brm\b/)
         staleOutputPresent = false
         return { code: 0, stdout: '', stderr: '' }
       }
@@ -800,16 +803,28 @@ describe('Android automation targets the attached device without a hand-written 
       }
       if (command.includes('find /workspace')) {
         discoveries += 1
-        if (workspaceSwappedAfterCapture) {
-          return { code: 0, stdout: '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        expect(command).toContain('-xdev -type f')
+        expect(command).toContain('-print0')
+        expect(command).not.toContain(' -L')
+        if (!command.includes('-xdev -type f') || command.includes(' -L')) {
+          return {
+            code: 0,
+            stdout:
+              '/workspace/mounted/build/outputs/apk/debug/output-metadata.json\0' +
+              '/workspace/symlinked/build/outputs/apk/debug/output-metadata.json\0',
+            stderr: ''
+          }
         }
-        const current = '/workspace/app/build/outputs/apk/debug/output-metadata.json\n'
+        if (workspaceSwappedAfterCapture) {
+          return { code: 0, stdout: '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
+        }
+        const current = '/workspace/app/build/outputs/apk/debug/output-metadata.json\0'
         const stale = staleOutputPresent
-          ? '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\n'
+          ? '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\0'
           : ''
         return { code: 0, stdout: `${stale}${current}`, stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/app/")) {
+      if (command.startsWith("cat -- '/workspace/app/")) {
         workspaceSwappedAfterCapture = true
         return {
           code: 0,
@@ -817,7 +832,7 @@ describe('Android automation targets the attached device without a hand-written 
           stderr: ''
         }
       }
-      if (command.startsWith("cat '/workspace/deleted/")) {
+      if (command.startsWith("cat -- '/workspace/deleted/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.stale.app', elements: [{ outputFile: 'stale-debug.apk' }] }),
@@ -835,6 +850,12 @@ describe('Android automation targets the attached device without a hand-written 
     expect(entry.captured).toEqual({ applicationId: 'com.example.app' })
     expect(buildRan).toBe(true)
     expect(discoveries).toBe(1)
+    const cleanupCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.includes('find . -xdev -depth'))
+    const discoveryCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.includes('find /workspace'))
+    const metadataCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.startsWith("cat -- '/workspace/"))
+    expect(cleanupCall?.opts).toMatchObject({ maxStdoutBytes: 16 * 1024, maxStderrBytes: 16 * 1024 })
+    expect(discoveryCall?.opts).toMatchObject({ maxStdoutBytes: 64 * (4096 + 2), maxStderrBytes: 16 * 1024 })
+    expect(metadataCall?.opts).toMatchObject({ maxStdoutBytes: 64 * 1024, maxStderrBytes: 16 * 1024 })
     expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([
       'copyFromRoom:/workspace/app/build/outputs/apk/debug/app-debug.apk'
     ])
@@ -852,8 +873,10 @@ describe('Android automation targets the attached device without a hand-written 
     let buildRan = false
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
-      if (command.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
-        return { code: 1, stdout: 'partial private path', stderr: 'permission denied' }
+      if (command.includes('find . -xdev -depth') && command.includes("-path '*/build/outputs/apk/debug'")) {
+        expect(command).toContain('-delete')
+        expect(command).not.toMatch(/\brm\b/)
+        return { code: 1, stdout: 'partial private path', stderr: 'Device or resource busy at nested mount' }
       }
       if (command === 'cd /workspace && gradle assembleDebug --no-daemon') buildRan = true
       return { code: 0, stdout: '', stderr: '' }
@@ -863,10 +886,79 @@ describe('Android automation targets the attached device without a hand-written 
 
     expect(entry.status).toBe('failed')
     expect(entry.verify?.detail).toMatch(/prior Android debug outputs could not be cleared safely/)
-    expect(entry.verify?.detail).not.toMatch(/partial private path|permission denied/)
+    expect(entry.verify?.detail).not.toMatch(/partial private path|Device or resource busy|nested mount/)
     expect(buildRan).toBe(false)
     expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
   })
+
+  it.each([
+    'discovery-nonzero',
+    'discovery-stderr',
+    'discovery-overflow',
+    'too-many-apps',
+    'duplicate-path',
+    'metadata-nonzero',
+    'metadata-stderr',
+    'metadata-overflow',
+    'duplicate-app-id',
+    'multiple-apk-elements'
+  ] as const)('fails android-run closed on bounded build provenance fault %s', async (fault) => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    const firstPath = '/workspace/app/build/outputs/apk/debug/output-metadata.json'
+    const secondPath = '/workspace/other/build/outputs/apk/debug/output-metadata.json'
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        if (fault === 'discovery-nonzero') return { code: 1, stdout: firstPath, stderr: '' }
+        if (fault === 'discovery-stderr') return { code: 0, stdout: `${firstPath}\0`, stderr: 'private warning' }
+        if (fault === 'discovery-overflow') {
+          return { code: -1, stdout: `${firstPath}\0`, stderr: '', outputLimitExceeded: true }
+        }
+        if (fault === 'too-many-apps') {
+          return {
+            code: 0,
+            stdout: `${Array.from({ length: 65 }, (_, index) =>
+              `/workspace/app${index}/build/outputs/apk/debug/output-metadata.json`).join('\0')}\0`,
+            stderr: ''
+          }
+        }
+        if (fault === 'duplicate-path') {
+          return { code: 0, stdout: `${firstPath}\0${firstPath}\0`, stderr: '' }
+        }
+        if (fault === 'duplicate-app-id') {
+          return { code: 0, stdout: `${firstPath}\0${secondPath}\0`, stderr: '' }
+        }
+        return { code: 0, stdout: `${firstPath}\0`, stderr: '' }
+      }
+      if (command.startsWith('cat -- ')) {
+        if (fault === 'metadata-nonzero') return { code: 1, stdout: '{}', stderr: '' }
+        if (fault === 'metadata-stderr') return { code: 0, stdout: '{}', stderr: 'private warning' }
+        if (fault === 'metadata-overflow') {
+          return { code: -1, stdout: '{}', stderr: '', outputLimitExceeded: true }
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            applicationId: 'com.example.app',
+            elements: fault === 'multiple-apk-elements'
+              ? [{ outputFile: 'one.apk' }, { outputFile: 'two.apk' }]
+              : [{ outputFile: command.includes('/other/') ? 'other.apk' : 'app.apk' }]
+          }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).not.toMatch(/private warning|output-metadata\.json/)
+    expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
+  }, 15_000)
 
   it.each([
     { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED', keepsReceipt: true },
@@ -883,9 +975,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -954,9 +1046,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -991,9 +1083,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -1038,67 +1130,75 @@ describe('Android automation targets the attached device without a hand-written 
   it.each([
     {
       name: 'applicationId shell metacharacters',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app;getprop.ro.serialno', elements: [{ outputFile: 'app-debug.apk' }] },
       expected: /Invalid Android applicationId/
     },
     {
       name: 'POSIX APK filename traversal',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '../../secret.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'Windows APK filename traversal',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '..\\secret.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'absolute POSIX APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '/tmp/secret.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'drive-relative APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'C:secret.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'UNC APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '\\\\server\\share\\secret.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'dot-segment APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '..apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'parent-dot-segment APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: '...apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'control character in APK filename',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'My\u0000App.apk' }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'APK filename over the UTF-8 byte limit',
-      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n',
+      findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: `${'앱'.repeat(90)}.apk` }] },
       expected: /unsafe APK filename/
     },
     {
       name: 'metadata path shell injection',
-      findOutput: "/workspace/app/build/outputs/apk/debug/output-metadata.json';getprop ro.serialno;'\n",
+      findOutput: "/workspace/app/build/outputs/apk/debug/output-metadata.json';getprop ro.serialno;'\0",
+      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] },
+      expected: /unsafe output-metadata path/
+    },
+    {
+      name: 'newline-delimited metadata path injection',
+      findOutput:
+        '/workspace/fake/build/outputs/apk/debug/output-metadata.json\n' +
+        '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] },
       expected: /unsafe output-metadata path/
     }
@@ -1129,7 +1229,7 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
       if (command.startsWith('cat ')) {
         return {
@@ -1175,9 +1275,9 @@ describe('Android automation targets the attached device without a hand-written 
         return { code: 0, stdout: '', stderr: '' }
       }
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -1218,9 +1318,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: "My App's $&-debug.APK" }] }),
@@ -1265,9 +1365,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -1333,9 +1433,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -1375,9 +1475,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
@@ -1417,9 +1517,9 @@ describe('Android automation targets the attached device without a hand-written 
     backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
       }
-      if (command.startsWith("cat '/workspace/")) {
+      if (command.startsWith("cat -- '/workspace/")) {
         return {
           code: 0,
           stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
