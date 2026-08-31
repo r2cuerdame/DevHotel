@@ -4,7 +4,17 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
-import type { AnchorSpec, ExecOpts, ExecResult, ExportedArtifact, IsolationBackend, WebSpec } from '../backend/types'
+import type {
+  AnchorSpec,
+  ExecOpts,
+  ExecResult,
+  ExportedArtifact,
+  IsolationBackend,
+  RoomArtifactExpectation,
+  RoomArtifactRecoveryOutcome,
+  RoomArtifactWebRuntimeFence,
+  WebSpec
+} from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { Route } from '../gateway/routes'
 import type {
@@ -66,6 +76,25 @@ export class FakeBackend implements IsolationBackend {
   calls: string[] = []
   execInRoomCalls: { roomId: string; cmd: string[]; opts?: ExecOpts }[] = []
   oneShotCalls: { spec: WebSpec; cmd: string; opts?: ExecOpts }[] = []
+  publishRoomArtifactCalls: {
+    roomId: string
+    workspaceVolumeRevision: number
+    hostPngPath: string
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string | undefined
+    webFence: RoomArtifactWebRuntimeFence
+  }[] = []
+  captureRoomArtifactWebFenceCalls: WebSpec[] = []
+  pauseRoomArtifactWebCalls: { spec: WebSpec; fence: RoomArtifactWebRuntimeFence }[] = []
+  restoreRoomArtifactWebCalls: { spec: WebSpec; fence: RoomArtifactWebRuntimeFence }[] = []
+  reconcileRoomArtifactPublicationCalls: {
+    roomId: string
+    workspaceVolumeRevision: number
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string
+  }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
   webStateValue: 'running' | 'exited' | 'missing' = 'running'
@@ -78,11 +107,34 @@ export class FakeBackend implements IsolationBackend {
   execHandler: ((cmd: string[]) => ExecResult) | null = null
   oneShotHandler: ((spec: WebSpec, cmd: string, opts?: ExecOpts) => ExecResult) | null = null
   execInRoomHandler: ((roomId: string, cmd: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
+  publishRoomArtifactHandler: ((input: {
+    roomId: string
+    workspaceVolumeRevision: number
+    hostPngPath: string
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string | undefined
+    webFence: RoomArtifactWebRuntimeFence
+  }) => Promise<void> | void) | null = null
+  captureRoomArtifactWebFenceHandler:
+    ((spec: WebSpec) => Promise<RoomArtifactWebRuntimeFence> | RoomArtifactWebRuntimeFence) | null = null
+  pauseRoomArtifactWebHandler:
+    ((spec: WebSpec, fence: RoomArtifactWebRuntimeFence) => Promise<void> | void) | null = null
+  restoreRoomArtifactWebHandler:
+    ((spec: WebSpec, fence: RoomArtifactWebRuntimeFence) => Promise<void> | void) | null = null
+  reconcileRoomArtifactPublicationHandler: ((input: {
+    roomId: string
+    workspaceVolumeRevision: number
+    relativePath: string
+    expected: RoomArtifactExpectation
+    stageToken: string
+  }) => Promise<RoomArtifactRecoveryOutcome> | RoomArtifactRecoveryOutcome) | null = null
   copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
   relayTokenValue = ''
   lastWebSpec: WebSpec | null = null
   lastAnchorSpec: AnchorSpec | null = null
+  roomArtifactWebFenceValue: RoomArtifactWebRuntimeFence | null = null
 
   async health() {
     return { ok: true, detail: 'fake docker' }
@@ -107,18 +159,91 @@ export class FakeBackend implements IsolationBackend {
   async stopRoomPod(roomId: string) {
     this.calls.push(`stopRoomPod:${roomId}`)
   }
+  async captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence> {
+    this.calls.push(`captureRoomArtifactWebFence:${spec.roomId}:r${spec.workspaceVolumeRevision}`)
+    this.captureRoomArtifactWebFenceCalls.push(spec)
+    this.lastWebSpec = spec
+    if (this.captureRoomArtifactWebFenceHandler) {
+      return await this.captureRoomArtifactWebFenceHandler(spec)
+    }
+    const fence = this.roomArtifactWebFenceValue ?? {
+      containerId: 'e'.repeat(64),
+      workspaceVolume: `dh-${spec.roomId}-src-r${spec.workspaceVolumeRevision}`,
+      runtimeSpecSha256: 'f'.repeat(64),
+      volumeSetSha256: 'b'.repeat(64),
+      networkAuthorityId: 'a'.repeat(64),
+      networkId: 'c'.repeat(64),
+      ...(!spec.standalone ? { networkSandboxId: 'd'.repeat(64) } : {})
+    }
+    this.roomArtifactWebFenceValue = fence
+    return fence
+  }
+  async pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
+    this.calls.push(`pauseRoomArtifactWeb:${spec.roomId}:${fence.containerId}`)
+    this.pauseRoomArtifactWebCalls.push({ spec, fence })
+    if (this.pauseRoomArtifactWebHandler) {
+      await this.pauseRoomArtifactWebHandler(spec, fence)
+      return
+    }
+    await this.pauseWeb(spec.roomId)
+    if (!await this.webPaused(spec.roomId)) throw new Error('Room execution pause was not established')
+  }
+  async restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
+    this.calls.push(`restoreRoomArtifactWeb:${spec.roomId}:${fence.containerId}`)
+    this.restoreRoomArtifactWebCalls.push({ spec, fence })
+    if (this.restoreRoomArtifactWebHandler) {
+      await this.restoreRoomArtifactWebHandler(spec, fence)
+      return
+    }
+    try {
+      if (await this.webRunningUnpaused(spec.roomId)) return
+    } catch {
+      // Preserve the production recovery shape for orchestrator tests.
+    }
+    let unpauseError: unknown
+    try {
+      await this.unpauseWeb(spec.roomId)
+      if (!await this.webRunningUnpaused(spec.roomId)) {
+        throw new Error('Room was not running and unpaused after unpause')
+      }
+      return
+    } catch (error) {
+      unpauseError = error
+    }
+    try {
+      await this.recreateWeb(spec)
+      if (!await this.webRunningUnpaused(spec.roomId)) {
+        throw new Error('Recreated Room was not running and unpaused')
+      }
+      return
+    } catch (recreateError) {
+      try {
+        if (await this.webRunningUnpaused(spec.roomId)) return
+      } catch {
+        // Exact recovery proof remains unavailable.
+      }
+      throw new AggregateError([unpauseError, recreateError], 'Room runtime could not be resumed or recreated')
+    }
+  }
   async pauseWeb(roomId: string) {
     this.calls.push(`pauseWeb:${roomId}`)
     this.webPausedValue = true
+    this.webRunningUnpausedValue = false
   }
   async unpauseWeb(roomId: string) {
     this.calls.push(`unpauseWeb:${roomId}`)
     this.webPausedValue = false
+    this.webRunningUnpausedValue = true
   }
   webPausedValue = false
   async webPaused(roomId: string) {
     this.calls.push(`webPaused:${roomId}`)
     return this.webPausedValue
+  }
+  webRunningUnpausedValue = true
+  async webRunningUnpaused(roomId: string) {
+    this.calls.push(`webRunningUnpaused:${roomId}`)
+    return this.webRunningUnpausedValue
   }
   async restartWeb(roomId: string) {
     this.calls.push(`restartWeb:${roomId}`)
@@ -126,6 +251,8 @@ export class FakeBackend implements IsolationBackend {
   async recreateWeb(spec: WebSpec) {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
+    this.webPausedValue = false
+    this.webRunningUnpausedValue = true
   }
   async recreateAnchor(spec: AnchorSpec) {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
@@ -190,6 +317,40 @@ export class FakeBackend implements IsolationBackend {
       })
     }
     return exported
+  }
+  async publishRoomArtifact(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    hostPngPath: string,
+    relativePath: string,
+    expected: RoomArtifactExpectation,
+    stageToken: string | undefined,
+    webFence: RoomArtifactWebRuntimeFence
+  ) {
+    const input = {
+      roomId,
+      workspaceVolumeRevision,
+      hostPngPath,
+      relativePath,
+      expected,
+      stageToken,
+      webFence
+    }
+    this.calls.push(`publishRoomArtifact:${roomId}:r${workspaceVolumeRevision}:${relativePath}`)
+    this.publishRoomArtifactCalls.push(input)
+    await this.publishRoomArtifactHandler?.(input)
+  }
+  async reconcileRoomArtifactPublication(
+    roomId: string,
+    workspaceVolumeRevision: number,
+    relativePath: string,
+    expected: RoomArtifactExpectation,
+    stageToken: string
+  ): Promise<RoomArtifactRecoveryOutcome> {
+    const input = { roomId, workspaceVolumeRevision, relativePath, expected, stageToken }
+    this.calls.push(`reconcileRoomArtifactPublication:${roomId}:r${workspaceVolumeRevision}:${relativePath}`)
+    this.reconcileRoomArtifactPublicationCalls.push(input)
+    return await this.reconcileRoomArtifactPublicationHandler?.(input) ?? 'absent'
   }
   async webState() {
     return this.webStateValue
@@ -352,6 +513,7 @@ export class FakeBackend implements IsolationBackend {
     }
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
+  emulatorScreenPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
   async createEmulator(
     roomId: string,
     opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
@@ -361,7 +523,7 @@ export class FakeBackend implements IsolationBackend {
   }
   async captureEmulatorScreen(roomId: string) {
     this.calls.push(`captureEmulatorScreen:${roomId}`)
-    return 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
+    return this.emulatorScreenPng
   }
   async removeEmulator(roomId: string) {
     this.calls.push(`removeEmulator:${roomId}`)

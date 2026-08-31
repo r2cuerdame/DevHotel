@@ -6,6 +6,10 @@ import {
   zAndroidExtras,
   zAndroidTargetSelector,
   zAndroidTextMatch,
+  zArtifactFilename,
+  zArtifactExportBody,
+  zArtifactId,
+  zArtifactListLimit,
   zChangeId,
   zLeasePurpose,
   zPmKind,
@@ -19,13 +23,26 @@ type ToolContent =
   | { type: 'image'; data: string; mimeType: string }
 type ToolResult = { content: ToolContent[]; isError?: boolean }
 
-async function screenshotContent(
+async function capturedScreenshotContent(
   client: import('./client').ControlClient,
   roomId: string,
-  mode: 'auto' | 'screen' = 'auto'
-): Promise<ToolContent> {
-  const shot = await client.screenshot(roomId, mode)
-  return { type: 'image', data: shot.png, mimeType: 'image/png' }
+  filename: string,
+  mode: 'auto' | 'screen' = 'auto',
+  association?: { changeId?: string; runId?: string }
+): Promise<ToolContent[]> {
+  const artifact = await client.captureScreenshotArtifact(roomId, {
+    filename,
+    mode,
+    ...(association ? { association } : {})
+  })
+  const content = await client.readRoomArtifactContent(roomId, artifact.id)
+  if (content.sha256 !== artifact.sha256 || content.sizeBytes !== artifact.sizeBytes) {
+    throw new Error('Screenshot artifact content does not match its durable receipt')
+  }
+  return [
+    { type: 'text', text: JSON.stringify(artifact, null, 2) },
+    { type: 'image', data: content.data, mimeType: content.mimeType }
+  ]
 }
 
 /**
@@ -347,18 +364,87 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_screenshot',
       description:
-        "Capture the Android room's phone screen and return it as an image. Default 'auto' uses sharp guest-side screencap; pass mode 'screen' to grab the emulator display instead — that also captures apps that set FLAG_SECURE. The room must be awake. Read the returned image; never point host screen-capture or host input automation at the DevHotel preview window.",
+        "Capture an API 31+ Android room's exact tracked foreground app into an immutable Room artifact and return its metadata plus a directly reviewable image. Pixels and app/install metadata share one active-screen witness; launcher, OS-dialog and untracked-app captures must use the compatibility screenshot endpoint instead. Give it an explicit portable .png filename. Default 'auto' uses sharp guest-side screencap; pass mode 'screen' to grab the emulator display instead — that also captures apps that set FLAG_SECURE. The room must be awake. Never point host screen-capture or host input automation at the DevHotel preview window.",
       schema: {
         roomId: zRoomId,
-        mode: z.enum(['auto', 'screen']).optional().describe("'screen' captures the display output, including FLAG_SECURE apps")
+        filename: zArtifactFilename.describe('portable artifact filename, e.g. login-success.png'),
+        mode: z.enum(['auto', 'screen']).optional().describe("'screen' captures the display output, including FLAG_SECURE apps"),
+        changeId: zChangeId.optional().describe('optional verified change this capture proves'),
+        runId: z.string().uuid().optional().describe('optional retained command/test run this capture belongs to')
       },
-      handler: async (a: { roomId: string; mode?: 'auto' | 'screen' }): Promise<ToolResult> => {
+      handler: async (a: {
+        roomId: string
+        filename: string
+        mode?: 'auto' | 'screen'
+        changeId?: string
+        runId?: string
+      }): Promise<ToolResult> => {
         try {
-          return { content: [await screenshotContent(await getClient(), a.roomId, a.mode ?? 'auto')] }
+          const association = a.changeId || a.runId
+            ? { ...(a.changeId ? { changeId: a.changeId } : {}), ...(a.runId ? { runId: a.runId } : {}) }
+            : undefined
+          return {
+            content: await capturedScreenshotContent(
+              await getClient(),
+              a.roomId,
+              a.filename,
+              a.mode ?? 'auto',
+              association
+            )
+          }
         } catch (err) {
           return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
         }
       }
+    },
+    {
+      name: 'list_room_artifacts',
+      description:
+        'List a Room’s newest durable screenshot artifacts and their secret-safe capture metadata. Content is fetched separately so listing stays small.',
+      schema: {
+        roomId: zRoomId,
+        limit: zArtifactListLimit.optional().describe('newest artifacts to return, default 20 and maximum 100')
+      },
+      handler: wrap(async (a) => (await getClient()).listRoomArtifacts(a.roomId, a.limit))
+    },
+    {
+      name: 'read_room_artifact',
+      description:
+        'Read one screenshot artifact from its owning Room as metadata plus a directly reviewable PNG image. Artifact IDs are Room-scoped and content is integrity-checked before return.',
+      schema: { roomId: zRoomId, artifactId: zArtifactId },
+      handler: async (a: { roomId: string; artifactId: string }): Promise<ToolResult> => {
+        try {
+          const client = await getClient()
+          const artifact = await client.getRoomArtifact(a.roomId, a.artifactId)
+          const content = await client.readRoomArtifactContent(a.roomId, a.artifactId)
+          if (content.sha256 !== artifact.sha256 || content.sizeBytes !== artifact.sizeBytes) {
+            throw new Error('Screenshot artifact content does not match its durable receipt')
+          }
+          return {
+            content: [
+              { type: 'text', text: JSON.stringify(artifact, null, 2) },
+              { type: 'image', data: content.data, mimeType: content.mimeType }
+            ]
+          }
+        } catch (err) {
+          return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+        }
+      }
+    },
+    {
+      name: 'export_room_artifact',
+      description:
+        'Export a screenshot artifact into a new safe repo-relative .png path in its Hotel-owned Room workspace. Every parent directory must already exist as a regular directory; create missing directories inside the Room before retrying. Never accepts Host paths or overwrites a project file. Returned Markdown is valid from the repository root; nested documents must rebase the path and issues/PRs need a repository/ref URL.',
+      schema: {
+        roomId: zRoomId,
+        artifactId: zArtifactId,
+        relativePath: zArtifactExportBody.shape.relativePath.describe(
+          'safe repo-relative destination, e.g. docs/evidence/login-success.png'
+        )
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).exportRoomArtifact(a.roomId, a.artifactId, { relativePath: a.relativePath })
+      )
     },
     {
       name: 'android_run',
@@ -384,7 +470,20 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           }
           const content: ToolContent[] = [{ type: 'text', text: JSON.stringify({ change: entry, android: status }, null, 2) }]
           try {
-            content.push(await screenshotContent(client, a.roomId))
+            const changeId =
+              typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string'
+                ? (entry as { id: string }).id
+                : undefined
+            if (!changeId) throw new Error('android-run returned no change ID for screenshot association')
+            content.push(
+              ...(await capturedScreenshotContent(
+                client,
+                a.roomId,
+                `android-run-${changeId}.png`,
+                'auto',
+                { changeId }
+              ))
+            )
           } catch (err) {
             content.push({ type: 'text', text: `screenshot skipped: ${err instanceof Error ? err.message : String(err)}` })
           }
