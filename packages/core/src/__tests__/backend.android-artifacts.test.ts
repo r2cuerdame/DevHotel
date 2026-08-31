@@ -68,8 +68,15 @@ describe('OciCliBackend Android artifact export', () => {
         const mount = args.find((arg) => arg.endsWith(':/out'))!
         const output = mount.slice(0, -':/out'.length)
         const apk = join(output, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk')
+        const metadata = join(dirname(apk), 'output-metadata.json')
         mkdirSync(dirname(apk), { recursive: true })
         writeFileSync(apk, 'verified-apk')
+        writeFileSync(metadata, '{}')
+        return {
+          code: 0,
+          stdout: 'devhotel-android-export-v1\t1\t14\t1\n',
+          stderr: ''
+        }
       }
       return ok
     })
@@ -179,12 +186,145 @@ describe('OciCliBackend Android artifact export', () => {
       size: 12,
       sha256: createHash('sha256').update('verified-apk').digest('hex')
     }])
-    const run = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'run')?.[0]
+    const exportCall = mockedRunDocker.mock.calls.find(([args]) =>
+      args[0] === 'run' && args.some((arg) => arg.endsWith(':/out'))
+    )!
+    const run = exportCall[0]
+    const opts = exportCall[1]
     expect(run).toEqual(expect.arrayContaining([
+      '--name',
+      '--label', `devhotel.room=${ROOM_ID}`, '--label', 'devhotel.role=job', '--label', 'devhotel.managed=1',
       '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '-v', `${SNAPSHOT}:/workspace:ro`
     ]))
+    expect(run[run.indexOf('--name') + 1]).toMatch(/^dh-room1abc-job-[0-9a-f]{32}$/)
     expect(run?.find((arg) => arg.endsWith(':/out'))).toBe(`${realpathSync.native(join(root, OPERATION_ID))}:/out`)
+    expect(opts).toMatchObject({
+      maxStdoutBytes: 256,
+      maxStderrBytes: 64 * 1024
+    })
+    expect(opts?.onAbort).toEqual(expect.any(Function))
+    const script = run.at(-1) ?? ''
+    expect(script).toContain("find . -xdev \\( -type f -o -type l \\) -path '*/build/outputs/apk/*' -iname '*.apk' -print0")
+    expect(script).toContain('sort -zu "$apk_paths"')
+    expect(script).toContain('while IFS= read -r -d "" file; do')
+    expect(script).toContain('line_feed=$(printf "\\nx"); line_feed=${line_feed%x}')
+    expect(script).toContain('*"$line_feed"*|*"$carriage_return"*')
+    expect(script).toContain('[ "$apk_count" -le 64 ]')
+    expect(script).toContain('[ "$3" -ge 1 ] && [ "$3" -le 536870912 ]')
+    expect(script).toContain('[ "$aggregate_bytes" -le 2147483648 ]')
+    expect(script).toContain('[ "$1" = "$workspace_device" ]')
+    expect(script).toContain('[ ! -L "$source" ]')
+    expect(script).toContain('cmp -s "$metadata_expected" "$metadata_sorted"')
+    expect(script.indexOf('cmp -s "$metadata_expected" "$metadata_sorted"'))
+      .toBeLessThan(script.indexOf('copy_manifest "$apk_manifest"'))
+  })
+
+  it('fails closed on bounded-helper overflow and on a Host inventory mismatch', async () => {
+    const helperId = 'a'.repeat(64)
+    let helperName = ''
+    let helperExists = false
+    let cleanupCompleted = false
+    mockedRunDocker.mockImplementation(async (args, opts) => {
+      if (args[0] === 'volume' && args[1] === 'inspect') return { code: 0, stdout: volumeInspect(), stderr: '' }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'inspect') {
+        if (helperExists && (args[1] === helperName || args[1] === helperId)) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{
+              Id: helperId,
+              Name: `/${helperName}`,
+              Config: { Labels: {
+                'devhotel.room': ROOM_ID,
+                'devhotel.role': 'job',
+                'devhotel.managed': '1'
+              } },
+              State: { Status: 'running' }
+            }]),
+            stderr: ''
+          }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'rm') {
+        expect(args).toEqual(['rm', '-f', helperId])
+        helperExists = false
+        cleanupCompleted = true
+        return ok
+      }
+      if (args[0] === 'run') {
+        helperName = args[args.indexOf('--name') + 1]!
+        helperExists = true
+        await opts?.onAbort?.()
+        return { code: -1, stdout: '', stderr: 'output exceeded safety limit', outputLimitExceeded: true }
+      }
+      return ok
+    })
+    let root = join(tempDir(), 'artifacts')
+    await expect(new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID))
+      .rejects.toThrow(/diagnostics exceeded the safety limit/)
+    expect(cleanupCompleted).toBe(true)
+    expect(existsSync(join(root, OPERATION_ID))).toBe(false)
+
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'volume' && args[1] === 'inspect') return { code: 0, stdout: volumeInspect(), stderr: '' }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'run') {
+        const mount = args.find((arg) => arg.endsWith(':/out'))!
+        const output = mount.slice(0, -':/out'.length)
+        const apk = join(output, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk')
+        const metadata = join(dirname(apk), 'output-metadata.json')
+        mkdirSync(dirname(apk), { recursive: true })
+        writeFileSync(apk, 'verified-apk')
+        writeFileSync(metadata, '{}')
+        return { code: 0, stdout: 'devhotel-android-export-v1\t2\t14\t1\n', stderr: '' }
+      }
+      return ok
+    })
+    root = join(tempDir(), 'artifacts')
+    await expect(new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID))
+      .rejects.toThrow(/do not match the validated snapshot inventory/)
+    expect(existsSync(join(root, OPERATION_ID))).toBe(false)
+  })
+
+  it('preserves case-insensitive APK extensions and rejects line-separator paths on the Host recheck', async () => {
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'volume' && args[1] === 'inspect') return { code: 0, stdout: volumeInspect(), stderr: '' }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'run') {
+        const mount = args.find((arg) => arg.endsWith(':/out'))!
+        const output = mount.slice(0, -':/out'.length)
+        const apk = join(output, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.APK')
+        mkdirSync(dirname(apk), { recursive: true })
+        writeFileSync(apk, 'verified-apk')
+        writeFileSync(join(dirname(apk), 'output-metadata.json'), '{}')
+        return { code: 0, stdout: 'devhotel-android-export-v1\t1\t14\t1\n', stderr: '' }
+      }
+      return ok
+    })
+    let root = join(tempDir(), 'artifacts')
+    await expect(new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID))
+      .resolves.toMatchObject([{ relativePath: expect.stringMatching(/\.APK$/) }])
+
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'volume' && args[1] === 'inspect') return { code: 0, stdout: volumeInspect(), stderr: '' }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'run') {
+        const mount = args.find((arg) => arg.endsWith(':/out'))!
+        const output = mount.slice(0, -':/out'.length)
+        const apk = join(output, 'app', 'build', 'outputs', 'apk', 'debug', 'bad\u2028name.apk')
+        mkdirSync(dirname(apk), { recursive: true })
+        writeFileSync(apk, 'verified-apk')
+        writeFileSync(join(dirname(apk), 'output-metadata.json'), '{}')
+        return { code: 0, stdout: 'devhotel-android-export-v1\t1\t14\t1\n', stderr: '' }
+      }
+      return ok
+    })
+    root = join(tempDir(), 'artifacts')
+    await expect(new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID))
+      .rejects.toThrow(/Host artifact path is invalid/)
+    expect(existsSync(join(root, OPERATION_ID))).toBe(false)
   })
 
   it('rejects a mismatched operation snapshot and refuses an existing output directory', async () => {
@@ -213,7 +353,7 @@ describe('OciCliBackend Android artifact export', () => {
     const root = join(tempDir(), 'artifacts')
     await expect(
       new OciCliBackend().exportAndroidArtifacts(ROOM_ID, SNAPSHOT, root, OPERATION_ID)
-    ).rejects.toThrow(/copy failed/)
+    ).rejects.toThrow(/export Android build artifacts failed \(exit 1\)/)
     expect(existsSync(join(root, OPERATION_ID))).toBe(false)
   })
 

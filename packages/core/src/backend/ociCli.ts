@@ -45,6 +45,8 @@ import type { AnchorSpec, ExecOpts, ExecOutputChunk, ExecResult, ExportedArtifac
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
+const ONE_SHOT_MAX_STDOUT_BYTES = 16 * 1024 * 1024
+const ONE_SHOT_MAX_STDERR_BYTES = 4 * 1024 * 1024
 // Keep the controlled helper's hard screen bound local until the screenshot
 // artifact package lands; the published artifact contract uses the same 16 MiB cap.
 const SCREENSHOT_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
@@ -895,7 +897,29 @@ export class OciCliBackend implements IsolationBackend {
     return spawnDockerProcess(['logs', '-f', '--tail', String(tail), exactContainerId(container, roomId)])
   }
 
-  async runOneShot(spec: WebSpec, cmd: string, log?: (line: string) => void): Promise<ExecResult> {
+  async runOneShot(
+    spec: WebSpec,
+    cmd: string,
+    log?: (line: string) => void,
+    opts: ExecOpts = {}
+  ): Promise<ExecResult> {
+    if (log && (opts.onStdout || opts.onStderr)) {
+      throw new Error('runOneShot accepts either a line logger or chunk sinks, not both')
+    }
+    const outputLimit = (name: 'maxStdoutBytes' | 'maxStderrBytes', hardLimit: number): number => {
+      const requested = opts[name]
+      if (requested === undefined) return hardLimit
+      if (!Number.isSafeInteger(requested) || requested < 0) {
+        throw new Error(`runOneShot ${name} must be a non-negative safe integer`)
+      }
+      return Math.min(requested, hardLimit)
+    }
+    const maxStdoutBytes = outputLimit('maxStdoutBytes', ONE_SHOT_MAX_STDOUT_BYTES)
+    const maxStderrBytes = outputLimit('maxStderrBytes', ONE_SHOT_MAX_STDERR_BYTES)
+    if (opts.timeoutMs !== undefined && (!Number.isSafeInteger(opts.timeoutMs) || opts.timeoutMs < 1)) {
+      throw new Error('runOneShot timeoutMs must be a positive safe integer')
+    }
+    throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(imageFor(spec), log)
     await this.ensureRoomNetwork(spec.roomId)
@@ -912,7 +936,82 @@ export class OciCliBackend implements IsolationBackend {
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
-    return runDocker(buildOneShotArgs(spec, cmd, randomUUID()), { timeoutMs: LONG_TIMEOUT_MS, onLine: log })
+    throwIfAborted(opts.signal)
+
+    const jobId = randomUUID()
+    const name = jobName(spec.roomId, jobId)
+    const createArgs = [...buildOneShotArgs(spec, cmd, jobId)]
+    if (createArgs[0] !== 'run' || createArgs[1] !== '--rm') {
+      throw new Error('one-shot lifecycle arguments are not in the expected canonical form')
+    }
+    createArgs[0] = 'create'
+    createArgs.splice(1, 1)
+    let containerId: string | undefined
+    try {
+      // Container creation is an ownership-critical section. Let the CLI reach
+      // a definitive answer, while bounding its own diagnostics, then validate
+      // the immutable ID before any user command is allowed to start.
+      const created = await runDocker(createArgs, {
+        timeoutMs: null,
+        maxStdoutBytes: 128,
+        maxStderrBytes: 8 * 1024,
+        killOnOutputLimit: false
+      })
+      const candidateId = created.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidateId)) containerId = candidateId
+      if (created.outputLimitExceeded === true) {
+        throw new Error('one-shot container create output exceeded its safety limit')
+      }
+      must(created, 'create one-shot container')
+      if (!containerId) throw new Error('one-shot container create did not return one immutable container ID')
+      const inspected = await this.inspectContainer(containerId)
+      const owned = await this.assertRoomContainer(spec.roomId, name, 'job', inspected ?? undefined)
+      if (exactContainerId(owned, spec.roomId) !== containerId) {
+        throw new Error('one-shot container immutable ID changed before start')
+      }
+      if (owned.State?.Status !== 'created') {
+        throw new Error('one-shot container was not inert before its controlled command')
+      }
+      throwIfAborted(opts.signal)
+    } catch (error) {
+      try {
+        await this.removeOneShotJob(spec.roomId, name, containerId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'one-shot create and exact cleanup both failed')
+      }
+      throw error
+    }
+    if (!containerId) throw new Error('one-shot immutable container ID was not retained')
+
+    let result: ExecResult | undefined
+    let executionError: unknown
+    try {
+      result = await runDocker(['start', '-a', containerId], {
+        timeoutMs: opts.timeoutMs ?? LONG_TIMEOUT_MS,
+        signal: opts.signal,
+        maxStdoutBytes,
+        maxStderrBytes,
+        onAbort: () => this.removeOneShotJob(spec.roomId, name, containerId),
+        ...(log ? { onLine: log } : {}),
+        ...(opts.onStdout ? { onStdout: opts.onStdout } : {}),
+        ...(opts.onStderr ? { onStderr: opts.onStderr } : {})
+      })
+    } catch (error) {
+      executionError = error
+    }
+    try {
+      // `docker start -a` leaves an exited container on normal completion;
+      // every path removes and post-verifies the exact immutable ID.
+      await this.removeOneShotJob(spec.roomId, name, containerId)
+    } catch (cleanupError) {
+      if (executionError) {
+        throw new AggregateError([executionError, cleanupError], 'one-shot execution and exact cleanup both failed')
+      }
+      throw cleanupError
+    }
+    if (executionError) throw executionError
+    if (!result) throw new Error('one-shot command did not return an execution result')
+    return result
   }
 
   async exportAndroidArtifacts(
@@ -921,6 +1020,11 @@ export class OciCliBackend implements IsolationBackend {
     artifactsRoot: string,
     operationId: string
   ): Promise<ExportedArtifact[]> {
+    const maxApkCount = 64
+    const maxApkBytes = 512 * 1024 * 1024
+    const maxAggregateBytes = 2 * 1024 * 1024 * 1024
+    const maxMetadataBytes = 256 * 1024
+    const maxRelativePathBytes = 4096
     await this.assertPinnedEngineIdentity()
     const expectedSnapshot = workspaceSnapshotVolume(roomId, operationId)
     if (workspaceVolume !== expectedSnapshot) throw new Error('artifact input is not this build operation snapshot')
@@ -940,60 +1044,231 @@ export class OciCliBackend implements IsolationBackend {
     if (!isPathInside(canonicalRoot, canonicalOutput)) throw new Error('artifact directory resolved outside the Hotel artifact root')
     await this.ensureImage(DU_IMAGE)
     try {
-      must(
-        await runDocker(
-          [
-            'run',
-            '--rm',
-            '--network',
-            'none',
-            '--cap-drop',
-            'ALL',
-            '--security-opt',
-            'no-new-privileges',
-            '-v',
-            `${workspaceVolume}:/workspace:ro`,
-            '-v',
-            `${canonicalOutput}:/out`,
-            DU_IMAGE,
-            'sh',
-            '-lc',
-            "cd /workspace && find . -type f \\( \\( -path '*/build/outputs/apk/*' -name '*.apk' \\) -o -path '*/build/outputs/apk/*/output-metadata.json' \\) -exec sh -c 'for file do rel=${file#./}; mkdir -p \"/out/${rel%/*}\"; cp \"$file\" \"/out/$rel\"; done' sh {} +"
-          ],
-          { timeoutMs: LONG_TIMEOUT_MS }
-        ),
-        'export Android build artifacts'
+      // Inventory the read-only snapshot completely before writing anything to
+      // the Host bind mount. Both inventories and identity records are NUL
+      // delimited, so hostile-but-valid Unix filenames cannot split records.
+      const exportScript = [
+        'set -eu',
+        'umask 077',
+        'export LC_ALL=C',
+        'fail() { printf "%s\\n" "$1" >&2; exit 65; }',
+        'apk_paths=$(mktemp) || fail "artifact inventory setup failed"',
+        'apk_sorted=$(mktemp) || fail "artifact inventory setup failed"',
+        'apk_manifest=$(mktemp) || fail "artifact inventory setup failed"',
+        'metadata_needed=$(mktemp) || fail "artifact inventory setup failed"',
+        'metadata_expected=$(mktemp) || fail "artifact inventory setup failed"',
+        'metadata_paths=$(mktemp) || fail "artifact inventory setup failed"',
+        'metadata_sorted=$(mktemp) || fail "artifact inventory setup failed"',
+        'metadata_manifest=$(mktemp) || fail "artifact inventory setup failed"',
+        "trap 'rm -f \"$apk_paths\" \"$apk_sorted\" \"$apk_manifest\" \"$metadata_needed\" \"$metadata_expected\" \"$metadata_paths\" \"$metadata_sorted\" \"$metadata_manifest\"' EXIT HUP INT TERM",
+        'line_feed=$(printf "\\nx"); line_feed=${line_feed%x}',
+        'carriage_return=$(printf "\\rx"); carriage_return=${carriage_return%x}',
+        'line_separator=$(printf "\\342\\200\\250")',
+        'paragraph_separator=$(printf "\\342\\200\\251")',
+        'validate_relative_path() {',
+        '  candidate=$1',
+        '  [ -n "$candidate" ] && [ "${#candidate}" -le 4096 ] || fail "artifact path is invalid"',
+        '  case "$candidate" in /*|*\\\\*) fail "artifact path is invalid" ;; esac',
+        '  case "/$candidate/" in *"/./"*|*"/../"*|*"//"*) fail "artifact path is invalid" ;; esac',
+        '  case "$candidate" in *"$line_feed"*|*"$carriage_return"*|*"$line_separator"*|*"$paragraph_separator"*) fail "artifact path is invalid" ;; esac',
+        '  if printf "%s" "$candidate" | grep -q "[[:cntrl:]]"; then fail "artifact path is invalid"; fi',
+        '}',
+        'source_identity() {',
+        '  source=$1',
+        '  [ -f "$source" ] && [ ! -L "$source" ] || fail "artifact source type is invalid"',
+        '  canonical=$(realpath "$source" 2>/dev/null) || fail "artifact source path is invalid"',
+        '  case "$canonical" in /workspace/*) ;; *) fail "artifact source escaped the snapshot" ;; esac',
+        '  identity=$(stat -c "%d %i %s" -- "$source" 2>/dev/null) || fail "artifact source identity is unavailable"',
+        '  printf "%s" "$identity"',
+        '}',
+        'cd /workspace || fail "artifact snapshot is unavailable"',
+        'workspace_device=$(stat -c "%d" . 2>/dev/null) || fail "artifact snapshot identity is unavailable"',
+        "find . -xdev \\( -type f -o -type l \\) -path '*/build/outputs/apk/*' -iname '*.apk' -print0 > \"$apk_paths\" 2>/dev/null || fail \"APK inventory failed\"",
+        'sort -zu "$apk_paths" > "$apk_sorted" 2>/dev/null || fail "APK inventory ordering failed"',
+        ': > "$apk_manifest"',
+        ': > "$metadata_needed"',
+        'apk_count=0',
+        'aggregate_bytes=0',
+        'while IFS= read -r -d "" file; do',
+        '  rel=${file#./}',
+        '  validate_relative_path "$rel"',
+        '  case "$rel" in build/outputs/apk/*|*/build/outputs/apk/*) ;; *) fail "APK path is outside build outputs" ;; esac',
+        '  case "$rel" in *.apk|*.apK|*.aPk|*.aPK|*.Apk|*.ApK|*.APk|*.APK) ;; *) fail "APK extension is invalid" ;; esac',
+        '  apk_count=$((apk_count + 1))',
+        '  [ "$apk_count" -le 64 ] || fail "APK count exceeds the safety limit"',
+        '  identity=$(source_identity "$file")',
+        '  set -- $identity',
+        '  [ "$#" -eq 3 ] && [ "$1" = "$workspace_device" ] || fail "APK crossed the snapshot filesystem"',
+        '  case "$3" in ""|*[!0-9]*) fail "APK size is invalid" ;; esac',
+        '  [ "$3" -ge 1 ] && [ "$3" -le 536870912 ] || fail "APK size exceeds the safety limit"',
+        '  aggregate_bytes=$((aggregate_bytes + $3))',
+        '  [ "$aggregate_bytes" -le 2147483648 ] || fail "artifact aggregate exceeds the safety limit"',
+        '  printf "%s\\0%s\\0%s\\0%s\\0" "$file" "$1" "$2" "$3" >> "$apk_manifest"',
+        '  printf "%s\\0" "${file%/*}/output-metadata.json" >> "$metadata_needed"',
+        'done < "$apk_sorted"',
+        'sort -zu "$metadata_needed" > "$metadata_expected" 2>/dev/null || fail "metadata inventory ordering failed"',
+        "find . -xdev \\( -type f -o -type l \\) -path '*/build/outputs/apk/*/output-metadata.json' -print0 > \"$metadata_paths\" 2>/dev/null || fail \"metadata inventory failed\"",
+        'sort -zu "$metadata_paths" > "$metadata_sorted" 2>/dev/null || fail "metadata inventory ordering failed"',
+        'cmp -s "$metadata_expected" "$metadata_sorted" || fail "APK metadata relationship is incomplete or ambiguous"',
+        ': > "$metadata_manifest"',
+        'metadata_count=0',
+        'while IFS= read -r -d "" file; do',
+        '  rel=${file#./}',
+        '  validate_relative_path "$rel"',
+        '  case "$rel" in build/outputs/apk/*/output-metadata.json|*/build/outputs/apk/*/output-metadata.json) ;; *) fail "metadata path is outside build outputs" ;; esac',
+        '  metadata_count=$((metadata_count + 1))',
+        '  [ "$metadata_count" -le 64 ] || fail "metadata count exceeds the safety limit"',
+        '  identity=$(source_identity "$file")',
+        '  set -- $identity',
+        '  [ "$#" -eq 3 ] && [ "$1" = "$workspace_device" ] || fail "metadata crossed the snapshot filesystem"',
+        '  case "$3" in ""|*[!0-9]*) fail "metadata size is invalid" ;; esac',
+        '  [ "$3" -ge 2 ] && [ "$3" -le 262144 ] || fail "metadata size exceeds the safety limit"',
+        '  aggregate_bytes=$((aggregate_bytes + $3))',
+        '  [ "$aggregate_bytes" -le 2147483648 ] || fail "artifact aggregate exceeds the safety limit"',
+        '  printf "%s\\0%s\\0%s\\0%s\\0" "$file" "$1" "$2" "$3" >> "$metadata_manifest"',
+        'done < "$metadata_sorted"',
+        'out_device=$(stat -c "%d" /out 2>/dev/null) || fail "Host artifact directory is unavailable"',
+        'copy_manifest() {',
+        '  manifest=$1',
+        '  while IFS= read -r -d "" file && IFS= read -r -d "" expected_device && IFS= read -r -d "" expected_inode && IFS= read -r -d "" expected_size; do',
+        '    identity=$(source_identity "$file")',
+        '    [ "$identity" = "$expected_device $expected_inode $expected_size" ] || fail "artifact source changed after inventory"',
+        '    rel=${file#./}',
+        '    destination_dir=/out/${rel%/*}',
+        '    mkdir -p "$destination_dir" 2>/dev/null || fail "Host artifact directory creation failed"',
+        '    [ ! -L "$destination_dir" ] || fail "Host artifact directory is unsafe"',
+        '    canonical_destination=$(realpath "$destination_dir" 2>/dev/null) || fail "Host artifact directory is unsafe"',
+        '    case "$canonical_destination" in /out/*) ;; *) fail "Host artifact path escaped its root" ;; esac',
+        '    [ "$(stat -c "%d" "$destination_dir" 2>/dev/null)" = "$out_device" ] || fail "Host artifact path crossed a filesystem"',
+        '    destination=/out/$rel',
+        '    [ ! -e "$destination" ] && [ ! -L "$destination" ] || fail "Host artifact destination already exists"',
+        '    cp "$file" "$destination" 2>/dev/null || fail "artifact copy failed"',
+        '    [ -f "$destination" ] && [ ! -L "$destination" ] || fail "Host artifact type is invalid"',
+        '    [ "$(stat -c "%s" "$destination" 2>/dev/null)" = "$expected_size" ] || fail "Host artifact size changed during copy"',
+        '    identity=$(source_identity "$file")',
+        '    [ "$identity" = "$expected_device $expected_inode $expected_size" ] || fail "artifact source changed during copy"',
+        '  done < "$manifest"',
+        '}',
+        'copy_manifest "$apk_manifest"',
+        'copy_manifest "$metadata_manifest"',
+        'printf "devhotel-android-export-v1\\t%s\\t%s\\t%s\\n" "$apk_count" "$aggregate_bytes" "$metadata_count"'
+      ].join('\n')
+      const exportJobName = jobName(roomId, randomUUID())
+      const exported = await runDocker(
+        [
+          'run',
+          '--rm',
+          '--name',
+          exportJobName,
+          '--label',
+          `devhotel.room=${roomId}`,
+          '--label',
+          'devhotel.role=job',
+          '--label',
+          'devhotel.managed=1',
+          '--network',
+          'none',
+          '--cap-drop',
+          'ALL',
+          '--security-opt',
+          'no-new-privileges',
+          '-v',
+          `${workspaceVolume}:/workspace:ro`,
+          '-v',
+          `${canonicalOutput}:/out`,
+          DU_IMAGE,
+          'sh',
+          '-lc',
+          exportScript
+        ],
+        {
+          timeoutMs: LONG_TIMEOUT_MS,
+          maxStdoutBytes: 256,
+          maxStderrBytes: 64 * 1024,
+          onAbort: () => this.removeOneShotJob(roomId, exportJobName)
+        }
       )
+      if (exported.outputLimitExceeded === true) throw new Error('Android artifact export diagnostics exceeded the safety limit')
+      if (exported.code !== 0) {
+        throw new Error(`export Android build artifacts failed (exit ${exported.code})`)
+      }
+      if (exported.stderr !== '') throw new Error('Android artifact export returned unexpected diagnostics')
+      const summary = /^devhotel-android-export-v1\t([0-9]+)\t([0-9]+)\t([0-9]+)\r?\n?$/.exec(exported.stdout)
+      if (!summary) throw new Error('Android artifact export returned an invalid bounded inventory summary')
+      const expectedApkCount = Number(summary[1])
+      const expectedAggregateBytes = Number(summary[2])
+      const expectedMetadataCount = Number(summary[3])
+      if (
+        !Number.isSafeInteger(expectedApkCount) ||
+        expectedApkCount < 0 ||
+        expectedApkCount > maxApkCount ||
+        !Number.isSafeInteger(expectedMetadataCount) ||
+        expectedMetadataCount < 0 ||
+        expectedMetadataCount > expectedApkCount ||
+        !Number.isSafeInteger(expectedAggregateBytes) ||
+        expectedAggregateBytes < 0 ||
+        expectedAggregateBytes > maxAggregateBytes
+      ) {
+        throw new Error('Android artifact export inventory summary exceeded its safety contract')
+      }
 
       if (realpathSync.native(output) !== canonicalOutput) throw new Error('artifact directory changed during export')
       const artifacts: ExportedArtifact[] = []
-      for (const path of filesBelow(canonicalOutput)) {
+      const metadataPaths = new Set<string>()
+      const expectedMetadataPaths = new Set<string>()
+      let aggregateBytes = 0
+      const exportedPaths = filesBelow(canonicalOutput)
+      if (exportedPaths.length > maxApkCount * 2) throw new Error('Host artifact count exceeds the safety limit')
+      for (const path of exportedPaths) {
         const relativePath = relative(canonicalOutput, path).replaceAll('\\', '/')
         const segments = relativePath.split('/')
+        if (
+          Buffer.byteLength(relativePath, 'utf8') > maxRelativePathBytes ||
+          relativePath.startsWith('/') ||
+          /^[A-Za-z]:/.test(relativePath) ||
+          relativePath.includes('\\') ||
+          /[\p{C}\p{Zl}\p{Zp}]/u.test(relativePath) ||
+          segments.some((segment) => segment === '' || segment === '.' || segment === '..')
+        ) {
+          throw new Error('Host artifact path is invalid')
+        }
+        const file = lstatSync(path)
+        if (file.isSymbolicLink() || !file.isFile()) throw new Error(`invalid Host artifact type: ${relativePath}`)
+        aggregateBytes += file.size
+        if (aggregateBytes > maxAggregateBytes) throw new Error('Host artifact aggregate exceeds the safety limit')
         if (relativePath.endsWith('/output-metadata.json')) {
-          const metadata = lstatSync(path)
           if (
-            metadata.isSymbolicLink() ||
-            !metadata.isFile() ||
-            metadata.size < 2 ||
-            metadata.size > 256 * 1024 ||
+            file.size < 2 ||
+            file.size > maxMetadataBytes ||
             !(relativePath.startsWith('build/outputs/apk/') || relativePath.includes('/build/outputs/apk/'))
           ) {
             throw new Error(`invalid exported Android output metadata: ${relativePath}`)
           }
+          metadataPaths.add(relativePath)
           continue
         }
         if (
-          relativePath.startsWith('/') ||
-          segments.some((segment) => segment === '' || segment === '.' || segment === '..') ||
-          !relativePath.endsWith('.apk') ||
-          !(relativePath.startsWith('build/outputs/apk/') || relativePath.includes('/build/outputs/apk/'))
+          !relativePath.toLowerCase().endsWith('.apk') ||
+          !(relativePath.startsWith('build/outputs/apk/') || relativePath.includes('/build/outputs/apk/')) ||
+          file.size < 1 ||
+          file.size > maxApkBytes
         ) {
           throw new Error(`invalid exported APK path: ${relativePath}`)
         }
-        artifacts.push({ relativePath, size: statSync(path).size, sha256: await sha256File(path) })
+        expectedMetadataPaths.add(`${relativePath.slice(0, relativePath.lastIndexOf('/'))}/output-metadata.json`)
+        artifacts.push({ relativePath, size: file.size, sha256: await sha256File(path) })
       }
       artifacts.sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+      if (
+        artifacts.length !== expectedApkCount ||
+        artifacts.length > maxApkCount ||
+        metadataPaths.size !== expectedMetadataCount ||
+        aggregateBytes !== expectedAggregateBytes ||
+        metadataPaths.size !== expectedMetadataPaths.size ||
+        [...metadataPaths].some((path) => !expectedMetadataPaths.has(path))
+      ) {
+        throw new Error('Host artifacts do not match the validated snapshot inventory')
+      }
       if (artifacts.length === 0) rmSync(canonicalOutput, { recursive: true, force: true })
       return artifacts
     } catch (error) {
@@ -2773,6 +3048,21 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomContainer(roomId, name, role)
     must(await runDocker(['rm', '-f', name]), `remove Room ${roomId} container ${name}`)
     if (await this.inspectContainer(name)) throw new Error(`Room ${roomId} container cleanup incomplete: ${name}`)
+  }
+
+  private async removeOneShotJob(roomId: string, name: string, expectedId?: string): Promise<void> {
+    const existing = await this.inspectContainer(expectedId ?? name)
+    if (!existing) return
+    const owned = await this.assertRoomContainer(roomId, name, 'job', existing)
+    const id = exactContainerId(owned, roomId)
+    if (expectedId && id !== expectedId) {
+      throw new Error('Refusing to clean up a replacement one-shot container')
+    }
+    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
+      throw new Error('Could not clean up the exact one-shot container')
+    }
+    if (await this.inspectContainer(id)) throw new Error('The exact one-shot container still exists after cleanup')
   }
 
   private async removeFailedCreatedService(

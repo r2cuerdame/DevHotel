@@ -57,6 +57,7 @@ export interface AndroidAppInstallsRepo {
     applicationId: string
   ): { userId: number; serial: number } | null
   remove(roomId: string, target: AndroidInstallTarget, applicationId: string): void
+  removeForChange(roomId: string, changeId: string): void
   invalidateTargetApplication(target: AndroidInstallTarget, applicationId: string): void
   invalidateTarget(target: Pick<AndroidInstallTarget, 'kind' | 'targetId'>): void
   clearTarget(roomId: string, target: AndroidInstallTarget): void
@@ -146,6 +147,11 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
         `DELETE FROM android_app_installs
          WHERE room_id = ? AND target_kind = ? AND target_id = ? AND lease_id IS ? AND application_id = ?`
       ).run(roomId, ...targetParams(target), applicationId)
+    },
+    removeForChange(roomId, changeId) {
+      sqlite.prepare(
+        'DELETE FROM android_app_installs WHERE room_id = ? AND change_id = ?'
+      ).run(roomId, changeId)
     },
     invalidateTargetApplication(target, applicationId) {
       sqlite.prepare(

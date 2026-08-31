@@ -108,7 +108,17 @@ export interface IsolationBackend {
   spawnInteractiveExec(roomId: string, cmd: string[]): Promise<ChildProcessWithoutNullStreams>
   /** Follow web logs only after engine and exact web-container ownership validation. */
   followRoomLogs(roomId: string, tail?: number): Promise<ChildProcessWithoutNullStreams>
-  runOneShot(spec: WebSpec, cmd: string, log?: (line: string) => void): Promise<ExecResult>
+  /**
+   * Run a disposable Room job with bounded output and ownership-safe cleanup.
+   * Existing callers may omit opts; the production backend still applies hard
+   * stdout/stderr caps and a finite timeout.
+   */
+  runOneShot(
+    spec: WebSpec,
+    cmd: string,
+    log?: (line: string) => void,
+    opts?: ExecOpts
+  ): Promise<ExecResult>
   /** Export APKs from an owned immutable workspace volume beneath a Room-owned Hotel artifact root. */
   exportAndroidArtifacts(
     roomId: string,

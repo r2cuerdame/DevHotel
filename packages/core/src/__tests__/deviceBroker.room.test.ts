@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
@@ -8,7 +8,9 @@ import { FakeAdbHost, FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from
 
 const TEST_BASE_APK = '/data/app/base.apk'
 const TEST_BASE_STAT = '103:4242:123456:1788157200:1788157201'
-const TEST_APK_SHA = createHash('sha256').update('fake-room-file').digest('hex')
+const TEST_APK_SHA = createHash('sha256')
+  .update('fake-apk:app/build/outputs/apk/debug/app-debug.apk')
+  .digest('hex')
 const TEST_PACKAGE_INCARNATION = createHash('sha256')
   .update('devhotel-android-package-incarnation\0')
   .update(TEST_BASE_APK)
@@ -121,6 +123,7 @@ describe('Rooms attach and release the shared phone', () => {
     const db = testDb()
     dbs.push(db)
     const backend = new FakeBackend()
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
     const gateway = new FakeGateway()
     const adb = new FakeAdbHost([
       { serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' },
@@ -279,6 +282,7 @@ describe('Android automation targets the attached device without a hand-written 
     const db = testDb()
     dbs.push(db)
     const backend = new FakeBackend()
+    backend.workspaceFingerprintValue = 'b'.repeat(64)
     const gateway = new FakeGateway()
     const adb = new FakeAdbHost([{ serial: 'R5CT30ABCDE', state: 'device', model: 'SM_G991N', release: '14', sdk: '34' }])
     const orch = new RoomOrchestrator({ userData, backend, gateway: gateway.asGateway(), db, appVersion: 'test', adb })
@@ -286,10 +290,10 @@ describe('Android automation targets the attached device without a hand-written 
       id: 'aaaa1111',
       project: 'AppDied',
       provider: 'android',
-      sourceType: 'empty',
-      sourceRef: '',
-      workspaceMode: 'empty',
-      syncStatus: 'empty',
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/android.git',
+      workspaceMode: 'hotel',
+      syncStatus: 'modified',
       runtime: { kind: 'jdk', version: '17' },
       packageManager: { kind: 'gradle' },
       startCommand: 'gradle assembleDebug --no-daemon',
@@ -419,7 +423,9 @@ describe('Android automation targets the attached device without a hand-written 
       expect(call.args).toHaveLength(2)
       expect(call.opts).toMatchObject({ timeoutMs: 20_000, maxStdoutBytes: 1024, maxStderrBytes: 1024 })
     }
-    expect(backend.execInRoomCalls).toEqual([])
+    expect(backend.execInRoomCalls.some((call) =>
+      call.cmd.some((arg) => /output-metadata|find \/workspace|(^|\s)adb(?:\s|$)/.test(arg))
+    )).toBe(false)
   })
 
   it('fails phone controls closed without exposing fenced helper output', async () => {
@@ -769,7 +775,8 @@ describe('Android automation targets the attached device without a hand-written 
       })
     ])
     expect(installEvidence.fence).toMatch(/^devhotel-install-u0-uid10123-[0-9a-f-]{36}$/)
-    expect(backend.calls).toContain('copyFromRoom:/workspace/app/build/outputs/apk/debug/My 앱-$&-debug.APK')
+    expect(backend.calls.some((call) => call.startsWith('copyFromRoom:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('exportAndroidArtifacts:'))).toBe(true)
     expect(adb.execs.find((call) => call.args[0] === 'install')?.args[2]).not.toContain('/workspace/')
     expect(adb.execs.find((call) => logicalAdbArgs(call.args)[1] === 'am')?.serial).toBe('R5CT30ABCDE')
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
@@ -782,62 +789,20 @@ describe('Android automation targets the attached device without a hand-written 
     if (attached.state !== 'granted') throw new Error('unreachable')
     adb.execs = []
     backend.execInRoomCalls = []
-    let staleOutputPresent = true
-    let workspaceSwappedAfterCapture = false
     let buildRan = false
-    let discoveries = 0
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('find . -xdev -depth') && command.includes("-path '*/build/outputs/apk/debug'")) {
+    backend.oneShotHandler = (_spec, command, opts) => {
+      if (command.includes('build/outputs/apk')) {
         expect(buildRan).toBe(false)
-        expect(command).toContain("-path '*/build/outputs/apk/debug/*'")
+        expect(command).toContain('-xdev')
         expect(command).toContain('-delete')
-        expect(command).not.toMatch(/\brm\b/)
-        staleOutputPresent = false
-        return { code: 0, stdout: '', stderr: '' }
-      }
-      if (command === 'cd /workspace && gradle assembleDebug --no-daemon') {
-        expect(staleOutputPresent).toBe(false)
+        expect(opts).toMatchObject({ maxStdoutBytes: 64 * 1024, maxStderrBytes: 64 * 1024 })
+      } else {
         buildRan = true
-        return { code: 0, stdout: '', stderr: '' }
-      }
-      if (command.includes('find /workspace')) {
-        discoveries += 1
-        expect(command).toContain('-xdev -type f')
-        expect(command).toContain('-print0')
-        expect(command).not.toContain(' -L')
-        if (!command.includes('-xdev -type f') || command.includes(' -L')) {
-          return {
-            code: 0,
-            stdout:
-              '/workspace/mounted/build/outputs/apk/debug/output-metadata.json\0' +
-              '/workspace/symlinked/build/outputs/apk/debug/output-metadata.json\0',
-            stderr: ''
-          }
-        }
-        if (workspaceSwappedAfterCapture) {
-          return { code: 0, stdout: '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
-        }
-        const current = '/workspace/app/build/outputs/apk/debug/output-metadata.json\0'
-        const stale = staleOutputPresent
-          ? '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\0'
-          : ''
-        return { code: 0, stdout: `${stale}${current}`, stderr: '' }
-      }
-      if (command.startsWith("cat -- '/workspace/app/")) {
-        workspaceSwappedAfterCapture = true
-        return {
-          code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
-          stderr: ''
-        }
-      }
-      if (command.startsWith("cat -- '/workspace/deleted/")) {
-        return {
-          code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.stale.app', elements: [{ outputFile: 'stale-debug.apk' }] }),
-          stderr: ''
-        }
+        expect(opts).toMatchObject({
+          timeoutMs: 15 * 60_000,
+          maxStdoutBytes: 8 * 1024 * 1024,
+          maxStderrBytes: 8 * 1024 * 1024
+        })
       }
       return { code: 0, stdout: '', stderr: '' }
     }
@@ -849,17 +814,14 @@ describe('Android automation targets the attached device without a hand-written 
     expect(entry.status).toBe('verified')
     expect(entry.captured).toEqual({ applicationId: 'com.example.app' })
     expect(buildRan).toBe(true)
-    expect(discoveries).toBe(1)
-    const cleanupCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.includes('find . -xdev -depth'))
-    const discoveryCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.includes('find /workspace'))
-    const metadataCall = backend.execInRoomCalls.find((call) => call.cmd.at(-1)?.startsWith("cat -- '/workspace/"))
-    expect(cleanupCall?.opts).toMatchObject({ maxStdoutBytes: 16 * 1024, maxStderrBytes: 16 * 1024 })
-    expect(discoveryCall?.opts).toMatchObject({ maxStdoutBytes: 64 * (4096 + 2), maxStderrBytes: 16 * 1024 })
-    expect(metadataCall?.opts).toMatchObject({ maxStdoutBytes: 64 * 1024, maxStderrBytes: 16 * 1024 })
-    expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([
-      'copyFromRoom:/workspace/app/build/outputs/apk/debug/app-debug.apk'
+    expect(backend.execInRoomCalls.some((call) =>
+      call.cmd.some((arg) => /output-metadata|find \/workspace|(^|\s)adb(?:\s|$)/.test(arg))
+    )).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('copyFromRoom:'))).toBe(false)
+    expect(backend.oneShotCalls.map((call) => call.spec.workspaceVolumeOverride)).toEqual([
+      expect.stringMatching(/^dh-aaaa1111-src-build-/),
+      expect.stringMatching(/^dh-aaaa1111-src-build-/)
     ])
-    expect(backend.calls.some((call) => call.includes('/workspace/deleted/'))).toBe(false)
     expect(orch.androidInstalls.list('aaaa1111', {
       kind: 'physical', targetId: attached.device.id, deviceId: attached.device.id, leaseId: attached.lease.id
     })).toEqual([expect.objectContaining({ applicationId: 'com.example.app', changeId: entry.id })])
@@ -871,102 +833,99 @@ describe('Android automation targets the attached device without a hand-written 
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
     adb.execs = []
     let buildRan = false
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('find . -xdev -depth') && command.includes("-path '*/build/outputs/apk/debug'")) {
-        expect(command).toContain('-delete')
-        expect(command).not.toMatch(/\brm\b/)
+    backend.oneShotHandler = (_spec, command) => {
+      if (command.includes('build/outputs/apk')) {
         return { code: 1, stdout: 'partial private path', stderr: 'Device or resource busy at nested mount' }
       }
-      if (command === 'cd /workspace && gradle assembleDebug --no-daemon') buildRan = true
+      buildRan = true
       return { code: 0, stdout: '', stderr: '' }
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry.status).toBe('failed')
-    expect(entry.verify?.detail).toMatch(/prior Android debug outputs could not be cleared safely/)
+    expect(entry.verify?.detail).toMatch(/isolated Android build cleanup failed/)
     expect(entry.verify?.detail).not.toMatch(/partial private path|Device or resource busy|nested mount/)
     expect(buildRan).toBe(false)
     expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
   })
 
   it.each([
-    'discovery-nonzero',
-    'discovery-stderr',
-    'discovery-overflow',
-    'too-many-apps',
-    'duplicate-path',
-    'metadata-nonzero',
-    'metadata-stderr',
-    'metadata-overflow',
+    'build-output-overflow',
     'duplicate-app-id',
     'multiple-apk-elements'
-  ] as const)('fails android-run closed on bounded build provenance fault %s', async (fault) => {
+  ] as const)('fails android-run closed on sealed build provenance fault %s', async (fault) => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
     adb.execs = []
-    const firstPath = '/workspace/app/build/outputs/apk/debug/output-metadata.json'
-    const secondPath = '/workspace/other/build/outputs/apk/debug/output-metadata.json'
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('find /workspace')) {
-        if (fault === 'discovery-nonzero') return { code: 1, stdout: firstPath, stderr: '' }
-        if (fault === 'discovery-stderr') return { code: 0, stdout: `${firstPath}\0`, stderr: 'private warning' }
-        if (fault === 'discovery-overflow') {
-          return { code: -1, stdout: `${firstPath}\0`, stderr: '', outputLimitExceeded: true }
-        }
-        if (fault === 'too-many-apps') {
+    if (fault === 'build-output-overflow') {
+      backend.oneShotHandler = (_spec, command) => command.includes('build/outputs/apk')
+        ? { code: 0, stdout: '', stderr: '' }
+        : { code: -1, stdout: 'private build bytes', stderr: '', outputLimitExceeded: true }
+    } else {
+      backend.exportAndroidArtifacts = async (_roomId, _workspaceVolume, artifactsRoot, operationId) => {
+        const relativePaths = fault === 'duplicate-app-id'
+          ? ['app/build/outputs/apk/debug/app.apk', 'other/build/outputs/apk/debug/other.apk']
+          : ['app/build/outputs/apk/debug/app.apk']
+        return relativePaths.map((relativePath) => {
+          const artifact = join(artifactsRoot, operationId, relativePath)
+          const bytes = Buffer.from(`sealed:${relativePath}`)
+          mkdirSync(dirname(artifact), { recursive: true })
+          writeFileSync(artifact, bytes)
+          writeFileSync(
+            join(dirname(artifact), 'output-metadata.json'),
+            JSON.stringify({
+              applicationId: 'com.example.app',
+              elements: fault === 'multiple-apk-elements'
+                ? [{ outputFile: 'app.apk' }, { outputFile: 'split.apk' }]
+                : [{ outputFile: relativePath.split('/').at(-1) }]
+            })
+          )
           return {
-            code: 0,
-            stdout: `${Array.from({ length: 65 }, (_, index) =>
-              `/workspace/app${index}/build/outputs/apk/debug/output-metadata.json`).join('\0')}\0`,
-            stderr: ''
+            relativePath,
+            size: bytes.byteLength,
+            sha256: createHash('sha256').update(bytes).digest('hex')
           }
-        }
-        if (fault === 'duplicate-path') {
-          return { code: 0, stdout: `${firstPath}\0${firstPath}\0`, stderr: '' }
-        }
-        if (fault === 'duplicate-app-id') {
-          return { code: 0, stdout: `${firstPath}\0${secondPath}\0`, stderr: '' }
-        }
-        return { code: 0, stdout: `${firstPath}\0`, stderr: '' }
+        })
       }
-      if (command.startsWith('cat -- ')) {
-        if (fault === 'metadata-nonzero') return { code: 1, stdout: '{}', stderr: '' }
-        if (fault === 'metadata-stderr') return { code: 0, stdout: '{}', stderr: 'private warning' }
-        if (fault === 'metadata-overflow') {
-          return { code: -1, stdout: '{}', stderr: '', outputLimitExceeded: true }
-        }
-        return {
-          code: 0,
-          stdout: JSON.stringify({
-            applicationId: 'com.example.app',
-            elements: fault === 'multiple-apk-elements'
-              ? [{ outputFile: 'one.apk' }, { outputFile: 'two.apk' }]
-              : [{ outputFile: command.includes('/other/') ? 'other.apk' : 'app.apk' }]
-          }),
-          stderr: ''
-        }
-      }
-      return { code: 0, stdout: '', stderr: '' }
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry.status).toBe('failed')
-    expect(entry.verify?.detail).not.toMatch(/private warning|output-metadata\.json/)
+    expect(entry.verify?.detail).not.toMatch(/private build bytes|output-metadata\.json/)
     expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
   }, 15_000)
 
+  it('withholds private Host paths when sealed output metadata disappears', async () => {
+    const { orch, adb, backend, userData } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    const exportArtifacts = backend.exportAndroidArtifacts.bind(backend)
+    backend.exportAndroidArtifacts = async (roomId, workspaceVolume, artifactsRoot, operationId) => {
+      const artifacts = await exportArtifacts(roomId, workspaceVolume, artifactsRoot, operationId)
+      rmSync(join(artifactsRoot, operationId, 'app/build/outputs/apk/debug/output-metadata.json'))
+      return artifacts
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({
+      status: 'failed',
+      verify: { detail: expect.stringContaining('sealed Android build metadata is missing or unreadable') }
+    })
+    expect(JSON.stringify(entry)).not.toContain(userData)
+    expect(adb.execs.some((call) => call.args[0] === 'install')).toBe(false)
+  })
+
   it.each([
-    { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED', keepsReceipt: true },
-    { race: 'replacement' as const, expectedCode: 'ANDROID_APP_REPLACED', keepsReceipt: false }
+    { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED' },
+    { race: 'replacement' as const, expectedCode: 'ANDROID_APP_REPLACED' }
   ])('fails android-run closed when a $race races its final tracked launch', async ({
     race,
-    expectedCode,
-    keepsReceipt
+    expectedCode
   }) => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
@@ -1027,7 +986,7 @@ describe('Android automation targets the attached device without a hand-written 
       deviceId: attached.device.id,
       leaseId: attached.lease.id
     }
-    expect(orch.androidInstalls.get('aaaa1111', receiptTarget, 'com.example.app') !== null).toBe(keepsReceipt)
+    expect(orch.androidInstalls.get('aaaa1111', receiptTarget, 'com.example.app')).toBeNull()
     const launch = adb.execs.find((call) => {
       const logical = logicalAdbArgs(call.args)
       return logical[1] === 'am' && logical[2] === 'start'
@@ -1125,6 +1084,12 @@ describe('Android automation targets the attached device without a hand-written 
       status: 'failed',
       verify: { ok: false }
     })
+    expect(orch.androidInstalls.list('aaaa1111', {
+      kind: 'physical',
+      targetId: attached.device.id,
+      deviceId: attached.device.id,
+      leaseId: attached.lease.id
+    })).toEqual([])
   }, 15_000)
 
   it.each([
@@ -1187,31 +1152,24 @@ describe('Android automation targets the attached device without a hand-written 
       findOutput: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
       metadata: { applicationId: 'com.example.app', elements: [{ outputFile: `${'앱'.repeat(90)}.apk` }] },
       expected: /unsafe APK filename/
-    },
-    {
-      name: 'metadata path shell injection',
-      findOutput: "/workspace/app/build/outputs/apk/debug/output-metadata.json';getprop ro.serialno;'\0",
-      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] },
-      expected: /unsafe output-metadata path/
-    },
-    {
-      name: 'newline-delimited metadata path injection',
-      findOutput:
-        '/workspace/fake/build/outputs/apk/debug/output-metadata.json\n' +
-        '/workspace/app/build/outputs/apk/debug/output-metadata.json\0',
-      metadata: { applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] },
-      expected: /unsafe output-metadata path/
     }
-  ])('fails closed on $name before a physical adb install', async ({ findOutput, metadata, expected }) => {
+  ])('fails closed on $name before a physical adb install', async ({ metadata, expected }) => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
     await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
     adb.execs = []
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('find /workspace')) return { code: 0, stdout: findOutput, stderr: '' }
-      if (command.startsWith('cat ')) return { code: 0, stdout: JSON.stringify(metadata), stderr: '' }
-      return { code: 0, stdout: '', stderr: '' }
+    backend.exportAndroidArtifacts = async (_roomId, _workspaceVolume, artifactsRoot, operationId) => {
+      const relativePath = 'app/build/outputs/apk/debug/app-debug.apk'
+      const artifact = join(artifactsRoot, operationId, relativePath)
+      const bytes = Buffer.from('sealed-invalid-metadata-fixture')
+      mkdirSync(dirname(artifact), { recursive: true })
+      writeFileSync(artifact, bytes)
+      writeFileSync(join(dirname(artifact), 'output-metadata.json'), JSON.stringify(metadata))
+      return [{
+        relativePath,
+        size: bytes.byteLength,
+        sha256: createHash('sha256').update(bytes).digest('hex')
+      }]
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
@@ -1241,15 +1199,13 @@ describe('Android automation targets the attached device without a hand-written 
       return { code: 0, stdout: '', stderr: '' }
     }
 
-    const entry = await orch.applyChange(
+    await expect(orch.applyChange(
       'aaaa1111',
       { kind: 'android-run', applicationId: 'com.example.app;getprop.ro.serialno' },
       'user'
-    )
-
-    expect(entry.status).toBe('failed')
-    expect(entry.verify?.detail).toMatch(/Invalid Android applicationId/)
-    expect(adb.execs.map((call) => call.args[0])).toEqual(['get-state'])
+    )).rejects.toThrow(/Invalid Android applicationId/)
+    expect(orch.listChanges('aaaa1111')).toEqual([])
+    expect(adb.execs).toEqual([])
   })
 
   it('keeps android-run fenced to its preflight lease across a long build', async () => {
@@ -1259,9 +1215,9 @@ describe('Android automation targets the attached device without a hand-written 
     if (first.state !== 'granted') throw new Error('unreachable')
     adb.execs = []
     let replaced = false
-    backend.execInRoomHandler = async (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('cd /workspace') && !replaced) {
+    const runOneShot = backend.runOneShot.bind(backend)
+    backend.runOneShot = async (spec, command, log, opts) => {
+      if (command === 'gradle assembleDebug --no-daemon' && !replaced) {
         replaced = true
         await orch.devices.release(first.lease.id, 'replace lease during build')
         const next = await orch.devices.requestDevice({
@@ -1272,19 +1228,8 @@ describe('Android automation targets the attached device without a hand-written 
           constraints: { deviceId: first.lease.deviceId }
         })
         expect(next.state).toBe('granted')
-        return { code: 0, stdout: '', stderr: '' }
       }
-      if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
-      }
-      if (command.startsWith("cat -- '/workspace/")) {
-        return {
-          code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
-          stderr: ''
-        }
-      }
-      return { code: 0, stdout: '', stderr: '' }
+      return await runOneShot(spec, command, log, opts)
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
@@ -1304,7 +1249,14 @@ describe('Android automation targets the attached device without a hand-written 
     adb.execs = []
     backend.emulatorStateValue = 'running'
     backend.execInRoomCalls = []
-    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
+    const unicodeArtifact = '앱 모듈/build/outputs/apk/debug/내 앱-debug.apk'
+    backend.exportedArtifacts = [{ relativePath: unicodeArtifact, size: 0, sha256: '0'.repeat(64) }]
+    const installEvidence = {
+      fence: '',
+      foregroundApplicationId: 'com.example.app',
+      locale: 'en-US',
+      apkSha256: createHash('sha256').update(`fake-apk:${unicodeArtifact}`).digest('hex')
+    }
     backend.fencedEmulatorExecHandler = (androidArgs) => {
       const logical = logicalAdbArgs(androidArgs)
       if (logical[1] === 'run-as') vi.setSystemTime('2026-08-31T01:00:01.000Z')
@@ -1346,9 +1298,8 @@ describe('Android automation targets the attached device without a hand-written 
     ])
     expect(adb.execs).toEqual([])
     expect(backend.execInRoomCalls.some((call) => call.cmd.some((arg) => /(^|\s)adb(?:\s|$)/.test(arg)))).toBe(false)
-    expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([
-      "copyFromRoom:/workspace/app/build/outputs/apk/debug/My App's $&-debug.APK"
-    ])
+    expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([])
+    expect(backend.calls.some((call) => call.startsWith('exportAndroidArtifacts:'))).toBe(true)
     expect(backend.calls.some((call) => call.startsWith('installFencedEmulatorApk:'))).toBe(true)
   })
 
@@ -1376,7 +1327,7 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
-    backend.copyFromRoomHook = (_roomId, _roomPath, hostPath) => {
+    backend.installFencedEmulatorApk = async (_roomId, hostPath) => {
       throw new Error(`daemon refused private destination ${hostPath}`)
     }
 
@@ -1387,6 +1338,33 @@ describe('Android automation targets the attached device without a hand-written 
     expect(published).toContain('[private APK stage]')
     expect(published).not.toContain(userData)
     expect(published).not.toMatch(/android-install-receipt-|installed\.apk/i)
+  })
+
+  it('redacts the sealed Host source path when it disappears before private staging', async () => {
+    const { orch, backend, userData } = setup()
+    backend.emulatorStateValue = 'running'
+    let deleted = false
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        const artifactRoot = join(userData, 'rooms', 'aaaa1111', 'artifacts')
+        for (const operationId of readdirSync(artifactRoot)) {
+          rmSync(join(artifactRoot, operationId, 'app/build/outputs/apk/debug/app-debug.apk'))
+          deleted = true
+        }
+        return { code: 0, stdout: '1\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+    const published = JSON.stringify(entry)
+
+    expect(deleted).toBe(true)
+    expect(entry.status).toBe('failed')
+    expect(published).toContain('[private APK stage]')
+    expect(published).not.toContain(userData)
+    expect(published).not.toContain(join('rooms', 'aaaa1111', 'artifacts'))
   })
 
   it('removes an old emulator receipt before tracked reinstall proof can fail', async () => {

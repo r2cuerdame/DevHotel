@@ -1,22 +1,24 @@
-import { assertLaunchersAreExecutable, lineEndingAttributionInRoom } from './androidLineEndings'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
+import { assertLaunchersAreExecutable } from './androidLineEndings'
+import {
+  buildSealedAndroidArtifacts,
+  cleanupAndroidBuildArtifacts,
+  sealedAndroidArtifactRef,
+  verifySealedAndroidBuild
+} from './androidBuild'
+import type { ExportedArtifact } from '../../backend/types'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
-const BUILD_TIMEOUT_MS = 15 * 60_000
 const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
 const MAX_BUILT_APPS = 64
-const MAX_METADATA_PATH_BYTES = 4096
-const MAX_DISCOVERY_STDOUT_BYTES = MAX_BUILT_APPS * (MAX_METADATA_PATH_BYTES + 2)
 const MAX_METADATA_STDOUT_BYTES = 64 * 1024
-const MAX_COMMAND_DIAGNOSTIC_BYTES = 16 * 1024
-const CLEAR_DEBUG_APK_OUTPUTS =
-  "cd /workspace && find . -xdev -depth \\( -path '*/build/outputs/apk/debug' -o -path '*/build/outputs/apk/debug/*' \\) -delete"
-const DISCOVER_DEBUG_APK_METADATA =
-  "find /workspace -xdev -type f -path '*/build/outputs/apk/debug/output-metadata.json' -print0"
+const DEBUG_APK_PATH = /^(?:[^/\0]+\/)*build\/outputs\/apk\/debug\/[^/\0]+\.apk$/i
 
 interface BuiltApp {
   appId: string
-  apkPath: string
+  artifact: ExportedArtifact
 }
 
 interface AndroidRunCapture {
@@ -34,22 +36,7 @@ function assertApplicationId(value: string, source: 'build metadata' | 'request'
   return value
 }
 
-function assertMetadataPath(metaPath: string): string {
-  const prefix = '/workspace/'
-  const suffix = '/build/outputs/apk/debug/output-metadata.json'
-  const segments = metaPath.slice(prefix.length).split('/')
-  if (
-    metaPath.length > MAX_METADATA_PATH_BYTES ||
-    !metaPath.startsWith(prefix) ||
-    !metaPath.endsWith(suffix) ||
-    segments.some((segment) => !segment || segment === '.' || segment === '..' || !/^[A-Za-z0-9._+@ -]+$/.test(segment))
-  ) {
-    throw new Error('Android build returned an unsafe output-metadata path')
-  }
-  return metaPath
-}
-
-function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
+function builtAppFromMetadata(artifact: ExportedArtifact, stdout: string): BuiltApp {
   let metadata: unknown
   try {
     metadata = JSON.parse(stdout)
@@ -81,82 +68,72 @@ function builtAppFromMetadata(metaPath: string, stdout: string): BuiltApp {
   ) {
     throw new Error('Android build output metadata contains an unsafe APK filename')
   }
-  const outputDirectory = metaPath.slice(0, metaPath.lastIndexOf('/') + 1)
-  return { appId, apkPath: `${outputDirectory}${outputFile}` }
+  if (outputFile !== basename(artifact.relativePath)) {
+    throw new Error('Android build output metadata does not match its sealed APK artifact')
+  }
+  return { appId, artifact }
 }
 
-/** Every module's debug APK, resolved strictly from its own output-metadata.json. */
-async function builtApps(ctx: ChangeCtx): Promise<BuiltApp[]> {
-  const list = await ctx.backend.execInRoom(
-    ctx.roomId,
-    ['sh', '-lc', DISCOVER_DEBUG_APK_METADATA],
-    {
-      timeoutMs: 30_000,
-      maxStdoutBytes: MAX_DISCOVERY_STDOUT_BYTES,
-      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
-    }
-  )
-  if (list.code !== 0 || list.stderr.length > 0 || list.outputLimitExceeded === true) {
-    throw new Error('Android build output metadata discovery failed its bounded provenance check')
+/** Resolve only bounded, verified debug APKs exported from this operation's private snapshot. */
+function builtApps(ctx: ChangeCtx, operationId: string, artifacts: ExportedArtifact[]): BuiltApp[] {
+  if (artifacts.length > MAX_BUILT_APPS) throw new Error('Android build returned too many APK artifacts')
+  const artifactRoot = join(ctx.userData, 'rooms', ctx.roomId, 'artifacts', operationId)
+  let canonicalRoot: string
+  try {
+    canonicalRoot = realpathSync.native(artifactRoot)
+  } catch {
+    throw new Error('sealed Android build metadata is missing or unreadable')
   }
-  if (list.stdout.length > 0 && !list.stdout.endsWith('\0')) {
-    throw new Error('Android build returned incomplete output metadata framing')
-  }
-  const discoveredPaths = list.stdout.length === 0 ? [] : list.stdout.slice(0, -1).split('\0')
-  if (discoveredPaths.length > MAX_BUILT_APPS || discoveredPaths.some((path) => path.length === 0)) {
-    throw new Error('Android build returned an invalid number of output metadata paths')
-  }
-  const metadataPaths = discoveredPaths.map(assertMetadataPath)
-  if (new Set(metadataPaths).size !== metadataPaths.length) {
-    throw new Error('Android build returned duplicate output metadata paths')
-  }
+  const debugArtifacts = artifacts.filter((artifact) => DEBUG_APK_PATH.test(artifact.relativePath))
   const apps: BuiltApp[] = []
   const applicationIds = new Set<string>()
-  const apkPaths = new Set<string>()
-  for (const metaPath of metadataPaths) {
-    const meta = await ctx.backend.execInRoom(ctx.roomId, ['sh', '-lc', `cat -- ${shellQuote(metaPath)}`], {
-      timeoutMs: 30_000,
-      maxStdoutBytes: MAX_METADATA_STDOUT_BYTES,
-      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
-    })
-    if (meta.code !== 0 || meta.stderr.length > 0 || meta.outputLimitExceeded === true) {
-      throw new Error('Android build output metadata could not be read safely')
+  const artifactPaths = new Set<string>()
+  const metadataPaths = new Set<string>()
+  for (const artifact of debugArtifacts) {
+    if (artifactPaths.has(artifact.relativePath)) {
+      throw new Error('Android build returned duplicate APK artifacts')
     }
-    const app = builtAppFromMetadata(metaPath, meta.stdout)
-    if (applicationIds.has(app.appId) || apkPaths.has(app.apkPath)) {
+    artifactPaths.add(artifact.relativePath)
+    const metadataRelativePath = `${dirname(artifact.relativePath).replaceAll('\\', '/')}/output-metadata.json`
+    if (metadataPaths.has(metadataRelativePath)) {
+      throw new Error('Android build returned multiple APKs for one tracked application')
+    }
+    metadataPaths.add(metadataRelativePath)
+    const metadataPath = join(artifactRoot, ...metadataRelativePath.split('/'))
+    let metadata: ReturnType<typeof lstatSync>
+    let canonicalMetadata: string
+    try {
+      metadata = lstatSync(metadataPath)
+      canonicalMetadata = realpathSync.native(metadataPath)
+    } catch {
+      throw new Error('sealed Android build metadata is missing or unreadable')
+    }
+    const metadataRelativeToRoot = relative(canonicalRoot, canonicalMetadata)
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isFile() ||
+      metadata.size < 2 ||
+      metadata.size > MAX_METADATA_STDOUT_BYTES ||
+      isAbsolute(metadataRelativeToRoot) ||
+      metadataRelativeToRoot === '..' ||
+      metadataRelativeToRoot.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    ) {
+      throw new Error('Android build returned unsafe output metadata')
+    }
+    let metadataText: string
+    try {
+      metadataText = readFileSync(canonicalMetadata, 'utf8')
+    } catch {
+      throw new Error('sealed Android build metadata is missing or unreadable')
+    }
+    const app = builtAppFromMetadata(artifact, metadataText)
+    if (applicationIds.has(app.appId)) {
       throw new Error('Android build returned ambiguous duplicate app metadata')
     }
     applicationIds.add(app.appId)
-    apkPaths.add(app.apkPath)
     apps.push(app)
   }
   return apps
-}
-
-async function clearPriorDebugOutputs(ctx: ChangeCtx): Promise<void> {
-  // GNU find does not follow symlinks by default. `-xdev` keeps cleanup in the
-  // workspace root filesystem and `-delete` avoids a child `rm` crossing a
-  // mount inserted between discovery and deletion. A nested mount remains
-  // busy/non-empty, so find exits nonzero and the build fails closed.
-  const cleared = await ctx.backend.execInRoom(
-    ctx.roomId,
-    ['sh', '-lc', CLEAR_DEBUG_APK_OUTPUTS],
-    {
-      timeoutMs: 30_000,
-      maxStdoutBytes: MAX_COMMAND_DIAGNOSTIC_BYTES,
-      maxStderrBytes: MAX_COMMAND_DIAGNOSTIC_BYTES
-    }
-  ).catch(() => {
-    throw new Error('prior Android debug outputs could not be cleared safely')
-  })
-  if (
-    cleared.code !== 0 ||
-    cleared.stdout.length > 0 ||
-    cleared.stderr.length > 0 ||
-    cleared.outputLimitExceeded === true
-  ) {
-    throw new Error('prior Android debug outputs could not be cleared safely')
-  }
 }
 
 function capturedTarget(captured: unknown, requestedApplicationId?: string): AndroidRunCapture | null {
@@ -189,10 +166,6 @@ function pickTarget(apps: BuiltApp[], applicationId?: string): BuiltApp {
   return target
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
 function targetLabel(ctx: ChangeCtx): string {
   return ctx.physicalAndroidDevice?.nickname ?? 'the Room emulator'
 }
@@ -219,10 +192,14 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       autoRollback: false
     }
   },
-  async preflight(ctx) {
+  async preflight(ctx, p) {
     const room = ctx.room()
     if (room.provider !== 'android') throw new Error('Only Android rooms can run Android apps')
     if (!ctx.isAwake()) throw new Error('Wake the room before running')
+    if (room.workspaceMode !== 'hotel') {
+      throw new Error('Android Build & Run requires a Room-owned Hotel workspace; move this Room into Hotel first')
+    }
+    if (p.applicationId) assertApplicationId(p.applicationId, 'request')
     if (ctx.physicalAndroidDevice) {
       if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
       const state = await ctx.execFencedAndroidTarget(['get-state'], { timeoutMs: 20_000 })
@@ -237,57 +214,87 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
   async apply(ctx, p, steps, operation) {
     const apply = async (): Promise<void> => {
       const room = ctx.room()
-      steps.push('Clear prior debug APK outputs')
-      await clearPriorDebugOutputs(ctx)
-      steps.push(`Run ${room.startCommand}`)
-      const build = await ctx.backend.execInRoom(room.id, ['sh', '-lc', `cd /workspace && ${room.startCommand}`], {
-        timeoutMs: BUILD_TIMEOUT_MS
-      })
-      if (build.code !== 0) {
-        const attribution = await lineEndingAttributionInRoom(ctx)
-        throw new Error(`build failed (exit ${build.code}): ${(build.stderr || build.stdout).slice(-500)}${attribution}`)
-      }
+      const committed: string[] = []
+      let primaryError: unknown
+      try {
+        const sealed = await buildSealedAndroidArtifacts(ctx, steps, operation)
+        const verified = await verifySealedAndroidBuild(ctx, sealed.provenance, operation)
+        if (!verified.ok) throw new Error(verified.detail)
+        const apps = builtApps(ctx, operation.id, sealed.provenance.artifacts)
+        if (apps.length === 0) throw new Error('no sealed debug APK metadata was produced')
+        const target = pickTarget(apps, p.applicationId)
+        // Android-run owns only its validated target capture. Build provenance
+        // remains an operation-local capability and is never persisted here.
+        steps.setCaptured({ applicationId: target.appId } satisfies AndroidRunCapture)
 
-      const apps = await builtApps(ctx)
-      if (apps.length === 0) throw new Error('no output-metadata.json produced')
-      const target = pickTarget(apps, p.applicationId)
-      steps.setCaptured({ applicationId: target.appId } satisfies AndroidRunCapture)
-
-      if (ctx.physicalAndroidDevice) {
-        steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
-      } else {
-        // the emulator boots asynchronously — wait until adb (shared netns)
-        // reports the device ready, bounded by wall clock (probes can block)
-        steps.push('Wait for the emulator to finish booting')
-        let booted = false
-        const bootDeadline = Date.now() + 5 * 60_000
-        if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
-        while (Date.now() < bootDeadline) {
-          const probe = await ctx.execFencedAndroidTarget(
-            ['shell', 'getprop', 'sys.boot_completed'],
-            { timeoutMs: 20_000 }
-          )
-          if (probe.stdout.trim() === '1') {
-            booted = true
-            break
+        if (ctx.physicalAndroidDevice) {
+          steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
+        } else {
+          steps.push('Wait for the emulator to finish booting')
+          let booted = false
+          const bootDeadline = Date.now() + 5 * 60_000
+          if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
+          while (Date.now() < bootDeadline) {
+            const probe = await ctx.execFencedAndroidTarget(
+              ['shell', 'getprop', 'sys.boot_completed'],
+              { timeoutMs: 20_000 }
+            )
+            if (probe.code === 0 && probe.stdout.trim() === '1') {
+              booted = true
+              break
+            }
+            await sleep(5000)
           }
-          await sleep(5000)
+          if (!booted) throw new Error('emulator did not finish booting within 5 minutes')
         }
-        if (!booted) throw new Error('emulator did not finish booting within 5 minutes')
+
+        for (const app of apps) {
+          steps.push(`Install sealed ${app.artifact.relativePath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
+          // Register before awaiting: the installer may commit its receipt and
+          // then fail while cleaning the private stage.
+          committed.push(app.appId)
+          await ctx.installTrackedAndroidArtifact(
+            app.appId,
+            sealedAndroidArtifactRef(sealed, app.artifact),
+            operation.id
+          )
+        }
+
+        steps.push(`Resolve and launch ${target.appId}`)
+        if (!ctx.launchTrackedAndroidApp) throw new Error('tracked Android launcher authority is unavailable')
+        await ctx.launchTrackedAndroidApp(target.appId)
+      } catch (error) {
+        primaryError = error
       }
 
-      // multi-module apps (app + companion/crash-lab modules) install together
-      if (!ctx.installTrackedAndroidApp) throw new Error('The tracked Android installer authority is unavailable')
-      for (const app of apps) {
-        steps.push(`Install ${app.apkPath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
-        await ctx.installTrackedAndroidApp(app.appId, app.apkPath, operation.id)
+      const cleanupError = cleanupAndroidBuildArtifacts(ctx.userData, room.id, operation.id)
+      if (cleanupError) {
+        primaryError = primaryError
+          ? new AggregateError(
+              [primaryError, new Error(cleanupError)],
+              'Android run failed and its private build artifact cleanup also failed'
+            )
+          : new Error(`Android run private build artifact cleanup failed: ${cleanupError}`)
       }
-
-      steps.push(`Resolve and launch ${target.appId}`)
-      if (!ctx.launchTrackedAndroidApp) {
-        throw new Error('tracked Android launcher authority is unavailable')
+      if (primaryError) {
+        for (const applicationId of committed) {
+          try {
+            ctx.removeTrackedAndroidInstall(applicationId, operation.id)
+          } catch {
+            // The exact target/lease may already be gone. The operation-wide
+            // repository cleanup below is the authoritative revocation.
+          }
+        }
+        try {
+          ctx.removeTrackedAndroidInstalls(operation.id)
+        } catch {
+          throw new AggregateError(
+            [primaryError, new Error('tracked Android receipt cleanup failed')],
+            'Android run failed and one or more tracked install receipts could not be revoked'
+          )
+        }
+        throw primaryError
       }
-      await ctx.launchTrackedAndroidApp(target.appId)
     }
 
     if (ctx.physicalAndroidDevice) {

@@ -65,6 +65,7 @@ const ok: ExecResult = { code: 0, stdout: '', stderr: '' }
 export class FakeBackend implements IsolationBackend {
   calls: string[] = []
   execInRoomCalls: { roomId: string; cmd: string[]; opts?: ExecOpts }[] = []
+  oneShotCalls: { spec: WebSpec; cmd: string; opts?: ExecOpts }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
   webStateValue: 'running' | 'exited' | 'missing' = 'running'
@@ -75,7 +76,7 @@ export class FakeBackend implements IsolationBackend {
   execResult: ExecResult = ok
   /** per-command answers for tests that drive several different in-room probes */
   execHandler: ((cmd: string[]) => ExecResult) | null = null
-  oneShotHandler: ((spec: WebSpec, cmd: string) => ExecResult) | null = null
+  oneShotHandler: ((spec: WebSpec, cmd: string, opts?: ExecOpts) => ExecResult) | null = null
   execInRoomHandler: ((roomId: string, cmd: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
   copyFromRoomHook: ((roomId: string, containerPath: string, hostPath: string) => Promise<void> | void) | null = null
   hostPort = 45000
@@ -155,10 +156,16 @@ export class FakeBackend implements IsolationBackend {
   async followRoomLogs(): Promise<ChildProcessWithoutNullStreams> {
     throw new Error('log streaming is not available in FakeBackend')
   }
-  async runOneShot(spec: WebSpec, cmd: string): Promise<ExecResult> {
+  async runOneShot(
+    spec: WebSpec,
+    cmd: string,
+    _log?: (line: string) => void,
+    opts?: ExecOpts
+  ): Promise<ExecResult> {
     this.calls.push(`runOneShot:${spec.workspaceVolumeOverride ?? spec.depsVolumeOverride ?? 'default'}:${cmd}`)
+    this.oneShotCalls.push({ spec, cmd, ...(opts ? { opts } : {}) })
     this.lastWebSpec = spec
-    return this.oneShotHandler?.(spec, cmd) ?? this.oneShotResult
+    return this.oneShotHandler?.(spec, cmd, opts) ?? this.oneShotResult
   }
   async exportAndroidArtifacts(roomId: string, workspaceVolume: string, artifactsRoot: string, operationId: string) {
     const hostDir = join(artifactsRoot, operationId)

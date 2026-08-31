@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
+  chmodSync,
+  constants,
+  copyFileSync,
   createReadStream,
   existsSync,
   lstatSync,
@@ -69,6 +72,11 @@ import type { ExecOutputChunk, ExecResult, IsolationBackend, WebSpec } from './b
 import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
+import {
+  cleanupAndroidBuildArtifacts,
+  isSafeAndroidArtifactRelativePath,
+  type SealedAndroidArtifactRef
+} from './changes/definitions/androidBuild'
 import {
   backupServiceToFile,
   pingService,
@@ -452,11 +460,18 @@ export class RoomOrchestrator {
       const pending = this.changes.list(room.id).filter((entry) => entry.status === 'pending')
       if (pending.length === 0) continue
       for (const entry of pending) {
-        if (entry.kind === 'android-build') {
+        if (entry.kind === 'android-build' || entry.kind === 'android-run') {
+          const cleanupFailures: string[] = []
           try {
             await this.backend.removeWorkspaceSnapshot(room.id, entry.id)
           } catch (error) {
-            const detail = `interrupted Android build snapshot cleanup will retry on next startup: ${error instanceof Error ? error.message : String(error)}`
+            cleanupFailures.push(error instanceof Error ? error.message : String(error))
+          }
+          const artifactCleanupError = cleanupAndroidBuildArtifacts(this.userData, room.id, entry.id)
+          if (artifactCleanupError) cleanupFailures.push(artifactCleanupError)
+          if (entry.kind === 'android-run') this.androidInstalls.removeForChange(room.id, entry.id)
+          if (cleanupFailures.length > 0) {
+            const detail = `interrupted Android snapshot cleanup will retry on next startup: ${cleanupFailures.join('; ')}`
             this.changes.setStatus(entry.id, 'pending', { verify: { ok: false, detail } })
             this.olog(room.id, detail)
             continue
@@ -3420,9 +3435,9 @@ export class RoomOrchestrator {
             })
           : this.backend.execFencedEmulatorAdb(roomId, args, opts)
       },
-      installTrackedAndroidApp: async (applicationId, apkPath, changeId) => {
+      installTrackedAndroidArtifact: async (applicationId, artifact, changeId) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
-        await this.installAndRecordAndroidAppLocked(
+        await this.installAndRecordAndroidArtifactLocked(
           roomId,
           physicalDevice
             ? {
@@ -3433,10 +3448,26 @@ export class RoomOrchestrator {
               }
             : { kind: 'emulator', targetId: roomId, deviceId: null },
           applicationId,
-          apkPath,
+          artifact,
           changeId,
           expectedLeaseId
         )
+      },
+      removeTrackedAndroidInstall: (applicationId, changeId) => {
+        const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
+        const target: AndroidInstallTarget = physicalDevice
+          ? {
+              kind: 'physical',
+              targetId: physicalDevice.id,
+              deviceId: physicalDevice.id,
+              leaseId: expectedLeaseId!
+            }
+          : { kind: 'emulator', targetId: roomId, deviceId: null }
+        const receipt = this.androidInstalls.get(roomId, target, applicationId)
+        if (receipt?.changeId === changeId) this.androidInstalls.remove(roomId, target, applicationId)
+      },
+      removeTrackedAndroidInstalls: (changeId) => {
+        this.androidInstalls.removeForChange(roomId, changeId)
       },
       launchTrackedAndroidApp: async (applicationId) => {
         const selector = physicalDevice
@@ -3469,39 +3500,73 @@ export class RoomOrchestrator {
     this.androidInstalls.clearTarget(roomId, { kind: 'emulator', targetId: roomId, deviceId: null })
   }
 
-  private async installAndRecordAndroidAppLocked(
+  private async installAndRecordAndroidArtifactLocked(
     roomId: string,
     target: AndroidInstallTarget,
     applicationId: string,
-    apkPath: string,
+    artifact: SealedAndroidArtifactRef,
     changeId: string,
     expectedLeaseId: string | null
   ): Promise<void> {
     if (
-      !/^\/workspace\/[^\0]+\.apk$/i.test(apkPath) ||
-      apkPath.split('/').some((segment) => segment === '..')
+      artifact.operationId !== changeId ||
+      !isSafeAndroidArtifactRelativePath(artifact.relativePath) ||
+      !/^[a-f0-9]{64}$/.test(artifact.apkSha256) ||
+      !Number.isSafeInteger(artifact.sizeBytes) ||
+      artifact.sizeBytes < 1 ||
+      artifact.sizeBytes > MAX_STAGED_APK_BYTES
     ) {
-      throw new Error('Android install receipt received an unsafe APK path')
+      throw new Error('Android install refused invalid sealed artifact evidence')
     }
-    const roomApkPath = this.validateRoomFilePath(roomId, apkPath)
-    // Revoke before any fallible copy/install/proof work. Once this operation
-    // intends to replace the package, a stale same-byte capability must never
-    // survive a failed install or evidence probe.
-    this.androidInstalls.invalidateTargetApplication(target, applicationId)
+    const artifactsRoot = join(this.userData, 'rooms', roomId, 'artifacts')
+    const operationRoot = join(artifactsRoot, changeId)
+    const sourcePath = join(operationRoot, ...artifact.relativePath.split('/'))
     const stagingRoot = join(this.userData, 'tmp')
     let stagingDir: string | null = null
     let stagedApk: string | null = null
+    let canonicalArtifactsRoot: string | null = null
+    let canonicalOperationRoot: string | null = null
+    let canonicalSource: string | null = null
     let operationError: Error | null = null
     try {
+      const operationRootStat = lstatSync(operationRoot)
+      canonicalArtifactsRoot = realpathSync.native(artifactsRoot)
+      canonicalOperationRoot = realpathSync.native(operationRoot)
+      if (
+        operationRootStat.isSymbolicLink() ||
+        !operationRootStat.isDirectory() ||
+        relative(canonicalArtifactsRoot, canonicalOperationRoot) !== changeId
+      ) throw new Error('Android sealed artifact directory escaped its Room-owned root')
+      const sourceStat = lstatSync(sourcePath)
+      canonicalSource = realpathSync.native(sourcePath)
+      const sourceRel = relative(canonicalOperationRoot, canonicalSource)
+      if (
+        sourceStat.isSymbolicLink() ||
+        !sourceStat.isFile() ||
+        sourceStat.size !== artifact.sizeBytes ||
+        isAbsolute(sourceRel) ||
+        sourceRel === '..' ||
+        sourceRel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) ||
+        await hashFileSha256(canonicalSource) !== artifact.apkSha256
+      ) throw new Error('Android sealed artifact no longer matches its build provenance')
+
       mkdirSync(stagingRoot, { recursive: true })
-      stagingDir = mkdtempSync(join(stagingRoot, 'android-install-receipt-'))
+      stagingDir = mkdtempSync(join(stagingRoot, 'android-sealed-install-'))
       stagedApk = join(stagingDir, 'installed.apk')
-      await this.backend.copyFromRoom(roomId, roomApkPath, stagedApk)
+      copyFileSync(canonicalSource, stagedApk, constants.COPYFILE_EXCL)
+      chmodSync(stagedApk, 0o400)
       const staged = lstatSync(stagedApk)
-      if (!staged.isFile() || staged.isSymbolicLink() || staged.size <= 0 || staged.size > MAX_STAGED_APK_BYTES) {
-        throw new Error('Android install receipt refused an invalid or oversized APK')
+      if (
+        !staged.isFile() ||
+        staged.isSymbolicLink() ||
+        staged.size !== artifact.sizeBytes ||
+        await hashFileSha256(stagedApk) !== artifact.apkSha256
+      ) {
+        throw new Error('Android sealed artifact changed while entering its private install stage')
       }
-      const apkSha256 = await hashFileSha256(stagedApk)
+      // Revoke immediately before the first target mutation. A failed or
+      // partially committed install must never leave the prior capability.
+      this.androidInstalls.invalidateTargetApplication(target, applicationId)
       let install: ExecResult
       if (target.kind === 'physical') {
         if (!expectedLeaseId) throw new Error('Physical Android install receipt has no captured lease')
@@ -3510,7 +3575,7 @@ export class RoomOrchestrator {
           target.deviceId,
           expectedLeaseId,
           stagedApk,
-          roomApkPath
+          '[sealed Android artifact]'
         )
       } else {
         install = await this.backend.installFencedEmulatorApk(roomId, stagedApk, {
@@ -3536,7 +3601,7 @@ export class RoomOrchestrator {
       // after the reported `since`, never in the gap before receipt commit.
       const installedAt = new Date().toISOString()
       const evidence = await session.establishInstallEvidence(applicationId)
-      if (evidence.apkSha256 !== apkSha256) {
+      if (evidence.apkSha256 !== artifact.apkSha256) {
         throw new Error('The installed Android package bytes differ from the tracked Room APK')
       }
       if (target.kind === 'physical') {
@@ -3554,7 +3619,7 @@ export class RoomOrchestrator {
         target,
         applicationId,
         changeId,
-        apkSha256,
+        apkSha256: artifact.apkSha256,
         installedAt,
         packageIncarnation: evidence.packageIncarnation,
         logFence: evidence.logFence,
@@ -3573,7 +3638,17 @@ export class RoomOrchestrator {
     } catch (error) {
       operationError = privateAndroidStageError(
         error,
-        [stagingRoot, stagingDir, stagedApk],
+        [
+          artifactsRoot,
+          operationRoot,
+          sourcePath,
+          canonicalArtifactsRoot,
+          canonicalOperationRoot,
+          canonicalSource,
+          stagingRoot,
+          stagingDir,
+          stagedApk
+        ],
         'Android install failed while handling its private APK stage'
       )
     }
@@ -3588,6 +3663,10 @@ export class RoomOrchestrator {
           'Android private APK staging cleanup failed'
         )
       }
+    }
+    if (operationError || cleanupError) {
+      const receipt = this.androidInstalls.get(roomId, target, applicationId)
+      if (receipt?.changeId === changeId) this.androidInstalls.remove(roomId, target, applicationId)
     }
     if (operationError && cleanupError) {
       throw new AggregateError(

@@ -5,6 +5,7 @@ import type { ChangesRepo } from '../store/changesRepo'
 import type { RoomsRepo } from '../store/roomsRepo'
 import type { SettingsRepo } from '../store/settingsRepo'
 import { connectRelay } from '../relayProtocol'
+import type { SealedAndroidArtifactRef } from './definitions/androidBuild'
 
 export interface ChangeCtx {
   roomId: string
@@ -37,8 +38,16 @@ export interface ChangeCtx {
   }
   /** Execute one bounded target probe through the physical broker or controlled emulator helper. */
   execFencedAndroidTarget?: (args: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>
-  /** Stage once on the Host, install, prove exact target identity, and atomically persist the receipt. */
-  installTrackedAndroidApp?: (applicationId: string, apkPath: string, changeId: string) => Promise<void>
+  /** Resolve one sealed Host artifact capability, stage once, install, prove, and atomically persist its receipt. */
+  installTrackedAndroidArtifact: (
+    applicationId: string,
+    artifact: SealedAndroidArtifactRef,
+    changeId: string
+  ) => Promise<void>
+  /** Revoke a receipt created by a failed or interrupted Android run. */
+  removeTrackedAndroidInstall: (applicationId: string, changeId: string) => void
+  /** Transactionally revoke every receipt owned by one failed Android run, independent of target lease state. */
+  removeTrackedAndroidInstalls: (changeId: string) => void
   /** Launch only through the exact tracked receipt/user/lease session. */
   launchTrackedAndroidApp?: (applicationId: string) => Promise<void>
   /** Verify foreground state through the same exact tracked session. */

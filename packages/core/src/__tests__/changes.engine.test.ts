@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
 import { androidRunChange } from '../changes/definitions/androidRun'
+import { ANDROID_SNAPSHOT_CLEAN_SCRIPT, cleanupAndroidBuildArtifacts } from '../changes/definitions/androidBuild'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
@@ -61,7 +62,12 @@ function ctx(roomId = 'room1abc'): ChangeCtx {
       if (r.hostPort != null) {
         await gateway.setRoute({ domain: r.domain, roomId, targetPort: r.hostPort, https: r.https })
       }
-    }
+    },
+    installTrackedAndroidArtifact: async () => {
+      throw new Error('tracked Android artifact installer was not configured for this test')
+    },
+    removeTrackedAndroidInstall: () => undefined,
+    removeTrackedAndroidInstalls: () => undefined
   }
 }
 
@@ -125,6 +131,9 @@ describe('Android emulator changes', () => {
   it('android-run refuses to start while the emulator container is not running', async () => {
     rooms.update('room1abc', {
       provider: 'android',
+      workspaceMode: 'hotel',
+      sourceType: 'managed-git',
+      sourceRef: 'https://example.test/android.git',
       runtime: { kind: 'jdk', version: '17' },
       packageManager: { kind: 'gradle' },
       hostPort: 45000
@@ -498,12 +507,18 @@ describe('Android immutable build', () => {
     const snapshot = `dh-room1abc-src-build-${entry.id.replaceAll('-', '')}`
     const pauseAt = backend.calls.indexOf('pauseWeb:room1abc')
     const copyAt = backend.calls.indexOf(`copyVolume:dh-room1abc-src-r3:${snapshot}`)
+    const cleanupAt = backend.calls.findIndex((call) =>
+      call === `runOneShot:${snapshot}:${ANDROID_SNAPSHOT_CLEAN_SCRIPT}`
+    )
+    const fingerprintAt = backend.calls.indexOf(`fingerprintBuildInput:${snapshot}`)
     const unpauseAt = backend.calls.indexOf('unpauseWeb:room1abc')
-    const buildAt = backend.calls.findIndex((call) => call.startsWith(`runOneShot:${snapshot}:`))
+    const buildAt = backend.calls.findIndex((call) =>
+      call === `runOneShot:${snapshot}:./gradlew assembleDebug --no-daemon`
+    )
     const exportAt = backend.calls.findIndex((call) => call.startsWith(`exportAndroidArtifacts:${snapshot}:`))
-    const cleanupAt = backend.calls.indexOf(`removeWorkspaceSnapshot:${entry.id}`)
-    expect([pauseAt, copyAt, unpauseAt, buildAt, exportAt, cleanupAt]).toEqual(
-      [...[pauseAt, copyAt, unpauseAt, buildAt, exportAt, cleanupAt]].sort((a, b) => a - b)
+    const snapshotCleanupAt = backend.calls.indexOf(`removeWorkspaceSnapshot:${entry.id}`)
+    expect([pauseAt, copyAt, unpauseAt, cleanupAt, fingerprintAt, buildAt, exportAt, snapshotCleanupAt]).toEqual(
+      [...[pauseAt, copyAt, unpauseAt, cleanupAt, fingerprintAt, buildAt, exportAt, snapshotCleanupAt]].sort((a, b) => a - b)
     )
     expect(pauseAt).toBeGreaterThanOrEqual(0)
     expect(backend.lastWebSpec?.workspaceVolumeOverride).toBe(snapshot)
@@ -523,7 +538,7 @@ describe('Android immutable build', () => {
       jobId: entry.id,
       changeId: entry.id,
       roomId: 'room1abc',
-      executionLifecycle: 'in-process-only',
+      executionLifecycle: 'isolated-snapshot',
       cleanExecution: true,
       input: { stateRevision: 17, workspaceVolumeRevision: 3, buildInputSha256: 'b'.repeat(64) }
     })
@@ -538,7 +553,9 @@ describe('Android immutable build', () => {
   })
 
   it('unpauses the live Room and removes its snapshot when the isolated build fails', async () => {
-    backend.oneShotResult = { code: 1, stdout: '', stderr: 'Gradle failed' }
+    backend.oneShotHandler = (_spec, cmd) => cmd === ANDROID_SNAPSHOT_CLEAN_SCRIPT
+      ? { code: 0, stdout: '', stderr: '' }
+      : { code: 1, stdout: '', stderr: 'Gradle failed' }
     const entry = await engine.execute(ctx(), 'android-build', {}, 'agent')
 
     expect(entry.status).toBe('failed')
@@ -559,12 +576,31 @@ describe('Android immutable build', () => {
     expect(entry.status).toBe('failed')
     expect(entry.verify?.detail).toContain('engine refused unpause')
     expect(backend.calls).toContain('recreateWeb:room1abc:node17:default')
+    expect(backend.calls.filter((call) => call === 'recreateWeb:room1abc:node17:default')).toHaveLength(1)
     expect(backend.lastWebSpec?.workspaceVolumeOverride).toBeUndefined()
     expect(backend.calls).toContain(`removeWorkspaceSnapshot:${entry.id}`)
     expect(backend.calls.some((call) => call.startsWith('runOneShot:'))).toBe(false)
   })
 
+  it('conservatively resumes the Room when pause succeeds but its response is lost', async () => {
+    backend.pauseWeb = async (roomId) => {
+      backend.calls.push(`pauseWeb:${roomId}`)
+      backend.webPausedValue = true
+      throw new Error('pause response was lost')
+    }
+
+    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('pause response was lost')
+    expect(backend.calls).toContain('unpauseWeb:room1abc')
+    expect(backend.webPausedValue).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('runOneShot:'))).toBe(false)
+  })
+
   it('fails verification when an exported APK does not match its recorded hash', async () => {
+    const changeCtx = ctx()
     backend.exportAndroidArtifacts = async (_roomId, workspaceVolume, artifactsRoot, operationId) => {
       backend.calls.push(`exportAndroidArtifacts:${workspaceVolume}`)
       const { mkdirSync, writeFileSync } = await import('node:fs')
@@ -575,11 +611,27 @@ describe('Android immutable build', () => {
       writeFileSync(path, 'tampered')
       return [{ relativePath, size: 8, sha256: 'c'.repeat(64) }]
     }
-    const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
+    const entry = await engine.execute(changeCtx, 'android-build', {}, 'user')
 
     expect(entry.status).toBe('applied')
     expect(entry.verify).toEqual({ ok: false, detail: expect.stringMatching(/checksum does not match/) })
+    expect(JSON.stringify(entry)).not.toContain(changeCtx.userData)
     expect(backend.calls).toContain(`removeWorkspaceSnapshot:${entry.id}`)
+  })
+
+  it('does not publish Host artifact paths when snapshot export fails', async () => {
+    const changeCtx = ctx()
+    backend.exportAndroidArtifacts = async (_roomId, _workspaceVolume, artifactsRoot, operationId) => {
+      throw new Error(`EACCES opening ${artifactsRoot}/${operationId}/private.apk`)
+    }
+
+    const entry = await engine.execute(changeCtx, 'android-build', {}, 'user')
+
+    expect(entry).toMatchObject({
+      status: 'failed',
+      verify: { detail: expect.stringContaining('Android build artifact export failed') }
+    })
+    expect(JSON.stringify(entry)).not.toContain(changeCtx.userData)
   })
 
   it.each(['missing', 'corrupt', 'tampered'] as const)(
@@ -607,6 +659,7 @@ describe('Android immutable build', () => {
 
       expect(entry.status).toBe('applied')
       expect(entry.verify?.detail).toMatch(/manifest/)
+      expect(entry.verify?.detail).not.toContain(changeCtx.userData)
       const { existsSync } = await import('node:fs')
       const { join } = await import('node:path')
       expect(existsSync(join(changeCtx.userData, 'rooms', 'room1abc', 'artifacts', entry.id))).toBe(false)
@@ -617,6 +670,32 @@ describe('Android immutable build', () => {
     rooms.update('room1abc', { workspaceMode: 'legacy-host-bind' })
     await expect(engine.execute(ctx(), 'android-build', {}, 'user')).rejects.toThrow(/Room-owned Hotel workspace/)
     expect(backend.calls).not.toContain('pauseWeb:room1abc')
+  })
+
+  it('refuses corrupted cleanup identities without escaping the private artifact root', async () => {
+    const changeCtx = ctx()
+    const { existsSync, mkdirSync, writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const operationEscape = join(changeCtx.userData, 'rooms', 'room1abc', 'outside', 'sentinel')
+    const roomEscape = join(changeCtx.userData, 'escape', 'artifacts', operationId, 'sentinel')
+    mkdirSync(join(operationEscape, '..'), { recursive: true })
+    mkdirSync(join(roomEscape, '..'), { recursive: true })
+    writeFileSync(operationEscape, 'keep')
+    writeFileSync(roomEscape, 'keep')
+
+    const errors = [
+      cleanupAndroidBuildArtifacts(changeCtx.userData, 'room1abc', '../outside'),
+      cleanupAndroidBuildArtifacts(changeCtx.userData, '../escape', operationId)
+    ]
+
+    expect(errors).toEqual([
+      'private Android build artifact cleanup failed',
+      'private Android build artifact cleanup failed'
+    ])
+    expect(errors.join(' ')).not.toContain(changeCtx.userData)
+    expect(existsSync(operationEscape)).toBe(true)
+    expect(existsSync(roomEscape)).toBe(true)
   })
 })
 
@@ -795,7 +874,9 @@ describe('android build line-ending preflight', () => {
     androidRoom()
     backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
     backend.oneShotHandler = (_spec, cmd) =>
-      cmd === LINE_ENDING_SCAN_SCRIPT
+      cmd === ANDROID_SNAPSHOT_CLEAN_SCRIPT
+        ? { code: 0, stdout: '', stderr: '' }
+        : cmd === LINE_ENDING_SCAN_SCRIPT
         ? { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
         : { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
     const entry = await engine.execute(ctx(), 'android-build', {}, 'user')
@@ -843,23 +924,71 @@ describe('android Build & Run line-ending preflight', () => {
       if (script === expectedProbe) {
         return { code: 0, stdout: `${SCAN_SENTINEL}\0`, stderr: '' }
       }
-      if (script === LINE_ENDING_SCAN_SCRIPT) {
-        return { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
-      }
-      if (script.includes("find . -xdev -depth") && script.includes("-path '*/build/outputs/apk/debug'")) {
-        return { code: 0, stdout: '', stderr: '' }
-      }
-      if (script.startsWith('cd /workspace && ')) {
-        return { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
-      }
       return { code: 0, stdout: '', stderr: '' }
     }
+    backend.oneShotHandler = (_spec, cmd) => cmd === ANDROID_SNAPSHOT_CLEAN_SCRIPT
+      ? { code: 0, stdout: '', stderr: '' }
+      : cmd === LINE_ENDING_SCAN_SCRIPT
+        ? { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
+        : { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }
 
     const entry = await engine.execute(ctx(), 'android-run', {}, 'user')
     expect(entry.status).toBe('failed')
     expect(entry.verify?.detail).toContain('Execution failed for task')
     expect(entry.verify?.detail).toContain('./scripts/sign.sh')
     expect(entry.verify?.detail).toContain('not a Gradle or build failure')
+  })
+
+  it('attempts every receipt revocation when a later tracked install fails', async () => {
+    androidRunRoom()
+    backend.workspaceFingerprintValue = 'a'.repeat(64)
+    backend.exportAndroidArtifacts = async (_roomId, _workspaceVolume, artifactsRoot, operationId) => {
+      const { createHash } = await import('node:crypto')
+      const { mkdirSync, writeFileSync } = await import('node:fs')
+      const { dirname, join } = await import('node:path')
+      return ['one', 'two'].map((name) => {
+        const relativePath = `${name}/build/outputs/apk/debug/${name}.apk`
+        const path = join(artifactsRoot, operationId, relativePath)
+        const bytes = Buffer.from(`sealed-${name}`)
+        mkdirSync(dirname(path), { recursive: true })
+        writeFileSync(path, bytes)
+        writeFileSync(
+          join(dirname(path), 'output-metadata.json'),
+          JSON.stringify({ applicationId: `com.example.${name}`, elements: [{ outputFile: `${name}.apk` }] })
+        )
+        return {
+          relativePath,
+          size: bytes.byteLength,
+          sha256: createHash('sha256').update(bytes).digest('hex')
+        }
+      })
+    }
+    const installed: string[] = []
+    const removalAttempts: string[] = []
+    const bulkRemovals: string[] = []
+    const changeCtx = ctx()
+    changeCtx.execFencedAndroidTarget = async () => ({ code: 0, stdout: '1\n', stderr: '' })
+    changeCtx.installTrackedAndroidArtifact = async (applicationId) => {
+      installed.push(applicationId)
+      if (applicationId === 'com.example.two') {
+        throw new Error(`private stage cleanup failed after committing ${applicationId}`)
+      }
+    }
+    changeCtx.removeTrackedAndroidInstall = (applicationId) => {
+      removalAttempts.push(applicationId)
+      if (applicationId === 'com.example.one') throw new Error('first receipt remover failed')
+    }
+    changeCtx.removeTrackedAndroidInstalls = (changeId) => {
+      bulkRemovals.push(changeId)
+    }
+
+    const entry = await engine.execute(changeCtx, 'android-run', {}, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toContain('private stage cleanup failed')
+    expect(installed).toEqual(['com.example.one', 'com.example.two'])
+    expect(removalAttempts).toEqual(['com.example.one', 'com.example.two'])
+    expect(bulkRemovals).toEqual([entry.id])
   })
 
   it('directs legacy Host-bound Build & Run failures to a Host-side line-ending fix', async () => {
@@ -872,9 +1001,8 @@ describe('android Build & Run line-ending preflight', () => {
       stderr: ''
     })
 
-    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(
-      /still bound to its Host folder.*will not rewrite/s
-    )
+    await expect(engine.execute(ctx(), 'android-run', {}, 'user')).rejects.toThrow(/Room-owned Hotel workspace/)
+    expect(backend.calls.some((call) => call.startsWith('pauseWeb:'))).toBe(false)
   })
 })
 
