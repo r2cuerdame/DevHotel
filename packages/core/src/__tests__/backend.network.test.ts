@@ -773,6 +773,90 @@ describe('OciCliBackend Room networks', () => {
     expect(serviceExists).toBe(false)
   })
 
+  it('removes a created Android service when its runtime anchor is replaced before final validation', async () => {
+    const runtimeId = 'a'.repeat(64)
+    const serviceId = 'b'.repeat(64)
+    const runtimeSandboxId = 'c'.repeat(64)
+    let serviceExists = false
+    let runtimeReplaced = false
+    let creationToken = ''
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return {
+          code: 0,
+          stdout: networkInspect('r1', androidControlNetworkName('r1')),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'inspect') {
+        if (args[1] === androidRuntimeAnchorName('r1') && !runtimeReplaced) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{
+              Id: runtimeId,
+              Name: `/${androidRuntimeAnchorName('r1')}`,
+              Config: { Labels: {
+                'devhotel.room': 'r1',
+                'devhotel.role': 'android-runtime-anchor',
+                'devhotel.managed': '1'
+              } },
+              State: { Status: 'running' },
+              HostConfig: { NetworkMode: roomNetworkName('r1') },
+              NetworkSettings: { SandboxID: runtimeSandboxId }
+            }]),
+            stderr: ''
+          }
+        }
+        if (serviceExists && args[1] === serviceId) {
+          runtimeReplaced = true
+          return {
+            code: 0,
+            stdout: JSON.stringify([{
+              Id: serviceId,
+              Name: '/dh-r1-svc-redis',
+              Config: { Labels: {
+                'devhotel.room': 'r1',
+                'devhotel.role': 'svc-redis',
+                'devhotel.managed': '1',
+                'devhotel.creation-token': creationToken
+              } },
+              State: { Status: 'running' },
+              HostConfig: { NetworkMode: `container:${runtimeId}` },
+              NetworkSettings: { SandboxID: runtimeSandboxId }
+            }]),
+            stderr: ''
+          }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Name: 'dh-r1-svc-redis-data',
+            Labels: { 'devhotel.room': 'r1', 'devhotel.role': 'volume', 'devhotel.managed': '1' }
+          }]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'run') {
+        creationToken = args.find((arg) => arg.startsWith('devhotel.creation-token='))!.split('=')[1]!
+        serviceExists = true
+        return { code: 0, stdout: `${serviceId}\n`, stderr: '' }
+      }
+      if (args[0] === 'rm' && args[2] === serviceId) {
+        serviceExists = false
+        return ok
+      }
+      return ok
+    })
+
+    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/runtime anchor disappeared/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
+  })
+
   it('does not revive a stopped Android service bound to a replaced runtime anchor ID', async () => {
     const runtimeId = 'a'.repeat(64)
     const serviceId = 'b'.repeat(64)
@@ -992,6 +1076,79 @@ describe('OciCliBackend Room networks', () => {
     startedStatus = 'running'
     corruptOwnership = true
     await expect(backend().startService('r1', 'redis')).rejects.toThrow(/ownership metadata/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
+  })
+
+  it('removes a started Android service when its runtime anchor is replaced before final validation', async () => {
+    const runtimeId = 'a'.repeat(64)
+    const serviceId = 'b'.repeat(64)
+    const runtimeSandboxId = 'c'.repeat(64)
+    let serviceExists = true
+    let serviceStatus = 'exited'
+    let runtimeReplaced = false
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return {
+          code: 0,
+          stdout: networkInspect('r1', androidControlNetworkName('r1')),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'inspect') {
+        if (args[1] === androidRuntimeAnchorName('r1') && !runtimeReplaced) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{
+              Id: runtimeId,
+              Name: `/${androidRuntimeAnchorName('r1')}`,
+              Config: { Labels: {
+                'devhotel.room': 'r1',
+                'devhotel.role': 'android-runtime-anchor',
+                'devhotel.managed': '1'
+              } },
+              State: { Status: 'running' },
+              HostConfig: { NetworkMode: roomNetworkName('r1') },
+              NetworkSettings: { SandboxID: runtimeSandboxId }
+            }]),
+            stderr: ''
+          }
+        }
+        if (serviceExists && (args[1] === 'dh-r1-svc-redis' || args[1] === serviceId)) {
+          if (args[1] === serviceId && serviceStatus === 'running') runtimeReplaced = true
+          return {
+            code: 0,
+            stdout: JSON.stringify([{
+              Id: serviceId,
+              Name: '/dh-r1-svc-redis',
+              Config: { Labels: {
+                'devhotel.room': 'r1',
+                'devhotel.role': 'svc-redis',
+                'devhotel.managed': '1'
+              } },
+              State: { Status: serviceStatus },
+              HostConfig: { NetworkMode: `container:${runtimeId}` },
+              ...(serviceStatus === 'running'
+                ? { NetworkSettings: { SandboxID: runtimeSandboxId } }
+                : {})
+            }]),
+            stderr: ''
+          }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'start' && args[1] === serviceId) {
+        serviceStatus = 'running'
+        return ok
+      }
+      if (args[0] === 'rm' && args[2] === serviceId) {
+        serviceExists = false
+        return ok
+      }
+      return ok
+    })
+
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/runtime anchor disappeared/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
   })

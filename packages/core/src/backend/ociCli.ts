@@ -1552,6 +1552,11 @@ export class OciCliBackend implements IsolationBackend {
         if (this.exactRunningSandboxId(created, `Android ${svc} service`) !== androidRuntimeSandboxId) {
           throw new Error(`Android ${svc} service was created outside the exact runtime namespace`)
         }
+        await this.assertCurrentAndroidRuntimeAnchor(
+          roomId,
+          androidRuntimeId,
+          androidRuntimeSandboxId
+        )
       }
     } catch (error) {
       try {
@@ -1569,6 +1574,7 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.assertRoomContainer(roomId, name, `svc-${svc}`)
     const id = exactContainerId(existing, roomId)
     const androidRuntime = await this.inspectContainer(androidRuntimeAnchorName(roomId))
+    let runtimeId: string | null = null
     let runtimeSandboxId: string | null = null
     const rejectAfterAndroidCleanup = async (error: unknown): Promise<never> => {
       try {
@@ -1593,7 +1599,7 @@ export class OciCliBackend implements IsolationBackend {
         'android-runtime-anchor',
         androidRuntime
       )
-      const runtimeId = exactContainerId(androidRuntime, roomId)
+      runtimeId = exactContainerId(androidRuntime, roomId)
       if (androidRuntime.State?.Status !== 'running') {
         throw new Error('Android runtime anchor must be running before a managed service is started')
       }
@@ -1626,6 +1632,9 @@ export class OciCliBackend implements IsolationBackend {
         runtimeSandboxId &&
         this.exactRunningSandboxId(started, `Android ${svc} service`) !== runtimeSandboxId
       ) throw new Error(`Android ${svc} service started outside the exact runtime namespace`)
+      if (runtimeId && runtimeSandboxId) {
+        await this.assertCurrentAndroidRuntimeAnchor(roomId, runtimeId, runtimeSandboxId)
+      }
     }
     if (androidRuntime) {
       try {
@@ -2637,6 +2646,30 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`${what} did not report a valid live network namespace identity`)
     }
     return sandboxId
+  }
+
+  private async assertCurrentAndroidRuntimeAnchor(
+    roomId: string,
+    expectedId: string,
+    expectedSandboxId: string
+  ): Promise<void> {
+    const current = await this.inspectContainer(expectedId)
+    if (!current) {
+      throw new Error('Android runtime anchor disappeared before service validation completed')
+    }
+    await this.assertRoomContainer(
+      roomId,
+      androidRuntimeAnchorName(roomId),
+      'android-runtime-anchor',
+      current
+    )
+    if (exactContainerId(current, roomId) !== expectedId) {
+      throw new Error('Android runtime anchor immutable ID changed before service validation completed')
+    }
+    this.assertContainerNetworkMode(current, roomNetworkName(roomId), 'Android runtime anchor')
+    if (this.exactRunningSandboxId(current, 'Android runtime anchor') !== expectedSandboxId) {
+      throw new Error('Android runtime anchor network namespace changed before service validation completed')
+    }
   }
 
   private async removeRoomNetwork(roomId: string): Promise<void> {
