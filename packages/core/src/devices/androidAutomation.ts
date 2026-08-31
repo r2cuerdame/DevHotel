@@ -347,6 +347,28 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+type SynchronousAndroidLocaleMutationHook = () => undefined
+
+function runSynchronousAndroidLocaleMutationHook(
+  hook: SynchronousAndroidLocaleMutationHook | undefined,
+  stage: 'before dispatch' | 'after acknowledgement'
+): void {
+  if (!hook) return
+  const result = (hook as () => unknown)()
+  if (result === undefined) return
+  if (
+    result !== null &&
+    (typeof result === 'object' || typeof result === 'function') &&
+    typeof (result as { then?: unknown }).then === 'function'
+  ) {
+    // Do not await a thenable at either linearization point. Absorb a later
+    // rejection so hostile/mistaken JavaScript cannot create an unhandled
+    // rejection after the synchronous contract has already been refused.
+    void Promise.resolve(result).catch(() => undefined)
+  }
+  throw new Error(`Android locale mutation hook ${stage} must complete synchronously`)
+}
+
 function sameAppLocaleRestoreFence(
   left: AndroidAppLocaleRestoreFence,
   right: AndroidAppLocaleRestoreFence
@@ -1618,8 +1640,10 @@ export class AndroidAutomationSession {
       signal?: AbortSignal
       expectedPreviousLocaleTags?: readonly string[]
       restoreFence?: AndroidAppLocaleRestoreFence
+      /** Runs synchronously after the final precondition read and before the setter command is created. */
+      onBeforeMutation?: SynchronousAndroidLocaleMutationHook
       /** Runs synchronously after an exact command acknowledgement, before any postflight or readiness await. */
-      onMutationAccepted?: () => void
+      onMutationAccepted?: SynchronousAndroidLocaleMutationHook
     } = {}
   ): Promise<AndroidAppLocaleTransition> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
@@ -1663,6 +1687,10 @@ export class AndroidAutomationSession {
         409
       )
     }
+    // This callback is the durable dispatch linearization point. If its exact
+    // CAS fails, it throws before this.command is called, so no helper or
+    // LocaleManager mutation can outlive the retained prepared record.
+    runSynchronousAndroidLocaleMutationHook(options.onBeforeMutation, 'before dispatch')
     let mutation: ExecResult
     try {
       mutation = await this.command(buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags), {
@@ -1700,7 +1728,7 @@ export class AndroidAutomationSession {
     // further target/readiness await. A thrown callback deliberately escapes
     // without a post-callback await; its operation-bound locale marker remains
     // the only safe recovery authority.
-    options.onMutationAccepted?.()
+    runSynchronousAndroidLocaleMutationHook(options.onMutationAccepted, 'after acknowledgement')
     await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
     const readiness = await this.waitForAppLocaleReady(
       applicationId,
@@ -1736,7 +1764,12 @@ export class AndroidAutomationSession {
     restoreFence: AndroidAppLocaleRestoreFence,
     expectedLocaleTags: readonly string[],
     attemptedLocaleTags: readonly string[],
-    options: { timeoutMs?: number; signal?: AbortSignal; onMutationAccepted?: () => void } = {}
+    options: {
+      timeoutMs?: number
+      signal?: AbortSignal
+      onBeforeMutation?: SynchronousAndroidLocaleMutationHook
+      onMutationAccepted?: SynchronousAndroidLocaleMutationHook
+    } = {}
   ): Promise<AndroidAppLocaleTransition> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_LOCALE_READINESS_TIMEOUT_MS
     const snapshot = await this.appLocaleSnapshot(applicationId, timeoutMs, options.signal)
@@ -1765,6 +1798,7 @@ export class AndroidAutomationSession {
         signal: options.signal,
         expectedPreviousLocaleTags: snapshot.localeTags,
         restoreFence,
+        onBeforeMutation: options.onBeforeMutation,
         onMutationAccepted: options.onMutationAccepted
       })
     }

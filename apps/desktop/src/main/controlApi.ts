@@ -7,6 +7,7 @@ import {
   zAndroidDumpUiBody,
   zAndroidForceStopBody,
   zAndroidLaunchAppBody,
+  zAbandonAndroidLocaleMatrixRecoveryBody,
   zAndroidLocaleScreenshotMatrixBody,
   zAndroidLogcatBody,
   zAndroidRunCrashScenarioBody,
@@ -313,6 +314,12 @@ export async function startControlApi(
                 safeRoomId,
                 parseAndroidBody(zAndroidLocaleScreenshotMatrixBody, body),
                 'agent'
+              ))
+              return
+            case 'locale-recovery-abandon':
+              sendJson(res, 200, await orch.abandonAndroidLocaleMatrixRecovery(
+                safeRoomId,
+                parseAndroidBody(zAbandonAndroidLocaleMatrixRecoveryBody, body)
               ))
               return
           }

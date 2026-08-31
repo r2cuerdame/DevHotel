@@ -20,7 +20,7 @@ import { screenshotPng } from './pngFixture'
 const ROOM_ID = 'aaaa1111'
 const APP_ID = 'com.example.app'
 const CHANGE_ID = '11111111-2222-4333-8444-555555555555'
-const OWNERSHIP_TAG = /^[a-z]{2,8}-x-dh-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{8}-[0-9a-f]{4}$/
+const OWNERSHIP_TAG = /^[a-z]{2,8}(?:-[A-Z][a-z]{3})?-x-dh-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{8}-[0-9a-f]{4}$/
 
 function expectMarkedLocaleList(localeTags: readonly string[] | undefined, requested: string): void {
   expect(localeTags).toHaveLength(2)
@@ -109,6 +109,9 @@ describe('Android locale screenshot matrix', () => {
     externalPlainTargetAfterPrecondition?: boolean
     failReadinessAfterAcceptedMutation?: boolean
     crashBeforeAcceptedCallback?: boolean
+    failFinalProofAfterPrecondition?: boolean
+    deletePendingBeforeDispatch?: boolean
+    dispatchPendingDuringFinalProof?: boolean
     driftAfterRestore?: string[]
     finalPidsAfterRestore?: number[]
   } = {}) {
@@ -199,6 +202,10 @@ describe('Android locale screenshot matrix', () => {
         applicationId: string,
         expectedFence: AndroidAppLocaleRestoreFence
       ) {
+        if (controls.failFinalProofAfterPrecondition) {
+          controls.failFinalProofAfterPrecondition = false
+          throw new DevHotelError('ANDROID_LOCALE_TARGET_CHANGED', 'final locale proof unavailable')
+        }
         const before = await session.appLocaleSnapshot(applicationId)
         const after = await session.appLocaleSnapshot(applicationId)
         if (
@@ -209,6 +216,24 @@ describe('Android locale screenshot matrix', () => {
         ) {
           throw new DevHotelError('ANDROID_LOCALE_TARGET_CHANGED', 'final locale proof changed')
         }
+        if (controls.dispatchPendingDuringFinalProof) {
+          controls.dispatchPendingDuringFinalProof = false
+          const settings = (orch as unknown as {
+            settings: {
+              get(key: string): string | null
+              setIfValue(key: string, expected: string, next: string): boolean
+            }
+          }).settings
+          const key = `androidLocaleRestorePending:${ROOM_ID}`
+          const raw = settings.get(key)
+          if (raw !== null) {
+            const pending = JSON.parse(raw) as Record<string, unknown>
+            settings.setIfValue(key, raw, JSON.stringify({
+              ...pending,
+              attemptedLocaleDispatchStarted: true
+            }))
+          }
+        }
         return after
       },
       async applyAppLocalesAndWait(
@@ -216,6 +241,7 @@ describe('Android locale screenshot matrix', () => {
         localeTags: readonly string[],
         applyOptions: {
           expectedPreviousLocaleTags?: readonly string[]
+          onBeforeMutation?: () => void
           onMutationAccepted?: () => void
         } = {}
       ) {
@@ -231,6 +257,16 @@ describe('Android locale screenshot matrix', () => {
           currentLocaleTags = [localeTags[0]!]
           controls.externalPlainTargetAfterPrecondition = false
         }
+        if (controls.deletePendingBeforeDispatch) {
+          controls.deletePendingBeforeDispatch = false
+          const settings = (orch as unknown as {
+            settings: { get(key: string): string | null; deleteIfValue(key: string, value: string): boolean }
+          }).settings
+          const key = `androidLocaleRestorePending:${ROOM_ID}`
+          const raw = settings.get(key)
+          if (raw !== null) settings.deleteIfValue(key, raw)
+        }
+        applyOptions.onBeforeMutation?.()
         applied.push([...localeTags])
         currentLocaleTags = [...localeTags]
         if (controls.crashBeforeAcceptedCallback) {
@@ -250,7 +286,7 @@ describe('Android locale screenshot matrix', () => {
         _restoreFence: AndroidAppLocaleRestoreFence,
         expectedLocaleTags: readonly string[],
         attemptedLocaleTags: readonly string[],
-        restoreOptions: { onMutationAccepted?: () => void } = {}
+        restoreOptions: { onBeforeMutation?: () => void; onMutationAccepted?: () => void } = {}
       ) {
         events.push('restore')
         pendingAtRestore.push((orch as unknown as { settings: { get(key: string): string | null } })
@@ -269,6 +305,7 @@ describe('Android locale screenshot matrix', () => {
         }
         const previous = [...currentLocaleTags]
         if (JSON.stringify(currentLocaleTags) !== JSON.stringify(localeTags)) {
+          restoreOptions.onBeforeMutation?.()
           applied.push([...localeTags])
           currentLocaleTags = [...localeTags]
           restoreOptions.onMutationAccepted?.()
@@ -283,6 +320,14 @@ describe('Android locale screenshot matrix', () => {
         localeSeals.push([...localeTags])
         captureSealCalls += 1
         if (controls.failCapture && captureSealCalls === 1) throw new Error('capture locale drift')
+      },
+      async launchApp() {
+        events.push('launch')
+        throw new Error('unexpected launch')
+      },
+      async forceStop() {
+        events.push('force-stop')
+        throw new Error('unexpected force-stop')
       },
       async withActiveUserScreenWitness<T>(
         action: (signal: AbortSignal) => Promise<T>,
@@ -448,7 +493,7 @@ describe('Android locale screenshot matrix', () => {
     expectMarkedLocaleList(pending.attemptedLocaleTags, 'ko-KR')
   })
 
-  it('never restores an attempted locale that an external actor reached before the setter', async () => {
+  it('explicitly acknowledges a proven outside plain target without any device mutation', async () => {
     const fixture = setup({ externalBeforeFirstMutation: ['ko-KR'] })
     const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
 
@@ -456,38 +501,37 @@ describe('Android locale screenshot matrix', () => {
       applicationId: APP_ID,
       locales: ['ko-KR'],
       filenamePrefix: 'external-attempted'
-    }, 'agent')).rejects.toMatchObject({
-      code: 'ANDROID_LOCALE_RECOVERY_REQUIRED',
-      evidence: {
-        stage: 'precondition',
-        primaryFailureCode: 'ANDROID_LOCALE_PRECONDITION_CHANGED'
-      }
-    })
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
 
-    // The forward setter rejected its exact previous-locale precondition, and
-    // the retained attempted value is not evidence that DevHotel owns the
-    // external actor's coincidentally matching locale. Neither setter runs.
+    // The failed matrix retains its prepared record until the caller explicitly
+    // acknowledges the fresh outside state. Neither path runs a locale setter.
     expect(fixture.applied).toEqual([])
     expect(fixture.pendingAtRestore).toEqual([])
     expect(fixture.events).not.toContain('restore')
     expect(fixture.currentLocaleTags()).toEqual(['ko-KR'])
-    expect((fixture.orch as unknown as { rooms: { get(id: string): { status: string } | null } })
-      .rooms.get(ROOM_ID)?.status).toBe('attention')
-    const raw = (fixture.orch as unknown as { settings: { get(key: string): string | null } })
-      .settings.get(pendingKey)
-    expect(raw).not.toBeNull()
-    const pending = JSON.parse(raw!) as {
-      stage: number
-      expectedLocaleTags: string[]
-      attemptedLocaleTags: string[]
-      attemptedLocaleOwned: boolean
-    }
-    expect(pending).toMatchObject({
-      stage: 0,
-      expectedLocaleTags: ['en-US'],
-      attemptedLocaleOwned: false
+    expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
+      .settings.get(pendingKey)).not.toBeNull()
+
+    fixture.backend.calls.length = 0
+    fixture.events.length = 0
+    fixture.open.mockClear()
+    const statusBefore = fixture.orch.rooms.get(ROOM_ID)?.status
+    const result = await fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
     })
-    expectMarkedLocaleList(pending.attemptedLocaleTags, 'ko-KR')
+
+    expect(result).toMatchObject({
+      abandoned: true,
+      applicationId: APP_ID,
+      target: { kind: 'emulator', deviceId: null }
+    })
+    expect(fixture.open).toHaveBeenCalledWith(ROOM_ID, { kind: 'emulator' })
+    expect(fixture.backend.calls.some((call) => /start|create|remove|stop/i.test(call))).toBe(false)
+    expect(fixture.events).toEqual(['open'])
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe(statusBefore)
+    expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
+      .settings.get(pendingKey)).toBeNull()
 
     await fixture.orch.init()
     expect(fixture.applied).toEqual([])
@@ -495,7 +539,252 @@ describe('Android locale screenshot matrix', () => {
     expect(fixture.events).not.toContain('restore')
     expect(fixture.currentLocaleTags()).toEqual(['ko-KR'])
     expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
+      .settings.get(pendingKey)).toBeNull()
+  })
+
+  it('starts no setter when exact acknowledgement deletes the prepared record before dispatch CAS', async () => {
+    const fixture = setup({ deletePendingBeforeDispatch: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'abandon-won-race'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+
+    expect(fixture.applied).toEqual([])
+    expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
+      .settings.get(pendingKey)).toBeNull()
+  })
+
+  it.each(['sleeping', 'attention'] as const)(
+    'refuses explicit acknowledgement for an exited emulator from %s without waking or changing the Room',
+    async (roomStatus) => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'sleeping-abandon'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+    fixture.orch.rooms.update(ROOM_ID, { status: roomStatus })
+    fixture.backend.emulatorStateValue = 'exited'
+    fixture.backend.calls.length = 0
+    fixture.events.length = 0
+    fixture.open.mockClear()
+
+    await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_ABANDON_REFUSED' })
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe(roomStatus)
+    expect(fixture.backend.emulatorStateValue).toBe('exited')
+    expect(fixture.backend.calls.some((call) => /start|create|remove|stop/i.test(call))).toBe(false)
+    expect(fixture.open).not.toHaveBeenCalled()
+    expect(fixture.applied).toEqual([])
+    expect(fixture.events).toEqual([])
+    expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
       .settings.get(pendingKey)).not.toBeNull()
+    }
+  )
+
+  it.each(['original', 'expected', 'attempted', 'past-marker'] as const)(
+    'refuses explicit acknowledgement for a potentially owned %s locale state',
+    async (state) => {
+      const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+      const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+      await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+        applicationId: APP_ID,
+        locales: ['ko-KR'],
+        filenamePrefix: 'owned-abandon'
+      }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+      const settings = (fixture.orch as unknown as {
+        settings: { get(key: string): string | null; set(key: string, value: string): void }
+      }).settings
+      let raw = settings.get(pendingKey)!
+      const pending = JSON.parse(raw) as {
+        originalLocaleTags: string[]
+        expectedLocaleTags: string[]
+        attemptedLocaleTags: string[]
+      }
+      if (state === 'expected') {
+        raw = JSON.stringify({ ...JSON.parse(raw), expectedLocaleTags: ['de-DE'] })
+        settings.set(pendingKey, raw)
+        fixture.setCurrentLocaleTags(['de-DE'])
+      } else if (state === 'original') {
+        fixture.setCurrentLocaleTags(pending.originalLocaleTags)
+      } else if (state === 'attempted') {
+        fixture.setCurrentLocaleTags(pending.attemptedLocaleTags)
+      } else {
+        fixture.setCurrentLocaleTags([
+          'fr-FR',
+          'fr-Latn-x-dh-00000000-0000-0000-0000-00000000-0000'
+        ])
+      }
+      fixture.backend.calls.length = 0
+      fixture.events.length = 0
+
+      await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+        applicationId: APP_ID,
+        acknowledgeOutsideLocale: true
+      })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_ABANDON_REFUSED' })
+
+      expect(settings.get(pendingKey)).toBe(raw)
+      expect(fixture.applied).toEqual([])
+      expect(fixture.events).toEqual(['open'])
+      expect(fixture.backend.calls.some((call) => /start|create|remove|stop/i.test(call))).toBe(false)
+    }
+  )
+
+  it.each([false, true])(
+    'refuses a v4 dispatch-started record before proof when ownership-confirmed=%s',
+    async (attemptedLocaleOwned) => {
+      const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+      const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+      await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+        applicationId: APP_ID,
+        locales: ['ko-KR'],
+        filenamePrefix: 'dispatch-won-race'
+      }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+      const settings = (fixture.orch as unknown as {
+        settings: { get(key: string): string | null; set(key: string, value: string): void }
+      }).settings
+      const pending = JSON.parse(settings.get(pendingKey)!) as Record<string, unknown>
+      const retained = JSON.stringify({
+        ...pending,
+        attemptedLocaleDispatchStarted: true,
+        attemptedLocaleOwned
+      })
+      settings.set(pendingKey, retained)
+      if (attemptedLocaleOwned) fixture.setCurrentLocaleTags(pending.attemptedLocaleTags as string[])
+      fixture.open.mockClear()
+
+      await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+        applicationId: APP_ID,
+        acknowledgeOutsideLocale: true
+      })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_ABANDON_REFUSED' })
+
+      expect(fixture.open).not.toHaveBeenCalled()
+      expect(fixture.applied).toEqual([])
+      expect(settings.get(pendingKey)).toBe(retained)
+    }
+  )
+
+  it.each([1, 2, 3])('refuses public acknowledgement for legacy v%s dispatch ambiguity', async (version) => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'legacy-abandon'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+    const settings = (fixture.orch as unknown as {
+      settings: { get(key: string): string | null; set(key: string, value: string): void }
+    }).settings
+    const pending = JSON.parse(settings.get(pendingKey)!) as Record<string, unknown>
+    delete pending.attemptedLocaleDispatchStarted
+    if (version !== 3) delete pending.attemptedLocaleOwnershipTag
+    if (version === 1) delete pending.attemptedLocaleOwned
+    const retained = JSON.stringify({
+      ...pending,
+      version,
+      attemptedLocaleTags: ['ko-KR'],
+      ...(version === 3 ? { attemptedLocaleOwnershipTag: null } : {})
+    })
+    settings.set(pendingKey, retained)
+    fixture.open.mockClear()
+
+    await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_ABANDON_REFUSED' })
+
+    expect(fixture.open).not.toHaveBeenCalled()
+    expect(fixture.applied).toEqual([])
+    expect(settings.get(pendingKey)).toBe(retained)
+  })
+
+  it('retains exact recovery authority when explicit acknowledgement loses its delete CAS', async () => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'abandon-cas'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+    const replacement = '{"replacement":true}'
+    const settings = (fixture.orch as unknown as {
+      settings: {
+        get(key: string): string | null
+        set(key: string, value: string): void
+        deleteIfValue(key: string, value: string): boolean
+      }
+    }).settings
+    const deleteIfValue = settings.deleteIfValue.bind(settings)
+    settings.deleteIfValue = (key, value) => {
+      if (key === pendingKey) {
+        settings.set(key, replacement)
+        return false
+      }
+      return deleteIfValue(key, value)
+    }
+
+    await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+
+    expect(fixture.applied).toEqual([])
+    expect(settings.get(pendingKey)).toBe(replacement)
+  })
+
+  it('retains a dispatch-started record when dispatch CAS wins during acknowledgement proof', async () => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'dispatch-during-abandon'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    fixture.controls.dispatchPendingDuringFinalProof = true
+
+    await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+
+    const retained = JSON.parse(settings.get(pendingKey)!) as {
+      attemptedLocaleDispatchStarted: boolean
+      attemptedLocaleOwned: boolean
+    }
+    expect(retained).toMatchObject({
+      attemptedLocaleDispatchStarted: true,
+      attemptedLocaleOwned: false
+    })
+    expect(fixture.applied).toEqual([])
+  })
+
+  it('retains the prepared record when the explicit acknowledgement proof is unavailable', async () => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'abandon-proof'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    fixture.controls.failFinalProofAfterPrecondition = true
+
+    await expect(fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })).rejects.toMatchObject({ code: 'ANDROID_LOCALE_TARGET_CHANGED' })
+
+    expect(fixture.applied).toEqual([])
+    expect(settings.get(pendingKey)).toBe(retained)
   })
 
   it('adds an operation-bound marker when an external actor selects the plain target after the final read', async () => {
@@ -514,17 +803,42 @@ describe('Android locale screenshot matrix', () => {
     expect(fixture.currentLocaleTags()).toEqual(['en-US'])
   })
 
+  it.each([
+    ['zh-TW', 'zh-Hant-x-dh-'],
+    ['zh-Hant-TW', 'zh-Hant-x-dh-'],
+    ['zh-Hans-CN', 'zh-Hans-x-dh-'],
+    ['sr-Latn-RS', 'sr-Latn-x-dh-'],
+    ['sr-RS', 'sr-Cyrl-x-dh-'],
+    ['sr-ME', 'sr-Latn-x-dh-'],
+    ['abcdefgh-Latn', 'abcdefgh-Latn-x-dh-']
+  ])('preserves the requested script fallback in the %s ownership marker', async (locale, prefix) => {
+    const fixture = setup()
+
+    const result = await fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: [locale],
+      filenamePrefix: 'script-marker'
+    }, 'agent')
+
+    const appliedLocaleTags = result.entries[0]?.appliedLocaleTags
+    expect(appliedLocaleTags?.[0]).toBe(locale)
+    expect(appliedLocaleTags?.[1]).toMatch(OWNERSHIP_TAG)
+    expect(appliedLocaleTags?.[1]?.startsWith(prefix)).toBe(true)
+    expect(appliedLocaleTags?.[1]?.length).toBeLessThanOrEqual(63)
+    expect(canonicalAndroidLocaleTags([appliedLocaleTags![1]!])).toEqual([appliedLocaleTags![1]!])
+  })
+
   it('persists accepted ownership before readiness timeout and restores the exact marker', async () => {
     const fixture = setup({ failReadinessAfterAcceptedMutation: true })
     const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
 
     await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
       applicationId: APP_ID,
-      locales: ['ko-KR'],
+      locales: ['zh-Hant-TW'],
       filenamePrefix: 'accepted-before-timeout'
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_READINESS_TIMEOUT' })
 
-    expectMarkedLocaleList(fixture.applied[0], 'ko-KR')
+    expectMarkedLocaleList(fixture.applied[0], 'zh-Hant-TW')
     expect(fixture.applied[1]).toEqual(['en-US'])
     expect(fixture.currentLocaleTags()).toEqual(['en-US'])
     expect((fixture.orch as unknown as { settings: { get(key: string): string | null } })
@@ -541,10 +855,9 @@ describe('Android locale screenshot matrix', () => {
       }
     }).settings
     const setIfValue = settings.setIfValue.bind(settings)
-    let failedStageAdvance = false
+    let localeCasAttempts = 0
     settings.setIfValue = (key, expected, next) => {
-      if (key === pendingKey && !failedStageAdvance) {
-        failedStageAdvance = true
+      if (key === pendingKey && ++localeCasAttempts === 2) {
         return false
       }
       return setIfValue(key, expected, next)
@@ -572,7 +885,7 @@ describe('Android locale screenshot matrix', () => {
     expect(settings.get(pendingKey)).toBeNull()
   })
 
-  it.each([1, 2])('treats a legacy v%s plain attempted locale as unowned during startup recovery', async (version) => {
+  it.each([1, 2, 3])('treats a legacy v%s plain attempted locale as unowned during startup recovery', async (version) => {
     const fixture = setup({ externalBeforeFirstMutation: ['ko-KR'] })
     const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
     await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
@@ -584,12 +897,14 @@ describe('Android locale screenshot matrix', () => {
       settings: { get(key: string): string | null; set(key: string, value: string): void }
     }).settings
     const legacy = JSON.parse(settings.get(pendingKey)!) as Record<string, unknown>
-    delete legacy.attemptedLocaleOwnershipTag
+    delete legacy.attemptedLocaleDispatchStarted
+    if (version !== 3) delete legacy.attemptedLocaleOwnershipTag
     if (version === 1) delete legacy.attemptedLocaleOwned
     settings.set(pendingKey, JSON.stringify({
       ...legacy,
       version,
-      attemptedLocaleTags: ['ko-KR']
+      attemptedLocaleTags: ['ko-KR'],
+      ...(version === 3 ? { attemptedLocaleOwnershipTag: null } : {})
     }))
     fixture.events.length = 0
 
@@ -600,6 +915,48 @@ describe('Android locale screenshot matrix', () => {
     expect(fixture.currentLocaleTags()).toEqual(['ko-KR'])
     expect(settings.get(pendingKey)).not.toBeNull()
   })
+
+  it.each([
+    [1, 'expected', false],
+    [2, 'expected', false],
+    [2, 'attempted', true],
+    [3, 'expected', false]
+  ] as const)(
+    'hard-gates legacy v%s plain %s state even when its old confirmation bit is %s',
+    async (version, currentState, attemptedLocaleOwned) => {
+      const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+      const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+      await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+        applicationId: APP_ID,
+        locales: ['ko-KR'],
+        filenamePrefix: 'legacy-plain-provenance'
+      }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+      const settings = (fixture.orch as unknown as {
+        settings: { get(key: string): string | null; set(key: string, value: string): void }
+      }).settings
+      const legacy = JSON.parse(settings.get(pendingKey)!) as Record<string, unknown>
+      delete legacy.attemptedLocaleDispatchStarted
+      if (version !== 3) delete legacy.attemptedLocaleOwnershipTag
+      if (version === 1) delete legacy.attemptedLocaleOwned
+      const retained = JSON.stringify({
+        ...legacy,
+        version,
+        expectedLocaleTags: ['fr-FR'],
+        attemptedLocaleTags: ['ko-KR'],
+        ...(version === 3 ? { attemptedLocaleOwnershipTag: null } : {}),
+        ...(version === 1 ? {} : { attemptedLocaleOwned })
+      })
+      settings.set(pendingKey, retained)
+      fixture.setCurrentLocaleTags(currentState === 'expected' ? ['fr-FR'] : ['ko-KR'])
+      fixture.events.length = 0
+
+      await fixture.orch.init()
+
+      expect(fixture.applied).toEqual([])
+      expect(fixture.events).not.toContain('restore')
+      expect(settings.get(pendingKey)).toBe(retained)
+    }
+  )
 
   it('does not accept an arbitrary canonical secondary tag as an operation-bound marker', async () => {
     const fixture = setup({ externalBeforeFirstMutation: ['ko-KR'] })
@@ -646,6 +1003,7 @@ describe('Android locale screenshot matrix', () => {
       expectedLocaleTags: ['fr-FR'],
       attemptedLocaleTags: ['ko-KR'],
       attemptedLocaleOwnershipTag: null,
+      attemptedLocaleDispatchStarted: true,
       attemptedLocaleOwned: true
     })
     settings.set(pendingKey, drifted)
@@ -688,9 +1046,9 @@ describe('Android locale screenshot matrix', () => {
       }
     }).settings
     const setIfValue = settings.setIfValue.bind(settings)
-    let confirmationAttempts = 0
+    let localeCasAttempts = 0
     settings.setIfValue = (key, expected, next) => {
-      if (key === pendingKey && confirmationAttempts++ < 2) return false
+      if (key === pendingKey && [2, 3].includes(++localeCasAttempts)) return false
       return setIfValue(key, expected, next)
     }
 
@@ -1016,7 +1374,7 @@ describe('Android locale screenshot matrix', () => {
     settings.setIfValue = (key, expected, next) => {
       if (key !== pendingKey) return advance(key, expected, next)
       advances += 1
-      if (advances === 2) {
+      if (advances === 3) {
         settings.set(key, replacement)
         return false
       }

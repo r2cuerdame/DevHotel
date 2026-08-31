@@ -432,6 +432,27 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       })
     },
     {
+      name: 'abandon_android_locale_matrix_recovery',
+      description:
+        'Explicitly acknowledge that a retained Android locale matrix intent is outside every DevHotel-owned locale state and release only that undispatched v4 fence. The exact Room emulator must already be awake/running; this never starts a target, changes Room status, sets a locale, launches/stops an app, or uses a screen witness. It succeeds only after fresh exact emulator/install/user/foreground/PID proofs and an exact compare-and-delete; dispatched, legacy, original, expected, attempted, or marker-bearing states are refused.',
+      schema: {
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        acknowledgeOutsideLocale: z.literal(true).describe(
+          'required explicit acknowledgement that the currently proved outside locale belongs to another actor'
+        )
+      },
+      strictInputSchema: z.object({
+        roomId: zRoomId,
+        applicationId: zAndroidApplicationId,
+        acknowledgeOutsideLocale: z.literal(true)
+      }).strict(),
+      handler: wrap(async (a) => (await getClient()).abandonAndroidLocaleMatrixRecovery(a.roomId, {
+        applicationId: a.applicationId,
+        acknowledgeOutsideLocale: a.acknowledgeOutsideLocale
+      }))
+    },
+    {
       name: 'list_room_artifacts',
       description:
         'List a Room’s newest durable screenshot artifacts and their secret-safe capture metadata. Content is fetched separately so listing stays small.',

@@ -99,6 +99,14 @@ beforeAll(async () => {
           restoration: { localeTags: ['en-US'], readiness: { consecutiveReadyChecks: 2 } }
         }))
       }
+      if (req.url === '/v1/rooms/abc12345/android/locale-recovery-abandon' && req.method === 'POST') {
+        const body = JSON.parse(raw)
+        return void res.end(JSON.stringify({
+          abandoned: true,
+          applicationId: body.applicationId,
+          target: { kind: 'emulator', deviceId: null }
+        }))
+      }
       if (req.url === '/v1/rooms/abc12345/artifacts?limit=5' && req.method === 'GET') {
         return void res.end(JSON.stringify({ artifacts: [artifact] }))
       }
@@ -254,6 +262,7 @@ describe('makeTools', () => {
         'android_dump_ui',
         'android_force_stop',
         'android_launch_app',
+        'abandon_android_locale_matrix_recovery',
         'android_locale_screenshot_matrix',
         'android_logcat',
         'android_run',
@@ -384,6 +393,38 @@ describe('makeTools', () => {
       roomId: 'abc12345', applicationId: 'com.example.app',
       locales: ['en-US'], filenamePrefix: 'release',
       target: { kind: 'physical', deviceId: `d${'a'.repeat(32)}` }
+    }).success).toBe(false)
+  })
+
+  it('forwards only a literal explicit locale-recovery acknowledgement', async () => {
+    const result = await byName.abandon_android_locale_matrix_recovery!.handler({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: true
+    })
+
+    expect(result.isError).toBeUndefined()
+    expect(firstText(result)).toContain('"abandoned": true')
+    expect(seen.findLast((request) =>
+      request.url === '/v1/rooms/abc12345/android/locale-recovery-abandon'
+    )).toMatchObject({
+      body: {
+        applicationId: 'com.example.app',
+        acknowledgeOutsideLocale: true
+      }
+    })
+
+    const schema = byName.abandon_android_locale_matrix_recovery!.strictInputSchema!
+    expect(schema.safeParse({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: false
+    }).success).toBe(false)
+    expect(schema.safeParse({
+      roomId: 'abc12345',
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: true,
+      extra: 'not-allowed'
     }).success).toBe(false)
   })
 

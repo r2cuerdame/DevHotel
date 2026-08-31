@@ -35,6 +35,8 @@ import type {
   AndroidLaunchResult,
   AndroidLogcatInput,
   AndroidLogcatResult,
+  AbandonAndroidLocaleMatrixRecoveryInput,
+  AbandonAndroidLocaleMatrixRecoveryResult,
   AndroidLocaleScreenshotMatrixInput,
   AndroidLocaleScreenshotMatrixResult,
   AndroidRunCrashScenarioInput,
@@ -78,6 +80,7 @@ import {
   zArtifactExportBody,
   zArtifactListLimit,
   zAndroidApplicationId,
+  zAbandonAndroidLocaleMatrixRecoveryBody,
   zAndroidLocaleScreenshotMatrixBody,
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
@@ -89,6 +92,7 @@ import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstal
 import {
   AndroidAutomationSession,
   type AndroidAppLocaleRestoreFence,
+  type AndroidAppLocaleSnapshot,
   type AndroidForegroundInstallEvidence
 } from './devices/androidAutomation'
 import { artifactsRepo } from './store/artifactsRepo'
@@ -254,7 +258,7 @@ function parsePendingArtifactExport(raw: string): PendingArtifactExport | null {
 }
 
 interface PendingAndroidLocaleRestore {
-  version: 3
+  version: 4
   operationId: string
   stage: number
   applicationId: string
@@ -263,10 +267,14 @@ interface PendingAndroidLocaleRestore {
   attemptedLocaleTags: string[]
   /** Exact secondary private-use tag that binds a forward attempt to operationId; null for restoration attempts. */
   attemptedLocaleOwnershipTag: string | null
+  /** True only after a synchronous durable CAS immediately before the locale setter is dispatched. */
+  attemptedLocaleDispatchStarted: boolean
   /** True only after the locale shell command returned an exact acknowledgement and ownership was synchronously CASed. */
   attemptedLocaleOwned: boolean
   fence: AndroidAppLocaleRestoreFence
 }
+
+type PendingAndroidLocaleAbandonDecision = 'released' | 'refused' | 'cas-changed'
 
 function pendingAndroidLocaleRestoreKey(roomId: string): string {
   return `${ANDROID_LOCALE_RESTORE_PENDING_PREFIX}${roomId}`
@@ -276,22 +284,32 @@ function sameStringValues(left: readonly string[], right: readonly string[]): bo
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
-function androidLocaleOwnershipTag(requestedLocale: string, operationId: string): string | null {
+function androidLocaleOwnershipTagForVersion(
+  requestedLocale: string,
+  operationId: string,
+  preserveScript: boolean
+): string | null {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(operationId)) return null
-  let language: string
+  let locale: Intl.Locale
   try {
-    language = new Intl.Locale(requestedLocale).language.toLowerCase()
+    locale = new Intl.Locale(requestedLocale)
   } catch {
     return null
   }
-  // `und` is not a useful resource fallback. It can occur only when an input
-  // itself carries an und private-use tag, so use the registered no-linguistic-
-  // content language while retaining the nonce's attribution property.
-  if (language === 'und') language = 'zxx'
+  const language = locale.language?.toLowerCase()
+  if (!language || language === 'und') return null
   if (!/^[a-z]{2,8}$/.test(language)) return null
+  let languageAndScript = language
+  if (preserveScript) {
+    const script = locale.script ?? locale.maximize().script
+    if (script !== undefined) {
+      if (!/^[A-Z][a-z]{3}$/.test(script)) return null
+      languageAndScript = `${language}-${script}`
+    }
+  }
   const nonce = operationId.replaceAll('-', '')
   const marker = [
-    `${language}-x-dh`,
+    `${languageAndScript}-x-dh`,
     nonce.slice(0, 8),
     nonce.slice(8, 12),
     nonce.slice(12, 16),
@@ -300,6 +318,29 @@ function androidLocaleOwnershipTag(requestedLocale: string, operationId: string)
     nonce.slice(28, 32)
   ].join('-')
   return canonicalAndroidLocaleTag(marker)
+}
+
+function androidLocaleOwnershipTag(requestedLocale: string, operationId: string): string | null {
+  return androidLocaleOwnershipTagForVersion(requestedLocale, operationId, true)
+}
+
+function legacyAndroidLocaleOwnershipTag(requestedLocale: string, operationId: string): string | null {
+  return androidLocaleOwnershipTagForVersion(requestedLocale, operationId, false)
+}
+
+function isExactAndroidLocaleOwnershipTag(
+  requestedLocale: string,
+  operationId: string,
+  ownershipTag: string
+): boolean {
+  return androidLocaleOwnershipTag(requestedLocale, operationId) === ownershipTag ||
+    legacyAndroidLocaleOwnershipTag(requestedLocale, operationId) === ownershipTag
+}
+
+function isAndroidLocaleOwnershipMarkerTag(localeTag: string): boolean {
+  return /^[a-z]{2,8}(?:-[A-Z][a-z]{3})?-x-dh-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{8}-[0-9a-f]{4}$/.test(
+    localeTag
+  )
 }
 
 function markedAndroidLocaleAttempt(requestedLocale: string, operationId: string): {
@@ -320,8 +361,11 @@ function hasExactAndroidLocaleOwnershipMarker(pending: PendingAndroidLocaleResto
   return pending.attemptedLocaleOwnershipTag !== null &&
     pending.attemptedLocaleTags.length === 2 &&
     pending.attemptedLocaleTags[1] === pending.attemptedLocaleOwnershipTag &&
-    androidLocaleOwnershipTag(pending.attemptedLocaleTags[0]!, pending.operationId) ===
+    isExactAndroidLocaleOwnershipTag(
+      pending.attemptedLocaleTags[0]!,
+      pending.operationId,
       pending.attemptedLocaleOwnershipTag
+    )
 }
 
 function pendingAndroidLocaleOwnsCurrent(
@@ -329,10 +373,15 @@ function pendingAndroidLocaleOwnsCurrent(
   currentLocaleTags: readonly string[]
 ): boolean {
   if (pending.attemptedLocaleOwned) {
-    return sameStringValues(currentLocaleTags, pending.attemptedLocaleTags)
+    return hasExactAndroidLocaleOwnershipMarker(pending) &&
+      sameStringValues(currentLocaleTags, pending.attemptedLocaleTags)
   }
-  return sameStringValues(currentLocaleTags, pending.expectedLocaleTags) ||
-    (hasExactAndroidLocaleOwnershipMarker(pending) &&
+  return (
+    pending.expectedLocaleTags.some(isAndroidLocaleOwnershipMarkerTag) &&
+    sameStringValues(currentLocaleTags, pending.expectedLocaleTags)
+  ) ||
+    (pending.attemptedLocaleDispatchStarted &&
+      hasExactAndroidLocaleOwnershipMarker(pending) &&
       sameStringValues(currentLocaleTags, pending.attemptedLocaleTags))
 }
 
@@ -381,8 +430,14 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
     'applicationId,attemptedLocaleOwned,attemptedLocaleOwnershipTag,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version' &&
     typeof record.attemptedLocaleOwned === 'boolean' &&
     (record.attemptedLocaleOwnershipTag === null || typeof record.attemptedLocaleOwnershipTag === 'string')
+  const currentV4 = record.version === 4 && keys ===
+    'applicationId,attemptedLocaleDispatchStarted,attemptedLocaleOwned,attemptedLocaleOwnershipTag,attemptedLocaleTags,expectedLocaleTags,fence,operationId,originalLocaleTags,stage,version' &&
+    typeof record.attemptedLocaleDispatchStarted === 'boolean' &&
+    typeof record.attemptedLocaleOwned === 'boolean' &&
+    (record.attemptedLocaleOwnershipTag === null || typeof record.attemptedLocaleOwnershipTag === 'string') &&
+    !(record.attemptedLocaleOwned && !record.attemptedLocaleDispatchStarted)
   if (
-    (!legacyV1 && !legacyV2 && !currentV3) ||
+    (!legacyV1 && !legacyV2 && !currentV3 && !currentV4) ||
     typeof record.operationId !== 'string' ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(record.operationId) ||
     !Number.isSafeInteger(record.stage) ||
@@ -398,14 +453,16 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
     expectedLocaleTags === null ||
     attemptedLocaleTags === null
   ) return null
-  const attemptedLocaleOwnershipTag = currentV3
+  const attemptedLocaleOwnershipTag = currentV3 || currentV4
     ? record.attemptedLocaleOwnershipTag as string | null
     : null
   if (attemptedLocaleOwnershipTag !== null) {
     if (
       attemptedLocaleTags.length !== 2 ||
       attemptedLocaleTags[1] !== attemptedLocaleOwnershipTag ||
-      androidLocaleOwnershipTag(attemptedLocaleTags[0]!, record.operationId) !== attemptedLocaleOwnershipTag
+      (currentV4
+        ? androidLocaleOwnershipTag(attemptedLocaleTags[0]!, record.operationId)
+        : legacyAndroidLocaleOwnershipTag(attemptedLocaleTags[0]!, record.operationId)) !== attemptedLocaleOwnershipTag
     ) return null
   }
 
@@ -445,10 +502,9 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
   ) return null
 
   return {
-    // Legacy v1 had no confirmation bit, while v2 had no operation-bound
-    // marker. Preserve their exact prior state but never infer ownership from
-    // a merely matching unconfirmed attempted locale.
-    version: 3,
+    // Legacy records had no pre-dispatch CAS. Treat that ambiguity as already
+    // dispatched so the public no-setter abandon path can never release one.
+    version: 4,
     operationId: record.operationId,
     stage: record.stage as number,
     applicationId: applicationId.data,
@@ -456,7 +512,10 @@ function parsePendingAndroidLocaleRestore(raw: string, roomId: string): PendingA
     expectedLocaleTags,
     attemptedLocaleTags,
     attemptedLocaleOwnershipTag,
-    attemptedLocaleOwned: (legacyV2 || currentV3) && record.attemptedLocaleOwned === true,
+    attemptedLocaleDispatchStarted: currentV4
+      ? record.attemptedLocaleDispatchStarted === true
+      : true,
+    attemptedLocaleOwned: (legacyV2 || currentV3 || currentV4) && record.attemptedLocaleOwned === true,
     fence: {
       targetKind: fence.targetKind,
       targetId: fence.targetId,
@@ -940,12 +999,13 @@ export class RoomOrchestrator {
             }
             const recoveryStage: PendingAndroidLocaleRestore = {
               ...pending,
-              version: 3,
+              version: 4,
               operationId: randomUUID(),
               stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
               expectedLocaleTags: [...beforeRestore.localeTags],
               attemptedLocaleTags: [...pending.originalLocaleTags],
               attemptedLocaleOwnershipTag: null,
+              attemptedLocaleDispatchStarted: false,
               attemptedLocaleOwned: false
             }
             const recoveryValue = JSON.stringify(recoveryStage)
@@ -957,7 +1017,26 @@ export class RoomOrchestrator {
             }
             let recoveryPending = recoveryStage
             let recoveryPendingValue = recoveryValue
-            const confirmRecoveryMutationAccepted = (): void => {
+            const markRecoveryMutationDispatched = (): undefined => {
+              if (recoveryPending.attemptedLocaleDispatchStarted) {
+                throw new Error('Interrupted Android locale restoration dispatch was already recorded')
+              }
+              const dispatched: PendingAndroidLocaleRestore = {
+                ...recoveryPending,
+                attemptedLocaleDispatchStarted: true
+              }
+              const dispatchedValue = JSON.stringify(dispatched)
+              if (!this.settings.setIfValue(key, recoveryPendingValue, dispatchedValue)) {
+                throw new Error('Interrupted Android locale restoration dispatch ownership changed')
+              }
+              recoveryPending = dispatched
+              recoveryPendingValue = dispatchedValue
+              return undefined
+            }
+            const confirmRecoveryMutationAccepted = (): undefined => {
+              if (!recoveryPending.attemptedLocaleDispatchStarted) {
+                throw new Error('Interrupted Android locale restoration acknowledgement preceded dispatch')
+              }
               const confirmed: PendingAndroidLocaleRestore = {
                 ...recoveryPending,
                 attemptedLocaleOwned: true
@@ -968,6 +1047,7 @@ export class RoomOrchestrator {
               }
               recoveryPending = confirmed
               recoveryPendingValue = confirmedValue
+              return undefined
             }
             const result = await session.withActiveUserScreenWitness(
               (signal) => session.restoreAppLocalesFromFence(
@@ -976,7 +1056,12 @@ export class RoomOrchestrator {
                 recoveryStage.fence,
                 recoveryStage.expectedLocaleTags,
                 recoveryStage.attemptedLocaleTags,
-                { timeoutMs: 30_000, signal, onMutationAccepted: confirmRecoveryMutationAccepted }
+                {
+                  timeoutMs: 30_000,
+                  signal,
+                  onBeforeMutation: markRecoveryMutationDispatched,
+                  onMutationAccepted: confirmRecoveryMutationAccepted
+                }
               ),
               { actionTimeoutMs: 30_000, allowApplicationIdTransitions: recoveryStage.applicationId }
             )
@@ -1418,6 +1503,41 @@ export class RoomOrchestrator {
       deviceId: pending.fence.deviceId,
       roomId: pending.fence.roomId
     })
+  }
+
+  /**
+   * Release only one v4 stage whose setter was durably proved never dispatched
+   * and whose fresh composite target proof is outside every potentially owned
+   * locale state. The exact delete is synchronous with that proof.
+   */
+  private abandonPendingAndroidLocaleRestorationIfProvenOutside(
+    key: string,
+    value: string,
+    pending: PendingAndroidLocaleRestore,
+    proof: AndroidAppLocaleSnapshot
+  ): PendingAndroidLocaleAbandonDecision {
+    if (
+      pending.version !== 4 ||
+      pending.fence.targetKind !== 'emulator' ||
+      pending.attemptedLocaleDispatchStarted ||
+      pending.attemptedLocaleOwned ||
+      proof.apiLevel !== pending.fence.apiLevel ||
+      proof.pids.length === 0 ||
+      !sameAndroidLocaleRestoreFence(proof.restoreFence, pending.fence)
+    ) return 'refused'
+
+    const currentLocaleTags = proof.localeTags
+    if (
+      sameStringValues(currentLocaleTags, pending.originalLocaleTags) ||
+      sameStringValues(currentLocaleTags, pending.expectedLocaleTags) ||
+      sameStringValues(currentLocaleTags, pending.attemptedLocaleTags) ||
+      // A marker from an earlier stage is still DevHotel-attributable even
+      // after stage advancement removed it from this record. Without durable
+      // marker history, fail closed on every structurally valid marker.
+      currentLocaleTags.some(isAndroidLocaleOwnershipMarkerTag)
+    ) return 'refused'
+
+    return this.settings.deleteIfValue(key, value) ? 'released' : 'cas-changed'
   }
 
   private assertRoomLockHeld(roomId: string): void {
@@ -2891,6 +3011,91 @@ export class RoomOrchestrator {
     }
   }
 
+  abandonAndroidLocaleMatrixRecovery(
+    roomId: string,
+    rawInput: AbandonAndroidLocaleMatrixRecoveryInput
+  ): Promise<AbandonAndroidLocaleMatrixRecoveryResult> {
+    return this.withRoomLock(roomId, async () => {
+      const input = zAbandonAndroidLocaleMatrixRecoveryBody.parse(rawInput)
+      const room = this.mustGet(roomId)
+      if (room.provider !== 'android') {
+        throw new DevHotelError(
+          'ANDROID_LOCALE_ABANDON_REFUSED',
+          'Android locale recovery can be acknowledged only for an Android Room.',
+          { recoveryHint: 'Choose the Android Room that owns the retained locale recovery fence.', httpStatus: 409 }
+        )
+      }
+      const key = pendingAndroidLocaleRestoreKey(roomId)
+      const raw = this.settings.get(key)
+      const pending = raw === null ? null : parsePendingAndroidLocaleRestore(raw, roomId)
+      if (
+        raw === null ||
+        pending === null ||
+        pending.applicationId !== input.applicationId ||
+        pending.fence.targetKind !== 'emulator' ||
+        pending.attemptedLocaleDispatchStarted ||
+        pending.attemptedLocaleOwned
+      ) {
+        throw new DevHotelError(
+          'ANDROID_LOCALE_ABANDON_REFUSED',
+          'The retained locale intent is absent, ambiguous, dispatched, owned, or belongs to another application.',
+          {
+            recoveryHint: 'Do not discard it; restart DevHotel for exact automatic restoration or inspect the matching app and target.',
+            httpStatus: 409
+          }
+        )
+      }
+
+      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      if (!awake || (await this.backend.emulatorState(roomId)) !== 'running') {
+        throw new DevHotelError(
+          'ANDROID_LOCALE_ABANDON_REFUSED',
+          'The exact Room emulator must already be awake and running for read-only acknowledgement.',
+          {
+            recoveryHint: 'Do not wake, restart or otherwise mutate the retained target through this workflow.',
+            httpStatus: 409
+          }
+        )
+      }
+      const session = await this.openAndroidAutomationSessionLocked(
+        roomId,
+        { kind: 'emulator' }
+      )
+      const proof = await session.proveAppLocaleFinalState(
+        pending.applicationId,
+        pending.fence,
+        30_000
+      )
+      // No await may separate the final two-pulse target/install/user/PID/
+      // locale proof from the exact raw compare-and-delete below.
+      const decision = this.abandonPendingAndroidLocaleRestorationIfProvenOutside(
+        key,
+        raw,
+        pending,
+        proof
+      )
+      if (decision === 'cas-changed') {
+        throw new DevHotelError(
+          'ANDROID_LOCALE_RECOVERY_REQUIRED',
+          'The retained Android locale intent changed before its exact acknowledgement could be committed.',
+          { recoveryHint: 'Keep the target unchanged and inspect the newer retained recovery state.', httpStatus: 409 }
+        )
+      }
+      if (decision === 'refused') {
+        throw new DevHotelError(
+          'ANDROID_LOCALE_ABANDON_REFUSED',
+          'The current locale is original, expected, attempted, marker-bearing, or otherwise potentially owned by DevHotel.',
+          {
+            recoveryHint: 'Do not acknowledge this state as external; restart DevHotel for exact automatic restoration.',
+            httpStatus: 409
+          }
+        )
+      }
+      this.olog(roomId, 'an explicitly acknowledged outside Android locale released one undispatched recovery fence')
+      return { abandoned: true, applicationId: pending.applicationId, target: session.target }
+    }, { allowPendingAndroidLocaleRestoration: true })
+  }
+
   androidLocaleScreenshotMatrix(
     roomId: string,
     rawInput: AndroidLocaleScreenshotMatrixInput,
@@ -2930,7 +3135,7 @@ export class RoomOrchestrator {
         const initialOperationId = randomUUID()
         const initialAttempt = markedAndroidLocaleAttempt(captures[0]!.locale, initialOperationId)
         let pending: PendingAndroidLocaleRestore = {
-          version: 3,
+          version: 4,
           operationId: initialOperationId,
           stage: 0,
           applicationId: input.applicationId,
@@ -2938,6 +3143,7 @@ export class RoomOrchestrator {
           expectedLocaleTags: [...original.localeTags],
           attemptedLocaleTags: initialAttempt.localeTags,
           attemptedLocaleOwnershipTag: initialAttempt.ownershipTag,
+          attemptedLocaleDispatchStarted: false,
           attemptedLocaleOwned: false,
           fence: original.restoreFence
         }
@@ -2988,12 +3194,13 @@ export class RoomOrchestrator {
             : { localeTags: [...attempted], ownershipTag: null }
           const next: PendingAndroidLocaleRestore = {
             ...pending,
-            version: 3,
+            version: 4,
             operationId: nextOperationId,
             stage: pending.stage === Number.MAX_SAFE_INTEGER ? 0 : pending.stage + 1,
             expectedLocaleTags: [...expected],
             attemptedLocaleTags: nextAttempt.localeTags,
             attemptedLocaleOwnershipTag: nextAttempt.ownershipTag,
+            attemptedLocaleDispatchStarted: false,
             attemptedLocaleOwned: false
           }
           const nextValue = JSON.stringify(next)
@@ -3010,7 +3217,41 @@ export class RoomOrchestrator {
           pending = next
           pendingValue = nextValue
         }
-        const confirmPendingAttemptedLocale = (): void => {
+        const markPendingAttemptedLocaleDispatched = (): undefined => {
+          if (pending.attemptedLocaleDispatchStarted) {
+            throw new DevHotelError(
+              'ANDROID_LOCALE_RECOVERY_REQUIRED',
+              'The Android locale recovery stage already recorded a setter dispatch.',
+              { recoveryHint: 'Restart DevHotel for exact retained recovery.', httpStatus: 409 }
+            )
+          }
+          const dispatched: PendingAndroidLocaleRestore = {
+            ...pending,
+            attemptedLocaleDispatchStarted: true
+          }
+          const dispatchedValue = JSON.stringify(dispatched)
+          if (!this.settings.setIfValue(pendingKey, pendingValue, dispatchedValue)) {
+            throw new DevHotelError(
+              'ANDROID_LOCALE_RECOVERY_REQUIRED',
+              'The Android locale recovery stage changed before setter dispatch.',
+              {
+                recoveryHint: 'No locale setter was started; inspect the retained intent and retry recovery.',
+                httpStatus: 409
+              }
+            )
+          }
+          pending = dispatched
+          pendingValue = dispatchedValue
+          return undefined
+        }
+        const confirmPendingAttemptedLocale = (): undefined => {
+          if (!pending.attemptedLocaleDispatchStarted) {
+            throw new DevHotelError(
+              'ANDROID_LOCALE_RECOVERY_REQUIRED',
+              'Android acknowledged a locale mutation before durable dispatch ownership was recorded.',
+              { recoveryHint: 'Keep the target unchanged and restart DevHotel for retained recovery.', httpStatus: 409 }
+            )
+          }
           const confirmed: PendingAndroidLocaleRestore = {
             ...pending,
             attemptedLocaleOwned: true
@@ -3028,6 +3269,7 @@ export class RoomOrchestrator {
           }
           pending = confirmed
           pendingValue = confirmedValue
+          return undefined
         }
         try {
           for (const [index, capture] of captures.entries()) {
@@ -3046,6 +3288,7 @@ export class RoomOrchestrator {
                   signal,
                   expectedPreviousLocaleTags: expectedLocaleTags,
                   restoreFence: original.restoreFence,
+                  onBeforeMutation: markPendingAttemptedLocaleDispatched,
                   onMutationAccepted: confirmPendingAttemptedLocale
                 }
               ),
@@ -3177,7 +3420,12 @@ export class RoomOrchestrator {
                 original.restoreFence,
                 pending.expectedLocaleTags,
                 pending.attemptedLocaleTags,
-                { timeoutMs, signal, onMutationAccepted: confirmPendingAttemptedLocale }
+                {
+                  timeoutMs,
+                  signal,
+                  onBeforeMutation: markPendingAttemptedLocaleDispatched,
+                  onMutationAccepted: confirmPendingAttemptedLocale
+                }
               ),
               { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
             )

@@ -3086,6 +3086,8 @@ describe('tracked Android automation session', () => {
   it('reads and mutates app locales only for the tracked numeric Android user', async () => {
     let applied = ['en-US']
     let pgrepCalls = 0
+    let dispatchCallbackRan = false
+    let setterRanBeforeDispatchCallback = false
     let setterAcknowledged = false
     let acceptedCallbackRan = false
     let postAckProbeRanBeforeCallback = false
@@ -3104,6 +3106,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [${applied.join(',')}]\n`, stderr: '' }
       }
       if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'set-app-locales') {
+        if (!dispatchCallbackRan) setterRanBeforeDispatchCallback = true
         const index = args.indexOf('--locales')
         applied = index < 0 ? [] : [args[index + 1]!]
         setterAcknowledged = true
@@ -3122,6 +3125,9 @@ describe('tracked Android automation session', () => {
     }, { now: () => HOST_NOW_MS, sleep: async () => {} })
 
     const result = await session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      onBeforeMutation: () => {
+        dispatchCallbackRan = true
+      },
       onMutationAccepted: () => {
         acceptedCallbackRan = true
       }
@@ -3142,8 +3148,83 @@ describe('tracked Android automation session', () => {
     ])
     expect(calls.filter((args) => args[1] === 'pgrep').every((args) => args.at(-1) === '10123')).toBe(true)
     expect(calls.some((args) => args.includes('current'))).toBe(false)
+    expect(dispatchCallbackRan).toBe(true)
+    expect(setterRanBeforeDispatchCallback).toBe(false)
     expect(acceptedCallbackRan).toBe(true)
     expect(postAckProbeRanBeforeCallback).toBe(false)
+  })
+
+  it('creates no locale command when an async pre-dispatch callback violates the synchronous contract', async () => {
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') {
+        return { code: 0, stdout: '34\n', stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    const typeContract: Parameters<AndroidAutomationSession['applyAppLocalesAndWait']>[2] = {
+      // @ts-expect-error async callbacks cannot satisfy the durable synchronous CAS contract
+      onBeforeMutation: async () => undefined
+    }
+    expect(typeContract).toBeDefined()
+    await expect(session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      onBeforeMutation: (async () => {
+        throw new Error('late async dispatch rejection')
+      }) as unknown as () => undefined
+    })).rejects.toThrow('must complete synchronously')
+
+    expect(calls.some((args) => args[1] === 'cmd' && args[3] === 'set-app-locales')).toBe(false)
+  })
+
+  it('runs no postflight probe when an async accepted hook violates the synchronous contract', async () => {
+    let setterAcknowledged = false
+    let postAcknowledgementProbes = 0
+    const { calls, session } = setup((args) => {
+      if (setterAcknowledged && args[1] === 'pm') postAcknowledgementProbes += 1
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') {
+        return { code: 0, stdout: '34\n', stderr: '' }
+      }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
+        return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
+      }
+      if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'set-app-locales') {
+        setterAcknowledged = true
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.applyAppLocalesAndWait(APP_ID, ['ko-KR'], {
+      onMutationAccepted: (async () => {
+        throw new Error('late async acknowledgement rejection')
+      }) as unknown as () => undefined
+    })).rejects.toThrow('must complete synchronously')
+
+    expect(calls.filter((args) => args[1] === 'cmd' && args[3] === 'set-app-locales')).toHaveLength(1)
+    expect(postAcknowledgementProbes).toBe(0)
   })
 
   it('rejects an original locale that changes while the restorable snapshot is being sealed', async () => {

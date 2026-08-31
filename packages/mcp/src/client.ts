@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   type AgentCreateRoomInput,
+  type AbandonAndroidLocaleMatrixRecoveryInput,
+  type AbandonAndroidLocaleMatrixRecoveryResult,
   type AndroidAutomationStatus,
   type AndroidCrashScenarioResult,
   type AndroidDumpUiInput,
@@ -333,6 +335,13 @@ export class ControlClient {
     return this.req<AndroidLocaleScreenshotMatrixResult>(
       'POST',
       `/v1/rooms/${encodeURIComponent(roomId)}/android/locale-matrix`,
+      input
+    )
+  }
+  abandonAndroidLocaleMatrixRecovery(roomId: string, input: AbandonAndroidLocaleMatrixRecoveryInput) {
+    return this.req<AbandonAndroidLocaleMatrixRecoveryResult>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/android/locale-recovery-abandon`,
       input
     )
   }

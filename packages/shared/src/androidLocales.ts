@@ -22,7 +22,9 @@ export function canonicalAndroidLocaleTag(value: string): string | null {
   try {
     const canonical = Intl.getCanonicalLocales(value)
     const locale = canonical.length === 1 ? canonical[0] : undefined
-    return locale && locale.toLowerCase() !== 'und' ? locale : null
+    if (!locale) return null
+    const language = new Intl.Locale(locale).language?.toLowerCase()
+    return language && language !== 'und' ? locale : null
   } catch {
     return null
   }
@@ -84,6 +86,23 @@ export const zAndroidLocaleScreenshotMatrixBody = z
   .strict()
 
 export type AndroidLocaleScreenshotMatrixInput = z.infer<typeof zAndroidLocaleScreenshotMatrixBody>
+
+export const zAbandonAndroidLocaleMatrixRecoveryBody = z
+  .object({
+    applicationId: zAndroidApplicationId,
+    acknowledgeOutsideLocale: z.literal(true)
+  })
+  .strict()
+
+export type AbandonAndroidLocaleMatrixRecoveryInput = z.infer<
+  typeof zAbandonAndroidLocaleMatrixRecoveryBody
+>
+
+export interface AbandonAndroidLocaleMatrixRecoveryResult {
+  abandoned: true
+  applicationId: string
+  target: AndroidAutomationTarget
+}
 
 export interface AndroidLocaleReadiness {
   adb: 'device'

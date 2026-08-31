@@ -47,12 +47,18 @@ plain requested locale that another actor selected in between. Each forward
 matrix stage instead writes an exact two-entry list:
 
 ```text
-[<requested-tag>, <requested-language>-x-dh-<128-bit-stage-capability>]
+[<requested-tag>, <requested-language-and-script>-x-dh-<128-bit-stage-capability>]
 ```
 
-The requested locale remains first. Android preserves `LocaleList` order and
-private-use extensions, so the secondary same-language tag is a temporary,
-stage-specific ownership capability rather than a competing primary UI locale.
+The requested locale remains first. The secondary tag keeps the requested
+explicit script, or the script produced by `Intl.Locale.maximize()` when the
+request omitted one. Thus `zh-TW` retains `Hant`, `zh-CN` retains `Hans`, and
+Serbian retains its resolved Cyrillic/Latin constraint instead of falling back
+through a language-only marker. The canonical marker is at most 63 characters;
+tags whose base language is absent or `und` are rejected. Android preserves
+`LocaleList` order and private-use extensions, so the secondary same-language-
+and-script tag is a temporary, stage-specific ownership capability rather than
+a competing primary UI locale.
 It is durably recorded before the setter, is different for every stage, and is
 verified byte-for-byte during readiness and capture. A coincidental external
 plain `[<requested-tag>]` selection therefore cannot be mistaken for the
@@ -82,14 +88,17 @@ Before the first mutation, the workflow double-reads the original locale around
 its target/install/user proof, then durably records that locale together with
 the exact managed-emulator target, package incarnation and user fence. The
 durable record has a random operation capability and advances by compare-and-
-swap before each set. A prepared stage owns only its expected prior locale; its
-attempted locale becomes owned when the setter returns an exact acknowledgement;
-that fact is synchronously confirmed by a second compare-and-swap before any
-install postflight or readiness await. If the process dies in the tiny interval
-before that confirmation, only an exact operation-bound secondary marker match
-is recoverable; a plain requested locale and every legacy non-marker attempt
-remain attention-gated. A later unattempted matrix locale is never treated as
-DevHotel-owned. Every set checks the expected prior locale
+swap before each set. After the final previous-locale read and immediately
+before command creation, a synchronous compare-and-swap records that dispatch
+started; if it loses, no setter/helper is created. The exact command
+acknowledgement is then synchronously compare-and-swapped before any install
+postflight or readiness await. Both hooks reject Promise/thenable results rather
+than weakening these linearization points. A prepared stage owns only a prior
+list carrying a valid DevHotel marker. After dispatch, only an exact operation-
+bound marker match is recoverable; a plain requested locale and legacy v1/v2
+plain expected/attempted states remain attention-gated even when an old
+confirmation bit was true. A later unattempted matrix locale is never treated
+as DevHotel-owned. Every set checks the expected prior locale
 immediately before mutation, and a fresh post-witness snapshot re-proves locale,
 install, target, user, PID and lease identity before publication can advance.
 Success and failure paths restore that exact list, prove that no temporary
@@ -108,6 +117,20 @@ intent is released by compare-and-delete, the Room remains attention-gated
 against further mutations. Shutdown and clean removal refuse to discard this
 recovery authority. A changed target, install, user, lease, or outside locale is
 never overwritten during recovery.
+
+An undispatched v4 record can be released only through the explicit
+`POST /v1/rooms/:id/android/locale-recovery-abandon` action or the
+`abandon_android_locale_matrix_recovery` MCP tool. The caller must send
+`{"applicationId":"…","acknowledgeOutsideLocale":true}`. This is a no-setter
+escape hatch for a crash-era precondition loss: it requires the exact Room
+emulator to be already awake and running, performs two fresh read-only
+target/install/user/foreground/PID/locale proof pulses, and compare-deletes the
+byte-exact pending value with no intervening await. It never wakes/restarts a
+target, launches or stops an app, changes Room status, invokes a screen witness,
+or changes a locale. Original, expected, full attempted, any DevHotel-shaped
+marker (including an older-stage marker), dispatched/owned, malformed, physical,
+and legacy v1-v3 states are refused. Proof drift or a lost delete CAS preserves
+the hard gate.
 
 ## Matrix publication gate
 

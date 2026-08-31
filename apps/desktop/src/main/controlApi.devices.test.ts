@@ -316,6 +316,9 @@ describe('agent Android automation routes', () => {
     ['crash-scenario', { applicationId: 'com.example.app', scenario: 'am-crash', runId: '' }],
     ['locale-matrix', {
       applicationId: 'com.example.app', locales: ['en-US', 'EN-us'], filenamePrefix: 'release'
+    }],
+    ['locale-recovery-abandon', {
+      applicationId: 'com.example.app', acknowledgeOutsideLocale: false
     }]
   ])('returns a sanitized 400 before Core for an invalid %s body', async (action, body) => {
     const orchestratorCalls = {
@@ -326,7 +329,8 @@ describe('agent Android automation routes', () => {
       androidDumpUi: vi.fn(),
       androidLogcat: vi.fn(),
       androidRunCrashScenario: vi.fn(),
-      androidLocaleScreenshotMatrix: vi.fn()
+      androidLocaleScreenshotMatrix: vi.fn(),
+      abandonAndroidLocaleMatrixRecovery: vi.fn()
     }
     await withApi(orchestratorCalls as unknown as Partial<RoomOrchestrator>, async (call) => {
       const result = await call(`/v1/rooms/room1abc/android/${action}`, {
@@ -434,6 +438,32 @@ describe('agent Android automation routes', () => {
         filenamePrefix: 'release-42',
         readinessTimeoutMs: 30_000
       }, 'agent')
+    })
+  })
+
+  it('forwards only an explicit literal locale-recovery acknowledgement to Core', async () => {
+    const abandonAndroidLocaleMatrixRecovery = vi.fn(async (
+      _roomId: string,
+      input: { applicationId: string }
+    ) => ({
+      abandoned: true as const,
+      applicationId: input.applicationId,
+      target: { kind: 'emulator' as const, deviceId: null }
+    }))
+    await withApi({ abandonAndroidLocaleMatrixRecovery } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/android/locale-recovery-abandon', {
+        method: 'POST',
+        body: JSON.stringify({
+          applicationId: 'com.example.app',
+          acknowledgeOutsideLocale: true
+        })
+      })
+
+      expect(result).toMatchObject({ status: 200, body: { abandoned: true } })
+      expect(abandonAndroidLocaleMatrixRecovery).toHaveBeenCalledWith('room1abc', {
+        applicationId: 'com.example.app',
+        acknowledgeOutsideLocale: true
+      })
     })
   })
 })

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   androidLocaleScreenshotFilename,
   canonicalAndroidLocaleTags,
+  zAbandonAndroidLocaleMatrixRecoveryBody,
   zAndroidLocaleFilenamePrefix,
   zAndroidLocaleScreenshotMatrixBody,
   zAndroidLocaleMatrixTags,
@@ -21,6 +22,7 @@ describe('Android locale contracts', () => {
   it.each([
     '',
     'und',
+    'und-x-devhotel',
     'en_US',
     ' en-US',
     'en-US ',
@@ -88,6 +90,25 @@ describe('Android locale contracts', () => {
       locales: ['ko-KR'],
       filenamePrefix: 'release-42',
       target: { kind: 'physical', deviceId: `d${'a'.repeat(32)}` }
+    }).success).toBe(false)
+  })
+
+  it('requires an explicit literal acknowledgement for no-setter recovery abandonment', () => {
+    expect(zAbandonAndroidLocaleMatrixRecoveryBody.parse({
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: true
+    })).toEqual({
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: true
+    })
+    expect(zAbandonAndroidLocaleMatrixRecoveryBody.safeParse({
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: false
+    }).success).toBe(false)
+    expect(zAbandonAndroidLocaleMatrixRecoveryBody.safeParse({
+      applicationId: 'com.example.app',
+      acknowledgeOutsideLocale: true,
+      extra: 'not-allowed'
     }).success).toBe(false)
   })
 })
