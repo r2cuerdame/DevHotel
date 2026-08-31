@@ -12,8 +12,11 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  rmdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync
 } from 'node:fs'
 import { isAbsolute, join, relative } from 'node:path'
@@ -518,6 +521,7 @@ export class RoomOrchestrator {
   private readonly engine = new ChangeEngine()
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
+  private readonly activeRoomLocks = new Set<string>()
   private readonly activeMutations = new Set<Promise<unknown>>()
   private readonly deletingRooms = new Set<string>()
   private readonly materializingRooms = new Set<string>()
@@ -573,9 +577,11 @@ export class RoomOrchestrator {
   }
 
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
-    // This is the only recovery step that must precede every fallible startup
-    // dependency. The desktop still exposes its control API when init fails;
-    // callers must never keep polling work that died with the prior process.
+    // The desktop still exposes its control API when init fails. Fence and
+    // stop an uncertain exported workspace before any unrelated startup work
+    // can abort initialization and leave the old Room record admissible.
+    await this.reconcileInterruptedArtifactExports()
+    // Callers must never keep polling work that died with the prior process.
     this.markInterruptedOperations()
     for (const room of this.rooms.list()) {
       try {
@@ -592,7 +598,6 @@ export class RoomOrchestrator {
     if (health.ok) {
       reconciled = await reconcile(this.backend, this.rooms, (l) => this.olog('system', l))
     }
-    await this.reconcileInterruptedArtifactExports(health.ok)
     await this.reconcileWindowsRooms()
     await this.markInterruptedChanges()
     return { backendOk: health.ok, reconciled }
@@ -609,17 +614,64 @@ export class RoomOrchestrator {
     }
   }
 
-  private async reconcileInterruptedArtifactExports(backendOk: boolean): Promise<void> {
+  private async reconcileInterruptedArtifactExports(): Promise<void> {
+    const interrupted: Array<{
+      room: RoomRecord
+      key: string
+      raw: string
+      pending: PendingArtifactExport | null
+      fenced: boolean
+    }> = []
     for (const room of this.rooms.list()) {
       const key = pendingArtifactExportKey(room.id)
       const raw = this.settings.get(key)
       if (raw === null) continue
       const pending = parsePendingArtifactExport(raw)
+      // Fence the persisted Room before touching any external startup
+      // dependency. init() failures are non-fatal to the desktop process, so a
+      // stale ready record must never survive long enough to admit new work.
+      let fenced = false
+      try {
+        this.markWorkspaceAmbiguous(room.id)
+        fenced = true
+      } catch {
+        // Keep the durable intent if the database fence itself could not land.
+      }
+      interrupted.push({ room, key, raw, pending, fenced })
+    }
+
+    // A retained created/exited job is still a restartable write capability.
+    // Reap every startup-stale job and prove the role absent before deleting
+    // private input bytes or running any recovery finalizer.
+    let staleJobsAbsent = false
+    try {
+      const staleJobs = (await this.backend.listManagedContainers()).filter((container) => container.role === 'job')
+      for (const job of staleJobs) await this.backend.removeManagedContainer(job.name)
+      staleJobsAbsent = !(await this.backend.listManagedContainers()).some((container) => container.role === 'job')
+    } catch {
+      // Pending intents remain as hard mutation gates until exact job absence
+      // can be established during a later startup.
+    }
+    if (staleJobsAbsent) this.cleanupStaleArtifactExportStaging()
+
+    for (const { room, key, raw, pending, fenced } of interrupted) {
+      // The recovery finalizer deliberately has no live-web probe: startup must
+      // first prove both stale-job absence and that every Room workload stopped.
+      let workloadsStopped = false
+      if (room.provider !== 'windows') {
+        try {
+          await this.backend.stopRoomPod(room.id)
+          workloadsStopped = true
+        } catch {
+          // Never finalize against a workspace that may still be in use.
+        }
+      }
       let settled = false
       if (
-        backendOk &&
+        fenced &&
+        staleJobsAbsent &&
+        workloadsStopped &&
         pending !== null &&
-        room.provider !== 'windows' &&
         room.workspaceMode === 'hotel' &&
         room.workspaceVolumeRevision === pending.workspaceVolumeRevision
       ) {
@@ -631,27 +683,155 @@ export class RoomOrchestrator {
             pending.expected,
             pending.stageToken
           )
-          settled = outcome === 'committed' || outcome === 'absent' || outcome === 'destination-exists'
+          settled = outcome === 'committed' || outcome === 'absent' ||
+            outcome === 'destination-exists' || outcome === 'unsafe-parent'
         } catch {
           // The durable intent remains for another startup. The Room fence is
           // still invalidated below so no workload can use an uncertain tree.
         }
       }
-      let fenced = false
-      try {
-        this.markWorkspaceAmbiguous(room.id)
-        fenced = true
-      } catch {
-        // Keep the durable intent if the database fence itself could not land.
-      }
       if (settled && fenced) {
         try {
-          this.settings.delete(key)
+          this.settings.deleteIfValue(key, raw)
         } catch {
           // A repeated recovery is conservative and identity-fenced.
         }
       }
       this.olog(room.id, 'interrupted artifact export was fenced; private recovery details were withheld')
+    }
+  }
+
+  private artifactExportTemporaryRoot(create: boolean): string | null {
+    const root = join(this.userData, 'tmp')
+    if (create) mkdirSync(root, { recursive: true })
+    if (!existsSync(root)) return null
+    const rootStat = lstatSync(root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new Error('Artifact export temporary root is not a private regular directory')
+    }
+    const canonicalUserData = realpathSync.native(this.userData)
+    const canonicalRoot = realpathSync.native(root)
+    if (relative(canonicalUserData, canonicalRoot) !== 'tmp') {
+      throw new Error('Artifact export temporary root escaped private app data')
+    }
+    return root
+  }
+
+  private inspectArtifactExportStaging(
+    root: string,
+    directory: string,
+    expectedName: string
+  ): { dev: number; ino: number; content: { path: string; dev: number; ino: number } | null } | null {
+    if (relative(this.userData, root) !== 'tmp' || isAbsolute(relative(this.userData, root))) return null
+    const rootStat = lstatSync(root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return null
+    const canonicalUserData = realpathSync.native(this.userData)
+    const canonicalRoot = realpathSync.native(root)
+    if (relative(canonicalUserData, canonicalRoot) !== 'tmp') return null
+    const directoryStat = lstatSync(directory)
+    const canonicalDirectory = realpathSync.native(directory)
+    if (
+      !directoryStat.isDirectory() ||
+      directoryStat.isSymbolicLink() ||
+      relative(canonicalRoot, canonicalDirectory) !== expectedName
+    ) return null
+    const children = readdirSync(directory, { withFileTypes: true })
+    if (children.length === 0) {
+      return { dev: directoryStat.dev, ino: directoryStat.ino, content: null }
+    }
+    const child = children[0]
+    if (
+      children.length !== 1 ||
+      child?.name !== 'content.png' ||
+      !child.isFile() ||
+      child.isSymbolicLink()
+    ) return null
+    const contentPath = join(directory, 'content.png')
+    const contentStat = lstatSync(contentPath)
+    const canonicalContent = realpathSync.native(contentPath)
+    if (
+      !contentStat.isFile() ||
+      contentStat.isSymbolicLink() ||
+      relative(canonicalDirectory, canonicalContent) !== 'content.png'
+    ) return null
+    return {
+      dev: directoryStat.dev,
+      ino: directoryStat.ino,
+      content: { path: contentPath, dev: contentStat.dev, ino: contentStat.ino }
+    }
+  }
+
+  private createArtifactExportStaging(content: Buffer): { root: string; temporary: string; hostFile: string } {
+    const root = this.artifactExportTemporaryRoot(true)
+    if (root === null) throw new Error('Artifact export temporary root was not created')
+    let temporary: string | null = null
+    try {
+      temporary = mkdtempSync(join(root, 'artifact-export-'))
+      const name = relative(root, temporary)
+      if (!/^artifact-export-[A-Za-z0-9]{6}$/.test(name) || this.inspectArtifactExportStaging(root, temporary, name)?.content !== null) {
+        throw new Error('Artifact export staging directory identity is invalid')
+      }
+      const hostFile = join(temporary, 'content.png')
+      writeFileSync(hostFile, content, { flag: 'wx', mode: 0o600 })
+      const staged = this.inspectArtifactExportStaging(root, temporary, name)
+      if (staged === null || staged.content === null) {
+        throw new Error('Artifact export staging file identity is invalid')
+      }
+      return { root, temporary, hostFile }
+    } catch (error) {
+      if (temporary !== null) {
+        try { this.cleanupArtifactExportStagingDirectory(root, temporary) } catch { /* withheld by caller */ }
+      }
+      throw error
+    }
+  }
+
+  /** Atomically quarantine one exact staging directory, then unlink without recursion. */
+  private cleanupArtifactExportStagingDirectory(root: string, directory: string): boolean {
+    const name = relative(root, directory)
+    if (
+      (!/^artifact-export-[A-Za-z0-9]{6}$/.test(name) &&
+        !/^\.artifact-export-cleanup-[a-f0-9]{32}$/.test(name)) ||
+      isAbsolute(name)
+    ) return false
+    const before = this.inspectArtifactExportStaging(root, directory, name)
+    if (before === null) return false
+    const quarantineName = `.artifact-export-cleanup-${randomUUID().replaceAll('-', '')}`
+    const quarantine = join(root, quarantineName)
+    renameSync(directory, quarantine)
+    const after = this.inspectArtifactExportStaging(root, quarantine, quarantineName)
+    if (
+      after === null ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      (before.content === null) !== (after.content === null) ||
+      (before.content !== null && after.content !== null &&
+        (before.content.dev !== after.content.dev || before.content.ino !== after.content.ino))
+    ) return false
+    if (after.content !== null) unlinkSync(after.content.path)
+    rmdirSync(quarantine)
+    return true
+  }
+
+  /** Reclaim only exact private export directories after stale jobs are absent. */
+  private cleanupStaleArtifactExportStaging(): void {
+    try {
+      const root = this.artifactExportTemporaryRoot(false)
+      if (root === null) return
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (
+          !/^artifact-export-[A-Za-z0-9]{6}$/.test(entry.name) &&
+          !/^\.artifact-export-cleanup-[a-f0-9]{32}$/.test(entry.name)
+        ) continue
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+        try {
+          this.cleanupArtifactExportStagingDirectory(root, join(root, entry.name))
+        } catch {
+          // A changed or inaccessible entry is retained rather than followed.
+        }
+      }
+    } catch {
+      // Startup continues without exposing the Host-private cleanup detail.
     }
   }
 
@@ -744,17 +924,48 @@ export class RoomOrchestrator {
   }
 
   /** Serializes lifecycle mutations per room — concurrent UI/MCP calls queue instead of interleaving docker operations. */
-  private withRoomLock<T>(roomId: string, fn: () => Promise<T>, admittedBeforeGate = false): Promise<T> {
-    if (this.mutationGate !== 'open' && !admittedBeforeGate) {
+  private withRoomLock<T>(
+    roomId: string,
+    fn: () => Promise<T>,
+    opts: { admittedBeforeGate?: boolean; allowPendingArtifactExport?: boolean } = {}
+  ): Promise<T> {
+    if (this.mutationGate !== 'open' && !opts.admittedBeforeGate) {
       return Promise.reject(this.mutationGateError())
     }
     const prev = this.roomOps.get(roomId) ?? Promise.resolve()
-    const next = prev.catch(() => undefined).then(fn)
+    const next = prev.catch(() => undefined).then(async () => {
+      if (!opts.allowPendingArtifactExport) this.assertNoPendingArtifactExport(roomId)
+      if (this.activeRoomLocks.has(roomId)) throw new Error(`Room ${roomId} lock ownership is ambiguous`)
+      this.activeRoomLocks.add(roomId)
+      try {
+        return await fn()
+      } finally {
+        this.activeRoomLocks.delete(roomId)
+      }
+    })
     this.roomOps.set(
       roomId,
       next.catch(() => undefined)
     )
     return next
+  }
+
+  private assertNoPendingArtifactExport(roomId: string): void {
+    if (this.settings.get(pendingArtifactExportKey(roomId)) === null) return
+    throw new DevHotelError(
+      'ARTIFACT_EXPORT_RECOVERY_REQUIRED',
+      'This Room is fenced while an interrupted artifact export is being recovered.',
+      {
+        recoveryHint: 'Restart DevHotel after the isolation backend is healthy; do not start or modify this Room meanwhile.',
+        httpStatus: 409
+      }
+    )
+  }
+
+  private assertRoomLockHeld(roomId: string): void {
+    if (!this.activeRoomLocks.has(roomId)) {
+      throw new Error(`Room ${roomId} operation requires the active Room lock`)
+    }
   }
 
   private mutationGateError(): Error {
@@ -1109,7 +1320,7 @@ export class RoomOrchestrator {
         this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
         this.rooms.update(id, { status: 'broken' })
       }
-    }, true)
+    }, { admittedBeforeGate: true })
 
     const room = this.rooms.get(id)!
     await writeManifest(this.userData, room)
@@ -1204,7 +1415,7 @@ export class RoomOrchestrator {
           this.rooms.update(id, { status: 'broken' })
         }
       },
-      true
+      { admittedBeforeGate: true }
     )
 
     const room = this.mustGet(id)
@@ -1504,6 +1715,7 @@ export class RoomOrchestrator {
     if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
     // Fail an unknown Room before an operation exists: there is nothing to poll.
     this.mustGet(roomId)
+    this.assertNoPendingArtifactExport(roomId)
     // A clone publishes its preparing ownership row before the target exists.
     // Other lifecycle calls may safely queue behind that target's barrier, but
     // a start operation must not publish yet: clone rollback can delete the row
@@ -1684,16 +1896,25 @@ export class RoomOrchestrator {
   }
 
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
-    return this.withRoomLock(roomId, () => this.sleepRoomLocked(roomId, actor))
+    return this.withRoomLock(
+      roomId,
+      () => this.sleepRoomLocked(roomId, actor),
+      { allowPendingArtifactExport: true }
+    )
   }
 
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     const room = this.mustGet(roomId)
+    const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
     await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
-      this.rooms.update(roomId, { status: 'sleeping', hostPort: null, lastUsedAt: new Date().toISOString() })
+      this.rooms.update(roomId, {
+        status: artifactRecoveryPending ? 'broken' : 'sleeping',
+        hostPort: null,
+        lastUsedAt: new Date().toISOString()
+      })
       await writeManifest(this.userData, this.mustGet(roomId))
       this.emit(roomId, 'status')
       return
@@ -1701,7 +1922,11 @@ export class RoomOrchestrator {
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     await this.backend.stopRoomPod(roomId)
-    this.rooms.update(roomId, { status: 'sleeping', hostPort: null, lastUsedAt: new Date().toISOString() })
+    this.rooms.update(roomId, {
+      status: artifactRecoveryPending ? 'broken' : 'sleeping',
+      hostPort: null,
+      lastUsedAt: new Date().toISOString()
+    })
     await writeManifest(this.userData, this.mustGet(roomId))
     this.emit(roomId, 'status')
   }
@@ -1787,7 +2012,11 @@ export class RoomOrchestrator {
     // creates its durable operation record, not queue behind deletion and write
     // a terminal orphan after the Room row is gone.
     this.deletingRooms.add(roomId)
-    const task = this.withRoomLock(roomId, () => this.deleteRoomLocked(roomId, actor))
+    const task = this.withRoomLock(
+      roomId,
+      () => this.deleteRoomLocked(roomId, actor),
+      { allowPendingArtifactExport: true }
+    )
     void task.then(
       () => this.deletingRooms.delete(roomId),
       () => this.deletingRooms.delete(roomId)
@@ -1865,6 +2094,7 @@ export class RoomOrchestrator {
   private static readonly ROOM_FILE_CAP = 16 * 1024 * 1024
 
   private validateRoomFilePath(roomId: string, path: string): string {
+    this.assertNoPendingArtifactExport(roomId)
     if (!/^\/workspace\/[^\0]*$/.test(path) || path.split('/').includes('..')) {
       throw new Error('Room file paths must be absolute paths under /workspace')
     }
@@ -1877,24 +2107,26 @@ export class RoomOrchestrator {
   }
 
   /** Official file egress: read one workspace file (base64), capped at 16MB. */
-  async pullRoomFile(roomId: string, path: string): Promise<{ path: string; size: number; contentBase64: string }> {
-    if (this.mustGet(roomId).provider === 'windows') {
-      throw new Error('Windows Room file transfer requires the forthcoming guest agent')
-    }
-    const safePath = this.validateRoomFilePath(roomId, path)
-    const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
-    mkdirSync(tmp, { recursive: true })
-    const hostFile = join(tmp, 'file.bin')
-    try {
-      await this.backend.copyFromRoom(roomId, safePath, hostFile)
-      const stats = statSync(hostFile)
-      if (stats.size > RoomOrchestrator.ROOM_FILE_CAP) {
-        throw new Error(`file is ${stats.size} bytes — larger than the 16MB pull cap`)
+  pullRoomFile(roomId: string, path: string): Promise<{ path: string; size: number; contentBase64: string }> {
+    return this.withRoomLock(roomId, async () => {
+      if (this.mustGet(roomId).provider === 'windows') {
+        throw new Error('Windows Room file transfer requires the forthcoming guest agent')
       }
-      return { path: safePath, size: stats.size, contentBase64: readFileSync(hostFile).toString('base64') }
-    } finally {
-      rmSync(tmp, { recursive: true, force: true })
-    }
+      const safePath = this.validateRoomFilePath(roomId, path)
+      const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
+      mkdirSync(tmp, { recursive: true })
+      const hostFile = join(tmp, 'file.bin')
+      try {
+        await this.backend.copyFromRoom(roomId, safePath, hostFile)
+        const stats = statSync(hostFile)
+        if (stats.size > RoomOrchestrator.ROOM_FILE_CAP) {
+          throw new Error(`file is ${stats.size} bytes — larger than the 16MB pull cap`)
+        }
+        return { path: safePath, size: stats.size, contentBase64: readFileSync(hostFile).toString('base64') }
+      } finally {
+        rmSync(tmp, { recursive: true, force: true })
+      }
+    })
   }
 
   /** Official file ingress: write one workspace file from base64, capped at 16MB. */
@@ -2145,19 +2377,10 @@ export class RoomOrchestrator {
       }
       const { artifact, content } = this.readRoomArtifactContent(roomId, artifactId)
       const targetPath = `/workspace/${input.relativePath}`
-      const temporaryRoot = join(this.userData, 'tmp')
-      const { temporary, hostFile } = (() => {
-        let privateDirectory: string | null = null
+      const { root: temporaryRoot, temporary, hostFile } = (() => {
         try {
-          mkdirSync(temporaryRoot, { recursive: true })
-          privateDirectory = mkdtempSync(join(temporaryRoot, 'artifact-export-'))
-          const privateFile = join(privateDirectory, 'content.png')
-          writeFileSync(privateFile, content, { flag: 'wx', mode: 0o600 })
-          return { temporary: privateDirectory, hostFile: privateFile }
+          return this.createArtifactExportStaging(content)
         } catch (error) {
-          if (privateDirectory) {
-            try { rmSync(privateDirectory, { recursive: true, force: true }) } catch { /* withheld below */ }
-          }
           throw new DevHotelError('ARTIFACT_EXPORT_FAILED', 'Artifact could not be staged for safe export.', {
             recoveryHint: 'Check Hotel storage health and retry with a new repository-relative destination.',
             httpStatus: 500,
@@ -2174,7 +2397,29 @@ export class RoomOrchestrator {
       let stagingCleanupError: unknown
       const pendingKey = pendingArtifactExportKey(roomId)
       const stageToken = randomUUID().replaceAll('-', '')
+      const pendingValue = JSON.stringify({
+        version: 1,
+        workspaceVolumeRevision: room.workspaceVolumeRevision,
+        relativePath: input.relativePath,
+        expected: { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
+        stageToken
+      } satisfies PendingArtifactExport)
       try {
+        // Own the durable recovery fence before the first runtime mutation.
+        // A second process that claimed it after this operation entered the
+        // in-process Room lock must remain byte-for-byte authoritative, and
+        // this process must not pause or later restore that owner's runtime.
+        if (!this.settings.setIfAbsent(pendingKey, pendingValue)) {
+          throw new DevHotelError(
+            'ARTIFACT_EXPORT_RECOVERY_REQUIRED',
+            'A prior artifact export still owns this Room recovery fence.',
+            {
+              recoveryHint: 'Restart DevHotel after the isolation backend is healthy; do not retry this destination meanwhile.',
+              httpStatus: 409
+            }
+          )
+        }
+        pendingIntentStored = true
         pauseAttempted = true
         try {
           await this.backend.pauseWeb(roomId)
@@ -2202,14 +2447,6 @@ export class RoomOrchestrator {
             { recoveryHint: 'Retry the export against the current Room state.' }
           )
         }
-        this.settings.set(pendingKey, JSON.stringify({
-          version: 1,
-          workspaceVolumeRevision: room.workspaceVolumeRevision,
-          relativePath: input.relativePath,
-          expected: { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
-          stageToken
-        } satisfies PendingArtifactExport))
-        pendingIntentStored = true
         await this.backend.publishRoomArtifact(
           roomId,
           room.workspaceVolumeRevision,
@@ -2241,7 +2478,9 @@ export class RoomOrchestrator {
           throw revisionError
         }
         try {
-          this.settings.delete(pendingKey)
+          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
+            throw new Error('Artifact export recovery intent ownership changed before completion')
+          }
           pendingIntentStored = false
         } catch (intentError) {
           runtimeRestoreUnsafe = true
@@ -2261,14 +2500,18 @@ export class RoomOrchestrator {
         primaryError = error
       }
       try {
-        rmSync(temporary, { recursive: true, force: true })
+        if (!this.cleanupArtifactExportStagingDirectory(temporaryRoot, temporary)) {
+          throw new Error('Private artifact staging directory could not be proven safe to remove')
+        }
       } catch (error) {
         stagingCleanupError = error
       }
 
       if (pendingIntentStored && !publicationCommitted && !publicationAmbiguous) {
         try {
-          this.settings.delete(pendingKey)
+          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
+            throw new Error('Artifact export recovery intent ownership changed before rollback')
+          }
           pendingIntentStored = false
         } catch (intentError) {
           publicationAmbiguous = true
@@ -2281,6 +2524,23 @@ export class RoomOrchestrator {
 
       if (publicationAmbiguous) {
         let stateFenceError: unknown
+        let routeFenceError: unknown
+        let logDetachError: unknown
+        let workloadStopError: unknown
+        let helperCleanupError: unknown
+        try {
+          // Remove the in-memory ingress capability before any fallible backend
+          // containment. A replacement/unpaused web discovered by the backend
+          // must not remain reachable while only the API-level CAS gate exists.
+          this.gateway.removeRoute(room.domain)
+        } catch (error) {
+          routeFenceError = error
+        }
+        try {
+          this.logs.detach(roomId)
+        } catch (error) {
+          logDetachError = error
+        }
         try {
           // The helper may already have changed the workspace or may still do
           // so after a lost engine response. Invalidate the stale generation
@@ -2290,13 +2550,42 @@ export class RoomOrchestrator {
         } catch (error) {
           stateFenceError = error
         }
+        try {
+          await this.backend.stopRoomPod(roomId)
+        } catch (error) {
+          workloadStopError = error
+        }
+        try {
+          // stopRoomPod intentionally treats created/exited jobs as stopped,
+          // but either state remains restartable with a RW workspace mount.
+          // Reap only this Room's jobs by their backend-validated immutable IDs
+          // and prove none remain before returning the failure.
+          const jobs = (await this.backend.listManagedContainers()).filter(
+            (container) => container.roomId === roomId && container.role === 'job'
+          )
+          for (const job of jobs) await this.backend.removeManagedContainer(job.name)
+          const retained = (await this.backend.listManagedContainers()).filter(
+            (container) => container.roomId === roomId && container.role === 'job'
+          )
+          if (retained.length > 0) throw new Error('Room artifact helper containment is incomplete')
+        } catch (error) {
+          helperCleanupError = error
+        }
         throw new DevHotelError(
           'ARTIFACT_EXPORT_PUBLICATION_AMBIGUOUS',
           'Artifact export could not prove whether publication completed, so the Room was not resumed.',
           {
             recoveryHint: 'Do not retry the same path. Restart DevHotel, then inspect the Room before further work.',
             cause: new AggregateError(
-              [primaryError, ...(stagingCleanupError ? [stagingCleanupError] : []), ...(stateFenceError ? [stateFenceError] : [])],
+              [
+                primaryError,
+                ...(stagingCleanupError ? [stagingCleanupError] : []),
+                ...(routeFenceError ? [routeFenceError] : []),
+                ...(logDetachError ? [logDetachError] : []),
+                ...(stateFenceError ? [stateFenceError] : []),
+                ...(workloadStopError ? [workloadStopError] : []),
+                ...(helperCleanupError ? [helperCleanupError] : [])
+              ],
               'Artifact export publication could not be reconciled exactly'
             ),
             evidence: { committed: null, retrySafe: false, relativePath: input.relativePath }
@@ -2520,7 +2809,11 @@ export class RoomOrchestrator {
   }
 
   releaseAndroidDevice(roomId: string, reason = 'released by the Room'): Promise<DeviceLease | null> {
-    return this.withRoomLock(roomId, () => this.releaseAndroidDeviceLocked(roomId, reason))
+    return this.withRoomLock(
+      roomId,
+      () => this.releaseAndroidDeviceLocked(roomId, reason),
+      { allowPendingArtifactExport: true }
+    )
   }
 
   private async releaseAndroidDeviceLocked(roomId: string, reason: string): Promise<DeviceLease | null> {
@@ -2557,10 +2850,11 @@ export class RoomOrchestrator {
   }
 
   /** Trusted Core composition point for a caller that already owns the Room lock. */
-  async androidAutomationStatusLocked(
+  private async androidAutomationStatusLocked(
     roomId: string,
     target: AndroidTargetSelector = { kind: 'auto' }
   ): Promise<AndroidAutomationStatus> {
+    this.assertRoomLockHeld(roomId)
     return (await this.openAndroidAutomationSessionLocked(roomId, target)).status()
   }
 
@@ -2572,10 +2866,11 @@ export class RoomOrchestrator {
    * capture and call `session.foregroundInstallContext()` afterwards, so a
    * mid-capture physical lease replacement throws rather than becoming null.
    */
-  async androidForegroundInstallReceiptLocked(
+  private async androidForegroundInstallReceiptLocked(
     roomId: string,
     target: AndroidTargetSelector = { kind: 'auto' }
   ): Promise<AndroidForegroundInstallContext> {
+    this.assertRoomLockHeld(roomId)
     return (await this.openAndroidAutomationSessionLocked(roomId, target)).foregroundInstallContext()
   }
 
@@ -2636,10 +2931,11 @@ export class RoomOrchestrator {
    * never reacquires that lock, captures one exact physical lease, and gives
    * future internal workflows bounded app-scoped methods rather than raw adb.
    */
-  async openAndroidAutomationSessionLocked(
+  private async openAndroidAutomationSessionLocked(
     roomId: string,
     selector: AndroidTargetSelector
   ): Promise<AndroidAutomationSession> {
+    this.assertRoomLockHeld(roomId)
     const room = this.mustGet(roomId)
     if (room.provider !== 'android') {
       throw new DevHotelError('ANDROID_ROOM_REQUIRED', 'Android automation is available only for Android Rooms.', {
@@ -4097,6 +4393,12 @@ export class RoomOrchestrator {
   async components(roomId: string): Promise<
     { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
   > {
+    return this.withRoomLock(roomId, () => this.componentsLocked(roomId))
+  }
+
+  private async componentsLocked(roomId: string): Promise<
+    { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
+  > {
     const room = this.mustGet(roomId)
     if (room.provider === 'windows') {
       return [
@@ -4573,7 +4875,8 @@ export class RoomOrchestrator {
     this.rooms.update(roomId, {
       stateRevision: room.stateRevision + 1,
       syncStatus: room.workspaceMode === 'hotel' ? 'modified' : room.syncStatus,
-      status: 'broken'
+      status: 'broken',
+      hostPort: null
     })
   }
 

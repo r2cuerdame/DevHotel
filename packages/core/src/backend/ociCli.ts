@@ -2014,6 +2014,7 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]> {
+    await this.assertPinnedEngineIdentity()
     const result = must(
       await runDocker(['ps', '-a', '--filter', 'label=devhotel.managed=1', '--format', '{{json .}}']),
       'list managed containers',
@@ -2026,18 +2027,31 @@ export class OciCliBackend implements IsolationBackend {
       try {
         row = JSON.parse(trimmed) as { Names?: string; State?: string; Labels?: string }
       } catch {
-        continue
+        throw new Error('list managed containers returned invalid JSON')
       }
+      const name = row.Names ?? ''
+      const state = row.State ?? ''
       const labels = new Map<string, string>()
       for (const pair of (row.Labels ?? '').split(',')) {
         const eq = pair.indexOf('=')
         if (eq > 0) labels.set(pair.slice(0, eq), pair.slice(eq + 1))
       }
+      const roomId = labels.get('devhotel.room') ?? ''
+      const role = labels.get('devhotel.role') ?? ''
+      if (
+        !name ||
+        !state ||
+        labels.get('devhotel.managed') !== '1' ||
+        !roomId ||
+        !isExpectedRoomContainer(roomId, name, role)
+      ) {
+        throw new Error(`managed container ownership metadata is invalid: ${name || 'unknown'}`)
+      }
       out.push({
-        roomId: labels.get('devhotel.room') ?? '',
-        role: labels.get('devhotel.role') ?? '',
-        state: row.State ?? '',
-        name: row.Names ?? '',
+        roomId,
+        role,
+        state,
+        name,
       })
     }
     return out
@@ -2051,6 +2065,10 @@ export class OciCliBackend implements IsolationBackend {
     const labels = container.Config?.Labels ?? {}
     const roomId = labels['devhotel.room'] ?? ''
     const role = labels['devhotel.role'] ?? ''
+    const id = roomId ? (container.Id?.trim() ?? '') : ''
+    if (!/^[a-f0-9]{64}$/.test(id)) {
+      throw new Error(`Room ${roomId || 'unknown'} container did not report a valid immutable ID`)
+    }
     if (
       actualName !== name ||
       labels['devhotel.managed'] !== '1' ||
@@ -2059,8 +2077,8 @@ export class OciCliBackend implements IsolationBackend {
     ) {
       throw new Error(`refusing to remove container not owned by DevHotel: ${name}`)
     }
-    must(await runDocker(['rm', '-f', name]), `remove managed container ${name}`)
-    if (await this.inspectContainer(name)) throw new Error(`container cleanup incomplete: ${name}`)
+    must(await runDocker(['rm', '-f', id]), `remove managed container ${name}`)
+    if (await this.inspectContainer(id)) throw new Error(`container cleanup incomplete: ${name}`)
   }
 
   async listManagedNetworks(): Promise<ManagedNetwork[]> {
@@ -3988,12 +4006,22 @@ export class OciCliBackend implements IsolationBackend {
       }
     }
 
-    // Exit 0 is the irreversible commit boundary: the exact owned finalizer
-    // removed the stage and re-proved the destination's size and hash. A lost
-    // cleanup/fence/attach response after that point must not make callers
-    // leave the workspace revision stale. Managed-job reconciliation may later
-    // remove a retained, already-exited finalizer container.
-    if (exitCode === 0) return 'committed'
+    // Exit 0 proves the workspace commit, but the durable recovery intent may
+    // be released only after the exact finalizer is gone and the paused web
+    // identity is still fenced. Otherwise an exited RW helper remains a
+    // restartable write capability. Report ambiguity so Core records the
+    // workspace mutation, keeps the Room broken, and retains the intent for
+    // startup cleanup/reconciliation. A lost attach response alone is safe
+    // once inspect preserved exit 0 and both settlement proofs succeeded.
+    if (exitCode === 0) {
+      if (finalizerError !== undefined || cleanupError !== undefined || postFenceError !== undefined) {
+        throw new RoomArtifactPublicationError(
+          'publication-ambiguous',
+          'Room artifact committed but finalizer settlement could not be proved'
+        )
+      }
+      return 'committed'
+    }
 
     const settlementErrors: unknown[] = []
     if (finalizerError !== undefined) settlementErrors.push(finalizerError)

@@ -15,6 +15,14 @@ const ROOM_ID = 'aaaa1111'
 const APP_ID = 'com.example.app'
 const CHANGE_ID = '11111111-2222-4333-8444-555555555555'
 const INSTALLED_AT = '2026-08-30T00:00:00.000Z'
+
+function lockedSessionTestTarget(orch: RoomOrchestrator): {
+  openAndroidAutomationSessionLocked: (...args: never[]) => Promise<AndroidAutomationSession>
+} {
+  return orch as unknown as {
+    openAndroidAutomationSessionLocked: (...args: never[]) => Promise<AndroidAutomationSession>
+  }
+}
 const emulatorTarget: AndroidAutomationTarget = {
   kind: 'emulator',
   deviceId: null,
@@ -88,7 +96,7 @@ function installSession(
       return action(new AbortController().signal)
     }
   } as unknown as AndroidAutomationSession
-  vi.spyOn(orch, 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
+  vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
   return { signals, timeouts }
 }
 
@@ -186,7 +194,7 @@ describe('Android screenshot artifact capture', () => {
 
   it('validates Room-scoped associations before opening a session or touching pixels', async () => {
     const { backend, adb, orch } = setup()
-    const open = vi.spyOn(orch, 'openAndroidAutomationSessionLocked')
+    const open = vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked')
 
     await expect(
       orch.captureAndroidScreenshotArtifact(
@@ -271,7 +279,7 @@ describe('Android screenshot artifact capture', () => {
         )
       }
     } as unknown as AndroidAutomationSession
-    vi.spyOn(orch, 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
+    vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
 
     await expect(
       orch.captureAndroidScreenshotArtifact(ROOM_ID, { filename: 'screen-aba.png' }, 'agent')
@@ -292,7 +300,7 @@ describe('Android screenshot artifact capture', () => {
         )
       }
     } as unknown as AndroidAutomationSession
-    vi.spyOn(orch, 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
+    vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
 
     await expect(
       orch.captureAndroidScreenshotArtifact(ROOM_ID, { filename: 'api30.png' }, 'agent')
@@ -412,7 +420,7 @@ describe('Android screenshot artifact capture', () => {
         return action(new AbortController().signal)
       }
     } as unknown as AndroidAutomationSession
-    vi.spyOn(orch, 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
+    vi.spyOn(lockedSessionTestTarget(orch), 'openAndroidAutomationSessionLocked').mockResolvedValue(session)
     adb.execs = []
 
     await expect(

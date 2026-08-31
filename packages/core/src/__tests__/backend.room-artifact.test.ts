@@ -400,7 +400,7 @@ describe('OciCliBackend atomic Room artifact publication', () => {
     expect(helpers.has(PRIMARY_ID)).toBe(true)
   })
 
-  it('does not reverse a proven commit when finalizer cleanup remains unavailable', async () => {
+  it('keeps a proven commit ambiguous while its restartable finalizer remains', async () => {
     rmRetainsKinds = new Set(['finalizer'])
 
     await expect(new OciCliBackend().publishRoomArtifact(
@@ -409,7 +409,7 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       hostPngPath,
       RELATIVE_PATH,
       expected
-    )).resolves.toBeUndefined()
+    )).rejects.toMatchObject({ reason: 'publication-ambiguous' })
     expect(helpers.has(PRIMARY_ID)).toBe(false)
     expect(helpers.has(FINALIZER_ID)).toBe(true)
     expect(workspaceResidue.size).toBe(0)

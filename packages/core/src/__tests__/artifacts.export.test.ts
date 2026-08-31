@@ -1,4 +1,13 @@
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from 'node:fs'
 import { join } from 'node:path'
 import type { AndroidScreenshotArtifactMetadata } from '@devhotel/shared'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -23,11 +32,12 @@ describe('Room screenshot artifact export', () => {
     const db = testDb()
     dbs.push(db)
     const backend = new FakeBackend()
+    const gateway = new FakeGateway()
     const orch = new RoomOrchestrator({
       userData,
       db,
       backend,
-      gateway: new FakeGateway().asGateway(),
+      gateway: gateway.asGateway(),
       adb: new FakeAdbHost(),
       appVersion: 'test'
     })
@@ -43,7 +53,7 @@ describe('Room screenshot artifact export', () => {
         workspaceVolumeRevision: 2
       })
     )
-    return { userData, backend, orch }
+    return { userData, backend, gateway, orch }
   }
 
   function publish(orch: RoomOrchestrator) {
@@ -142,6 +152,28 @@ describe('Room screenshot artifact export', () => {
     expect(backend.execInRoomCalls).toEqual([])
   })
 
+  it('never overwrites a recovery intent claimed after the Room lock was admitted', async () => {
+    const { backend, orch } = setup()
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const priorOwner = JSON.stringify({ version: 'external-owner' })
+    const claim = orch.settings.setIfAbsent.bind(orch.settings)
+    orch.settings.setIfAbsent = (settingKey, value) => {
+      orch.settings.set(key, priorOwner)
+      return claim(settingKey, value)
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/cas-race.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+
+    expect(orch.settings.get(key)).toBe(priorOwner)
+    expect(backend.publishRoomArtifactCalls).toEqual([])
+    expect(backend.calls).not.toContain('pauseWeb:aaaa1111')
+    expect(backend.calls).not.toContain('unpauseWeb:aaaa1111')
+    expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+  })
+
   it('maps an unsafe atomic-publication parent without exposing helper diagnostics', async () => {
     const { backend, orch } = setup()
     const artifact = publish(orch)
@@ -196,11 +228,27 @@ describe('Room screenshot artifact export', () => {
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 4, status: 'ready' })
   })
 
-  it('keeps an ambiguous publication paused and atomically invalidates the Room fence', async () => {
-    const { backend, orch } = setup()
+  it('removes ingress and stops an ambiguous replacement runtime before returning', async () => {
+    const { backend, gateway, orch } = setup()
     const artifact = publish(orch)
+    const room = orch.rooms.get('aaaa1111')!
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    let replacementWasRunning = false
     backend.publishRoomArtifactHandler = () => {
+      replacementWasRunning = true
+      backend.webPausedValue = false
+      backend.webRunningUnpausedValue = true
+      backend.managedContainers = [{
+        roomId: 'aaaa1111',
+        role: 'job',
+        state: 'exited',
+        name: 'dh-aaaa1111-job-11111111-2222-4333-8444-555555555555'
+      }]
       throw new RoomArtifactPublicationError('publication-ambiguous', 'private helper identity withheld')
+    }
+    backend.stopRoomPod = async (roomId) => {
+      backend.calls.push(`stopRoomPod:${roomId}`)
+      backend.webRunningUnpausedValue = false
     }
 
     let captured: unknown
@@ -214,7 +262,14 @@ describe('Room screenshot artifact export', () => {
     expect(JSON.stringify(captured)).not.toContain('private helper identity withheld')
     expect(backend.calls).not.toContain('unpauseWeb:aaaa1111')
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
-    expect(backend.webPausedValue).toBe(true)
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+    expect(backend.calls).toContain(
+      'removeManagedContainer:dh-aaaa1111-job-11111111-2222-4333-8444-555555555555'
+    )
+    expect(backend.managedContainers).toEqual([])
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(replacementWasRunning).toBe(true)
+    expect(backend.webRunningUnpausedValue).toBe(false)
     expect(orch.rooms.get('aaaa1111')).toMatchObject({
       stateRevision: 5,
       syncStatus: 'modified',
@@ -233,6 +288,12 @@ describe('Room screenshot artifact export', () => {
       stageToken: 'b'.repeat(32)
     }
     orch.settings.set('artifactExportPending:aaaa1111', JSON.stringify(pending))
+    backend.managedContainers = [{
+      roomId: 'aaaa1111',
+      role: 'job',
+      state: 'created',
+      name: 'dh-aaaa1111-job-stale-artifact-helper'
+    }]
     backend.reconcileRoomArtifactPublicationHandler = () => 'committed'
 
     await orch.init()
@@ -244,9 +305,14 @@ describe('Room screenshot artifact export', () => {
       expected: pending.expected,
       stageToken: pending.stageToken
     }])
-    expect(backend.calls.indexOf('stopRoomPod:aaaa1111')).toBeLessThan(
-      backend.calls.indexOf('reconcileRoomArtifactPublication:aaaa1111:r2:docs/interrupted.png')
+    const removeAt = backend.calls.indexOf('removeManagedContainer:dh-aaaa1111-job-stale-artifact-helper')
+    const stopAt = backend.calls.indexOf('stopRoomPod:aaaa1111')
+    const finalizeAt = backend.calls.indexOf(
+      'reconcileRoomArtifactPublication:aaaa1111:r2:docs/interrupted.png'
     )
+    expect(removeAt).toBeGreaterThanOrEqual(0)
+    expect(stopAt).toBeGreaterThan(removeAt)
+    expect(finalizeAt).toBeGreaterThan(stopAt)
     expect(orch.rooms.get('aaaa1111')).toMatchObject({
       stateRevision: 5,
       syncStatus: 'modified',
@@ -256,22 +322,212 @@ describe('Room screenshot artifact export', () => {
     expect(orch.settings.get('artifactExportPending:aaaa1111')).toBeNull()
   })
 
-  it('keeps an unsettled startup intent while fencing the Room', async () => {
+  it('retains the hard recovery gate when stale helper removal cannot be proven', async () => {
+    const { backend, orch } = setup()
+    const key = 'artifactExportPending:aaaa1111'
+    const raw = JSON.stringify({
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/removal-unproven.png',
+      expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+      stageToken: 'b'.repeat(32)
+    })
+    orch.settings.set(key, raw)
+    backend.managedContainers = [{
+      roomId: 'aaaa1111',
+      role: 'job',
+      state: 'created',
+      name: 'dh-aaaa1111-job-stale-artifact-helper'
+    }]
+    backend.removeManagedContainer = async (name) => {
+      backend.calls.push(`removeManagedContainer:${name}`)
+      throw new Error('exact helper removal could not be proved')
+    }
+
+    await expect(orch.init()).rejects.toThrow('exact helper removal could not be proved')
+
+    expect(backend.calls).toContain('removeManagedContainer:dh-aaaa1111-job-stale-artifact-helper')
+    expect(backend.reconcileRoomArtifactPublicationCalls).toEqual([])
+    expect(orch.settings.get(key)).toBe(raw)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ status: 'broken', hostPort: null })
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+  })
+
+  it('retains startup recovery ownership when a committed finalizer cannot settle', async () => {
+    const { backend, orch } = setup()
+    const key = 'artifactExportPending:aaaa1111'
+    const raw = JSON.stringify({
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/finalizer-retained.png',
+      expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+      stageToken: 'b'.repeat(32)
+    })
+    orch.settings.set(key, raw)
+    backend.reconcileRoomArtifactPublicationHandler = () => {
+      throw new RoomArtifactPublicationError(
+        'publication-ambiguous',
+        'private retained finalizer identity'
+      )
+    }
+
+    await orch.init()
+
+    expect(backend.reconcileRoomArtifactPublicationCalls).toHaveLength(1)
+    expect(orch.settings.get(key)).toBe(raw)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ status: 'broken', hostPort: null })
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+  })
+
+  it('treats an exactly rolled-back unsafe parent as a terminal startup outcome', async () => {
     const { backend, orch } = setup()
     const key = 'artifactExportPending:aaaa1111'
     orch.settings.set(key, JSON.stringify({
       version: 1,
       workspaceVolumeRevision: 2,
-      relativePath: 'docs/unsettled.png',
+      relativePath: 'docs/unsafe-parent.png',
       expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
       stageToken: 'b'.repeat(32)
     }))
+    backend.reconcileRoomArtifactPublicationHandler = () => 'unsafe-parent'
+
+    await orch.init()
+
+    expect(orch.settings.get(key)).toBeNull()
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, status: 'broken' })
+  })
+
+  it('reclaims only exact stale private PNG staging after stale jobs are absent', async () => {
+    const { userData, orch } = setup()
+    const temporaryRoot = join(userData, 'tmp')
+    mkdirSync(temporaryRoot, { recursive: true })
+    const stale = mkdtempSync(join(temporaryRoot, 'artifact-export-'))
+    writeFileSync(join(stale, 'content.png'), screenshotPng())
+    const unexpected = mkdtempSync(join(temporaryRoot, 'artifact-export-'))
+    writeFileSync(join(unexpected, 'do-not-delete.txt'), 'private unrelated data')
+
+    await orch.init()
+
+    expect(existsSync(stale)).toBe(false)
+    expect(readFileSync(join(unexpected, 'do-not-delete.txt'), 'utf8')).toBe('private unrelated data')
+  })
+
+  it('reclaims an exact quarantine left by a crash without recursive deletion', async () => {
+    const { userData, orch } = setup()
+    const temporaryRoot = join(userData, 'tmp')
+    mkdirSync(temporaryRoot, { recursive: true })
+    const quarantine = join(temporaryRoot, `.artifact-export-cleanup-${'a'.repeat(32)}`)
+    mkdirSync(quarantine)
+    writeFileSync(join(quarantine, 'content.png'), screenshotPng())
+
+    await orch.init()
+
+    expect(existsSync(quarantine)).toBe(false)
+    expect(readdirSync(temporaryRoot)).toEqual([])
+  })
+
+  it('rejects a linked temporary root before staging and preserves outside files', async () => {
+    const { backend, orch, userData } = setup()
+    const artifact = publish(orch)
+    const outside = tempDir()
+    roots.push(outside)
+    writeFileSync(join(outside, 'sentinel.txt'), 'keep')
+    symlinkSync(outside, join(userData, 'tmp'), 'junction')
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/rejected.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_FAILED' })
+
+    expect(readFileSync(join(outside, 'sentinel.txt'), 'utf8')).toBe('keep')
+    expect(readdirSync(outside)).toEqual(['sentinel.txt'])
+    expect(backend.calls).not.toContain('pauseWeb:aaaa1111')
+  })
+
+  it('settles and fences before every unrelated fallible startup stage', async () => {
+    for (const stage of ['gateway', 'health', 'reconcile'] as const) {
+      const { backend, gateway, orch } = setup()
+      const key = 'artifactExportPending:aaaa1111'
+      const pending = {
+        version: 1,
+        workspaceVolumeRevision: 2,
+        relativePath: `docs/interrupted-before-${stage}.png`,
+        expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+        stageToken: 'b'.repeat(32)
+      }
+      orch.settings.set(key, JSON.stringify(pending))
+      backend.reconcileRoomArtifactPublicationHandler = () => 'committed'
+      const failureCall = `startup-failure:${stage}`
+      if (stage === 'gateway') {
+        gateway.start = async () => {
+          backend.calls.push(failureCall)
+          throw new Error(failureCall)
+        }
+      } else if (stage === 'health') {
+        backend.health = async () => {
+          backend.calls.push(failureCall)
+          throw new Error(failureCall)
+        }
+      } else {
+        backend.listManagedNetworks = async () => {
+          backend.calls.push(failureCall)
+          throw new Error(failureCall)
+        }
+      }
+
+      await expect(orch.init()).rejects.toThrow(failureCall)
+
+      const stopCall = backend.calls.indexOf('stopRoomPod:aaaa1111')
+      const recoveryCall = backend.calls.indexOf(
+        `reconcileRoomArtifactPublication:aaaa1111:r2:${pending.relativePath}`
+      )
+      expect(stopCall).toBeGreaterThanOrEqual(0)
+      expect(recoveryCall).toBeGreaterThan(stopCall)
+      expect(backend.calls.indexOf(failureCall)).toBeGreaterThan(recoveryCall)
+      expect(orch.rooms.get('aaaa1111')).toMatchObject({
+        stateRevision: 5,
+        syncStatus: 'modified',
+        status: 'broken',
+        hostPort: null
+      })
+      expect(orch.settings.get(key)).toBeNull()
+    }
+  })
+
+  it('keeps an unsettled startup intent while fencing the Room', async () => {
+    const { backend, orch } = setup()
+    const key = 'artifactExportPending:aaaa1111'
+    const raw = JSON.stringify({
+      version: 1,
+      workspaceVolumeRevision: 2,
+      relativePath: 'docs/unsettled.png',
+      expected: { sizeBytes: 123, sha256: 'a'.repeat(64) },
+      stageToken: 'b'.repeat(32)
+    })
+    orch.settings.set(key, raw)
     backend.reconcileRoomArtifactPublicationHandler = () => 'incomplete'
 
     await orch.init()
 
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, status: 'broken' })
-    expect(orch.settings.get(key)).not.toBeNull()
+    expect(orch.settings.get(key)).toBe(raw)
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', '11111111-2222-4333-8444-555555555555', { relativePath: 'docs/new.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    await expect(orch.components('aaaa1111')).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    await expect(orch.pullRoomFile('aaaa1111', '/workspace/README.md')).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED'
+    })
+    expect(orch.settings.get(key)).toBe(raw)
+    await expect(orch.sleepRoom('aaaa1111', 'user')).resolves.toBeUndefined()
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({ status: 'broken', hostPort: null })
+    expect(orch.settings.get(key)).toBe(raw)
   })
 
   it('returns success after an unpause failure is recovered by one exact web recreation', async () => {
