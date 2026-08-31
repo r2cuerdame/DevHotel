@@ -1450,15 +1450,24 @@ export class AndroidAutomationSession {
         safeEvidence(result)
       )
     }
-    const stopped = await this.runWithTrackedPostflight(
+    const stoppedBeforeForeground = await this.runWithTrackedPostflight(
       applicationId,
       tracked,
       () => this.packageStoppedState(applicationId, tracked.installUserId)
     )
     const foreground = await this.foregroundPackage()
-    await this.assertTrackedInstall(applicationId, tracked)
+    // Foreground absence alone cannot prove that an app stayed stopped: it may
+    // have been relaunched as a background service after the first package
+    // dump. Sandwich the focus observation between two exact stopped-state
+    // proofs, with the second proof and install postflight as the final await.
+    const stoppedAfterForeground = await this.runWithTrackedPostflight(
+      applicationId,
+      tracked,
+      () => this.packageStoppedState(applicationId, tracked.installUserId)
+    )
     if (
-      !stopped ||
+      !stoppedBeforeForeground ||
+      !stoppedAfterForeground ||
       foreground === undefined ||
       (foreground?.applicationId === applicationId && foreground.userId === tracked.installUserId)
     ) {

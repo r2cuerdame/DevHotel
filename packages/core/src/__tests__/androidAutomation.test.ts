@@ -831,6 +831,31 @@ describe('tracked Android automation session', () => {
     await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
   })
 
+  it('rejects a background relaunch between foreground absence and the final stopped-state proof', async () => {
+    let stoppedProofs = 0
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        stoppedProofs += 1
+        const stopped = stoppedProofs === 1
+        return {
+          code: 0,
+          stdout: `${exclusivePackageDump('appId', [
+            `    User 0: installed=true hidden=false stopped=${stopped} enabled=0`
+          ])}\n\n${args.at(-1)}\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+    expect(stoppedProofs).toBe(2)
+  })
+
   it.each([
     { probe: 'nonzero', result: { code: 1, stdout: 'mCurrentFocus=null\n', stderr: '' } },
     { probe: 'stderr', result: { code: 0, stdout: 'mCurrentFocus=null\n', stderr: 'window probe warning' } },
