@@ -3,8 +3,6 @@ import { join, relative, resolve, sep } from 'node:path'
 import type { Session } from 'electron'
 import { describe, expect, it } from 'vitest'
 import { HOST_INPUT_CAPABILITIES, HOST_INPUT_PERMISSIONS, hostInputCapability } from '@devhotel/shared'
-import { EMULATOR_ADB_SERIAL } from '@devhotel/core'
-import { androidActionCommand } from './androidInput'
 import { hardenRoomSession } from './roomSessionPolicy'
 
 /**
@@ -269,19 +267,18 @@ describe('Room preview session policy', () => {
 })
 
 describe('Room-local input paths', () => {
-  it('drives the Android phone strip through in-Room adb, not Host clicks on the preview', () => {
-    for (const action of ['back', 'home', 'recents', 'rotate'] as const) {
-      const command = androidActionCommand(action)
-      expect(command[0]).toBe('sh')
-      expect(command[1]).toBe('-lc')
-      expect(command[2]).toContain(`adb -s ${EMULATOR_ADB_SERIAL}`)
-      // No Host screen coordinates anywhere in the Room-local input path.
-      expect(command[2]).not.toMatch(/screen|cursor|mouse/i)
-    }
-    expect(androidActionCommand('back')[2]).toContain('input keyevent 4')
-    expect(androidActionCommand('home')[2]).toContain('input keyevent 3')
-    expect(androidActionCommand('recents')[2]).toContain('input keyevent 187')
-    expect(androidActionCommand('rotate')[2]).toContain('user_rotation')
+  it('routes the Android phone strip through the typed Core emulator boundary', () => {
+    const source = readFileSync(join(REPO_ROOT, 'apps', 'desktop', 'src', 'main', 'ipc.ts'), 'utf8')
+    const start = source.indexOf('handle(IPC.androidAction')
+    const end = source.indexOf('handle(IPC.androidPairingDiscover', start)
+    const handler = source.slice(start, end)
+
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    expect(handler).toContain('zAndroidAction.parse(action)')
+    expect(handler).toContain('orch.androidEmulatorAction(safeRoomId, safeAction)')
+    expect(handler).not.toContain('execInRoom')
+    expect(handler).not.toMatch(/\badb\b/i)
   })
 })
 

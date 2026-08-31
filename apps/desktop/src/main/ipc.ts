@@ -53,7 +53,6 @@ import {
   validateCleanRemovalTarget
 } from './cleanRemoval'
 import type { CleanRemovalOperation } from './cleanRemovalGate'
-import { androidActionCommand } from './androidInput'
 import { assertTrustedMainFrame, type RendererIpcEvent } from './ipcSecurity'
 import { LinkedFolderGrants, requirePathWithinRoots } from './linkedFolderGrants'
 import { makeMcpSetupInfo } from './mcpSetup'
@@ -400,9 +399,9 @@ export function registerIpc(opts: {
   handle(IPC.androidAction, (_event, roomId, action) => {
     const safeRoomId = zRoomId.parse(roomId)
     const safeAction = zAndroidAction.parse(action)
-    // Room-local input: an in-Room `adb` command against the Room's own
-    // emulator, never a synthetic Host click on the preview. See androidInput.ts.
-    return orch.execInRoom(safeRoomId, androidActionCommand(safeAction), { timeoutMs: 20_000 }, 'user')
+    // The Core maps this closed action type to fixed argv on the isolated
+    // emulator control transport; the mutable Room runtime never receives it.
+    return orch.androidEmulatorAction(safeRoomId, safeAction)
   })
   handle(IPC.androidPairingDiscover, () => androidPairing.discover())
   handle(IPC.androidPairingBegin, (_event, input) => androidPairing.begin(input))

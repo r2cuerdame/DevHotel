@@ -1301,6 +1301,33 @@ describe('tracked Android automation session', () => {
     expect(JSON.stringify(capturedError)).not.toContain('private-ui')
   })
 
+  it('withholds partial cross-app XML from a failed UI hierarchy read', async () => {
+    const privateXml = '<hierarchy><node package="com.android.systemui" text="private-overlay" /></hierarchy>'
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return { code: 1, stdout: privateXml, stderr: 'bounded UI transport failure' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let captured: unknown
+    try {
+      await session.dumpUi({ applicationId: APP_ID })
+    } catch (error) {
+      captured = error
+    }
+    expect(captured).toMatchObject({
+      code: 'ANDROID_UI_DUMP_FAILED',
+      evidence: { code: 1, stdout: '', stderr: 'bounded UI transport failure', truncated: true }
+    })
+    expect(JSON.stringify(captured)).not.toContain('private-overlay')
+    expect(JSON.stringify(captured)).not.toContain('com.android.systemui')
+  })
+
   it('withholds UI captured across an active-user A-B-A switch witness', async () => {
     const { calls, session } = setup((args, witness) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
@@ -1917,6 +1944,32 @@ describe('tracked Android automation session', () => {
     expect(packageLists.length).toBeGreaterThanOrEqual(4)
     expect(packageLists.every((args) => args[6] === '0')).toBe(true)
     expect(packageLists.flat()).not.toContain('current')
+  })
+
+  it('withholds partial pre-fence stdout when package-scoped logcat fails', async () => {
+    const privateRow = '1690000000.001 com.other.app private-before-fence-row'
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[0] === 'logcat') {
+        return { code: 1, stdout: `${privateRow}\n`, stderr: 'bounded logcat transport failure' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let captured: unknown
+    try {
+      await session.logcat({ applicationId: APP_ID })
+    } catch (error) {
+      captured = error
+    }
+    expect(captured).toMatchObject({
+      code: 'ANDROID_LOGCAT_UNSUPPORTED',
+      evidence: { code: 1, stdout: '', stderr: 'bounded logcat transport failure', truncated: true }
+    })
+    expect(JSON.stringify(captured)).not.toContain('private-before-fence-row')
+    expect(JSON.stringify(captured)).not.toContain('com.other.app')
   })
 
   it('preserves the full package UID for a secondary Android user', async () => {

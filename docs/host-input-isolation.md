@@ -18,10 +18,9 @@ cannot remove. The contract is also expressed in code, in
 
 1. **Prefer control paths that need no UI input at all** — an API, an
    accessibility interface, `adb`, or a browser automation protocol.
-2. **If UI input is required, inject it inside the Room**: the Room's own
-   `adb`, the Room's browser, or the Room's virtual display. Every one of these
-   ends up as a command executed *in* the Room, not as a synthetic event on the
-   Host desktop.
+2. **If UI input is required, inject it through a Room-owned target channel**:
+   the isolated Android control helper, the Room's browser, or the Room's
+   virtual display. None becomes a synthetic event on the Host desktop.
 3. **Direct Host input is a capability, never a default.** Every path that can
    take the Host cursor, keyboard or foreground window is named in
    `HOST_INPUT_CAPABILITIES`, is reachable only by an explicit user action, and
@@ -34,8 +33,8 @@ cannot remove. The contract is also expressed in code, in
 | Path | Where the input actually happens | Host input? |
 | --- | --- | --- |
 | `run_in_room` / `exec` / Room terminal | `docker exec` inside the Room's container | No |
-| Android phone strip (Back / Home / Recents / Rotate) | in-Room `adb -s emulator-5554 shell input keyevent …` (`apps/desktop/src/main/androidInput.ts`) | No |
-| `android_run`, `android_screenshot` (Room emulator) | in-Room `adb`, or an `x11grab` of the emulator's own X display inside the container | No |
+| Android phone strip (Back / Home / Recents / Rotate) | a closed typed Core action mapped to fixed argv in a disposable helper on the dedicated Android control bridge | No |
+| `android_run`, `android_screenshot` (Room emulator) | the same fenced helper or exact-ID emulator display capture; the mutable Room runtime cannot reach this control bridge | No |
 | `android_device_adb`, `android_screenshot` on a leased phone | Host-side `adb` from the Device Broker, addressed to a USB phone's own serial. It runs on the Host but injects only into that phone — no Host cursor, keys, or foreground window. Requires a live device lease ([Android Device Broker](./android-device-broker.md)) | No |
 | Android emulator display | Xvfb + openbox **inside** the emulator container; the window manager only ever moves the guest's own windows | No |
 | Room web preview | an Electron `WebContentsView` on a Room-scoped session with every permission denied | No |
@@ -82,7 +81,7 @@ modeled rather than hidden:
 | …→ "keeps the Host foreground exemption list exact" | A stale exemption cannot silently pre-approve the next Host-focus call added to that file |
 | …→ "depends on no Host input-synthesis package" | No workspace manifest pulls in a mouse/keyboard synthesis package |
 | …→ "denies every permission that would hand Room content the Host cursor…" | The Room preview session denies Pointer Lock, Keyboard Lock, fullscreen, display capture, window management, idle detection, HID, serial and USB — and everything else |
-| …→ "drives the Android phone strip through in-Room adb" | Room UI input is an in-Room `adb` argv against the Room's own emulator serial, with no Host screen coordinates |
+| …→ "routes the Android phone strip through the typed Core emulator boundary" | Desktop IPC accepts only the four closed actions and cannot submit raw argv or use the mutable Room runtime; Core uses the fenced emulator helper with no Host screen coordinates |
 | `windows.lifecycle.test.ts` → "treats the VMware console as a user-only, journaled Host-input capability" | An Agent is refused; a user's use is written to the Room log |
 | `controlApi.security.test.ts` → "exposes no Host-input operation to Agents" | The Agent-facing REST surface has no console/input/focus route |
 | `hostInputProbe.test.ts` | The drift detector retains mouse, focus and keyboard activity after every endpoint is restored; treats button/wheel activity with no cursor move as drift; and exposes only activity/injection booleans and pressed-key counts, never mouse-message or key identities. On every ordinary Windows test run it also compiles, starts and stops the native helper. |

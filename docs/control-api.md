@@ -141,9 +141,11 @@ broker can distinguish a live worker from a dead one directly. Other stable
 worker IDs are supported but must heartbeat; after TTL plus grace an opaque,
 silent owner is reclaimed rather than parking a phone indefinitely.
 
-Development belongs on the Room emulator (`POST /v1/rooms/:id/exec`); request
-a physical device for final acceptance/release verification and for behaviour an
-emulator cannot reproduce, then release it.
+Build and runtime commands belong on `POST /v1/rooms/:id/exec`, but that mutable
+runtime cannot reach the Room emulator's isolated control bridge. Use the
+tracked Android routes below for emulator app/UI work. Request a physical device
+for final acceptance/release verification and for behaviour an emulator cannot
+reproduce, then release it.
 
 There is deliberately no Control API or MCP pairing operation. Secure wireless
 pairing candidates and their private mDNS endpoints live only inside the Host

@@ -246,7 +246,7 @@ describe('makeTools', () => {
   it('run_in_room forwards the bounded-output selection to the control API', async () => {
     await byName.run_in_room!.handler({
       roomId: 'abc12345',
-      cmd: ['adb', 'logcat', '-d'],
+      cmd: ['pnpm', 'test'],
       maxBytes: 4096,
       mode: 'head',
       include: 'FATAL',

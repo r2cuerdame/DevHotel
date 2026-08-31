@@ -1555,7 +1555,7 @@ export class AndroidAutomationSession {
           'Android UIAutomator hierarchy evidence could not be read.',
           'Retry the dump while the selected target remains connected.',
           409,
-          safeEvidence(read)
+          safeEvidenceWithoutStdout(read)
         )
       }
       if (Buffer.byteLength(read.stdout, 'utf8') > MAX_UI_XML_BYTES) {
@@ -2162,7 +2162,7 @@ export class AndroidAutomationSession {
         'The selected Android target rejected package-scoped logcat.',
         'Use current platform-tools and an Android target that supports logcat --uid; global fallback is intentionally disabled.',
         409,
-        safeEvidence(result)
+        safeEvidenceWithoutStdout(result)
       )
     }
     const source = result.stdout.split(/\r?\n/).filter(Boolean)

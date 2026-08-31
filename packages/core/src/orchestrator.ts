@@ -17,6 +17,7 @@ import { isAbsolute, join, relative } from 'node:path'
 import { customAlphabet } from 'nanoid'
 import type {
   Actor,
+  AndroidAction,
   AndroidAutomationStatus,
   AndroidCrashScenarioResult,
   AndroidDumpUiInput,
@@ -179,6 +180,25 @@ function protectAndroidRemoteCommand(args: string[]): string[] {
   const verb = args[0]
   if (verb !== 'shell' || args.length < 2) return args
   return [verb, args.slice(1).map(posixRemoteArg).join(' ')]
+}
+
+const ANDROID_EMULATOR_ROTATE_SCRIPT = [
+  'settings put system accelerometer_rotation 0',
+  'rotation=$(settings get system user_rotation)',
+  'case "$rotation" in 0|1|2|3) ;; *) rotation=0 ;; esac',
+  'settings put system user_rotation "$(( (rotation + 1) % 4 ))"'
+].join('; ')
+
+function androidEmulatorActionArgs(action: AndroidAction): string[] {
+  switch (action) {
+    case 'back': return ['shell', 'input', 'keyevent', '4']
+    case 'home': return ['shell', 'input', 'keyevent', '3']
+    case 'recents': return ['shell', 'input', 'keyevent', '187']
+    case 'rotate': return ['shell', 'sh', '-c', ANDROID_EMULATOR_ROTATE_SCRIPT]
+  }
+  throw new DevHotelError('ANDROID_EMULATOR_ACTION_UNSUPPORTED', 'Unsupported Android emulator control.', {
+    recoveryHint: 'Use Back, Home, Recents, or Rotate.', httpStatus: 400
+  })
 }
 
 function workerProcessLiveness(workerId: string): boolean | 'unknown' {
@@ -3088,6 +3108,50 @@ export class RoomOrchestrator {
    * that asked for 64KB of a 400MB logcat still gets the complete raw stream
    * back by run id instead of losing it to a response limit.
    */
+  androidEmulatorAction(roomId: string, action: AndroidAction): Promise<void> {
+    return this.withRoomLock(roomId, async () => {
+      const room = this.mustGet(roomId)
+      if (room.provider !== 'android') {
+        throw new DevHotelError('ANDROID_ROOM_REQUIRED', 'Android emulator controls are available only for Android Rooms.', {
+          recoveryHint: 'Choose an awake Android Room.', httpStatus: 409
+        })
+      }
+      const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+      if (!awake) {
+        throw new DevHotelError('ANDROID_ROOM_ASLEEP', 'Wake the Android Room before using its emulator controls.', {
+          recoveryHint: 'Start the Room, wait for the emulator, and retry.', httpStatus: 409
+        })
+      }
+      if ((await this.backend.emulatorState(roomId)) !== 'running') {
+        throw new DevHotelError('ANDROID_EMULATOR_NOT_RUNNING', 'The Room emulator is not running.', {
+          recoveryHint: 'Restart the Android Room and wait for its emulator container.', httpStatus: 409
+        })
+      }
+
+      let result: ExecResult
+      try {
+        result = await this.backend.execFencedEmulatorAdb(
+          roomId,
+          protectAndroidRemoteCommand(androidEmulatorActionArgs(action)),
+          { timeoutMs: 20_000, maxStdoutBytes: 1024, maxStderrBytes: 1024 }
+        )
+      } catch {
+        throw new DevHotelError(
+          'ANDROID_EMULATOR_ACTION_FAILED',
+          'The Room emulator did not accept the requested phone control.',
+          { recoveryHint: 'Wait for the Room emulator to become responsive and retry.', httpStatus: 409 }
+        )
+      }
+      if (result.code !== 0 || result.outputLimitExceeded === true) {
+        throw new DevHotelError(
+          'ANDROID_EMULATOR_ACTION_FAILED',
+          'The Room emulator did not accept the requested phone control.',
+          { recoveryHint: 'Wait for the Room emulator to become responsive and retry.', httpStatus: 409 }
+        )
+      }
+    })
+  }
+
   execInRoom(
     roomId: string,
     cmd: string[],

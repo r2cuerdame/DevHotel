@@ -400,6 +400,63 @@ describe('Android automation targets the attached device without a hand-written 
     ])
   })
 
+  it('routes the four desktop phone controls only through the fenced emulator helper', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    backend.fencedEmulatorExecCalls = []
+
+    for (const action of ['back', 'home', 'recents', 'rotate'] as const) {
+      await orch.androidEmulatorAction('aaaa1111', action)
+    }
+
+    expect(backend.fencedEmulatorExecCalls.map((call) => logicalAdbArgs(call.args))).toEqual([
+      ['shell', 'input', 'keyevent', '4'],
+      ['shell', 'input', 'keyevent', '3'],
+      ['shell', 'input', 'keyevent', '187'],
+      ['shell', 'sh', '-c', expect.stringContaining('settings put system user_rotation')]
+    ])
+    for (const call of backend.fencedEmulatorExecCalls) {
+      expect(call.args).toHaveLength(2)
+      expect(call.opts).toMatchObject({ timeoutMs: 20_000, maxStdoutBytes: 1024, maxStderrBytes: 1024 })
+    }
+    expect(backend.execInRoomCalls).toEqual([])
+  })
+
+  it('fails phone controls closed without exposing fenced helper output', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    backend.execResult = { code: 1, stdout: 'private-emulator-output', stderr: 'private-helper-error' }
+
+    let captured: unknown
+    try {
+      await orch.androidEmulatorAction('aaaa1111', 'back')
+    } catch (error) {
+      captured = error
+    }
+    expect(captured).toMatchObject({
+      code: 'ANDROID_EMULATOR_ACTION_FAILED',
+      message: 'The Room emulator did not accept the requested phone control.'
+    })
+    expect(JSON.stringify(captured)).not.toContain('private-emulator-output')
+    expect(JSON.stringify(captured)).not.toContain('private-helper-error')
+  })
+
+  it('refuses phone controls while the Android Room or its emulator is stopped', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    orch.rooms.update('aaaa1111', { status: 'sleeping', hostPort: null })
+
+    await expect(orch.androidEmulatorAction('aaaa1111', 'home')).rejects.toMatchObject({
+      code: 'ANDROID_ROOM_ASLEEP'
+    })
+    orch.rooms.update('aaaa1111', { status: 'ready', hostPort: 45000 })
+    backend.emulatorStateValue = 'missing'
+    await expect(orch.androidEmulatorAction('aaaa1111', 'home')).rejects.toMatchObject({
+      code: 'ANDROID_EMULATOR_NOT_RUNNING'
+    })
+    expect(backend.fencedEmulatorExecCalls).toEqual([])
+  })
+
   it('fails an attached physical run when that phone becomes unhealthy instead of using the emulator', async () => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
