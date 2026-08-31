@@ -170,17 +170,20 @@ last installing Room. Physical receipts are also fenced to the lease that
 performed the install, so releasing and reacquiring the same phone requires a
 fresh `android-run` before automation.
 
-Core also seals the active Android user privately at install time; numeric user
-IDs are never part of the public receipt or error contract. Status lists and
-foreground metadata include only receipts for the currently active user while
-preserving receipts owned by other users. A direct operation after a user
-switch fails with `ANDROID_APP_USER_CHANGED` without deleting the dormant
-receipt, so switching back can reactivate it. Legacy receipts without this
-private fence fail closed with `ANDROID_APP_USER_UNVERIFIED` and require a fresh
-`android-run`. Evidence-producing commands are followed by another exact-user,
-APK-byte and package-incarnation check before either success or bounded failure
-evidence is returned; the install receipt itself receives the same post-commit
-check while the Room target and physical lease remain captured.
+Core also seals the active Android user's numeric ID and non-reused user serial
+privately at install time; neither value is part of the public receipt or error
+contract. The pair prevents a deleted-and-recreated Android user from
+reactivating an older receipt merely because the system recycled its numeric
+ID. Status lists and foreground metadata include only receipts for the current
+user incarnation while preserving receipts owned by other users. A direct
+operation after a user switch fails with `ANDROID_APP_USER_CHANGED` without
+deleting the dormant receipt, so switching back to that same incarnation can
+reactivate it. Legacy receipts missing either private field fail closed with
+`ANDROID_APP_USER_UNVERIFIED` and require a fresh `android-run`.
+Evidence-producing commands are followed by another exact-user, APK-byte and
+package-incarnation check before either success or bounded failure evidence is
+returned; the install receipt itself receives the same post-commit check while
+the Room target and physical lease remain captured.
 
 `target` is `{ kind: 'auto' }` (the default), `{ kind: 'emulator' }`, or
 `{ kind: 'physical', deviceId? }`. Auto follows an attached physical proof target
@@ -195,9 +198,9 @@ Automation POST bodies are strict and capped at 64 KiB.
 |---|---|---|
 | `GET /v1/rooms/:id/android/status` | `?target=auto\|emulator\|physical&deviceId=` | safe target descriptor, live `installedApplicationIds`, tracked foreground app or `null`, and locale |
 | `POST /v1/rooms/:id/android/launch` | `{ applicationId, activity?, extras?, target? }` | resolved in-package component and bounded command evidence |
-| `POST /v1/rooms/:id/android/force-stop` | `{ applicationId, target? }` | bounded force-stop evidence |
+| `POST /v1/rooms/:id/android/force-stop` | `{ applicationId, target? }` | bounded force-stop evidence after exact-user foreground absence and the package's `stopped=true` state are proven |
 | `POST /v1/rooms/:id/android/wait-for-text` | `{ applicationId, text, match?, timeoutMs?, pollIntervalMs?, target? }` | one sanitized app-owned node, attempts and elapsed time |
-| `POST /v1/rooms/:id/android/tap-text` | `{ applicationId, text, match?, target? }` | the one unambiguous app-owned node and bounded input evidence |
+| `POST /v1/rooms/:id/android/tap-text` | `{ applicationId, text, match?, target? }` | the one unambiguous app-owned node plus a non-retry-safe `confirmed`, `committed`, or `indeterminate` input outcome; evidence exists only for confirmed results |
 | `POST /v1/rooms/:id/android/dump-ui` | `{ applicationId, filter?, maxNodes?, target? }` | at most 500 sanitized nodes plus scan/truncation accounting |
 | `POST /v1/rooms/:id/android/logcat` | `{ applicationId, since?, filter?, maxLines?, target? }` | at most 500 secret-redacted lines after the tracked install's clock-independent app-UID fence; a later explicit Host-clock `since` is translated by a bounded exact-target clock probe |
 | `POST /v1/rooms/:id/android/crash-scenario` | `{ applicationId, scenario: 'am-crash', runId, target? }` | original/new PIDs, observed flag, bounded command evidence, and package-scoped logs |
@@ -206,10 +209,17 @@ UIAutomator XML is read through a 1 MiB source cap, parsed by a bounded
 non-expanding parser, and discarded. Only nodes whose `package` exactly equals
 the tracked app cross the boundary. Taps require the same unique node and bounds
 across two consecutive dumps, then recheck foreground ownership immediately
-before input. Android's input shell has no user selector, so the tap command
-performs an additional active-user guard in the same guest shell invocation and
-then applies the usual user/package postflight before reporting success. On
-Android 12+ a successful tracked install emits a random marker
+before input. A live bounded Android 12+ log witness brackets every hierarchy
+capture and tap with private markers across the globally ordered main/events
+buffers; any intervening `am_switch_user` record, missing marker, reordering,
+overflow, or reader failure withholds the result. Android's input shell has no
+user selector, so the tap command also keeps active-user guards and input in the
+same guest shell invocation, then applies the usual user/package postflight
+before reporting a confirmed outcome. Because a focus transition can be emitted
+while a non-idempotent input command is still returning, a post-injection witness
+failure returns `committed` (command returned success) or `indeterminate`
+(commit unknown), always with `retrySafe: false`, instead of inviting an
+automatic duplicate tap. On Android 12+ a successful tracked install emits a random marker
 as the exact unshared app UID and proves that marker through bounded `--uid`
 logcat. Reads discard the marker and everything before it in logd sequence
 order. Crash evidence emits a fresh app-UID marker immediately before `am crash`
@@ -218,6 +228,15 @@ evidence fails closed; there is no target-clock fallback for the install/crash
 boundary and global logs are never read. Android 11 and older, shared UIDs, or
 apps without `run-as` support keep their non-log automation receipt but return
 `ANDROID_LOG_FENCE_UNSUPPORTED` for logcat and crash evidence.
+
+Room-emulator automation never trusts the mutable Room container's `adb`,
+`PATH`, environment, workspace, or shared localhost ADB server. Android Rooms
+place only the control relay, emulator, and disposable helper on a dedicated
+Android control bridge/namespace; web, jobs, and services remain on a separate
+runtime bridge. The helper uses a private `localfilesystem:` server socket, an
+absolute pinned platform-tools binary, bounded output, and no workspace mount.
+APK installs accept only a Host-private sealed regular-file stage mounted
+read-only into that helper.
 
 ### Rooms
 

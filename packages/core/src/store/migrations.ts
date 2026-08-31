@@ -278,14 +278,19 @@ export const migrations: Migration[] = [
     `
   },
   {
-    // Android APK paths and bytes are shared across users. Keep the active
-    // user that authorized the tracked install as private durable authority;
-    // legacy rows remain null and therefore fail closed until android_run.
+    // Android APK paths and bytes are shared across users, and numeric user
+    // IDs may be recycled after deletion. Keep the active user's non-reused
+    // serial together with its ID as private durable authority; legacy rows
+    // remain null and therefore fail closed until android_run.
     version: 8,
     sql: `
       ALTER TABLE android_app_installs
         ADD COLUMN install_user_id INTEGER CHECK (
           install_user_id IS NULL OR install_user_id BETWEEN 0 AND 21474
+        );
+      ALTER TABLE android_app_installs
+        ADD COLUMN install_user_serial INTEGER CHECK (
+          install_user_serial IS NULL OR install_user_serial BETWEEN 0 AND 2147483647
         );
     `
   }

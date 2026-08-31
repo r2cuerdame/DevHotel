@@ -17,6 +17,7 @@ interface AndroidInstallRow {
   package_incarnation: string
   log_fence: string | null
   install_user_id: number | null
+  install_user_serial: number | null
 }
 
 function receipt(row: AndroidInstallRow): AndroidInstallReceipt {
@@ -44,12 +45,17 @@ export interface AndroidAppInstallsRepo {
     packageIncarnation: string
     logFence: string | null
     installUserId: number
+    installUserSerial: number
   }): AndroidInstallReceipt
   get(roomId: string, target: AndroidInstallTarget, applicationId: string): AndroidInstallReceipt | null
   list(roomId: string, target: AndroidInstallTarget): AndroidInstallReceipt[]
   packageIncarnation(roomId: string, target: AndroidInstallTarget, applicationId: string): string | null
   logFence(roomId: string, target: AndroidInstallTarget, applicationId: string): string | null
-  installUserId(roomId: string, target: AndroidInstallTarget, applicationId: string): number | null
+  installUserAuthority(
+    roomId: string,
+    target: AndroidInstallTarget,
+    applicationId: string
+  ): { userId: number; serial: number } | null
   remove(roomId: string, target: AndroidInstallTarget, applicationId: string): void
   invalidateTargetApplication(target: AndroidInstallTarget, applicationId: string): void
   invalidateTarget(target: Pick<AndroidInstallTarget, 'kind' | 'targetId'>): void
@@ -68,8 +74,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
       sqlite.prepare(
         `INSERT INTO android_app_installs (
            target_kind, target_id, lease_id, application_id, room_id, change_id, apk_sha256, installed_at,
-           package_incarnation, log_fence, install_user_id
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           package_incarnation, log_fence, install_user_id, install_user_serial
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(target_kind, target_id, application_id) DO UPDATE SET
            lease_id = excluded.lease_id,
            room_id = excluded.room_id,
@@ -78,7 +84,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
            installed_at = excluded.installed_at,
            package_incarnation = excluded.package_incarnation,
            log_fence = excluded.log_fence,
-           install_user_id = excluded.install_user_id`
+           install_user_id = excluded.install_user_id,
+           install_user_serial = excluded.install_user_serial`
       ).run(
         input.target.kind,
         input.target.targetId,
@@ -90,7 +97,8 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
         input.installedAt,
         input.packageIncarnation,
         input.logFence,
-        input.installUserId
+        input.installUserId,
+        input.installUserSerial
       )
       return this.get(input.roomId, input.target, input.applicationId)!
     },
@@ -122,12 +130,16 @@ export function androidAppInstallsRepo(db: Db): AndroidAppInstallsRepo {
       ).get(roomId, ...targetParams(target), applicationId) as Pick<AndroidInstallRow, 'log_fence'> | undefined
       return row?.log_fence ?? null
     },
-    installUserId(roomId, target, applicationId) {
+    installUserAuthority(roomId, target, applicationId) {
       const row = sqlite.prepare(
-        `SELECT install_user_id FROM android_app_installs
+        `SELECT install_user_id, install_user_serial FROM android_app_installs
          WHERE room_id = ? AND target_kind = ? AND target_id = ? AND lease_id IS ? AND application_id = ?`
-      ).get(roomId, ...targetParams(target), applicationId) as Pick<AndroidInstallRow, 'install_user_id'> | undefined
-      return row?.install_user_id ?? null
+      ).get(roomId, ...targetParams(target), applicationId) as Pick<
+        AndroidInstallRow,
+        'install_user_id' | 'install_user_serial'
+      > | undefined
+      if (!row || row.install_user_id === null || row.install_user_serial === null) return null
+      return { userId: row.install_user_id, serial: row.install_user_serial }
     },
     remove(roomId, target, applicationId) {
       sqlite.prepare(

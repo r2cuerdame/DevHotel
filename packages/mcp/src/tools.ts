@@ -445,7 +445,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_tap_text',
       description:
-        'Tap one unambiguous literal text node belonging to the foreground tracked app. Zero or multiple matches fail with stable structured errors; the physical lease is rechecked immediately before input.',
+        'Tap one unambiguous literal text node belonging to the foreground tracked app. The result is never retry-safe and distinguishes confirmed, committed-but-unverified, and indeterminate input outcomes.',
       schema: {
         roomId: zRoomId,
         applicationId: zAndroidApplicationId,

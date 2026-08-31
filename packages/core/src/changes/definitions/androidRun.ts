@@ -1,10 +1,8 @@
-import { EMULATOR_ADB_SERIAL } from '../../backend/naming'
 import { assertLaunchersAreExecutable, lineEndingAttributionInRoom } from './androidLineEndings'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
 const BUILD_TIMEOUT_MS = 15 * 60_000
-const ADB = `adb -s ${EMULATOR_ADB_SERIAL}`
 const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
 
 interface BuiltApp {
@@ -108,25 +106,8 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
 
-async function runAdb(ctx: ChangeCtx, args: string[], timeoutMs: number) {
-  if (ctx.physicalAndroidDevice) return ctx.physicalAndroidDevice.exec(args, { timeoutMs })
-  return ctx.backend.execInRoom(
-    ctx.roomId,
-    ['sh', '-lc', `${ADB} ${args.map(shellQuote).join(' ')}`],
-    { timeoutMs }
-  )
-}
-
 function targetLabel(ctx: ChangeCtx): string {
   return ctx.physicalAndroidDevice?.nickname ?? 'the Room emulator'
-}
-
-function resolvedLauncher(stdout: string, appId: string): string | undefined {
-  const exactPackagePrefix = `${appId}/`
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.startsWith(exactPackagePrefix) && /^[A-Za-z0-9._]+\/[A-Za-z0-9._$]+$/.test(line))
 }
 
 function androidProbeFailure(ctx: ChangeCtx, appId: string): { ok: false; detail: string } {
@@ -156,7 +137,8 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
     if (room.provider !== 'android') throw new Error('Only Android rooms can run Android apps')
     if (!ctx.isAwake()) throw new Error('Wake the room before running')
     if (ctx.physicalAndroidDevice) {
-      const state = await ctx.physicalAndroidDevice.exec(['get-state'], { timeoutMs: 20_000 })
+      if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
+      const state = await ctx.execFencedAndroidTarget(['get-state'], { timeoutMs: 20_000 })
       if (state.code !== 0 || state.stdout.trim() !== 'device') {
         throw new Error(`${ctx.physicalAndroidDevice.nickname} is not ready: ${(state.stderr || state.stdout).trim() || `adb exited ${state.code}`}`)
       }
@@ -189,8 +171,12 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
         steps.push('Wait for the emulator to finish booting')
         let booted = false
         const bootDeadline = Date.now() + 5 * 60_000
+        if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
         while (Date.now() < bootDeadline) {
-          const probe = await runAdb(ctx, ['shell', 'getprop', 'sys.boot_completed'], 20_000)
+          const probe = await ctx.execFencedAndroidTarget(
+            ['shell', 'getprop', 'sys.boot_completed'],
+            { timeoutMs: 20_000 }
+          )
           if (probe.stdout.trim() === '1') {
             booted = true
             break
@@ -201,46 +187,17 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       }
 
       // multi-module apps (app + companion/crash-lab modules) install together
+      if (!ctx.installTrackedAndroidApp) throw new Error('The tracked Android installer authority is unavailable')
       for (const app of apps) {
         steps.push(`Install ${app.apkPath.split('/').pop()} (${app.appId}) on ${targetLabel(ctx)}`)
-        // Once package replacement starts, an old same-byte receipt must never
-        // survive a later install/proof failure.
-        ctx.invalidateAndroidInstall?.(app.appId)
-        const install = await runAdb(ctx, ['install', '-r', app.apkPath], 180_000)
-        if (install.code !== 0) {
-          throw new Error(`adb install ${app.appId} failed: ${(install.stderr || install.stdout).slice(-300)}`)
-        }
-        await ctx.recordAndroidInstall?.(app.appId, app.apkPath, operation.id)
+        await ctx.installTrackedAndroidApp(app.appId, app.apkPath, operation.id)
       }
 
       steps.push(`Resolve and launch ${target.appId}`)
-      const resolved = await runAdb(
-        ctx,
-        [
-          'shell',
-          'cmd',
-          'package',
-          'resolve-activity',
-          '--brief',
-          '--components',
-          '-a',
-          'android.intent.action.MAIN',
-          '-c',
-          'android.intent.category.LAUNCHER',
-          target.appId
-        ],
-        30_000
-      )
-      const component = resolvedLauncher(resolved.stdout, target.appId)
-      if (resolved.code !== 0 || !component) {
-        throw new Error(`could not resolve launcher for ${target.appId}: ${(resolved.stderr || resolved.stdout).slice(-300)}`)
+      if (!ctx.launchTrackedAndroidApp) {
+        throw new Error('tracked Android launcher authority is unavailable')
       }
-      const launch = await runAdb(
-        ctx,
-        ['shell', 'am', 'start', '-W', '-n', component],
-        60_000
-      )
-      if (launch.code !== 0) throw new Error(`launch failed: ${(launch.stderr || launch.stdout).slice(-300)}`)
+      await ctx.launchTrackedAndroidApp(target.appId)
     }
 
     if (ctx.physicalAndroidDevice) {
@@ -257,12 +214,9 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       return { ok: false, detail: 'Android run verification could not read validated build metadata' }
     }
     try {
+      if (!ctx.isTrackedAndroidAppForeground) return androidProbeFailure(ctx, appId)
       for (let i = 0; i < 6; i++) {
-        const pid = await runAdb(ctx, ['shell', 'pidof', appId], 20_000)
-        // Android's pidof normally exits 1 while a just-launched process is
-        // still absent. That is a retryable no-match, not a transport failure.
-        const processIds = pid.stdout.trim()
-        if (pid.code === 0 && /^\d+(?:\s+\d+)*$/.test(processIds)) {
+        if (await ctx.isTrackedAndroidAppForeground(appId)) {
           return { ok: true, detail: `${appId} running on ${targetLabel(ctx)}` }
         }
         await sleep(2000)

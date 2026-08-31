@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
 import { runDocker } from '../backend/cli'
 import {
   anchorName,
@@ -29,6 +28,7 @@ const ROOM_ID = 'room1abc'
 const OPERATION_ID = '11111111-2222-4333-8444-555555555555'
 const SNAPSHOT = workspaceSnapshotVolume(ROOM_ID, OPERATION_ID)
 const ok = { code: 0, stdout: '', stderr: '' }
+const SCREENSHOT_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_BASE64_LIMIT = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 
 function volumeInspect(): string {

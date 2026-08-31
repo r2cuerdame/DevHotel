@@ -394,6 +394,8 @@ describe('Room start as a trackable operation', () => {
     ])
     expect(stage(finished!, 'adb-ready')?.status).toBe('done')
     expect(stage(finished!, 'adb-ready')?.detail).toContain('finished booting')
+    expect(backend.calls).toContain(`execFencedEmulatorAdb:shell getprop sys.boot_completed`)
+    expect(backend.execInRoomCalls.some((call) => call.cmd.some((arg) => /(^|\s)adb(?:\s|$)/.test(arg)))).toBe(false)
   })
 
   it('says the phone is still booting instead of pretending the Room is usable', async () => {
@@ -419,6 +421,8 @@ describe('Room start as a trackable operation', () => {
     expect(stage(finished!, 'adb-ready')?.status).toBe('skipped')
     expect(stage(finished!, 'adb-ready')?.detail).toContain('still booting')
     expect(orch.rooms.get(room.id)?.status).toBe('ready')
+    expect(backend.calls).toContain(`execFencedEmulatorAdb:shell getprop sys.boot_completed`)
+    expect(backend.execInRoomCalls.some((call) => call.cmd.some((arg) => /(^|\s)adb(?:\s|$)/.test(arg)))).toBe(false)
   })
 
   it('keeps an Android Room build-only when the emulator cannot start, and says so', async () => {

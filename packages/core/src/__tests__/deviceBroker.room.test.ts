@@ -32,10 +32,23 @@ function roomAndroidArgs(command: string[]): string[] | null {
   return logicalAdbArgs(command.slice(3))
 }
 
-function installEvidenceResult(args: string[], state: { fence: string; apkSha256?: string }): { code: number; stdout: string; stderr: string } | null {
+function installEvidenceResult(args: string[], state: {
+  fence: string
+  apkSha256?: string
+  resolveComponent?: string
+  foregroundApplicationId?: string | null
+  locale?: string
+}): { code: number; stdout: string; stderr: string } | null {
   const logical = logicalAdbArgs(args)
   if (logical[1] === 'am' && logical[2] === 'get-current-user') {
     return { code: 0, stdout: '0\n', stderr: '' }
+  }
+  if (logical[1] === 'dumpsys' && logical[2] === 'user' && logical[3] === '--user') {
+    return {
+      code: 0,
+      stdout: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
+      stderr: ''
+    }
   }
   if (logical[1] === 'pm' && logical[2] === 'path') {
     return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
@@ -62,6 +75,26 @@ function installEvidenceResult(args: string[], state: { fence: string; apkSha256
   }
   if (logical[1] === 'pm' && logical[2] === 'list') {
     return { code: 0, stdout: 'package:com.example.app uid:10123\n', stderr: '' }
+  }
+  if (logical[1] === 'cmd' && logical[2] === 'package' && logical[3] === 'resolve-activity') {
+    return {
+      code: 0,
+      stdout: `${state.resolveComponent ?? 'com.example.app/.MainActivity'}\n`,
+      stderr: ''
+    }
+  }
+  if (logical[1] === 'am' && logical[2] === 'start') {
+    return { code: 0, stdout: 'Status: ok\n', stderr: '' }
+  }
+  if (logical[1] === 'sh' && logical[3]?.includes('dumpsys window')) {
+    if (state.foregroundApplicationId === undefined) return null
+    const foreground = state.foregroundApplicationId
+    return foreground
+      ? { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${foreground}/.MainActivity}\n`, stderr: '' }
+      : { code: 0, stdout: '', stderr: '' }
+  }
+  if (logical[1] === 'getprop' && state.locale !== undefined) {
+    return { code: 0, stdout: `${state.locale}\n`, stderr: '' }
   }
   if (logical[1] === 'run-as') {
     state.fence = logical.at(-1) ?? ''
@@ -303,11 +336,14 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
     adb.execs = []
     adb.execResultFor = (_serial, args) =>
-      installEvidenceResult(args, { fence: '', apkSha256: 'a'.repeat(64) })
+      installEvidenceResult(args, {
+        fence: '', apkSha256: 'a'.repeat(64), foregroundApplicationId: 'com.example.app'
+      })
     const hostile = "quote' $HOME; $(id)\nnext"
 
     await orch.androidLaunchApp('aaaa1111', {
@@ -337,15 +373,15 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
-    backend.execInRoomCalls = []
-    backend.execInRoomHandler = (_roomId, command) => {
-      const androidArgs = roomAndroidArgs(command)
-      if (!androidArgs) return { code: 0, stdout: '', stderr: '' }
-      return installEvidenceResult(androidArgs, { fence: '', apkSha256: 'a'.repeat(64) }) ??
+    backend.fencedEmulatorExecCalls = []
+    backend.fencedEmulatorExecHandler = (androidArgs) =>
+      installEvidenceResult(androidArgs, {
+        fence: '', apkSha256: 'a'.repeat(64), foregroundApplicationId: 'com.example.app'
+      }) ??
         { code: 0, stdout: 'Status: ok\n', stderr: '' }
-    }
     const hostile = "quote' $HOME; $(id)\nnext"
 
     await orch.androidLaunchApp('aaaa1111', {
@@ -355,11 +391,11 @@ describe('Android automation targets the attached device without a hand-written 
       target: { kind: 'emulator' }
     })
 
-    const launch = backend.execInRoomCalls.find((call) =>
-      call.cmd[0] === 'adb' && call.cmd[4]?.includes("'am' 'start'")
+    const launch = backend.fencedEmulatorExecCalls.find((call) =>
+      call.args[0] === 'shell' && call.args[1]?.includes("'am' 'start'")
     )
-    expect(launch?.cmd).toEqual([
-      'adb', '-s', 'emulator-5554', 'shell',
+    expect(launch?.args).toEqual([
+      'shell',
       "'am' 'start' '-W' '--user' '0' '-n' 'com.example.app/.MainActivity' '--es' 'label' 'quote'\\'' $HOME; $(id)\nnext'"
     ])
   })
@@ -448,7 +484,8 @@ describe('Android automation targets the attached device without a hand-written 
         installedAt: '2026-08-31T00:00:00.000Z',
         packageIncarnation: TEST_PACKAGE_INCARNATION,
         logFence: null,
-        installUserId: 0
+        installUserId: 0,
+        installUserSerial: 42
       })
     }
     adb.execResultFor = (_serial, args) => args[0] === 'install'
@@ -649,7 +686,7 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
-    const installEvidence = { fence: '' }
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
     adb.execResultFor = (_serial, args) => {
       const evidence = installEvidenceResult(args, installEvidence)
       if (evidence) return evidence
@@ -681,6 +718,84 @@ describe('Android automation targets the attached device without a hand-written 
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
   })
 
+  it.each([
+    { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED', keepsReceipt: true },
+    { race: 'replacement' as const, expectedCode: 'ANDROID_APP_REPLACED', keepsReceipt: false }
+  ])('fails android-run closed when a $race races its final tracked launch', async ({
+    race,
+    expectedCode,
+    keepsReceipt
+  }) => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const installEvidence = { fence: '' }
+    let raced = false
+    adb.execResultFor = (_serial, args) => {
+      const logical = logicalAdbArgs(args)
+      if (logical[1] === 'am' && logical[2] === 'get-current-user' && raced && race === 'user-switch') {
+        return { code: 0, stdout: '10\n', stderr: '' }
+      }
+      if (
+        logical[1] === 'dumpsys' &&
+        logical[2] === 'user' &&
+        logical[3] === '--user' &&
+        logical[4] === '10' &&
+        raced &&
+        race === 'user-switch'
+      ) {
+        return {
+          code: 0,
+          stdout: ' UserInfo{10:Work:13} serialNo=77 isPrimary=false\n Type: android.os.usertype.full.SECONDARY\n',
+          stderr: ''
+        }
+      }
+      if (logical[1] === 'stat' && raced && race === 'replacement') {
+        return { code: 0, stdout: '103:9999:123456:1788157200:1788157300\n', stderr: '' }
+      }
+      const evidence = installEvidenceResult(args, installEvidence)
+      if (logical[1] === 'am' && logical[2] === 'start') raced = true
+      return evidence
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({
+      status: 'failed',
+      verify: { detail: expect.stringContaining(expectedCode === 'ANDROID_APP_USER_CHANGED' ? 'active Android user' : 'package incarnation') }
+    })
+    const receiptTarget = {
+      kind: 'physical' as const,
+      targetId: attached.device.id,
+      deviceId: attached.device.id,
+      leaseId: attached.lease.id
+    }
+    expect(orch.androidInstalls.get('aaaa1111', receiptTarget, 'com.example.app') !== null).toBe(keepsReceipt)
+    const launch = adb.execs.find((call) => {
+      const logical = logicalAdbArgs(call.args)
+      return logical[1] === 'am' && logical[2] === 'start'
+    })
+    expect(logicalAdbArgs(launch!.args)).toEqual([
+      'shell', 'am', 'start', '-W', '--user', '0', '-n', 'com.example.app/.MainActivity'
+    ])
+    expect(adb.execs.some((call) => logicalAdbArgs(call.args)[1] === 'pidof')).toBe(false)
+  })
+
   it('refuses to launch a component resolved for a different package', async () => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
@@ -700,27 +815,24 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
-    const installEvidence = { fence: '' }
+    const installEvidence = { fence: '', resolveComponent: 'com.other.app/.MainActivity' }
     adb.execResultFor = (_serial, args) => {
       const evidence = installEvidenceResult(args, installEvidence)
       if (evidence) return evidence
-      const logical = logicalAdbArgs(args)
-      return logical[0] === 'shell' && logical[1] === 'cmd'
-        ? { code: 0, stdout: 'com.other.app/.MainActivity\n', stderr: '' }
-        : null
+      return null
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
-    expect(entry.verify?.detail).toMatch(/could not resolve launcher/)
+    expect(entry.verify?.detail).toMatch(/launcher activity/i)
     expect(adb.execs.some((call) => {
       const logical = logicalAdbArgs(call.args)
       return logical[0] === 'shell' && logical[1] === 'am' && logical[2] === 'start'
     })).toBe(false)
   })
 
-  it('durably records a safe failed verify when the physical PID probe loses its lease', async () => {
+  it('durably records a safe failed apply when tracked launch proof loses its lease', async () => {
     const { orch, adb, backend } = setup()
     await orch.refreshAndroidDevices()
     const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
@@ -740,34 +852,35 @@ describe('Android automation targets the attached device without a hand-written 
       }
       return { code: 0, stdout: '', stderr: '' }
     }
-    const installEvidence = { fence: '' }
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
+    let launched = false
+    let postLaunchUserProbes = 0
     adb.execResultFor = async (_serial, args) => {
-      const evidence = installEvidenceResult(args, installEvidence)
-      if (evidence) return evidence
       const logical = logicalAdbArgs(args)
-      if (logical[0] === 'shell' && logical[1] === 'cmd') {
-        return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
+      if (logical[1] === 'am' && logical[2] === 'start') launched = true
+      if (launched && logical[1] === 'am' && logical[2] === 'get-current-user') {
+        postLaunchUserProbes += 1
+        if (postLaunchUserProbes > 4) {
+          await orch.devices.release(attached.lease.id, 'simulated disconnect during physical verification')
+          throw new Error('R5CT30ABCDE C:\\Users\\private\\adb.exe token=ghp_12345678901234567890')
+        }
       }
-      if (logical[0] === 'shell' && logical[1] === 'pidof') {
-        await orch.devices.release(attached.lease.id, 'simulated disconnect during physical verification')
-        throw new Error('R5CT30ABCDE C:\\Users\\private\\adb.exe token=ghp_12345678901234567890')
-      }
-      return null
+      return installEvidenceResult(args, installEvidence)
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
 
     expect(entry).toMatchObject({
-      status: 'applied',
+      status: 'failed',
       verify: {
         ok: false,
-        detail: expect.stringMatching(/could not be verified on the attached physical device/)
+        detail: expect.stringMatching(/lease captured for this operation is no longer active/)
       }
     })
     expect(entry.verify!.detail.length).toBeLessThanOrEqual(300)
     expect(entry.verify!.detail).not.toMatch(/R5CT30ABCDE|Users|adb\.exe|ghp_/i)
     expect(orch.listChanges('aaaa1111').find((change) => change.id === entry.id)).toMatchObject({
-      status: 'applied',
+      status: 'failed',
       verify: { ok: false }
     })
   })
@@ -941,16 +1054,18 @@ describe('Android automation targets the attached device without a hand-written 
     adb.execs = []
     backend.emulatorStateValue = 'running'
     backend.execInRoomCalls = []
-    const installEvidence = { fence: '' }
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const androidArgs = roomAndroidArgs(cmd)
-      if (androidArgs) {
-        if (logicalAdbArgs(androidArgs)[1] === 'run-as') {
-          vi.setSystemTime('2026-08-31T01:00:01.000Z')
-        }
-        const evidence = installEvidenceResult(androidArgs, installEvidence)
-        if (evidence) return evidence
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[1] === 'run-as') vi.setSystemTime('2026-08-31T01:00:01.000Z')
+      if (logical[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        return { code: 0, stdout: '1\n', stderr: '' }
       }
+      return installEvidenceResult(androidArgs, installEvidence) ??
+        { code: 0, stdout: '', stderr: '' }
+    }
+    backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
         return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
@@ -962,9 +1077,6 @@ describe('Android automation targets the attached device without a hand-written 
           stderr: ''
         }
       }
-      if (command.includes('resolve-activity')) return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
-      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
-      if (command.includes('pidof')) return { code: 0, stdout: '1234\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -983,14 +1095,48 @@ describe('Android automation targets the attached device without a hand-written 
       })
     ])
     expect(adb.execs).toEqual([])
-    expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('adb -s emulator-5554'))).toBe(true)
-    expect(
-      backend.execInRoomCalls.some((call) =>
-        call.cmd
-          .at(-1)
-          ?.includes("'install' '-r' '/workspace/app/build/outputs/apk/debug/My App'\\''s $&-debug.APK'")
-      )
-    ).toBe(true)
+    expect(backend.execInRoomCalls.some((call) => call.cmd.some((arg) => /(^|\s)adb(?:\s|$)/.test(arg)))).toBe(false)
+    expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([
+      "copyFromRoom:/workspace/app/build/outputs/apk/debug/My App's $&-debug.APK"
+    ])
+    expect(backend.calls.some((call) => call.startsWith('installFencedEmulatorApk:'))).toBe(true)
+  })
+
+  it('never publishes a private Host APK stage when copy or local inspection fails', async () => {
+    const { orch, backend, userData } = setup()
+    backend.emulatorStateValue = 'running'
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        return { code: 0, stdout: '1\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    backend.copyFromRoomHook = (_roomId, _roomPath, hostPath) => {
+      throw new Error(`daemon refused private destination ${hostPath}`)
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+    const published = JSON.stringify(entry)
+
+    expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
+    expect(published).toContain('[private APK stage]')
+    expect(published).not.toContain(userData)
+    expect(published).not.toMatch(/android-install-receipt-|installed\.apk/i)
   })
 
   it('removes an old emulator receipt before tracked reinstall proof can fail', async () => {
@@ -1006,23 +1152,35 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const androidArgs = roomAndroidArgs(cmd)
-      if (androidArgs) {
-        const logical = logicalAdbArgs(androidArgs)
-        if (logical[1] === 'am' && logical[2] === 'get-current-user') {
-          return { code: 0, stdout: '0\n', stderr: '' }
-        }
-        if (logical[1] === 'pm' && logical[2] === 'path') return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
-        if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
-        if (logical[1] === 'sha256sum') return { code: 0, stdout: `${'b'.repeat(64)}  ${TEST_BASE_APK}\n`, stderr: '' }
-        if (logical[1] === 'pm' && logical[2] === 'list') {
-          return { code: 0, stdout: 'package:com.example.app uid:10123\n', stderr: '' }
-        }
-        if (logical[1] === 'run-as') return { code: 1, stdout: '', stderr: 'not debuggable' }
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        return { code: 0, stdout: '1\n', stderr: '' }
       }
+      if (logical[1] === 'am' && logical[2] === 'get-current-user') {
+        return { code: 0, stdout: '0\n', stderr: '' }
+      }
+      if (logical[1] === 'dumpsys' && logical[2] === 'user') {
+        return {
+          code: 0,
+          stdout: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
+          stderr: ''
+        }
+      }
+      if (logical[1] === 'pm' && logical[2] === 'path') return { code: 0, stdout: `package:${TEST_BASE_APK}\n`, stderr: '' }
+      if (logical[1] === 'stat') return { code: 0, stdout: `${TEST_BASE_STAT}\n`, stderr: '' }
+      if (logical[1] === 'sha256sum') return { code: 0, stdout: `${'b'.repeat(64)}  ${TEST_BASE_APK}\n`, stderr: '' }
+      if (logical[1] === 'pm' && logical[2] === 'list') {
+        return { code: 0, stdout: 'package:com.example.app uid:10123\n', stderr: '' }
+      }
+      if (logical[1] === 'run-as') return { code: 1, stdout: '', stderr: 'not debuggable' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
         return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
@@ -1034,7 +1192,6 @@ describe('Android automation targets the attached device without a hand-written 
           stderr: ''
         }
       }
-      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -1049,20 +1206,23 @@ describe('Android automation targets the attached device without a hand-written 
     const { orch, backend } = setup()
     backend.emulatorStateValue = 'running'
     const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
-    const installEvidence = { fence: '' }
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
     let pathProbes = 0
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const androidArgs = roomAndroidArgs(cmd)
-      if (androidArgs) {
-        const logical = logicalAdbArgs(androidArgs)
-        if (logical[1] === 'pm' && logical[2] === 'path') {
-          pathProbes += 1
-          const path = pathProbes < 3 ? TEST_BASE_APK : '/data/app/replaced/base.apk'
-          return { code: 0, stdout: `package:${path}\n`, stderr: '' }
-        }
-        const evidence = installEvidenceResult(androidArgs, installEvidence)
-        if (evidence) return evidence
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        return { code: 0, stdout: '1\n', stderr: '' }
       }
+      if (logical[1] === 'pm' && logical[2] === 'path') {
+        pathProbes += 1
+        const path = pathProbes < 3 ? TEST_BASE_APK : '/data/app/replaced/base.apk'
+        return { code: 0, stdout: `package:${path}\n`, stderr: '' }
+      }
+      return installEvidenceResult(androidArgs, installEvidence) ??
+        { code: 0, stdout: '', stderr: '' }
+    }
+    backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
         return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
@@ -1074,7 +1234,6 @@ describe('Android automation targets the attached device without a hand-written 
           stderr: ''
         }
       }
-      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -1090,17 +1249,22 @@ describe('Android automation targets the attached device without a hand-written 
     const { orch, backend } = setup()
     backend.emulatorStateValue = 'running'
     const target = { kind: 'emulator' as const, targetId: 'aaaa1111', deviceId: null }
-    const installEvidence = { fence: '' }
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const androidArgs = roomAndroidArgs(cmd)
-      if (androidArgs) {
-        const evidence = installEvidenceResult(androidArgs, installEvidence)
-        if (evidence) {
-          return androidArgs[0] === 'logcat'
-            ? { code: 0, stdout: 'x'.repeat((1024 * 1024) + 1), stderr: '' }
-            : evidence
-        }
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
+    backend.fencedEmulatorExecHandler = (androidArgs) => {
+      const logical = logicalAdbArgs(androidArgs)
+      if (logical[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
+        return { code: 0, stdout: '1\n', stderr: '' }
       }
+      const evidence = installEvidenceResult(androidArgs, installEvidence)
+      if (evidence) {
+        return logical[0] === 'logcat'
+          ? { code: 0, stdout: 'x'.repeat((1024 * 1024) + 1), stderr: '' }
+          : evidence
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    backend.execInRoomHandler = (_roomId, cmd) => {
       const command = cmd.at(-1) ?? ''
       if (command.includes('find /workspace')) {
         return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
@@ -1112,9 +1276,6 @@ describe('Android automation targets the attached device without a hand-written 
           stderr: ''
         }
       }
-      if (command.includes('resolve-activity')) return { code: 0, stdout: 'com.example.app/.MainActivity\n', stderr: '' }
-      if (command.includes('sys.boot_completed')) return { code: 0, stdout: '1\n', stderr: '' }
-      if (command.includes('pidof')) return { code: 0, stdout: '1234\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
 
@@ -1140,12 +1301,12 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const logical = roomAndroidArgs(cmd)
-      if (!logical) return { code: 0, stdout: '', stderr: '' }
-      const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
+    backend.fencedEmulatorExecHandler = (args) => {
+      const logical = logicalAdbArgs(args)
+      const identity = installEvidenceResult(args, { fence: '', apkSha256: 'a'.repeat(64) })
       if (identity) return identity
       if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n', stderr: '' }
@@ -1177,16 +1338,20 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
-    backend.execInRoomHandler = (_roomId, cmd, opts) => {
-      const logical = roomAndroidArgs(cmd)
-      if (!logical) return { code: 0, stdout: '', stderr: '' }
-      const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
+    backend.fencedEmulatorExecHandler = (args) => {
+      const logical = logicalAdbArgs(args)
+      const identity = installEvidenceResult(args, { fence: '', apkSha256: 'a'.repeat(64) })
       if (identity) return identity
       if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
-        opts?.onStdout?.(`mCurrentFocus=Window{1 u0 com.example.app/.MainActivity}\n${'x'.repeat(3_000)}`)
-        return { code: 0, stdout: '', stderr: '' }
+        return {
+          code: 0,
+          stdout: 'x'.repeat(2_048),
+          stderr: '',
+          outputLimitExceeded: true
+        }
       }
       if (logical[1] === 'getprop') return { code: 0, stdout: 'ko-KR\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
@@ -1218,11 +1383,36 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
     let replaced = false
-    adb.execResultFor = async (_serial, args) => {
+    let screenBegin = ''
+    let readerAborted = false
+    let screenReader: {
+      onStdout?: (chunk: string | Uint8Array) => void
+      signal?: AbortSignal
+      reject(error: unknown): void
+    } | null = null
+    adb.execResultFor = async (_serial, args, opts) => {
       const logical = logicalAdbArgs(args)
+      if (logical[1] === 'log' && logical.at(-1)?.startsWith('devhotel-user-begin-')) {
+        screenBegin = logical.at(-1)!
+        screenReader?.onStdout?.(`--------- beginning of main\nI/DEVHOTEL_USER_FENCE: ${screenBegin}\n`)
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (logical[1] === 'sh' && logical[3]?.includes('logcat -b main -b events')) {
+        return new Promise((_resolve, reject) => {
+          screenReader = { onStdout: opts?.onStdout, signal: opts?.signal, reject }
+          const abort = () => {
+            readerAborted = true
+            screenReader = null
+            reject(opts?.signal?.reason ?? new Error('screen reader aborted'))
+          }
+          if (opts?.signal?.aborted) abort()
+          else opts?.signal?.addEventListener('abort', abort, { once: true })
+        })
+      }
       const identity = installEvidenceResult(logical, { fence: '', apkSha256: 'a'.repeat(64) })
       if (identity) return identity
       if (logical[1] === 'sh' && logical.at(-1)?.includes('dumpsys window')) {
@@ -1250,13 +1440,92 @@ describe('Android automation targets the attached device without a hand-written 
       applicationId: 'com.example.app', text: 'Crash'
     })).rejects.toMatchObject({ code: 'lease-expired' })
     expect(replaced).toBe(true)
+    expect(readerAborted).toBe(true)
     const execOut = adb.execs.find((call) => call.args[0] === 'exec-out')
     expect(execOut?.args.slice(0, 3)).toEqual(['exec-out', 'sh', '-c'])
     expect(execOut?.args.length).toBeGreaterThan(5)
     expect(adb.execs.some((call) => {
       const logical = logicalAdbArgs(call.args)
-      return logical[1] === 'sh' && logical[3]?.includes('exec input tap')
+      return logical[1] === 'sh' && logical[3]?.includes('input tap "$x" "$y"')
     })).toBe(false)
+  })
+
+  it('aborts an in-flight physical automation command when its exact lease is revoked', async () => {
+    const { orch, adb } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    let aborted = false
+    adb.execResultFor = async (_serial, args, opts) => {
+      const logical = logicalAdbArgs(args)
+      if (logical[1] !== 'am' || logical[2] !== 'get-current-user') return null
+      markStarted()
+      return new Promise((_resolve, reject) => {
+        const abort = () => {
+          aborted = true
+          reject(opts?.signal?.reason ?? new Error('physical command aborted'))
+        }
+        if (opts?.signal?.aborted) abort()
+        else opts?.signal?.addEventListener('abort', abort, { once: true })
+      })
+    }
+
+    const operation = orch.androidAutomationStatus('aaaa1111', { kind: 'physical' })
+    await started
+    const revokedAt = Date.now()
+    await orch.devices.release(attached.lease.id, 'test mid-command revocation')
+
+    await expect(operation).rejects.toMatchObject({ code: 'lease-expired' })
+    expect(aborted).toBe(true)
+    expect(Date.now() - revokedAt).toBeLessThan(2_000)
+    expect(adb.execs).toHaveLength(1)
+  })
+
+  it('does not miss caller cancellation between the heartbeat precheck and listener registration', async () => {
+    const { orch } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    const reason = new Error('caller revoked the local operation')
+    let abortedReads = 0
+    const racedSignal = {
+      get aborted() {
+        abortedReads += 1
+        return abortedReads >= 2
+      },
+      reason,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn()
+    } as unknown as AbortSignal
+    const heartbeat = orch as unknown as {
+      withDeviceHeartbeat<T>(
+        roomId: string,
+        deviceId: string,
+        leaseId: string,
+        run: (signal: AbortSignal) => Promise<T>,
+        busy: boolean,
+        callerSignal: AbortSignal
+      ): Promise<T>
+    }
+    let ran = false
+
+    await expect(heartbeat.withDeviceHeartbeat(
+      'aaaa1111',
+      attached.device.id,
+      attached.lease.id,
+      async (signal) => {
+        ran = true
+        if (signal.aborted) throw signal.reason
+        return 'unsafe-success'
+      },
+      true,
+      racedSignal
+    )).rejects.toBe(reason)
+    expect(ran).toBe(true)
+    expect(racedSignal.addEventListener).toHaveBeenCalledOnce()
   })
 
   it('does not reuse a physical install receipt after the phone is leased again', async () => {
@@ -1278,7 +1547,8 @@ describe('Android automation targets the attached device without a hand-written 
       installedAt: '2026-08-31T00:00:00.000Z',
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: 42
     })
     await orch.releaseAndroidDevice('aaaa1111', 'rotate lease')
     const second = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-b' })

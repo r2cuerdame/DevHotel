@@ -80,7 +80,9 @@ describe('database migrations', () => {
       expect(installColumns.find(({ name }) => name === 'package_incarnation')).toMatchObject({ notnull: 1 })
       expect(installColumns.find(({ name }) => name === 'log_fence')).toMatchObject({ notnull: 0 })
       expect(installColumns.find(({ name }) => name === 'install_user_id')).toMatchObject({ notnull: 0 })
+      expect(installColumns.find(({ name }) => name === 'install_user_serial')).toMatchObject({ notnull: 0 })
       expect(installTable.sql.replace(/\s+/g, ' ')).toContain('install_user_id BETWEEN 0 AND 21474')
+      expect(installTable.sql.replace(/\s+/g, ' ')).toContain('install_user_serial BETWEEN 0 AND 2147483647')
     } finally {
       sqlite.close()
     }

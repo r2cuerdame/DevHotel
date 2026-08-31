@@ -2,7 +2,6 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFi
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
-import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
@@ -46,6 +45,10 @@ import type { AnchorSpec, ExecOpts, ExecOutputChunk, ExecResult, ExportedArtifac
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 const LONG_TIMEOUT_MS = 600_000
+// Keep the controlled helper's hard screen bound local until the screenshot
+// artifact package lands; the published artifact contract uses the same 16 MiB cap.
+const SCREENSHOT_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
+const SCREENSHOT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
   '.git',

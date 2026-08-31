@@ -223,6 +223,30 @@ function redactAdbResult(
   }
 }
 
+function privateAndroidStageError(
+  error: unknown,
+  privateRoots: Array<string | null | undefined>,
+  fallback: string
+): Error {
+  const originalMessage = error instanceof Error ? error.message : String(error)
+  let message = originalMessage
+  // Replace the most specific private path first. Replacing the staging root
+  // before its child would leave the random directory and filename visible in
+  // a message such as `<root>\\android-install-receipt-*\\installed.apk`.
+  const orderedRoots = privateRoots
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => right.length - left.length)
+  for (const root of orderedRoots) {
+    for (const candidate of new Set([root, root.replaceAll('\\', '/')])) {
+      const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      message = message.replace(new RegExp(escaped, 'gi'), '[private APK stage]')
+    }
+  }
+  message = redactSecrets(message).trim()
+  if (error instanceof Error && message === originalMessage) return error
+  return new Error(message || fallback)
+}
+
 function hashFileSha256(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256')
@@ -1358,16 +1382,16 @@ export class RoomOrchestrator {
           this.olog(roomId, detail)
           report.skip(detail)
         }
-      } else {
-        report.begin('services-start', 'Start the Room services')
-        // services join the anchor's netns, so a fresh anchor needs fresh service containers
-        const services = Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]
-        if (services.length === 0) report.skip('this Room has no Room Services')
-        for (const [svc, cfg] of services) {
-          this.olog(roomId, `start service ${svc} ${cfg.version}`)
-          await this.backend.removeService(roomId, svc, { volume: false })
-          await this.backend.createService(roomId, svc, cfg.version)
-        }
+      }
+      report.begin('services-start', 'Start the Room services')
+      // Services use the fresh runtime anchor (separate from Android's control
+      // bridge), so every provider recreates them after anchor replacement.
+      const services = Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]
+      if (services.length === 0) report.skip('this Room has no Room Services')
+      for (const [svc, cfg] of services) {
+        this.olog(roomId, `start service ${svc} ${cfg.version}`)
+        await this.backend.removeService(roomId, svc, { volume: false })
+        await this.backend.createService(roomId, svc, cfg.version)
       }
       report.begin('web-start', 'Start the Room web process')
       await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
@@ -1405,10 +1429,10 @@ export class RoomOrchestrator {
     report.begin('adb-ready', 'Check whether the emulator answers adb')
     let detail = ''
     try {
-      const probe = await this.backend.execInRoom(
+      const probe = await this.backend.execFencedEmulatorAdb(
         roomId,
-        ['sh', '-lc', `adb -s ${EMULATOR_ADB_SERIAL} shell getprop sys.boot_completed 2>/dev/null`],
-        { timeoutMs: EMULATOR_ADB_PROBE_TIMEOUT_MS }
+        ['shell', 'getprop', 'sys.boot_completed'],
+        { timeoutMs: EMULATOR_ADB_PROBE_TIMEOUT_MS, maxStdoutBytes: 1024, maxStderrBytes: 1024 }
       )
       if (probe.stdout.trim() === '1') {
         report.detail(`emulator ${EMULATOR_ADB_SERIAL} answers adb and finished booting`)
@@ -1899,12 +1923,17 @@ export class RoomOrchestrator {
             expectedLeaseId
           )
           const executableArgs = protectAndroidRemoteCommand(args)
-          const result = await this.withDeviceHeartbeat(roomId, attached.id, expectedLeaseId, () =>
+          const result = await this.withDeviceHeartbeat(roomId, attached.id, expectedLeaseId, (signal) =>
             this.devices.hostAdb.exec(authorized.serial, executableArgs, {
               timeoutMs: opts?.timeoutMs,
+              signal,
               maxStdoutBytes: opts?.maxStdoutBytes,
-              maxStderrBytes: opts?.maxStderrBytes
-            })
+              maxStderrBytes: opts?.maxStderrBytes,
+              onStdout: opts?.onStdout,
+              onStderr: opts?.onStderr
+            }),
+            true,
+            opts?.signal
           )
           return redactAdbResult(result, authorized.serial)
         }
@@ -1931,32 +1960,24 @@ export class RoomOrchestrator {
       installTarget: { kind: 'emulator', targetId: roomId, deviceId: null },
       installs: this.androidInstalls,
       exec: async (args, opts) => {
-        // OCI backends stream into bounded collectors so app-controlled UI or
-        // log output never becomes an unbounded host allocation.
-        const stdout = boundedTextCapture(opts?.maxStdoutBytes ?? 1024 * 1024)
-        const stderr = boundedTextCapture(opts?.maxStderrBytes ?? 64 * 1024)
-        let sawStdout = false
-        let sawStderr = false
-        const result = await this.backend.execInRoom(
+        const result = await this.backend.execFencedEmulatorAdb(
           roomId,
-          ['adb', '-s', EMULATOR_ADB_SERIAL, ...protectAndroidRemoteCommand(args)],
+          protectAndroidRemoteCommand(args),
           {
             timeoutMs: opts?.timeoutMs,
-            onStdout: (chunk) => { sawStdout = true; stdout.push(chunk) },
-            onStderr: (chunk) => { sawStderr = true; stderr.push(chunk) }
+            signal: opts?.signal,
+            maxStdoutBytes: opts?.maxStdoutBytes,
+            maxStderrBytes: opts?.maxStderrBytes,
+            onStdout: opts?.onStdout,
+            onStderr: opts?.onStderr
           }
         )
-        // Preserve compatibility with a backend that does not honour streaming.
-        if (!sawStdout && result.stdout) stdout.push(result.stdout)
-        if (!sawStderr && result.stderr) stderr.push(result.stderr)
-        const exceeded = stdout.exceeded || stderr.exceeded
-        const limitMessage = exceeded
-          ? '\nAndroid emulator command output exceeded its safety limit.'
-          : ''
         return {
-          code: exceeded ? -1 : result.code,
-          stdout: stdout.text(),
-          stderr: `${stderr.text()}${limitMessage}`
+          ...result,
+          code: result.outputLimitExceeded === true ? -1 : result.code,
+          stderr: `${result.stderr}${result.outputLimitExceeded === true
+            ? '\nAndroid emulator command output exceeded its safety limit.'
+            : ''}`
         }
       }
     })
@@ -2119,8 +2140,8 @@ export class RoomOrchestrator {
       if (ADB_INSTALL_VERBS.has(verb) && !internal) {
         this.androidInstalls.invalidateTarget({ kind: 'physical', targetId: target.deviceId })
       }
-      const result = await this.withDeviceHeartbeat(roomId, target.deviceId, authorized.leaseId, () =>
-        this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs }).catch((error: unknown) => {
+      const result = await this.withDeviceHeartbeat(roomId, target.deviceId, authorized.leaseId, (signal) =>
+        this.devices.hostAdb.exec(authorized.serial, executableArgs, { timeoutMs: opts.timeoutMs, signal }).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           throw new Error(redactAdbText(message, authorized.serial, outputReplacements))
         })
@@ -2137,34 +2158,76 @@ export class RoomOrchestrator {
     roomId: string,
     deviceId: string,
     expectedLeaseId: string | null,
-    run: () => Promise<T>,
-    busy = true
+    run: (signal: AbortSignal) => Promise<T>,
+    busy = true,
+    callerSignal?: AbortSignal
   ): Promise<T> {
-    if (!expectedLeaseId) return run()
+    if (!expectedLeaseId) return run(callerSignal ?? new AbortController().signal)
     this.devices.authorizeInternalOperation(roomId, deviceId, 'starting the fenced device operation', expectedLeaseId)
     const lease = this.devices.leaseForRoom(roomId)
     if (!lease || lease.id !== expectedLeaseId || lease.deviceId !== deviceId) {
       throw new Error('The captured Android device lease changed before execution')
     }
+    const controller = new AbortController()
+    const abortFromCaller = (): void => controller.abort(
+      callerSignal?.reason instanceof Error ? callerSignal.reason : new Error('Fenced Android operation was aborted')
+    )
+    if (callerSignal?.aborted) {
+      abortFromCaller()
+    } else if (callerSignal) {
+      callerSignal.addEventListener('abort', abortFromCaller, { once: true })
+      // Abort can race the precheck and listener registration. Re-read after
+      // registration so a state-changing Host ADB child cannot miss that edge.
+      if (callerSignal.aborted) abortFromCaller()
+    }
+    let fenceError: unknown
     const pulse = (strict = false): void => {
       try {
+        this.devices.authorizeInternalOperation(
+          roomId,
+          deviceId,
+          'continuing the fenced device operation',
+          expectedLeaseId
+        )
         this.devices.heartbeat(expectedLeaseId, { busy })
       } catch (error) {
+        fenceError ??= error
+        controller.abort(fenceError)
         if (strict) throw error
-        // A concurrent disconnect/recovery owns the lease now; the in-flight
-        // adb process will surface its own transport result.
       }
     }
     pulse(true)
-    const interval = Math.max(1000, Math.min(30_000, Math.floor(lease.ttlMs / 3)))
+    // This is an authorization fence, not only a TTL keepalive. A short pulse
+    // bounds how long an in-flight Host adb process may outlive lease loss.
+    const interval = Math.max(100, Math.min(1_000, Math.floor(lease.ttlMs / 6)))
     const timer = setInterval(pulse, interval)
     timer.unref?.()
+    let value!: T
+    let runError: unknown
+    let runFailed = false
     try {
-      return await run()
+      value = await run(controller.signal)
+    } catch (error) {
+      runFailed = true
+      runError = error
     } finally {
       clearInterval(timer)
-      pulse()
+      callerSignal?.removeEventListener('abort', abortFromCaller)
     }
+    // No await may occur after this final exact-lease authorization. If lease
+    // loss aborted the process, its structured fence error takes precedence
+    // over the transport's AbortError or partial result.
+    pulse()
+    if (fenceError) throw fenceError
+    if (callerSignal?.aborted || controller.signal.aborted) {
+      throw callerSignal?.reason instanceof Error
+        ? callerSignal.reason
+        : controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : new Error('Fenced Android operation was aborted')
+    }
+    if (runFailed) throw runError
+    return value
   }
 
   androidScreenshot(roomId: string, mode: 'auto' | 'screen' = 'auto'): Promise<{ png: string; source: 'adb' | 'screen' }> {
@@ -2194,8 +2257,8 @@ export class RoomOrchestrator {
     if (physicalDevice && mode === 'auto') {
       const args = ['exec-out', 'screencap', '-p']
       const authorized = this.devices.authorizeInternalOperation(roomId, physicalDevice.id, 'capturing the attached phone screen')
-      const result = await this.withDeviceHeartbeat(roomId, physicalDevice.id, authorized.leaseId, () =>
-        this.devices.hostAdb.execBinary(authorized.serial, args, { timeoutMs: 60_000 })
+      const result = await this.withDeviceHeartbeat(roomId, physicalDevice.id, authorized.leaseId, (signal) =>
+        this.devices.hostAdb.execBinary(authorized.serial, args, { timeoutMs: 60_000, signal })
       )
       const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
       if (result.code === 0 && result.stdout.subarray(0, signature.length).equals(signature)) {
@@ -2208,10 +2271,10 @@ export class RoomOrchestrator {
       throw new Error(`screenshot of ${physicalDevice.nickname} failed: ${safeError.trim().slice(0, 200) || `adb exited ${result.code}`}`)
     }
     if (mode !== 'screen') {
-      const result = await this.backend.execInRoom(
+      const result = await this.backend.execFencedEmulatorAdb(
         roomId,
-        ['sh', '-lc', `adb -s ${EMULATOR_ADB_SERIAL} exec-out screencap -p | base64 | tr -d '\\n'`],
-        { timeoutMs: 60_000 }
+        ['exec-out', 'sh', '-c', "screencap -p | base64 | tr -d '\\n'"],
+        { timeoutMs: 60_000, maxStdoutBytes: 16 * 1024 * 1024, maxStderrBytes: 16 * 1024 }
       )
       const png = result.stdout.trim()
       if (result.code === 0 && png.length > 100) return { png, source: 'adb' }
@@ -3283,21 +3346,18 @@ export class RoomOrchestrator {
       syncRoute: () => this.syncRouteFor(roomId),
       clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
       clearAndroidEmulatorInstalls: () => this.clearAndroidEmulatorInstalls(roomId),
-      invalidateAndroidInstall: (applicationId) => {
+      execFencedAndroidTarget: (args, opts) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
-        const target: AndroidInstallTarget = physicalDevice
-          ? {
-              kind: 'physical',
-              targetId: physicalDevice.id,
-              deviceId: physicalDevice.id,
-              leaseId: expectedLeaseId!
-            }
-          : { kind: 'emulator', targetId: roomId, deviceId: null }
-        this.androidInstalls.invalidateTargetApplication(target, applicationId)
+        return physicalDevice
+          ? this.adbOnDeviceLocked(roomId, args, opts, {
+              reason: 'running the tracked Android app',
+              expectedLeaseId: expectedLeaseId!
+            })
+          : this.backend.execFencedEmulatorAdb(roomId, args, opts)
       },
-      recordAndroidInstall: async (applicationId, apkPath, changeId) => {
+      installTrackedAndroidApp: async (applicationId, apkPath, changeId) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
-        await this.recordAndroidInstallLocked(
+        await this.installAndRecordAndroidAppLocked(
           roomId,
           physicalDevice
             ? {
@@ -3313,14 +3373,27 @@ export class RoomOrchestrator {
           expectedLeaseId
         )
       },
+      launchTrackedAndroidApp: async (applicationId) => {
+        const selector = physicalDevice
+          ? { kind: 'physical' as const, deviceId: physicalDevice.id }
+          : { kind: 'emulator' as const }
+        if (physicalDevice) capturePhysicalLease()
+        const session = await this.openAndroidAutomationSessionLocked(roomId, selector)
+        await session.launch(applicationId)
+      },
+      isTrackedAndroidAppForeground: async (applicationId) => {
+        const selector = physicalDevice
+          ? { kind: 'physical' as const, deviceId: physicalDevice.id }
+          : { kind: 'emulator' as const }
+        if (physicalDevice) capturePhysicalLease()
+        const session = await this.openAndroidAutomationSessionLocked(roomId, selector)
+        const status = await session.status()
+        return status.foregroundApplicationId === applicationId
+      },
       physicalAndroidDevice:
         physicalDevice
           ? {
               nickname: physicalDevice.nickname,
-              exec: (args, opts) => this.adbOnDeviceLocked(roomId, args, opts, {
-                reason: 'running the tracked Android app',
-                expectedLeaseId: capturePhysicalLease()
-              }),
               keepAlive: (run) => this.withDeviceHeartbeat(roomId, physicalDevice.id, capturePhysicalLease(), run, false)
             }
           : undefined
@@ -3331,7 +3404,7 @@ export class RoomOrchestrator {
     this.androidInstalls.clearTarget(roomId, { kind: 'emulator', targetId: roomId, deviceId: null })
   }
 
-  private async recordAndroidInstallLocked(
+  private async installAndRecordAndroidAppLocked(
     roomId: string,
     target: AndroidInstallTarget,
     applicationId: string,
@@ -3345,30 +3418,47 @@ export class RoomOrchestrator {
     ) {
       throw new Error('Android install receipt received an unsafe APK path')
     }
-    // The install already succeeded. Remove any prior capability before the
-    // fallible copy/hash/fence work so a same-byte reinstall cannot retain it.
+    const roomApkPath = this.validateRoomFilePath(roomId, apkPath)
+    // Revoke before any fallible copy/install/proof work. Once this operation
+    // intends to replace the package, a stale same-byte capability must never
+    // survive a failed install or evidence probe.
     this.androidInstalls.invalidateTargetApplication(target, applicationId)
     const stagingRoot = join(this.userData, 'tmp')
-    mkdirSync(stagingRoot, { recursive: true })
-    const stagingDir = mkdtempSync(join(stagingRoot, 'android-install-receipt-'))
-    const stagedApk = join(stagingDir, 'installed.apk')
+    let stagingDir: string | null = null
+    let stagedApk: string | null = null
+    let operationError: Error | null = null
     try {
-      await this.backend.copyFromRoom(roomId, apkPath, stagedApk)
+      mkdirSync(stagingRoot, { recursive: true })
+      stagingDir = mkdtempSync(join(stagingRoot, 'android-install-receipt-'))
+      stagedApk = join(stagingDir, 'installed.apk')
+      await this.backend.copyFromRoom(roomId, roomApkPath, stagedApk)
       const staged = lstatSync(stagedApk)
       if (!staged.isFile() || staged.isSymbolicLink() || staged.size <= 0 || staged.size > MAX_STAGED_APK_BYTES) {
         throw new Error('Android install receipt refused an invalid or oversized APK')
       }
       const apkSha256 = await hashFileSha256(stagedApk)
+      let install: ExecResult
       if (target.kind === 'physical') {
         if (!expectedLeaseId) throw new Error('Physical Android install receipt has no captured lease')
-        this.devices.authorizeInternalOperation(
+        install = await this.installStagedApkOnPhysicalLocked(
           roomId,
           target.deviceId,
-          'recording the tracked Android install',
-          expectedLeaseId
+          expectedLeaseId,
+          stagedApk,
+          roomApkPath
         )
-      } else if ((await this.backend.emulatorState(roomId)) !== 'running') {
-        throw new Error('The Room emulator disappeared before its install receipt was recorded')
+      } else {
+        install = await this.backend.installFencedEmulatorApk(roomId, stagedApk, {
+          timeoutMs: 180_000,
+          maxStdoutBytes: 64 * 1024,
+          maxStderrBytes: 64 * 1024
+        })
+      }
+      if (install.code !== 0 || install.outputLimitExceeded === true) {
+        const detail = redactSecrets((install.stderr || install.stdout).slice(-300))
+        throw new Error(
+          `adb install ${applicationId} failed${detail ? `: ${detail}` : ` (exit ${install.code})`}`
+        )
       }
       const session = await this.openAndroidAutomationSessionLocked(
         roomId,
@@ -3403,7 +3493,8 @@ export class RoomOrchestrator {
         installedAt,
         packageIncarnation: evidence.packageIncarnation,
         logFence: evidence.logFence,
-        installUserId: evidence.installUserId
+        installUserId: evidence.installUserId,
+        installUserSerial: evidence.installUserSerial
       })
       try {
         // Close the evidence-return/SQLite-commit gap while the Room and exact
@@ -3414,9 +3505,68 @@ export class RoomOrchestrator {
         this.androidInstalls.remove(roomId, target, applicationId)
         throw error
       }
-    } finally {
-      rmSync(stagingDir, { recursive: true, force: true })
+    } catch (error) {
+      operationError = privateAndroidStageError(
+        error,
+        [stagingRoot, stagingDir, stagedApk],
+        'Android install failed while handling its private APK stage'
+      )
     }
+    let cleanupError: Error | null = null
+    if (stagingDir) {
+      try {
+        rmSync(stagingDir, { recursive: true, force: true })
+      } catch (error) {
+        cleanupError = privateAndroidStageError(
+          error,
+          [stagingRoot, stagingDir, stagedApk],
+          'Android private APK staging cleanup failed'
+        )
+      }
+    }
+    if (operationError && cleanupError) {
+      throw new AggregateError(
+        [operationError, cleanupError],
+        `${operationError.message}; private APK staging cleanup also failed`
+      )
+    }
+    if (operationError) throw operationError
+    if (cleanupError) throw cleanupError
+  }
+
+  /** Install one already sealed Host-private APK through an exact physical lease. */
+  private async installStagedApkOnPhysicalLocked(
+    roomId: string,
+    deviceId: string,
+    expectedLeaseId: string,
+    stagedApk: string,
+    publicRoomPath: string
+  ): Promise<ExecResult> {
+    const canonicalApk = realpathSync(stagedApk)
+    const staged = lstatSync(stagedApk)
+    if (
+      staged.isSymbolicLink() ||
+      !staged.isFile() ||
+      staged.size <= 0 ||
+      staged.size > MAX_STAGED_APK_BYTES
+    ) {
+      throw new Error('Physical Android install refused an invalid private APK stage')
+    }
+    const authorized = this.devices.authorizeInternalOperation(
+      roomId,
+      deviceId,
+      'installing the tracked Android app',
+      expectedLeaseId
+    )
+    const result = await this.withDeviceHeartbeat(roomId, deviceId, expectedLeaseId, (signal) =>
+      this.devices.hostAdb.exec(authorized.serial, ['install', '-r', canonicalApk], {
+        timeoutMs: 180_000,
+        signal,
+        maxStdoutBytes: 64 * 1024,
+        maxStderrBytes: 64 * 1024
+      })
+    )
+    return redactAdbResult(result, authorized.serial, [{ privateValue: canonicalApk, publicValue: publicRoomPath }])
   }
 
   private webSpecFor(room: RoomRecord, overrides?: Partial<WebSpec>): WebSpec {

@@ -10,6 +10,7 @@ import type { Route } from '../gateway/routes'
 import type {
   AdbBinaryResult,
   AdbDeviceLine,
+  AdbExecOptions,
   AdbHost,
   AdbHostAvailability,
   AdbPairingAttempt,
@@ -310,14 +311,36 @@ export class FakeBackend implements IsolationBackend {
     const { existsSync, writeFileSync } = await import('node:fs')
     if (!existsSync(hostPath)) writeFileSync(hostPath, 'fake-room-file')
   }
-  fencedEmulatorExecHandler: ((args: string[]) => Promise<ExecResult> | ExecResult) | null = null
-  async execFencedEmulatorAdb(_roomId: string, args: string[], _opts?: ExecOpts): Promise<ExecResult> {
+  fencedEmulatorExecHandler: ((args: string[], opts?: ExecOpts) => Promise<ExecResult> | ExecResult) | null = null
+  fencedEmulatorExecCalls: { args: string[]; opts?: ExecOpts }[] = []
+  async execFencedEmulatorAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {
     this.calls.push(`execFencedEmulatorAdb:${args.join(' ')}`)
-    return this.fencedEmulatorExecHandler?.(args) ?? this.execResult
+    this.fencedEmulatorExecCalls.push({ args, opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const result = await (this.fencedEmulatorExecHandler?.(args, opts) ?? this.execResult)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+    if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+    return {
+      ...result,
+      stdout: opts?.onStdout ? '' : result.stdout,
+      stderr: opts?.onStderr ? '' : result.stderr
+    }
   }
-  async installFencedEmulatorApk(_roomId: string, hostApkPath: string, _opts?: ExecOpts): Promise<ExecResult> {
+  async installFencedEmulatorApk(_roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult> {
     this.calls.push(`installFencedEmulatorApk:${hostApkPath}`)
-    return this.fencedEmulatorExecHandler?.(['install', '-r', '[private-staged-apk]']) ?? this.execResult
+    const args = ['install', '-r', '[private-staged-apk]']
+    this.fencedEmulatorExecCalls.push({ args, opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const result = await (this.fencedEmulatorExecHandler?.(args, opts) ?? this.execResult)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+    if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+    return {
+      ...result,
+      stdout: opts?.onStdout ? '' : result.stdout,
+      stderr: opts?.onStderr ? '' : result.stderr
+    }
   }
   emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
   async createEmulator(
@@ -479,9 +502,11 @@ export class FakeAdbHost implements AdbHost {
   /** Raw PNG bytes this fake phone answers exec-out screencap with. */
   screencapPng = Buffer.alloc(0)
   execHook: ((serial: string, args: string[]) => void) | null = null
-  execResultFor: ((serial: string, args: string[]) => Promise<ExecResult | null> | ExecResult | null) | null = null
+  execResultFor:
+    | ((serial: string, args: string[], opts?: AdbExecOptions) => Promise<ExecResult | null> | ExecResult | null)
+    | null = null
   execBinaryResultFor:
-    | ((serial: string, args: string[]) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
+    | ((serial: string, args: string[], opts?: AdbExecOptions) => Promise<AdbBinaryResult | null> | AdbBinaryResult | null)
     | null = null
   pairingServices: AdbPairingService[] = []
   pairingDiscoveryError: Error | null = null
@@ -515,12 +540,23 @@ export class FakeAdbHost implements AdbHost {
     return this.pairingResult
   }
 
-  async exec(serial: string, args: string[]): Promise<ExecResult> {
+  async exec(serial: string, args: string[], opts?: AdbExecOptions): Promise<ExecResult> {
     this.execs.push({ serial, args })
     this.execHook?.(serial, args)
-    const custom = await this.execResultFor?.(serial, args)
-    if (custom) return custom
-    if (args[0] === 'get-state') return { code: 0, stdout: 'device\n', stderr: '' }
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const custom = await this.execResultFor?.(serial, args, opts)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const stream = (result: ExecResult): ExecResult => {
+      if (opts?.onStdout && result.stdout) opts.onStdout(result.stdout)
+      if (opts?.onStderr && result.stderr) opts.onStderr(result.stderr)
+      return {
+        ...result,
+        stdout: opts?.onStdout ? '' : result.stdout,
+        stderr: opts?.onStderr ? '' : result.stderr
+      }
+    }
+    if (custom) return stream(custom)
+    if (args[0] === 'get-state') return stream({ code: 0, stdout: 'device\n', stderr: '' })
     const phone = this.phones.find((candidate) => candidate.serial === serial)
     if (args[0] === 'shell' && args[1] === 'getprop') {
       const hardwareSerial = phone?.hardwareSerial === undefined ? phone?.serial : (phone.hardwareSerial ?? undefined)
@@ -532,14 +568,16 @@ export class FakeAdbHost implements AdbHost {
         'ro.boot.serialno': hardwareSerial
       }
       const value = values[args[2] ?? '']
-      return { code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' }
+      return stream({ code: value ? 0 : 1, stdout: value ? `${value}\n` : '', stderr: '' })
     }
-    return { code: 0, stdout: '', stderr: '' }
+    return stream({ code: 0, stdout: '', stderr: '' })
   }
 
-  async execBinary(serial: string, args: string[]): Promise<AdbBinaryResult> {
+  async execBinary(serial: string, args: string[], opts?: AdbExecOptions): Promise<AdbBinaryResult> {
     this.execs.push({ serial, args })
-    const custom = await this.execBinaryResultFor?.(serial, args)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    const custom = await this.execBinaryResultFor?.(serial, args, opts)
+    if (opts?.signal?.aborted) throw opts.signal.reason
     if (custom) return custom
     if (args[0] === 'exec-out' && args[1] === 'screencap') {
       return { code: 0, stdout: this.screencapPng, stderr: '', outputLimitExceeded: false }

@@ -188,12 +188,21 @@ export interface AndroidWaitForTextResult {
   attempts: number
 }
 
-export interface AndroidTapTextResult {
+interface AndroidTapTextResultBase {
   target: AndroidAutomationTarget
   applicationId: string
   tapped: AndroidUiNode
-  evidence: AndroidCommandEvidence
+  /** A tap is never safe to repeat automatically, including after an uncertain transport boundary. */
+  retrySafe: false
 }
+
+export type AndroidTapTextResult = AndroidTapTextResultBase & (
+  | { outcome: 'confirmed'; evidence: AndroidCommandEvidence }
+  /** Input returned success, but its post-input screen outcome could not be authorized. */
+  | { outcome: 'committed'; evidence: null }
+  /** Input execution began, but DevHotel could not prove whether Android committed it. */
+  | { outcome: 'indeterminate'; evidence: null }
+)
 
 export interface AndroidLogcatResult {
   target: AndroidAutomationTarget

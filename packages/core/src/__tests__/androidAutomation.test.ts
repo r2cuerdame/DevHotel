@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { AndroidAutomationTarget } from '@devhotel/shared'
+import { DeviceLeaseError } from '@devhotel/shared'
 import {
   AndroidAutomationSession,
   parseAndroidUiHierarchy,
@@ -24,13 +26,18 @@ const PACKAGE_INCARNATION = createHash('sha256')
   .digest('hex')
 const INSTALL_LOG_FENCE = 'devhotel-install-u0-uid10123-11111111-2222-4333-8444-555555555555'
 const SECONDARY_INSTALL_LOG_FENCE = 'devhotel-install-u10-uid1010123-11111111-2222-4333-8444-555555555555'
-function exclusivePackageDump(idField: 'userId' | 'appId'): string {
+const INSTALL_USER_SERIAL = 42
+function exclusivePackageDump(
+  idField: 'userId' | 'appId',
+  userRows: string[] = ['    User 0: ceDataInode=1 installed=true hidden=false stopped=true enabled=0']
+): string {
   return [
     'Packages:',
     `  Package [${APP_ID}] (abc123):`,
     `    ${idField}=10123`,
     `    pkg=Package{abc123 ${APP_ID}}`,
-    `    codePath=${BASE_APK_PATH}`
+    `    codePath=${BASE_APK_PATH}`,
+    ...userRows
   ].join('\n')
 }
 
@@ -38,7 +45,7 @@ const EXCLUSIVE_PACKAGE_DUMP = exclusivePackageDump('appId')
 
 function isGuardedTap(args: string[]): boolean {
   return args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
-    Boolean(args[3]?.includes('exec input tap'))
+    Boolean(args[3]?.includes('input tap "$x" "$y"'))
 }
 
 function targetEpoch(epochMs: number): string {
@@ -153,10 +160,24 @@ describe('tracked Android automation session', () => {
   })
 
   function setup(
-    handler: (args: string[]) => { code: number; stdout: string; stderr: string },
+    handler: (
+      args: string[],
+      witness: {
+        emitScreenEvent(tag: string, payload: string): void
+        emitScreenMarker(payload: string): void
+        emitRawScreenChunk(chunk: string): void
+        emitRawScreenStderr(chunk: string): void
+      }
+    ) => { code: number; stdout: string; stderr: string } | Promise<{ code: number; stdout: string; stderr: string }>,
     timing: Pick<AndroidAutomationSessionOptions, 'now' | 'sleep'> = {},
     targetOverride: AndroidAutomationTarget = target,
-    logFence: string | null = INSTALL_LOG_FENCE
+    logFence: string | null = INSTALL_LOG_FENCE,
+    witnessFixture: {
+      splitInitialDivider?: boolean
+      readerFailureAfterReadyMs?: number
+      readerStartupDelayMs?: number
+      dropPreStartBegin?: boolean
+    } = {}
   ) {
     const installUserId = Number.parseInt(/^devhotel-install-u(\d+)-/.exec(logFence ?? '')?.[1] ?? '0', 10)
     const db = testDb()
@@ -178,10 +199,61 @@ describe('tracked Android automation session', () => {
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
       logFence,
-      installUserId
+      installUserId,
+      installUserSerial: INSTALL_USER_SERIAL
     })
     const calls: string[][] = []
     const timeouts: Array<number | undefined> = []
+    const signals: Array<AbortSignal | undefined> = []
+    let witnessBegin: string | null = null
+    let witnessReader: {
+      onStdout?: (chunk: string | Uint8Array) => void
+      onStderr?: (chunk: string | Uint8Array) => void
+      resolve(result: { code: number; stdout: string; stderr: string }): void
+      reject(error: unknown): void
+      signal?: AbortSignal
+      abort(): void
+    } | null = null
+    let witnessBuffer: 'main' | 'events' = 'main'
+    let witnessEventsStarted = false
+    let witnessRecordCount = 0
+    let witnessMaxRecords = 2
+    const finishWitness = (): void => {
+      if (!witnessReader || witnessRecordCount < witnessMaxRecords) return
+      const reader = witnessReader
+      witnessReader = null
+      reader.signal?.removeEventListener('abort', reader.abort)
+      reader.resolve({ code: 0, stdout: '', stderr: '' })
+    }
+    const emitScreenEvent = (tag: string, payload: string): void => {
+      const reader = witnessReader
+      if (!reader) return
+      const divider = witnessEventsStarted
+        ? witnessBuffer === 'events' ? '' : '--------- switch to events\n'
+        : '--------- beginning of events\n'
+      witnessEventsStarted = true
+      witnessBuffer = 'events'
+      reader.onStdout?.(`${divider}I/${tag}: ${payload}\n`)
+      witnessRecordCount += 1
+      finishWitness()
+    }
+    const emitScreenMarker = (payload: string): void => {
+      const reader = witnessReader
+      if (!reader) return
+      const divider = witnessRecordCount === 0
+        ? '--------- beginning of main\n'
+        : witnessBuffer === 'events' ? '--------- switch to main\n' : ''
+      reader.onStdout?.(`${divider}I/DEVHOTEL_USER_FENCE: ${payload}\n`)
+      witnessBuffer = 'main'
+      witnessRecordCount += 1
+      finishWitness()
+    }
+    const emitRawScreenChunk = (chunk: string): void => {
+      witnessReader?.onStdout?.(chunk)
+    }
+    const emitRawScreenStderr = (chunk: string): void => {
+      witnessReader?.onStderr?.(chunk)
+    }
     const session = new AndroidAutomationSession({
       roomId: 'aaaa1111',
       target: targetOverride,
@@ -190,7 +262,116 @@ describe('tracked Android automation session', () => {
       exec: async (args, opts) => {
         calls.push(args)
         timeouts.push(opts?.timeoutMs)
-        const result = handler(args)
+        signals.push(opts?.signal)
+        if (opts?.signal?.aborted) throw opts.signal.reason
+        if (
+          witnessFixture.readerStartupDelayMs !== undefined &&
+          args[1] === 'sh' &&
+          args[3]?.includes('logcat -b main -b events')
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, witnessFixture.readerStartupDelayMs))
+        }
+        const handled = handler(args, { emitScreenEvent, emitScreenMarker, emitRawScreenChunk, emitRawScreenStderr })
+        // Keep synchronous fake transports synchronous so reader registration
+        // faithfully precedes the first bootstrap marker. Individual command
+        // fixtures can still return a Promise to model in-flight input.
+        const result = handled instanceof Promise ? await handled : handled
+        if (opts?.signal?.aborted) throw opts.signal.reason
+        if (
+          args[0] === 'shell' &&
+          args[1] === 'log' &&
+          args[5] === 'DEVHOTEL_USER_FENCE'
+        ) {
+          const marker = args[6] ?? ''
+          if (marker.startsWith('devhotel-user-begin-')) {
+            witnessBegin = marker
+            emitScreenMarker(marker)
+          }
+          if (marker.startsWith('devhotel-user-end-') && witnessReader) {
+            const reader = witnessReader
+            if (result.code === 0 && result.stdout.length === 0 && result.stderr.length === 0) {
+              const divider = witnessBuffer === 'events' ? '--------- switch to main\n' : ''
+              reader.onStdout?.(`${divider}I/DEVHOTEL_USER_FENCE: ${marker}\n`)
+              witnessBuffer = 'main'
+              witnessRecordCount += 1
+            }
+            finishWitness()
+          }
+          return result
+        }
+        if (
+          args[0] === 'shell' &&
+          args[1] === 'sh' &&
+          args[3]?.includes('for payload in "$@"')
+        ) {
+          const closeMarkers = args.slice(6)
+          if (closeMarkers[0]?.startsWith('devhotel-user-end-') && witnessReader) {
+            const reader = witnessReader
+            if (result.code === 0 && result.stdout.length === 0 && result.stderr.length === 0) {
+              for (const marker of closeMarkers) {
+                if (!witnessReader || witnessRecordCount >= witnessMaxRecords) break
+                const divider = witnessBuffer === 'events' ? '--------- switch to main\n' : ''
+                reader.onStdout?.(`${divider}I/DEVHOTEL_USER_FENCE: ${marker}\n`)
+                witnessBuffer = 'main'
+                witnessRecordCount += 1
+              }
+            }
+            finishWitness()
+          }
+          return result
+        }
+        if (
+          args[0] === 'shell' &&
+          args[1] === 'sh' &&
+          args[3]?.includes('logcat -b main -b events')
+        ) {
+          if (result.stdout) opts?.onStdout?.(result.stdout)
+          if (result.stderr) opts?.onStderr?.(result.stderr)
+          if (result.code !== 0 || result.stdout.length > 0 || result.stderr.length > 0) {
+            return result
+          }
+          witnessBuffer = 'main'
+          witnessEventsStarted = false
+          witnessRecordCount = 0
+          witnessMaxRecords = Number.parseInt(args.at(-1) ?? '2', 10)
+          return new Promise((resolve, reject) => {
+            const reader = {
+              onStdout: opts?.onStdout,
+              onStderr: opts?.onStderr,
+              resolve,
+              reject,
+              signal: opts?.signal,
+              abort: () => undefined
+            }
+            reader.abort = () => {
+              if (witnessReader !== reader) return
+              witnessReader = null
+              reader.signal?.removeEventListener('abort', reader.abort)
+              reject(reader.signal?.reason ?? new Error('fake witness reader aborted'))
+            }
+            witnessReader = reader
+            if (reader.signal?.aborted) reader.abort()
+            else reader.signal?.addEventListener('abort', reader.abort, { once: true })
+            if (witnessBegin && !witnessFixture.dropPreStartBegin) {
+              if (witnessFixture.splitInitialDivider) {
+                opts?.onStdout?.('--------- beginning of main\n')
+                opts?.onStdout?.(`I/DEVHOTEL_USER_FENCE: ${witnessBegin}\n`)
+                witnessRecordCount += 1
+              } else {
+                emitScreenMarker(witnessBegin)
+              }
+            }
+            if (witnessFixture.readerFailureAfterReadyMs !== undefined) {
+              const timer = setTimeout(() => {
+                if (witnessReader !== reader) return
+                witnessReader = null
+                reader.signal?.removeEventListener('abort', reader.abort)
+                reject(new Error('fake reader transport timed out'))
+              }, witnessFixture.readerFailureAfterReadyMs)
+              timer.unref?.()
+            }
+          })
+        }
         if (
           args[1] === 'am' &&
           args[2] === 'get-current-user' &&
@@ -198,6 +379,19 @@ describe('tracked Android automation session', () => {
           !result.stdout.trim()
         ) {
           return { code: 0, stdout: `${installUserId}\n`, stderr: '' }
+        }
+        if (
+          args[1] === 'dumpsys' &&
+          args[2] === 'user' &&
+          args[3] === '--user' &&
+          !result.stdout.startsWith(' UserInfo{')
+        ) {
+          const userId = args[4]!
+          return {
+            code: 0,
+            stdout: ` UserInfo{${userId}:DevHotel:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=${userId === '0'}\n Type: android.os.usertype.full.SECONDARY\n`,
+            stderr: ''
+          }
         }
         if (
           args[1] === 'sh' &&
@@ -213,11 +407,14 @@ describe('tracked Android automation session', () => {
         if (args[1] === 'sha256sum' && result.code === 0 && !/^[a-fA-F0-9]{64}(?:\s|$)/.test(result.stdout)) {
           return { code: 0, stdout: `${'a'.repeat(64)}  ${args[2]}\n`, stderr: '' }
         }
+        if (args[1] === 'pgrep' && result.code === 0 && result.stdout.length === 0 && result.stderr.length === 0) {
+          return { code: 1, stdout: '', stderr: '' }
+        }
         return result
       },
       ...timing
     })
-    return { db, installs, calls, session, timeouts }
+    return { db, installs, calls, session, signals, timeouts }
   }
 
   it.each([
@@ -258,6 +455,7 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
       installUserId: userId,
+      installUserSerial: INSTALL_USER_SERIAL,
       logFence: emittedFence
     })
     expect(emittedFence).toMatch(new RegExp(`^devhotel-install-u${userId}-uid${uid}-[0-9a-f-]{36}$`))
@@ -296,6 +494,36 @@ describe('tracked Android automation session', () => {
     })
   })
 
+  it('rejects install evidence when the numeric user ID is recycled during proof', async () => {
+    let markerRead = false
+    let emittedFence = ''
+    const { session } = setup((args) => {
+      if (args[1] === 'dumpsys' && args[2] === 'user') {
+        return {
+          code: 0,
+          stdout: ` UserInfo{0:DevHotel:13} serialNo=${markerRead ? INSTALL_USER_SERIAL + 1 : INSTALL_USER_SERIAL} isPrimary=true\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'run-as') {
+        emittedFence = args.at(-1)!
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'logcat') {
+        markerRead = true
+        return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.establishInstallEvidence(APP_ID)).rejects.toMatchObject({
+      code: 'ANDROID_APP_USER_CHANGED'
+    })
+  })
+
   it('keeps non-log install evidence when the bounded fence proof overflows', async () => {
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
@@ -310,6 +538,7 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
       installUserId: 0,
+      installUserSerial: INSTALL_USER_SERIAL,
       logFence: null
     })
   })
@@ -331,6 +560,7 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
       installUserId: 0,
+      installUserSerial: INSTALL_USER_SERIAL,
       logFence: null
     })
     expect(pathProbes).toBe(2)
@@ -383,6 +613,7 @@ describe('tracked Android automation session', () => {
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
       installUserId: 0,
+      installUserSerial: INSTALL_USER_SERIAL,
       logFence: null
     })
     expect(calls.some((args) => args[1] === 'run-as' || args[0] === 'logcat')).toBe(false)
@@ -395,6 +626,9 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'stat') return { code: 0, stdout: `${BASE_APK_STAT}\n`, stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
       return { code: 0, stdout: 'Status: ok\n', stderr: '' }
     })
 
@@ -426,6 +660,9 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'am' && args[2] === 'get-current-user') return { code: 0, stdout: '0\n', stderr: '' }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: 'package:/data/app/base.apk\n', stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/com.vendor.auth.LoginActivity}\n`, stderr: '' }
+      }
       return { code: 0, stdout: 'Status: ok\n', stderr: '' }
     })
 
@@ -446,6 +683,9 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'stat') return { code: 0, stdout: `${BASE_APK_STAT}\n`, stderr: '' }
       if (args[1] === 'sha256sum') return { code: 0, stdout: `${'a'.repeat(64)}  /data/app/base.apk\n`, stderr: '' }
       if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
       return { code: 1, stdout: 'x'.repeat(5_000), stderr: `token=${secret}` }
     })
 
@@ -460,6 +700,44 @@ describe('tracked Android automation session', () => {
     await session.launch(APP_ID).catch((error: unknown) => {
       expect(JSON.stringify(error)).not.toContain(secret)
     })
+  })
+
+  it('rejects a dispatched launch that redirects away from the tracked package', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
+      if (args[1] === 'am' && args[2] === 'start') return { code: 0, stdout: 'Status: ok\n', stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.other.app/.PrivateActivity}\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.launch(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_APP_NOT_FOREGROUND' })
+  })
+
+  it.each([
+    {
+      state: 'tracked mFocusedApp behind a SystemUI current-focus window',
+      stdout: `mFocusedApp=AppWindowToken{1 token=Token{2 ActivityRecord{3 u0 ${APP_ID}/.MainActivity}}}\n` +
+        'mCurrentFocus=Window{4 u0 com.android.systemui/.SystemUI}\n',
+      code: 'ANDROID_FOREGROUND_UNKNOWN'
+    },
+    {
+      state: 'mFocusedApp without any current-focus window',
+      stdout: `mFocusedApp=AppWindowToken{1 token=Token{2 ActivityRecord{3 u0 ${APP_ID}/.MainActivity}}}\n`,
+      code: 'ANDROID_FOREGROUND_UNKNOWN'
+    }
+  ])('never treats $state as launch foreground authority', async ({ stdout, code }) => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'cmd') return { code: 0, stdout: `${APP_ID}/.MainActivity\n`, stderr: '' }
+      if (args[1] === 'am' && args[2] === 'start') return { code: 0, stdout: 'Status: ok\n', stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) return { code: 0, stdout, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.launch(APP_ID)).rejects.toMatchObject({ code })
   })
 
   it('prioritizes package replacement over launch failure evidence from the replacement', async () => {
@@ -492,6 +770,7 @@ describe('tracked Android automation session', () => {
     let replaced = false
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'stat') return { code: 0, stdout: `${replaced ? replacementStat : BASE_APK_STAT}\n`, stderr: '' }
       if (args[1] === 'am' && args[2] === 'force-stop') {
         replaced = true
@@ -510,6 +789,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `${switched ? 10 : 0}\n`, stderr: '' }
       }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
       if (args[1] === 'am' && args[2] === 'force-stop') {
         switched = true
         return { code: 0, stdout: 'Force stopped\n', stderr: '' }
@@ -523,6 +803,364 @@ describe('tracked Android automation session', () => {
       { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
       APP_ID
     )).not.toBeNull()
+  })
+
+  it('returns force-stop success only after exact-user foreground absence and the package stopped bit are proven', async () => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
+  })
+
+  it.each([
+    { state: 'package stopped bit remains false', stopped: false, foregroundRemains: false },
+    { state: 'foreground remains', stopped: true, foregroundRemains: true }
+  ])('rejects code-zero force-stop when the $state', async ({ stopped, foregroundRemains }) => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return {
+          code: 0,
+          stdout: `${exclusivePackageDump('appId', [
+            `    User 0: installed=true hidden=false stopped=${stopped} enabled=0`
+          ])}\n\n${args.at(-1)}\n`,
+          stderr: ''
+        }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return {
+          code: 0,
+          stdout: foregroundRemains
+            ? `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`
+            : 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, { sleep: async () => undefined })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+  })
+
+  it('supports API 30 and a declared shared UID without treating sibling processes as package state', async () => {
+    const api30 = { ...target, androidVersion: '11.0', apiLevel: 30 }
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        const dump = exclusivePackageDump('userId').replace(
+          '    pkg=',
+          '    sharedUser=SharedUserSetting{legacy.shared/10123}\n    pkg='
+        )
+        return { code: 0, stdout: `${dump}\n\n${args.at(-1)}\n`, stderr: '' }
+      }
+      if (args[1] === 'pgrep') return { code: 0, stdout: '1234\n5678\n', stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }, {}, api30)
+
+    await expect(session.forceStop(APP_ID)).resolves.toMatchObject({ applicationId: APP_ID })
+    expect(calls.some((args) => args[1] === 'pgrep' || args[1] === 'pm' && args.includes('--uid'))).toBe(false)
+  })
+
+  it.each([
+    { label: 'missing', rows: [] as string[], code: 0, stderr: '', oversized: false },
+    { label: 'duplicate', rows: ['    User 0: installed=true stopped=true', '    User 0: installed=true stopped=true'], code: 0, stderr: '', oversized: false },
+    { label: 'wrong user', rows: ['    User 10: installed=true stopped=true'], code: 0, stderr: '', oversized: false },
+    { label: 'nonzero', rows: ['    User 0: installed=true stopped=true'], code: 1, stderr: '', oversized: false },
+    { label: 'stderr', rows: ['    User 0: installed=true stopped=true'], code: 0, stderr: 'private warning', oversized: false },
+    { label: 'truncated', rows: ['    User 0: installed=true stopped=true'], code: 0, stderr: '', oversized: true }
+  ])('fails force-stop closed on a $label package-state proof', async ({ rows, code, stderr, oversized }) => {
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.startsWith('dumpsys package "$1"')) {
+        return {
+          code,
+          stdout: oversized
+            ? 'x'.repeat(1024 * 1024 + 1)
+            : `${exclusivePackageDump('appId', rows)}\n\n${args.at(-1)}\n`,
+          stderr
+        }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
+  })
+
+  it('streams a screen witness into Host memory and reveals its end marker only after the action', async () => {
+    const { calls, session } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+    let actionAt = -1
+
+    const value = await session.withActiveUserScreenWitness(async () => {
+      actionAt = calls.length
+      return 'captured'
+    })
+
+    expect(value).toBe('captured')
+    const beginIndex = calls.findIndex((args) => args[1] === 'log' && args.at(-1)?.startsWith('devhotel-user-begin-'))
+    const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('DEVHOTEL_USER_FENCE:I'))
+    const endIndex = calls.findIndex((args) =>
+      args[1] === 'sh' && args.some((value) => value.startsWith('devhotel-user-end-'))
+    )
+    expect(beginIndex).toBeGreaterThanOrEqual(0)
+    expect(readerIndex).toBeLessThan(beginIndex)
+    expect(readerIndex).toBeLessThan(actionAt)
+    expect(endIndex).toBeGreaterThanOrEqual(actionAt)
+    expect(calls[readerIndex]?.[3]).toContain('-D -v tag,printable')
+    expect(calls[readerIndex]?.[3]).toMatch(/^exec logcat /)
+    expect(calls[readerIndex]?.[3]).not.toMatch(/mkfifo|\/data\/local\/tmp|\|/)
+    expect(calls[readerIndex]?.[3]).toContain('am_switch_user:V')
+    expect(calls[readerIndex]?.[3]).toContain('wm_resume_activity:V')
+    const syntax = spawnSync('sh', ['-n', '-c', calls[readerIndex]?.[3] ?? ''], {
+      encoding: 'utf8',
+      windowsHide: true
+    })
+    expect({ status: syntax.status, stderr: syntax.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(Number(calls[readerIndex]?.at(-1))).toBeGreaterThan(2)
+    expect(calls.some((args) => args.some((value) => value.includes('/data/local/tmp')))).toBe(false)
+  })
+
+  it('does not miss cancellation between a pause precheck and listener registration', async () => {
+    const reason = new Error('screen witness was cancelled during pause setup')
+    let abortedReads = 0
+    const signal = {
+      get aborted() {
+        abortedReads += 1
+        return abortedReads >= 2
+      },
+      reason,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined
+    } as unknown as AbortSignal
+    const { calls, session } = setup(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      { sleep: () => new Promise(() => undefined) }
+    )
+    const pauseWithSignal = (session as unknown as {
+      pauseWithSignal(ms: number, signal: AbortSignal): Promise<void>
+    }).pauseWithSignal.bind(session)
+
+    await expect(pauseWithSignal(60_000, signal)).rejects.toBe(reason)
+    expect(abortedReads).toBeGreaterThanOrEqual(2)
+    expect(calls).toEqual([])
+  })
+
+  it('preserves an exact lease error when its command deadline expires concurrently', async () => {
+    const leaseError = new DeviceLeaseError('lease-expired', 'exact physical lease expired')
+    let clockReads = 0
+    const { session } = setup(
+      () => { throw leaseError },
+      { now: () => clockReads++ === 0 ? 0 : 100 }
+    )
+    const command = (session as unknown as {
+      command(args: string[], opts: {
+        deadline: { at: number; applicationId: string }
+        operation: string
+      }): Promise<unknown>
+    }).command.bind(session)
+
+    await expect(command(['shell', 'get-state'], {
+      deadline: { at: 50, applicationId: APP_ID },
+      operation: 'deadline and lease precedence probe'
+    })).rejects.toBe(leaseError)
+  })
+
+  it('returns the original action error only after an exact screen witness closes', async () => {
+    const { session } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+    const original = new Error('bounded capture failed')
+
+    let captured: unknown
+    try {
+      await session.withActiveUserScreenWitness(async () => { throw original })
+    } catch (error) {
+      captured = error
+    }
+    expect(captured).toBe(original)
+  })
+
+  it('accepts a divider/record chunk split while the live reader is becoming ready', async () => {
+    const { session } = setup(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      {},
+      target,
+      INSTALL_LOG_FENCE,
+      { splitInitialDivider: true }
+    )
+
+    await expect(session.withActiveUserScreenWitness(async () => 'split-ok')).resolves.toBe('split-ok')
+  })
+
+  it('never starts an action when one bootstrap chunk already contains a forbidden transition', async () => {
+    let actions = 0
+    const { session } = setup((args, witness) => {
+      if (args[1] === 'log' && args.at(-1)?.startsWith('devhotel-user-begin-')) {
+        witness.emitRawScreenChunk([
+          '--------- beginning of main',
+          `I/DEVHOTEL_USER_FENCE: ${args.at(-1)}`,
+          '--------- beginning of events',
+          'I/input_focus: Window{private-system-overlay},reason=UpdateInputWindows',
+          ''
+        ].join('\n'))
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.withActiveUserScreenWitness(async () => {
+      actions += 1
+      return 'must-not-run'
+    })).rejects.toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+    expect(actions).toBe(0)
+  })
+
+  it('never starts an action when its observed begin marker is beyond the bootstrap record budget', async () => {
+    let actions = 0
+    const { session } = setup((args, witness) => {
+      if (args[1] === 'log' && args.at(-1)?.startsWith('devhotel-user-begin-')) {
+        witness.emitRawScreenChunk([
+          '--------- beginning of main',
+          ...Array.from({ length: 8 }, (_, index) => `I/DEVHOTEL_USER_FENCE: stale-${index}`),
+          `I/DEVHOTEL_USER_FENCE: ${args.at(-1)}`,
+          ''
+        ].join('\n'))
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.withActiveUserScreenWitness(async () => {
+      actions += 1
+      return 'must-not-run'
+    })).rejects.toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+    expect(actions).toBe(0)
+  })
+
+  it('observes a fresh marker on one live reader after slow startup displaced every pre-start marker', async () => {
+    let actions = 0
+    const { calls, session } = setup(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      {},
+      target,
+      INSTALL_LOG_FENCE,
+      { readerStartupDelayMs: 1_100, dropPreStartBegin: true }
+    )
+
+    await expect(session.withActiveUserScreenWitness(async () => {
+      actions += 1
+      return 'retry-ok'
+    })).resolves.toBe('retry-ok')
+    expect(actions).toBe(1)
+    expect(calls.filter((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events')))
+      .toHaveLength(1)
+    expect(calls.filter((args) => args[1] === 'log' && args.at(-1)?.startsWith('devhotel-user-begin-')).length)
+      .toBeGreaterThan(1)
+  })
+
+  it('aborts and awaits the live reader when close markers fail before an end record exists', async () => {
+    const started = Date.now()
+    const { calls, session, signals } = setup((args) =>
+      args[1] === 'sh' && args[3]?.includes('for payload in "$@"')
+        ? { code: 1, stdout: '', stderr: 'marker unavailable' }
+        : { code: 0, stdout: '', stderr: '' }
+    )
+
+    await expect(session.withActiveUserScreenWitness(async () => 'withheld')).rejects.toMatchObject({
+      code: 'ANDROID_SCREEN_WITNESS_FAILED'
+    })
+    const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
+    expect(signals[readerIndex]?.aborted).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('derives the reader lifetime from the declared action window plus setup and close budgets', async () => {
+    const { calls, session, timeouts } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+
+    await session.withActiveUserScreenWitness(async () => 'slow-boundary', { actionTimeoutMs: 70_000 })
+
+    const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
+    expect(timeouts[readerIndex]).toBe(160_000)
+  })
+
+  it('aborts an action-aware never-ending callback and awaits reader cleanup at its declared deadline', async () => {
+    const started = Date.now()
+    const { calls, session, signals } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+    let actionAborted = false
+
+    await expect(session.withActiveUserScreenWitness(
+      (signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          actionAborted = true
+          reject(signal.reason)
+        }, { once: true })
+      }),
+      { actionTimeoutMs: 20 }
+    )).rejects.toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+
+    const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
+    expect(actionAborted).toBe(true)
+    expect(signals[readerIndex]?.aborted).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('aborts an action-aware callback when the live reader transport exits first', async () => {
+    const { session } = setup(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      {},
+      target,
+      INSTALL_LOG_FENCE,
+      { readerFailureAfterReadyMs: 20 }
+    )
+    let actionAborted = false
+
+    await expect(session.withActiveUserScreenWitness((signal) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          actionAborted = true
+          reject(signal.reason)
+        }, { once: true })
+      })
+    )).rejects.toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+    expect(actionAborted).toBe(true)
+  })
+
+  it('allows a fenced emulator helper more than one second to start its live reader', async () => {
+    const { session } = setup(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      {},
+      target,
+      INSTALL_LOG_FENCE,
+      { readerStartupDelayMs: 1_100 }
+    )
+
+    await expect(session.withActiveUserScreenWitness(async () => 'ready')).resolves.toBe('ready')
+  })
+
+  it('prioritizes a foreground-transition witness failure over private action errors', async () => {
+    let emitScreenEvent: (tag: string, payload: string) => void = () => undefined
+    const { session } = setup((_args, witness) => {
+      emitScreenEvent = witness.emitScreenEvent
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let captured: unknown
+    try {
+      await session.withActiveUserScreenWitness(async () => {
+        emitScreenEvent('wm_set_resumed_activity', '[0,com.other.app/.PrivateActivity,topResumed]')
+        throw new Error('private-cross-app-capture-error')
+      })
+    } catch (error) {
+      captured = error
+    }
+    expect(captured).toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+    expect(JSON.stringify(captured)).not.toContain('private-cross-app-capture-error')
   })
 
   it('filters cross-app UI and refuses an ambiguous text tap before input', async () => {
@@ -575,6 +1213,31 @@ describe('tracked Android automation session', () => {
       code: 'ANDROID_UI_TEXT_MOVED'
     })
     expect(hierarchy).toBe(2)
+    expect(calls.some(isGuardedTap)).toBe(false)
+  })
+
+  it('refuses coordinates that move while the tap witness is bootstrapping', async () => {
+    let screenReaders = 0
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'sh' && args[3]?.includes('logcat -b main -b events')) screenReaders += 1
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        const left = screenReaders >= 2 ? 20 : 0
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[${left},0][${left + 20},20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
+      code: 'ANDROID_UI_TEXT_MOVED'
+    })
     expect(calls.some(isGuardedTap)).toBe(false)
   })
 
@@ -638,6 +1301,39 @@ describe('tracked Android automation session', () => {
     expect(JSON.stringify(capturedError)).not.toContain('private-ui')
   })
 
+  it('withholds UI captured across an active-user A-B-A switch witness', async () => {
+    const { calls, session } = setup((args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        witness.emitScreenEvent('am_switch_user', '10')
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="cross-user-private-ui" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    let capturedError: unknown
+    try {
+      await session.dumpUi({ applicationId: APP_ID })
+    } catch (error) {
+      capturedError = error
+    }
+    expect(capturedError).toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+    const wire = calls.find((args) => args[0] === 'shell' && args[1] === 'sh' && args[3]?.includes('logcat'))
+    expect(wire?.[3]).toContain('-b main -b events -T 1 -m "$1" -D')
+    expect(wire?.[3]).toContain('DEVHOTEL_USER_FENCE:I')
+    expect(wire?.[3]).toContain('am_switch_user:V')
+    expect(wire?.[3]).toContain('wm_resume_activity:V')
+    expect(calls.some((args) => args.some((value) => value.includes('.user-switch')))).toBe(false)
+    expect(JSON.stringify(capturedError)).not.toContain('cross-user-private-ui')
+  })
+
   it('withholds tap success when the package is replaced during input', async () => {
     const replacementStat = '103:5252:123456:1788157200:1788157300'
     let replaced = false
@@ -666,6 +1362,308 @@ describe('tracked Android automation session', () => {
     })
   })
 
+  it('confirms same-app navigation observed after the guarded input witness closes', async () => {
+    let tapped = false
+    const { session } = setup((args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        const activity = tapped ? '.DetailsActivity' : '.MainActivity'
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/${activity}}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" resource-id="${APP_ID}:id/next" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        tapped = true
+        setTimeout(() => {
+          witness.emitScreenEvent(
+            'wm_resume_activity',
+            `[0,12345,44,${APP_ID}/.DetailsActivity]`
+          )
+          witness.emitScreenEvent('input_focus', 'Window{same-app-details},reason=UpdateInputWindows')
+        }, 10)
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).resolves.toMatchObject({
+      applicationId: APP_ID,
+      tapped: { text: 'Next' },
+      outcome: 'confirmed',
+      retrySafe: false
+    })
+  })
+
+  it('returns an explicit non-retry-safe indeterminate outcome when focus changes while input is pending', async () => {
+    const { calls, session } = setup(async (args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        // AOSP logs Activity focus changes while `input tap` can still be
+        // returning. DevHotel cannot distinguish input-caused navigation from
+        // an overlay race at this boundary, so it must forbid auto-retry.
+        witness.emitScreenEvent(
+          'input_focus',
+          `Focus entering 123 ${APP_ID}/.DetailsActivity (server),reason=setFocusedWindow`
+        )
+        await Promise.resolve()
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).resolves.toMatchObject({
+      applicationId: APP_ID,
+      tapped: { text: 'Next' },
+      outcome: 'indeterminate',
+      retrySafe: false,
+      evidence: null
+    })
+    expect(calls.filter(isGuardedTap)).toHaveLength(1)
+  })
+
+  it('returns indeterminate when the guarded input transport rejects after invocation', async () => {
+    const transportError = new Error('private adb transport disconnected after input dispatch')
+    const { calls, session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') {
+        return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) throw transportError
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).resolves.toMatchObject({
+      applicationId: APP_ID,
+      tapped: { text: 'Next' },
+      outcome: 'indeterminate',
+      retrySafe: false,
+      evidence: null
+    })
+    expect(calls.filter(isGuardedTap)).toHaveLength(1)
+  })
+
+  it.each([
+    { transitions: 0, outcome: 'success' as const },
+    { transitions: 14, outcome: 'success' as const },
+    { transitions: 15, outcome: 'failure' as const }
+  ])('handles exactly $transitions allowed tap transitions with deterministic record padding', async ({
+    transitions,
+    outcome
+  }) => {
+    const { session } = setup((args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" resource-id="${APP_ID}:id/next" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        for (let index = 0; index < transitions; index += 1) {
+          witness.emitScreenEvent(
+            'wm_resume_activity',
+            `[0,${10_000 + index},44,${APP_ID}/.DetailsActivity]`
+          )
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    const result = session.tapText({ applicationId: APP_ID, text: 'Next' })
+    if (outcome === 'success') {
+      await expect(result).resolves.toMatchObject({ applicationId: APP_ID, outcome: 'confirmed' })
+    } else {
+      await expect(result).resolves.toMatchObject({
+        applicationId: APP_ID,
+        outcome: 'indeterminate',
+        retrySafe: false,
+        evidence: null
+      })
+    }
+  })
+
+  it('returns committed without inviting retry when the observed follow-up belongs to another app', async () => {
+    let tapped = false
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return {
+          code: 0,
+          stdout: tapped
+            ? 'mCurrentFocus=Window{1 u0 com.other.app/.PrivateActivity}\n'
+            : `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`,
+          stderr: ''
+        }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) tapped = true
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).resolves.toMatchObject({
+      outcome: 'committed',
+      retrySafe: false,
+      evidence: null
+    })
+  })
+
+  it.each([
+    { mode: 'forbidden input focus', flood: false },
+    { mode: 'record-cap flood', flood: true }
+  ])('aborts before input when the live witness observes a $mode during preflight', async ({ flood }) => {
+    let readerStarted = false
+    let emitted = false
+    const { calls, session } = setup((args, witness) => {
+      if (args[1] === 'sh' && args[3]?.includes('logcat -b main -b events')) readerStarted = true
+      if (readerStarted && !emitted && args[1] === 'am' && args[2] === 'get-current-user') {
+        emitted = true
+        if (flood) {
+          for (let index = 0; index < 15; index += 1) {
+            witness.emitScreenEvent(
+              'wm_resume_activity',
+              `[0,${20_000 + index},44,${APP_ID}/.DetailsActivity]`
+            )
+          }
+        } else {
+          witness.emitScreenEvent('input_focus', 'Window{private-system-overlay},reason=UpdateInputWindows')
+        }
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).rejects.toMatchObject({
+      code: 'ANDROID_SCREEN_WITNESS_FAILED'
+    })
+    expect(calls.some(isGuardedTap)).toBe(false)
+  })
+
+  it('aborts before input when the live reader writes diagnostics during preflight', async () => {
+    let screenReaders = 0
+    let emitted = false
+    const { calls, session } = setup((args, witness) => {
+      if (args[1] === 'sh' && args[3]?.includes('logcat -b main -b events')) screenReaders += 1
+      if (screenReaders >= 2 && !emitted && args[0] === 'exec-out') {
+        emitted = true
+        witness.emitRawScreenStderr('private logcat warning')
+      }
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).rejects.toMatchObject({
+      code: 'ANDROID_SCREEN_WITNESS_FAILED'
+    })
+    expect(calls.some(isGuardedTap)).toBe(false)
+  })
+
+  it('withholds strict screen evidence across an input-focus-only transient overlay', async () => {
+    const { session } = setup((_args, witness) => {
+      witness.emitScreenEvent('input_focus', 'Window{private-system-overlay},reason=UpdateInputWindows')
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.withActiveUserScreenWitness(async () => 'private-screen')).rejects.toMatchObject({
+      code: 'ANDROID_SCREEN_WITNESS_FAILED'
+    })
+  })
+
+  it('returns committed when close framing is corrupted after Android accepted input', async () => {
+    let tapped = false
+    const { session } = setup((args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Next" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) tapped = true
+      if (tapped && args[1] === 'sh' && args[3]?.includes('for payload in "$@"')) {
+        witness.emitScreenMarker(args[6]!)
+        witness.emitScreenEvent('wm_resume_activity', '[0,12345,44,com.other.app/.PrivateActivity]')
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Next' })).resolves.toMatchObject({
+      outcome: 'committed',
+      retrySafe: false,
+      evidence: null
+    })
+  })
+
+  it('rejects an ambiguous tagged activity transition instead of treating it as same-app', async () => {
+    let emitScreenEvent: (tag: string, payload: string) => void = () => undefined
+    const { session } = setup((_args, witness) => {
+      emitScreenEvent = witness.emitScreenEvent
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.withActiveUserScreenWitness(async () => {
+      emitScreenEvent('wm_resume_activity', `[0,not-a-complete-record,${APP_ID}/.DetailsActivity]`)
+    })).rejects.toMatchObject({ code: 'ANDROID_SCREEN_WITNESS_FAILED' })
+  })
+
   it('guards input with the sealed active user inside the same guest command', async () => {
     let switched = false
     const { calls, session } = setup((args) => {
@@ -690,16 +1688,57 @@ describe('tracked Android automation session', () => {
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).rejects.toMatchObject({
-      code: 'ANDROID_APP_USER_CHANGED'
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).resolves.toMatchObject({
+      outcome: 'indeterminate',
+      retrySafe: false,
+      evidence: null
     })
     const tap = calls.find(isGuardedTap)
     expect(tap?.slice(0, 5)).toEqual([
       'shell', 'sh', '-c',
-      'current="$(am get-current-user)" || exit 70; [ "$current" = "$1" ] || exit 71; exec input tap "$2" "$3"',
+      expect.stringContaining('input tap "$x" "$y"'),
       'devhotel-tap'
     ])
-    expect(tap?.slice(5)).toEqual(['0', '10', '10'])
+    expect(tap?.slice(5, 8)).toEqual(['0', '10', '10'])
+    expect(tap?.[3]).toContain('[ "$current" = "$expected_user" ] || exit 71')
+    expect(tap).toHaveLength(8)
+    const tapIndex = calls.indexOf(tap!)
+    const endIndex = calls.findIndex((args, index) =>
+      index > tapIndex && (
+        args[1] === 'log' && args.at(-1)?.startsWith('devhotel-user-end-') ||
+        args[1] === 'sh' && args.some((value) => value.startsWith('devhotel-user-end-'))
+      )
+    )
+    expect(endIndex).toBeGreaterThan(tapIndex)
+  })
+
+  it('returns indeterminate when the live witness observes an A-B-A user switch during input', async () => {
+    const { calls, session } = setup((args, witness) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
+      }
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: `<hierarchy><node package="${APP_ID}" text="Crash" resource-id="${APP_ID}:id/crash" class="android.widget.Button" bounds="[0,0][20,20]" /></hierarchy>`,
+          stderr: ''
+        }
+      }
+      if (isGuardedTap(args)) {
+        witness.emitScreenEvent('wm_set_resumed_activity', '[0,com.other.app/.PrivateActivity,topResumed]')
+        return { code: 0, stdout: 'private-tap-evidence\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.tapText({ applicationId: APP_ID, text: 'Crash' })).resolves.toMatchObject({
+      outcome: 'indeterminate',
+      retrySafe: false,
+      evidence: null
+    })
+    expect(calls.some((args) => args[0] === 'shell' && args[1] === 'sh' && args[3]?.includes('logcat'))).toBe(true)
+    expect(calls.some((args) => args.some((value) => value.includes('/data/local/tmp/devhotel-tap-')))).toBe(false)
   })
 
   it('withholds tap evidence when the package is replaced during the final foreground probe', async () => {
@@ -786,20 +1825,27 @@ describe('tracked Android automation session', () => {
     await expect(session.waitForText({
       applicationId: APP_ID,
       text: 'Ready',
-      timeoutMs: 250,
+      timeoutMs: 1_000,
       pollIntervalMs: 250
     })).rejects.toMatchObject({ code: 'ANDROID_WAIT_TIMEOUT' })
 
-    expect(timeouts[0]).toBe(250)
+    expect(timeouts[0]).toBe(1_000)
     expect(timeouts.every((timeout, index) =>
       timeout !== undefined && timeout > 0 && (index === 0 || timeout <= timeouts[index - 1]!)
     )).toBe(true)
-    expect(timeouts.at(-1)).toBeLessThan(250)
-    expect(calls.some((args) => args[1] === 'rm')).toBe(false)
+    expect(timeouts.at(-1)).toBeLessThan(1_000)
+    expect(calls.some((args) =>
+      args[1] === 'rm' && args.at(-1)?.includes('/data/local/tmp/devhotel-ui-')
+    )).toBe(false)
     const trappedDump = calls.find((args) => args[0] === 'exec-out')
     expect(trappedDump?.[3]).toContain('trap cleanup 0 1 2 15')
     expect(trappedDump?.[3]).toContain('kill "$child"')
+    expect(trappedDump?.[3]).not.toContain('logcat')
     expect(trappedDump?.[5]).toMatch(/^\/data\/local\/tmp\/devhotel-ui-[a-f0-9-]+\.xml$/)
+    expect(calls.find((args) => args[1] === 'sh' && args[3]?.includes('logcat'))?.[3]).toContain(
+      'logcat -b main -b events -T 1 -m "$1" -D'
+    )
+    expect(calls.some((args) => args.some((value) => value.includes('.user-switch')))).toBe(false)
   })
 
   it('uses an exact unshared UID, clamps time to install, and redacts log secrets', async () => {
@@ -1259,7 +2305,8 @@ describe('tracked Android automation session', () => {
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 0
+      installUserId: 0,
+      installUserSerial: INSTALL_USER_SERIAL
     })
 
     await expect(session.logcat({ applicationId: APP_ID })).rejects.toMatchObject({
@@ -1315,6 +2362,81 @@ describe('tracked Android automation session', () => {
     expect(calls.some((args) => args[1] === 'pm' || (args[1] === 'am' && args[2] === 'force-stop'))).toBe(false)
   })
 
+  it.each(['install_user_id', 'install_user_serial'] as const)(
+    'fails a legacy receipt with null %s closed without deleting it',
+    async (column) => {
+      const { db, installs, calls, session } = setup(() => ({ code: 0, stdout: '', stderr: '' }))
+      db.sqlite.prepare(`UPDATE android_app_installs SET ${column} = NULL`).run()
+
+      await expect(session.forceStop(APP_ID)).rejects.toMatchObject({
+        code: 'ANDROID_APP_USER_UNVERIFIED'
+      })
+      expect(installs.get(
+        'aaaa1111',
+        { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+        APP_ID
+      )).not.toBeNull()
+      expect(calls).toEqual([])
+    }
+  )
+
+  it('rejects a recycled numeric user ID with a new serial without deleting the old receipt', async () => {
+    const recycledSerial = INSTALL_USER_SERIAL + 1
+    const { installs, calls, session } = setup((args) => {
+      if (args[1] === 'dumpsys' && args[2] === 'user') {
+        return {
+          code: 0,
+          stdout: ` UserInfo{0:Replacement user:13} serialNo=${recycledSerial} isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(session.launch(APP_ID, '.MainActivity')).rejects.toMatchObject({
+      code: 'ANDROID_APP_USER_CHANGED'
+    })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
+    expect(calls.some((args) => args[1] === 'pm' || (args[1] === 'am' && args[2] === 'start'))).toBe(false)
+  })
+
+  it.each([
+    {
+      label: 'malformed',
+      stdout: ' UserInfo{0:Private user name:13} serialNo=not-a-number isPrimary=true\n'
+    },
+    {
+      label: 'duplicate',
+      stdout: [
+        ` UserInfo{0:Private user name:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=true`,
+        ` UserInfo{0:Injected:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=true`,
+        ''
+      ].join('\n')
+    },
+    {
+      label: 'overflow',
+      stdout: ' UserInfo{0:Private user name:13} serialNo=2147483648 isPrimary=true\n'
+    }
+  ])('fails a $label user-serial probe closed without exposing its dump', async ({ stdout }) => {
+    const { calls, session } = setup((args) => args[1] === 'dumpsys' && args[2] === 'user'
+      ? { code: 0, stdout, stderr: 'private-user-diagnostic' }
+      : { code: 0, stdout: '', stderr: '' })
+
+    await session.forceStop(APP_ID).catch((error: unknown) => {
+      expect(error).toMatchObject({
+        code: 'ANDROID_APP_USER_UNVERIFIED',
+        evidence: { code: 0, stdout: '', stderr: '', truncated: true }
+      })
+      expect(JSON.stringify(error)).not.toContain('Private user name')
+      expect(JSON.stringify(error)).not.toContain('private-user-diagnostic')
+    })
+    expect(calls.some((args) => args[1] === 'pm' || (args[1] === 'am' && args[2] === 'force-stop'))).toBe(false)
+  })
+
   it('keeps other-user receipts durable while status returns only the active user context', async () => {
     const otherApplicationId = 'com.example.other'
     const { installs, calls, session } = setup((args) => {
@@ -1334,7 +2456,8 @@ describe('tracked Android automation session', () => {
       installedAt: INSTALLED_AT,
       packageIncarnation: PACKAGE_INCARNATION,
       logFence: null,
-      installUserId: 10
+      installUserId: 10,
+      installUserSerial: INSTALL_USER_SERIAL
     })
 
     await expect(session.status()).resolves.toMatchObject({
@@ -1486,6 +2609,42 @@ describe('tracked Android automation session', () => {
     )).toMatchObject({ applicationId: APP_ID, apkSha256: 'a'.repeat(64) })
     expect(calls.some((args) => args[1] === 'sha256sum')).toBe(false)
     expect(calls.some((args) => args[1] === 'am' && args[2] === 'force-stop')).toBe(false)
+  })
+
+  it.each([
+    {
+      shape: 'stderr warning',
+      stdout: `package:${BASE_APK_PATH}\n`,
+      stderr: 'private package-manager warning'
+    },
+    {
+      shape: 'mixed stdout record',
+      stdout: `private warning\npackage:${BASE_APK_PATH}\n`,
+      stderr: ''
+    },
+    {
+      shape: 'extra blank line',
+      stdout: `package:${BASE_APK_PATH}\n\n`,
+      stderr: ''
+    }
+  ])('preserves the receipt when pm path has a non-exact $shape', async ({ stdout, stderr }) => {
+    const { installs, calls, session } = setup((args) => args[1] === 'pm' && args[2] === 'path'
+      ? { code: 0, stdout, stderr }
+      : { code: 0, stdout: '', stderr: '' })
+
+    await session.forceStop(APP_ID).catch((error: unknown) => {
+      expect(error).toMatchObject({
+        code: 'ANDROID_APP_IDENTITY_UNVERIFIED',
+        evidence: { stdout: '', stderr: '', truncated: true }
+      })
+      expect(JSON.stringify(error)).not.toMatch(/private package-manager warning|private warning/)
+    })
+    expect(installs.get(
+      'aaaa1111',
+      { kind: 'emulator', targetId: 'aaaa1111', deviceId: null },
+      APP_ID
+    )).not.toBeNull()
+    expect(calls.some((args) => args[1] === 'stat' || args[1] === 'sha256sum')).toBe(false)
   })
 
   it('does not misreport a pre-crash PID probe failure as an app that is not running', async () => {
@@ -1732,12 +2891,12 @@ describe('tracked Android automation session', () => {
     installs.record({
       roomId: 'aaaa1111', target: firstLease, applicationId: APP_ID,
       changeId: '21111111-2222-4333-8444-555555555555', apkSha256: 'b'.repeat(64), installedAt: INSTALLED_AT,
-      packageIncarnation: 'b'.repeat(64), logFence: null, installUserId: 0
+      packageIncarnation: 'b'.repeat(64), logFence: null, installUserId: 0, installUserSerial: INSTALL_USER_SERIAL
     })
     installs.record({
       roomId: 'bbbb2222', target: secondLease, applicationId: APP_ID,
       changeId: '31111111-2222-4333-8444-555555555555', apkSha256: 'c'.repeat(64), installedAt: INSTALLED_AT,
-      packageIncarnation: 'c'.repeat(64), logFence: null, installUserId: 0
+      packageIncarnation: 'c'.repeat(64), logFence: null, installUserId: 0, installUserSerial: INSTALL_USER_SERIAL
     })
 
     expect(installs.get('aaaa1111', firstLease, APP_ID)).toBeNull()
