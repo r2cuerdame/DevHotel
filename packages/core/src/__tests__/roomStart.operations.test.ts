@@ -386,6 +386,7 @@ describe('Room start as a trackable operation', () => {
       'preparing',
       'container-start',
       'emulator-boot',
+      'services-start',
       'web-start',
       'verify',
       'adb-ready',

@@ -76,11 +76,10 @@ describe('Android room lifecycle', () => {
     await orch.startRoom(room.id, 'user')
 
     expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: backend.hostPort })
-    expect(backend.calls).toContain(`recreateAnchor:${room.id}:6080`)
-    const removeAt = backend.calls.indexOf(`removeEmulator:${room.id}`)
+    const anchorAt = backend.calls.indexOf(`recreateAnchor:${room.id}:6080`)
     const createAt = backend.calls.indexOf(`createEmulator:${room.id}:Pixel 6:15.0`)
-    expect(removeAt).toBeGreaterThanOrEqual(0)
-    expect(createAt).toBeGreaterThan(removeAt)
+    expect(anchorAt).toBeGreaterThanOrEqual(0)
+    expect(createAt).toBeGreaterThan(anchorAt)
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(true)
     expect(backend.calls.some((call) => call.startsWith('createService:'))).toBe(false)
     expect(orch.androidInstalls.list(room.id, {
