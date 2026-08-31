@@ -1391,9 +1391,15 @@ export class RoomOrchestrator {
       fenced: boolean
     }> = []
     for (const room of this.rooms.list()) {
-      // Acceptance recovery owns the exact paused/live web runtime. Artifact
-      // recovery is intentionally deferred until that stronger fence clears.
-      if (this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null) continue
+      // Android locale and acceptance recovery can each own the exact
+      // emulator/live web runtime. Legacy builds could persist one of those
+      // intents beside an artifact intent before the shared atomic claim was
+      // introduced, so artifact recovery must preserve both owners byte-exact
+      // instead of fencing or stopping their runtime underneath them.
+      if (
+        this.settings.get(pendingAndroidLocaleRestoreKey(room.id)) !== null ||
+        this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null
+      ) continue
       const key = pendingArtifactExportKey(room.id)
       const raw = this.settings.get(key)
       if (raw === null) continue
