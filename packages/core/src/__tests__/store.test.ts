@@ -97,6 +97,29 @@ describe('roomsRepo', () => {
     expect(rooms.get('room-1')).toEqual(room)
   })
 
+  it('marks only the exact Hotel workspace revision modified', () => {
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ stateRevision: 7, workspaceVolumeRevision: 3, syncStatus: 'synced' }))
+
+    expect(rooms.markWorkspaceModifiedIfRevision({
+      roomId: 'room-1',
+      expectedWorkspaceVolumeRevision: 2,
+      expectedStateRevision: 7
+    })).toBe(false)
+    expect(rooms.markWorkspaceModifiedIfRevision({
+      roomId: 'room-1',
+      expectedWorkspaceVolumeRevision: 3,
+      expectedStateRevision: 6
+    })).toBe(false)
+    expect(rooms.get('room-1')).toMatchObject({ stateRevision: 7, syncStatus: 'synced' })
+    expect(rooms.markWorkspaceModifiedIfRevision({
+      roomId: 'room-1',
+      expectedWorkspaceVolumeRevision: 3,
+      expectedStateRevision: 7
+    })).toBe(true)
+    expect(rooms.get('room-1')).toMatchObject({ stateRevision: 8, syncStatus: 'modified' })
+  })
+
   it('round-trips optional fields as null/undefined', () => {
     const rooms = roomsRepo(db)
     const room = makeRoom({
@@ -350,6 +373,20 @@ describe('settingsRepo', () => {
     expect(settings.deleteIfValue('artifact-export', 'second')).toBe(false)
     expect(settings.get('artifact-export')).toBe('first')
     expect(settings.deleteIfValue('artifact-export', 'first')).toBe(true)
+    expect(settings.get('artifact-export')).toBeNull()
+  })
+
+  it('releases an exact value only while the owning Room revision still matches', () => {
+    const rooms = roomsRepo(db)
+    const settings = settingsRepo(db)
+    rooms.create(makeRoom({ stateRevision: 7, workspaceVolumeRevision: 3 }))
+    settings.set('artifact-export', 'owned')
+
+    expect(settings.deleteIfValueAndRoomRevision('artifact-export', 'owned', 'room-1', 3, 6)).toBe(false)
+    expect(settings.get('artifact-export')).toBe('owned')
+    expect(settings.deleteIfValueAndRoomRevision('artifact-export', 'other', 'room-1', 3, 7)).toBe(false)
+    expect(settings.get('artifact-export')).toBe('owned')
+    expect(settings.deleteIfValueAndRoomRevision('artifact-export', 'owned', 'room-1', 3, 7)).toBe(true)
     expect(settings.get('artifact-export')).toBeNull()
   })
 })

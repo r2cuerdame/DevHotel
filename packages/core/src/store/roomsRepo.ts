@@ -232,6 +232,12 @@ export interface RoomsRepo {
     expectedDepsGeneration: number
     depsGeneration: number
   }): void
+  /** Mark one exact Hotel workspace generation modified without advancing a newer Room record. */
+  markWorkspaceModifiedIfRevision(input: {
+    roomId: string
+    expectedWorkspaceVolumeRevision: number
+    expectedStateRevision: number
+  }): boolean
   delete(id: string): void
   nextRoomNumber(): number
 }
@@ -359,6 +365,22 @@ export function roomsRepo(db: Db): RoomsRepo {
         sqlite.exec('ROLLBACK')
         throw error
       }
+    },
+    markWorkspaceModifiedIfRevision(input) {
+      const updated = sqlite.prepare(
+        `UPDATE rooms
+         SET state_revision = ?, sync_status = 'modified'
+         WHERE id = ?
+           AND workspace_mode = 'hotel'
+           AND workspace_volume_revision = ?
+           AND state_revision = ?`
+      ).run(
+        input.expectedStateRevision + 1,
+        input.roomId,
+        input.expectedWorkspaceVolumeRevision,
+        input.expectedStateRevision
+      )
+      return updated.changes === 1
     },
     delete(id) {
       sqlite.exec('BEGIN IMMEDIATE')

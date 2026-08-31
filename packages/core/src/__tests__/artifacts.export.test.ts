@@ -288,6 +288,113 @@ describe('Room screenshot artifact export', () => {
     expect(orch.rooms.get(room.id)).toMatchObject({ stateRevision: 6, status: 'broken', hostPort: null })
   })
 
+  it('contains the paused old runtime when the Room revision advances while publication is in flight', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    backend.publishRoomArtifactHandler = () => {
+      const current = orch.rooms.get(room.id)!
+      orch.rooms.update(room.id, { stateRevision: current.stateRevision + 1 })
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/publish-revision-race.png' }, 'agent')
+    ).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_COMMITTED_CLEANUP_FAILED',
+      evidence: { committed: true, retrySafe: false, relativePath: 'docs/publish-revision-race.png' }
+    })
+
+    expect(backend.publishRoomArtifactCalls).toHaveLength(1)
+    expect(backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(orch.rooms.get(room.id)).toMatchObject({ stateRevision: 6, status: 'broken', hostPort: null })
+  })
+
+  it('contains the paused runtime when the final Room revision proof is unavailable', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    const get = orch.rooms.get.bind(orch.rooms)
+    let proofFailed = false
+    orch.rooms.get = (roomId) => {
+      if (!proofFailed && backend.publishRoomArtifactCalls.length === 1 && backend.restoreRoomArtifactWebCalls.length === 0) {
+        proofFailed = true
+        throw new Error('Room revision database unavailable')
+      }
+      return get(roomId)
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/revision-proof-failed.png' }, 'agent')
+    ).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_COMMITTED_CLEANUP_FAILED',
+      evidence: { committed: true, retrySafe: false, relativePath: 'docs/revision-proof-failed.png' }
+    })
+
+    expect(proofFailed).toBe(true)
+    expect(backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(orch.rooms.get(room.id)).toMatchObject({ stateRevision: 6, status: 'broken', hostPort: null })
+  })
+
+  it('contains a restored runtime when the Room revision advances during restoration', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    backend.restoreRoomArtifactWebHandler = () => {
+      backend.webPausedValue = false
+      backend.webRunningUnpausedValue = true
+      const current = orch.rooms.get(room.id)!
+      orch.rooms.update(room.id, { stateRevision: current.stateRevision + 1 })
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+      backend.webRunningUnpausedValue = false
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/restore-revision-race.png' }, 'agent')
+    ).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED',
+      evidence: { committed: true, retrySafe: false, relativePath: 'docs/restore-revision-race.png' }
+    })
+
+    expect(backend.restoreRoomArtifactWebCalls).toHaveLength(1)
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(backend.webRunningUnpausedValue).toBe(false)
+    expect(orch.rooms.get(room.id)).toMatchObject({ stateRevision: 7, status: 'broken', hostPort: null })
+  })
+
   it('maps an unsafe atomic-publication parent without exposing helper diagnostics', async () => {
     const { backend, orch } = setup()
     const artifact = publish(orch)
@@ -728,10 +835,10 @@ describe('Room screenshot artifact export', () => {
     const containment = observeContainment(context)
     let pendingAtPublication = ''
     let deleteIfValueCalls = 0
-    const deleteIfValue = orch.settings.deleteIfValue.bind(orch.settings)
-    orch.settings.deleteIfValue = (settingKey, value) => {
+    const deleteIfValueAndRoomRevision = orch.settings.deleteIfValueAndRoomRevision.bind(orch.settings)
+    orch.settings.deleteIfValueAndRoomRevision = (settingKey, value, roomId, workspaceRevision, stateRevision) => {
       deleteIfValueCalls += 1
-      return deleteIfValue(settingKey, value)
+      return deleteIfValueAndRoomRevision(settingKey, value, roomId, workspaceRevision, stateRevision)
     }
     const replacementFence = {
       containerId: 'b'.repeat(64),
@@ -815,9 +922,17 @@ describe('Room screenshot artifact export', () => {
       await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
       const containment = observeContainment(context)
       let ownedValue = ''
-      const deleteIfValue = orch.settings.deleteIfValue.bind(orch.settings)
-      orch.settings.deleteIfValue = (settingKey, value) => {
-        if (settingKey !== key) return deleteIfValue(settingKey, value)
+      const deleteIfValueAndRoomRevision = orch.settings.deleteIfValueAndRoomRevision.bind(orch.settings)
+      orch.settings.deleteIfValueAndRoomRevision = (
+        settingKey,
+        value,
+        roomId,
+        workspaceRevision,
+        stateRevision
+      ) => {
+        if (settingKey !== key) {
+          return deleteIfValueAndRoomRevision(settingKey, value, roomId, workspaceRevision, stateRevision)
+        }
         ownedValue = value
         if (mode === 'ownership-changed') {
           orch.settings.set(key, replacement)
@@ -1001,13 +1116,8 @@ describe('Room screenshot artifact export', () => {
   it('marks the Room broken when publication commits but its revision update fails', async () => {
     const { backend, orch } = setup()
     const artifact = publish(orch)
-    const update = orch.rooms.update.bind(orch.rooms)
-    let revisionWrites = 0
-    orch.rooms.update = (roomId, patch) => {
-      if (patch.stateRevision !== undefined && revisionWrites++ === 0) {
-        throw new Error('workspace revision storage failed')
-      }
-      update(roomId, patch)
+    orch.rooms.markWorkspaceModifiedIfRevision = () => {
+      throw new Error('workspace revision storage failed')
     }
 
     await expect(
@@ -1025,6 +1135,9 @@ describe('Room screenshot artifact export', () => {
   it('preserves both state-write failures when publication cannot persist either fence', async () => {
     const { backend, orch } = setup()
     const artifact = publish(orch)
+    orch.rooms.markWorkspaceModifiedIfRevision = () => {
+      throw new Error('Room database writes unavailable')
+    }
     orch.rooms.update = () => { throw new Error('Room database writes unavailable') }
 
     let captured: unknown

@@ -2397,6 +2397,7 @@ export class RoomOrchestrator {
       let pendingIntentStored = false
       let runtimeRestoreUnsafe = false
       let runtimeContained = false
+      let expectedRecoveryStateRevision = room.stateRevision
       let primaryError: unknown
       let stagingCleanupError: unknown
       const containmentErrors: unknown[] = []
@@ -2486,9 +2487,18 @@ export class RoomOrchestrator {
         publicationCommitted = true
         // The controlled helper resolves only after exact publication and
         // response-loss reconciliation. Record the real workspace mutation
-        // before any fallible runtime resume step.
+        // before any fallible runtime resume step. This is a cross-process CAS:
+        // never increment a newer Room record after publishing into the old
+        // workspace generation.
         try {
-          this.markWorkspaceModified(roomId)
+          if (!this.rooms.markWorkspaceModifiedIfRevision({
+            roomId,
+            expectedWorkspaceVolumeRevision: room.workspaceVolumeRevision,
+            expectedStateRevision: room.stateRevision
+          })) {
+            throw new Error('Room workspace revision changed during artifact publication')
+          }
+          expectedRecoveryStateRevision = room.stateRevision + 1
         } catch (revisionError) {
           runtimeRestoreUnsafe = true
           throw revisionError
@@ -2509,11 +2519,42 @@ export class RoomOrchestrator {
 
       if (publicationAmbiguous || runtimeRestoreUnsafe) await containRuntime()
 
+      // Publication and cleanup can let an already-admitted second process
+      // advance the Room record. Re-read its durable fence at the last point
+      // before runtime restoration so the old generation is never resumed.
+      if (pauseAttempted && !publicationAmbiguous && !runtimeRestoreUnsafe) {
+        try {
+          const recoveryRoom = this.rooms.get(roomId)
+          if (
+            recoveryRoom === null ||
+            recoveryRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+            recoveryRoom.stateRevision !== expectedRecoveryStateRevision
+          ) {
+            throw new Error('Room workspace revision changed before runtime restoration')
+          }
+        } catch (revisionProofError) {
+          runtimeRestoreUnsafe = true
+          primaryError = new AggregateError(
+            [...(primaryError ? [primaryError] : []), revisionProofError],
+            'Artifact export runtime fence was unavailable before restoration'
+          )
+          await containRuntime()
+        }
+      }
+
       let runtimeRecoveryError: unknown
       if (pauseAttempted && !runtimeRestoreUnsafe && !publicationAmbiguous) {
         try {
           if (!webFence) throw new Error('Room artifact runtime fence was not retained')
           await this.backend.restoreRoomArtifactWeb(runtimeSpec, webFence)
+          const restoredRoom = this.rooms.get(roomId)
+          if (
+            restoredRoom === null ||
+            restoredRoom.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+            restoredRoom.stateRevision !== expectedRecoveryStateRevision
+          ) {
+            throw new Error('Room workspace revision changed while restoring the artifact runtime')
+          }
         } catch (error) {
           runtimeRecoveryError = error
         }
@@ -2564,7 +2605,13 @@ export class RoomOrchestrator {
           // Keep the durable mutation gate until runtime recovery is proved.
           // If the final CAS cannot release this exact ownership, contain the
           // now-unpaused runtime while the retained value blocks new work.
-          if (!this.settings.deleteIfValue(pendingKey, pendingValue)) {
+          if (!this.settings.deleteIfValueAndRoomRevision(
+            pendingKey,
+            pendingValue,
+            roomId,
+            room.workspaceVolumeRevision,
+            expectedRecoveryStateRevision
+          )) {
             throw new Error('Artifact export recovery intent ownership changed before completion')
           }
           pendingIntentStored = false
