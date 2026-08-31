@@ -91,6 +91,7 @@ import {
   type ExecResult,
   type IsolationBackend,
   type RoomArtifactExpectation,
+  type RoomArtifactWebRuntimeFence,
   type WebSpec
 } from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
@@ -2376,6 +2377,7 @@ export class RoomOrchestrator {
         })
       }
       const { artifact, content } = this.readRoomArtifactContent(roomId, artifactId)
+      const runtimeSpec = this.webSpecFor(room)
       const targetPath = `/workspace/${input.relativePath}`
       const { root: temporaryRoot, temporary, hostFile } = (() => {
         try {
@@ -2389,6 +2391,7 @@ export class RoomOrchestrator {
         }
       })()
       let pauseAttempted = false
+      let webFence: RoomArtifactWebRuntimeFence | null = null
       let publicationCommitted = false
       let publicationAmbiguous = false
       let pendingIntentStored = false
@@ -2427,12 +2430,25 @@ export class RoomOrchestrator {
           )
         }
         pendingIntentStored = true
+        try {
+          // Bind the export to the exact immutable web container and runtime
+          // specification before making the first runtime mutation. A
+          // conventional-name replacement must never inherit this fence.
+          webFence = await this.backend.captureRoomArtifactWebFence(runtimeSpec)
+        } catch (error) {
+          runtimeRestoreUnsafe = true
+          throw new DevHotelError(
+            'ARTIFACT_EXPORT_FENCE_CHANGED',
+            'Artifact export could not identify the exact Room workspace runtime.',
+            {
+              recoveryHint: 'Restart the Room runtime and retry with a new destination path.',
+              cause: error
+            }
+          )
+        }
         pauseAttempted = true
         try {
-          await this.backend.pauseWeb(roomId)
-          if (!await this.backend.webPaused(roomId)) {
-            throw new Error('Room execution pause was not established')
-          }
+          await this.backend.pauseRoomArtifactWeb(runtimeSpec, webFence)
         } catch (error) {
           throw new DevHotelError(
             'ARTIFACT_EXPORT_FENCE_CHANGED',
@@ -2460,7 +2476,8 @@ export class RoomOrchestrator {
           hostFile,
           input.relativePath,
           { sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 },
-          stageToken
+          stageToken,
+          webFence
         )
         publicationCommitted = true
         // The controlled helper resolves only after exact publication and
@@ -2491,7 +2508,8 @@ export class RoomOrchestrator {
       let runtimeRecoveryError: unknown
       if (pauseAttempted && !runtimeRestoreUnsafe && !publicationAmbiguous) {
         try {
-          await this.restoreRoomAfterArtifactExport(room)
+          if (!webFence) throw new Error('Room artifact runtime fence was not retained')
+          await this.backend.restoreRoomArtifactWeb(runtimeSpec, webFence)
         } catch (error) {
           runtimeRecoveryError = error
         }
@@ -2715,44 +2733,6 @@ export class RoomOrchestrator {
         cause
       }
     )
-  }
-
-  private async restoreRoomAfterArtifactExport(room: RoomRecord): Promise<void> {
-    try {
-      if (await this.backend.webRunningUnpaused(room.id)) return
-    } catch {
-      // Ambiguous state: continue with unpause and then exact proof.
-    }
-    let unpauseError: unknown
-    try {
-      await this.backend.unpauseWeb(room.id)
-      if (!await this.backend.webRunningUnpaused(room.id)) {
-        throw new Error('Room was not running and unpaused after unpause')
-      }
-      return
-    } catch (error) {
-      unpauseError = error
-    }
-    try {
-      await this.backend.recreateWeb(this.webSpecFor(room))
-      if (!await this.backend.webRunningUnpaused(room.id)) {
-        throw new Error('Recreated Room was not running and unpaused')
-      }
-      this.olog(room.id, 'artifact export restored the Room runtime after an ambiguous pause state')
-      return
-    } catch (recreateError) {
-      // A recreate response can be lost after Docker applied it. Accept only a
-      // fresh exact-container probe that proves the replacement is unpaused.
-      try {
-        if (await this.backend.webRunningUnpaused(room.id)) {
-          this.olog(room.id, 'artifact export proved the Room runtime recovered after an ambiguous recreate response')
-          return
-        }
-      } catch {
-        // Exact recovery proof remains unavailable.
-      }
-      throw new AggregateError([unpauseError, recreateError], 'Room runtime could not be resumed or recreated')
-    }
   }
 
   /**

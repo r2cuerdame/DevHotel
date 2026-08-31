@@ -86,6 +86,29 @@ export interface RoomArtifactExpectation {
   sha256: string
 }
 
+/**
+ * Immutable live-runtime identity captured before a Room artifact export.
+ * A backend may restore the original container or a token-fenced exact
+ * recreation, but must never treat an unrelated same-name container as this
+ * runtime.
+ */
+export interface RoomArtifactWebRuntimeFence {
+  /** Full immutable OCI container ID (never a mutable name or short ID). */
+  containerId: string
+  /** Exact owned workspace generation mounted read-write at /workspace. */
+  workspaceVolume: string
+  /** Digest of the validated runtime configuration observed at capture time. */
+  runtimeSpecSha256: string
+  /** Digest of every owned named-volume instance, including creation identity and mountpoint. */
+  volumeSetSha256: string
+  /** Immutable container/network authority backing the web network namespace. */
+  networkAuthorityId: string
+  /** Immutable ID of the underlying owned Room bridge network. */
+  networkId: string
+  /** Exact live namespace identity when the authority is another container. */
+  networkSandboxId?: string
+}
+
 export type RoomArtifactPublicationFailureReason =
   | 'invalid-source'
   | 'invalid-input'
@@ -130,6 +153,12 @@ export interface IsolationBackend {
   /** Freeze/unfreeze the web container while taking a consistent volume copy. */
   pauseWeb(roomId: string): Promise<void>
   unpauseWeb(roomId: string): Promise<void>
+  /** Capture a complete immutable web-runtime fence before artifact publication. */
+  captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence>
+  /** Pause only the exact fenced web runtime and prove its configuration did not change. */
+  pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
+  /** Restore only the exact fenced runtime or a one-time-token exact recreation. */
+  restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
   /** Exact execution fence state; acceptance code must not infer this from `running`. */
   webPaused(roomId: string): Promise<boolean>
   /** One owned-container inspect proving the web workload is both running and not paused. */
@@ -172,7 +201,8 @@ export interface IsolationBackend {
     hostPngPath: string,
     relativePath: string,
     expected: RoomArtifactExpectation,
-    stageToken?: string
+    stageToken: string | undefined,
+    webFence: RoomArtifactWebRuntimeFence
   ): Promise<void>
   /** Settle one durable interrupted artifact publication after all Room workloads are stopped. */
   reconcileRoomArtifactPublication(

@@ -40,6 +40,7 @@ import {
   svcName,
   svcVolume,
   webName,
+  wrapStartCommand,
   workspaceSnapshotVolume,
 } from './naming'
 import type {
@@ -52,6 +53,7 @@ import type {
   ManagedNetwork,
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
+  RoomArtifactWebRuntimeFence,
   WebSpec
 } from './types'
 
@@ -142,6 +144,7 @@ const ROOM_ARTIFACT_ROLLBACK_EXIT = 76
 const ROOM_ARTIFACT_HELPER_TIMEOUT_MS = 120_000
 const ROOM_ARTIFACT_HELPER_STDOUT_BYTES = 256
 const ROOM_ARTIFACT_HELPER_STDERR_BYTES = 8 * 1024
+const ROOM_ARTIFACT_RESTORE_TOKEN_LABEL = 'devhotel.artifact-restore-token'
 const WINDOWS_RESERVED_ARTIFACT_SEGMENT = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i
 
 interface PrivateRoomArtifactIdentity {
@@ -1191,6 +1194,221 @@ export class OciCliBackend implements IsolationBackend {
     must(await runDocker(['unpause', webName(roomId)]), 'unpause web container')
   }
 
+  async captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence> {
+    this.assertRoomArtifactLiveWebSpec(spec)
+    await this.assertPinnedEngineIdentity()
+    const volumeProof = await this.assertRoomArtifactExpectedVolumes(spec)
+    const authority = await this.assertRoomArtifactNetworkAuthority(spec)
+    const container = await this.inspectContainer(webName(spec.roomId))
+    if (!container) throw new Error(`Room ${spec.roomId} artifact web runtime is missing`)
+    const captured = this.assertRoomArtifactWebRuntime(spec, container, authority, {
+      volumeProof,
+      state: 'running-unpaused'
+    })
+    const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, captured)
+    const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, captured)
+    const current = await this.inspectContainer(captured.containerId)
+    if (!current) throw new Error('Room artifact web runtime disappeared during fence capture')
+    return this.assertRoomArtifactWebRuntime(spec, current, currentAuthority, {
+      fence: captured,
+      volumeProof: currentVolumeProof,
+      state: 'running-unpaused'
+    })
+  }
+
+  async pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
+    this.assertRoomArtifactLiveWebSpec(spec)
+    this.assertRoomArtifactWebFence(spec, fence)
+    await this.assertPinnedEngineIdentity()
+    const volumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+    const authority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+    const before = await this.inspectContainer(fence.containerId)
+    if (!before) throw new Error('Room artifact web runtime disappeared before pause')
+    this.assertRoomArtifactWebRuntime(spec, before, authority, {
+      fence,
+      volumeProof,
+      state: 'running-or-paused'
+    })
+    if (before.State?.Paused !== true) {
+      try {
+        must(
+          await runDocker(['pause', fence.containerId], {
+            timeoutMs: 30_000,
+            maxStdoutBytes: 128,
+            maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+          }),
+          'pause exact Room artifact web runtime'
+        )
+      } catch {
+        // A post-command exact-ID/config/state proof below reconciles a lost response.
+      }
+    }
+    const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+    const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+    const paused = await this.inspectContainer(fence.containerId)
+    if (!paused) throw new Error('Room artifact web runtime disappeared while pausing')
+    this.assertRoomArtifactWebRuntime(spec, paused, currentAuthority, {
+      fence,
+      volumeProof: currentVolumeProof,
+      state: 'paused'
+    })
+  }
+
+  async restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
+    this.assertRoomArtifactLiveWebSpec(spec)
+    this.assertRoomArtifactWebFence(spec, fence)
+    await this.assertPinnedEngineIdentity()
+    const volumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+    const authority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+
+    const original = await this.inspectContainer(fence.containerId)
+    if (original) {
+      this.assertRoomArtifactWebRuntime(spec, original, authority, {
+        fence,
+        volumeProof,
+        state: 'restorable'
+      })
+      if (this.roomArtifactWebIsRunningUnpaused(original)) {
+        const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+        const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+        const current = await this.inspectContainer(fence.containerId)
+        if (!current) throw new Error('Room artifact web runtime disappeared during restore proof')
+        this.assertRoomArtifactWebRuntime(spec, current, currentAuthority, {
+          fence,
+          volumeProof: currentVolumeProof,
+          state: 'running-unpaused'
+        })
+        return
+      }
+      if (original.State?.Running === true && original.State?.Paused === true) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            must(
+              await runDocker(['unpause', fence.containerId], {
+                timeoutMs: 30_000,
+                maxStdoutBytes: 128,
+                maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+              }),
+              'unpause exact Room artifact web runtime'
+            )
+          } catch {
+            // Re-inspection is authoritative for response-loss reconciliation.
+          }
+          const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+          const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+          const resumed = await this.inspectContainer(fence.containerId)
+          if (!resumed) break
+          this.assertRoomArtifactWebRuntime(spec, resumed, currentAuthority, {
+            fence,
+            volumeProof: currentVolumeProof,
+            state: 'restorable'
+          })
+          if (this.roomArtifactWebIsRunningUnpaused(resumed)) {
+            this.assertRoomArtifactWebRuntime(spec, resumed, currentAuthority, {
+              fence,
+              volumeProof: currentVolumeProof,
+              state: 'running-unpaused'
+            })
+            return
+          }
+        }
+      }
+      await this.removeExactRoomArtifactWebForRestore(spec, fence, authority, volumeProof)
+    } else {
+      const replacement = await this.inspectContainer(webName(spec.roomId))
+      if (replacement) {
+        throw new Error('Refusing to restore across an unrelated same-name Room web replacement')
+      }
+    }
+
+    // Revalidate the immutable network authority after removing the original.
+    await this.assertRoomArtifactNetworkAuthority(spec, fence)
+    await this.assertRoomArtifactExpectedVolumes(spec, fence)
+    await this.ensureImage(imageFor(spec))
+    const restoreToken = randomUUID().replaceAll('-', '')
+    const createArgs = this.roomArtifactRestoreCreateArgs(spec, restoreToken)
+    let createError: unknown
+    let recreatedId: string | undefined
+    try {
+      const created = must(
+        await runDocker(createArgs, {
+          timeoutMs: 120_000,
+          maxStdoutBytes: 256,
+          maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+        }),
+        'create token-fenced Room artifact web runtime'
+      )
+      const candidate = created.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidate)) recreatedId = candidate
+      else createError = new Error('Room artifact web recreation did not return a full immutable ID')
+    } catch (error) {
+      createError = error
+    }
+
+    try {
+      const createCandidate = await this.inspectContainer(recreatedId ?? webName(spec.roomId))
+      if (!createCandidate) {
+        if (createError) throw createError
+        throw new Error('Room artifact web recreation could not be reconciled')
+      }
+      recreatedId = exactFullContainerId(createCandidate, spec.roomId)
+      const currentCreateVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+      const currentCreateAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+      const createdContainer = await this.inspectContainer(recreatedId)
+      if (!createdContainer) throw new Error('Token-fenced Room artifact web changed before inert proof')
+      const reconciledFence = this.assertRoomArtifactWebRuntime(spec, createdContainer, currentCreateAuthority, {
+        fence,
+        restoreToken,
+        volumeProof: currentCreateVolumeProof,
+        state: 'created-or-stopped'
+      })
+      recreatedId = reconciledFence.containerId
+
+      let startError: unknown
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          must(
+            await runDocker(['start', recreatedId], {
+              timeoutMs: 120_000,
+              maxStdoutBytes: 256,
+              maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+            }),
+            'start token-fenced Room artifact web runtime'
+          )
+          startError = undefined
+        } catch (error) {
+          startError = error
+        }
+        try {
+          const currentStartVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
+          const currentStartAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
+          const started = await this.inspectContainer(recreatedId)
+          if (!started) break
+          this.assertRoomArtifactWebRuntime(spec, started, currentStartAuthority, {
+            fence,
+            restoreToken,
+            volumeProof: currentStartVolumeProof,
+            state: 'running-unpaused'
+          })
+          return
+        } catch (error) {
+          startError = startError
+            ? new AggregateError([startError, error], 'Room artifact web start and proof both failed')
+            : error
+        }
+      }
+      if (startError) throw startError
+      throw new Error('Room artifact web recreation did not become exactly running and unpaused')
+    } catch (error) {
+      try {
+        await this.removeFailedRoomArtifactWebRestore(spec, restoreToken, recreatedId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Room artifact web recreation and cleanup both failed')
+      }
+      throw error
+    }
+  }
+
   async webPaused(roomId: string): Promise<boolean> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
@@ -1742,7 +1960,8 @@ export class OciCliBackend implements IsolationBackend {
     hostPngPath: string,
     relativePath: string,
     expected: RoomArtifactExpectation,
-    requestedStageToken?: string
+    requestedStageToken: string | undefined,
+    webFence: RoomArtifactWebRuntimeFence
   ): Promise<void> {
     try {
       assertRoomArtifactPublishInput(roomId, workspaceVolumeRevision, hostPngPath, relativePath, expected)
@@ -1751,6 +1970,19 @@ export class OciCliBackend implements IsolationBackend {
       const privateInput = await privateRoomArtifactIdentity(hostPngPath, expected)
       const workspaceVolume = srcVolume(roomId, workspaceVolumeRevision)
       assertExpectedRoomVolumeName(roomId, workspaceVolume)
+      if (
+        webFence.workspaceVolume !== workspaceVolume ||
+        !/^[a-f0-9]{64}$/.test(webFence.containerId) ||
+        !/^[a-f0-9]{64}$/.test(webFence.runtimeSpecSha256) ||
+        !/^[a-f0-9]{64}$/.test(webFence.volumeSetSha256) ||
+        !/^[a-f0-9]{64}$/.test(webFence.networkAuthorityId) ||
+        !/^[a-f0-9]{64}$/.test(webFence.networkId)
+      ) {
+        throw new RoomArtifactPublicationError(
+          'fence-changed',
+          'Room artifact publication received an invalid live runtime fence'
+        )
+      }
 
       await this.assertPinnedEngineIdentity()
       const volume = await this.inspectVolume(workspaceVolume)
@@ -1762,9 +1994,9 @@ export class OciCliBackend implements IsolationBackend {
       } catch {
         throw new RoomArtifactPublicationError('fence-changed', 'Room artifact workspace ownership is invalid')
       }
-      const webFence = await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume)
+      await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.containerId)
       await this.ensureImage(ANDROID_IMAGE)
-      await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.webId)
+      await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.containerId)
       await recheckPrivateRoomArtifact(hostPngPath, expected, privateInput)
 
       const jobId = randomUUID()
@@ -1845,7 +2077,7 @@ export class OciCliBackend implements IsolationBackend {
         if (inert.State?.Status !== 'created') {
           throw new Error('Room artifact helper was not inert before its controlled action')
         }
-        await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.webId)
+        await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.containerId)
         await recheckPrivateRoomArtifact(hostPngPath, expected, privateInput)
         result = await runDocker(['start', '-a', helperId], {
           timeoutMs: ROOM_ARTIFACT_HELPER_TIMEOUT_MS,
@@ -1878,7 +2110,7 @@ export class OciCliBackend implements IsolationBackend {
 
       let finalFenceError: unknown
       try {
-        await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.webId)
+        await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.containerId)
       } catch (fenceError) {
         finalFenceError = fenceError
       }
@@ -1909,7 +2141,7 @@ export class OciCliBackend implements IsolationBackend {
         outcome = await this.finalizeRoomArtifactPublication(
           roomId,
           workspaceVolume,
-          webFence.webId,
+          webFence.containerId,
           relativePath,
           expected,
           stageToken
@@ -3790,6 +4022,457 @@ export class OciCliBackend implements IsolationBackend {
     return container
   }
 
+  private assertRoomArtifactLiveWebSpec(spec: WebSpec): void {
+    if (spec.workspaceMode !== 'hotel' || spec.workspaceVolumeOverride !== undefined) {
+      throw new Error('Room artifact export requires the live owned Hotel workspace generation')
+    }
+    const workspaceVolume = srcVolume(spec.roomId, spec.workspaceVolumeRevision)
+    assertExpectedRoomVolumeName(spec.roomId, workspaceVolume)
+    if (!imageFor(spec) || !spec.startCommand) {
+      throw new Error('Room artifact web runtime spec is incomplete')
+    }
+    const destinations = new Set<string>()
+    for (const mount of this.expectedRoomArtifactWebMounts(spec)) {
+      if (!mount.destination.startsWith('/') || destinations.has(mount.destination)) {
+        throw new Error('Room artifact web runtime spec has an ambiguous mount destination')
+      }
+      destinations.add(mount.destination)
+      assertExpectedRoomVolumeName(spec.roomId, mount.volume)
+    }
+  }
+
+  private assertRoomArtifactWebFence(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): void {
+    const fullId = /^[a-f0-9]{64}$/
+    if (
+      !fullId.test(fence.containerId) ||
+      fence.workspaceVolume !== srcVolume(spec.roomId, spec.workspaceVolumeRevision) ||
+      !/^[a-f0-9]{64}$/.test(fence.runtimeSpecSha256) ||
+      !/^[a-f0-9]{64}$/.test(fence.volumeSetSha256) ||
+      !fullId.test(fence.networkAuthorityId) ||
+      !fullId.test(fence.networkId) ||
+      (fence.networkSandboxId !== undefined && !fullId.test(fence.networkSandboxId)) ||
+      (!spec.standalone && fence.networkSandboxId === undefined)
+    ) {
+      throw new Error('Room artifact web runtime fence is invalid for this exact spec')
+    }
+  }
+
+  private expectedRoomArtifactWebMounts(spec: WebSpec): RoomArtifactExpectedMount[] {
+    const mounts: RoomArtifactExpectedMount[] = [{
+      destination: '/workspace',
+      volume: srcVolume(spec.roomId, spec.workspaceVolumeRevision)
+    }]
+    if (!spec.noDepsVolume) {
+      mounts.push({ destination: '/workspace/node_modules', volume: effectiveDepsVolume(spec) })
+    }
+    if (!spec.noCacheVolume) {
+      mounts.push({ destination: '/cache', volume: cacheVolume(spec.roomId) })
+    }
+    for (const extra of spec.extraVolumes ?? []) {
+      mounts.push({ destination: extra.path, volume: extra.volume })
+    }
+    return mounts
+  }
+
+  private async assertRoomArtifactExpectedVolumes(
+    spec: WebSpec,
+    fence?: RoomArtifactWebRuntimeFence
+  ): Promise<RoomArtifactVolumeProof> {
+    const sources = new Map<string, string>()
+    const seenSources = new Set<string>()
+    const identities: RoomArtifactVolumeIdentity[] = []
+    for (const expected of this.expectedRoomArtifactWebMounts(spec)) {
+      const volume = await this.inspectVolume(expected.volume)
+      if (!volume) {
+        throw new Error(`Room artifact runtime volume is missing: ${expected.destination}`)
+      }
+      await this.assertRoomVolumeOwnership(volume, spec.roomId, expected.volume)
+      const source = volume.Mountpoint?.trim() ?? ''
+      const createdAt = volume.CreatedAt?.trim() ?? ''
+      const driver = volume.Driver?.trim() ?? ''
+      const scope = volume.Scope?.trim() ?? ''
+      if (
+        !source ||
+        seenSources.has(source) ||
+        !createdAt ||
+        !Number.isFinite(Date.parse(createdAt)) ||
+        !driver ||
+        !scope
+      ) {
+        throw new Error(`Room artifact runtime volume source is invalid: ${expected.destination}`)
+      }
+      sources.set(expected.volume, source)
+      seenSources.add(source)
+      identities.push({
+        name: expected.volume,
+        createdAt,
+        driver,
+        scope,
+        mountpoint: source,
+        labels: canonicalStringRecord(volume.Labels),
+        options: canonicalStringRecord(volume.Options)
+      })
+    }
+    identities.sort((a, b) => a.name.localeCompare(b.name))
+    const setSha256 = createHash('sha256').update(JSON.stringify(identities)).digest('hex')
+    if (fence && setSha256 !== fence.volumeSetSha256) {
+      throw new Error('Room artifact runtime volume instance identity changed')
+    }
+    return { sources, setSha256 }
+  }
+
+  private async assertRoomArtifactNetworkAuthority(
+    spec: WebSpec,
+    fence?: RoomArtifactWebRuntimeFence
+  ): Promise<RoomArtifactNetworkAuthority> {
+    const networkName = roomNetworkName(spec.roomId)
+    const network = await this.inspectNetwork(networkName)
+    if (!network) throw new Error(`Room ${spec.roomId} artifact runtime network is missing`)
+    assertRoomNetwork(network, spec.roomId, networkName)
+    const networkId = exactDockerObjectId(network.Id, `Room ${spec.roomId} network`)
+    if (fence && fence.networkId !== networkId) {
+      throw new Error('Room artifact underlying bridge network identity changed')
+    }
+
+    if (spec.standalone) {
+      if (fence && fence.networkAuthorityId !== networkId) {
+        throw new Error('Room artifact bridge network immutable identity changed')
+      }
+      const currentNetwork = await this.inspectNetwork(networkId)
+      if (!currentNetwork) throw new Error('Room artifact bridge network disappeared during proof')
+      assertRoomNetwork(currentNetwork, spec.roomId, networkName)
+      if (exactDockerObjectId(currentNetwork.Id, `Room ${spec.roomId} network`) !== networkId) {
+        throw new Error('Room artifact bridge network immutable identity changed during proof')
+      }
+      return { kind: 'network', id: networkId, networkId, networkName }
+    }
+
+    const authorityName = spec.androidRuntimeIsolation
+      ? androidRuntimeAnchorName(spec.roomId)
+      : anchorName(spec.roomId)
+    const authorityRole = spec.androidRuntimeIsolation ? 'android-runtime-anchor' : 'anchor'
+    const inspected = await this.inspectContainer(fence?.networkAuthorityId ?? authorityName)
+    if (!inspected) throw new Error('Room artifact network authority is missing')
+    const authority = await this.assertRoomContainer(spec.roomId, authorityName, authorityRole, inspected)
+    const authorityId = exactFullContainerId(authority, spec.roomId)
+    if (fence && authorityId !== fence.networkAuthorityId) {
+      throw new Error('Room artifact network authority immutable identity changed')
+    }
+    if (
+      authority.State?.Status !== 'running' ||
+      authority.State?.Running !== true ||
+      authority.State?.Paused === true
+    ) {
+      throw new Error('Room artifact network authority is not exactly running')
+    }
+    this.assertContainerNetworkMode(authority, networkName, 'Room artifact network authority')
+    const sandboxId = exactLiveSandboxId(authority, 'Room artifact network authority')
+    if (fence?.networkSandboxId && sandboxId !== fence.networkSandboxId) {
+      throw new Error('Room artifact network namespace identity changed')
+    }
+    const authorityNetworks = authority.NetworkSettings?.Networks ?? {}
+    if (
+      Object.keys(authorityNetworks).length !== 1 ||
+      authorityNetworks[networkName]?.NetworkID !== networkId
+    ) {
+      throw new Error('Room artifact network authority endpoint changed underlying bridge identity')
+    }
+    const currentNetwork = await this.inspectNetwork(networkId)
+    if (!currentNetwork) throw new Error('Room artifact bridge network disappeared during authority proof')
+    assertRoomNetwork(currentNetwork, spec.roomId, networkName)
+    if (exactDockerObjectId(currentNetwork.Id, `Room ${spec.roomId} network`) !== networkId) {
+      throw new Error('Room artifact bridge network immutable identity changed during authority proof')
+    }
+    if (currentNetwork.Containers?.[authorityId]?.Name !== authorityName) {
+      throw new Error('Room artifact network does not contain the exact runtime authority endpoint')
+    }
+    return { kind: 'container', id: authorityId, networkId, sandboxId, networkName, authorityName }
+  }
+
+  private assertRoomArtifactWebRuntime(
+    spec: WebSpec,
+    container: DockerContainerInspect,
+    authority: RoomArtifactNetworkAuthority,
+    opts: {
+      fence?: RoomArtifactWebRuntimeFence
+      restoreToken?: string
+      volumeProof: RoomArtifactVolumeProof
+      state: RoomArtifactRuntimeState
+    }
+  ): RoomArtifactWebRuntimeFence {
+    const labels = container.Config?.Labels ?? {}
+    const id = exactFullContainerId(container, spec.roomId)
+    const imageContentId = container.Image?.trim() ?? ''
+    if (
+      (container.Name ?? '').replace(/^\//, '') !== webName(spec.roomId) ||
+      labels['devhotel.room'] !== spec.roomId ||
+      labels['devhotel.role'] !== 'web' ||
+      labels['devhotel.managed'] !== '1' ||
+      (opts.restoreToken !== undefined && labels[ROOM_ARTIFACT_RESTORE_TOKEN_LABEL] !== opts.restoreToken) ||
+      (opts.fence && opts.restoreToken === undefined && id !== opts.fence.containerId)
+    ) {
+      throw new Error('Room artifact web immutable ownership identity changed')
+    }
+    if (opts.restoreToken !== undefined && !/^[a-f0-9]{32}$/.test(opts.restoreToken)) {
+      throw new Error('Room artifact web restore token is invalid')
+    }
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageContentId)) {
+      throw new Error('Room artifact web image content identity is invalid')
+    }
+
+    const expectedCmd = ['sh', '-lc', wrapStartCommand(spec.startCommand)]
+    const actualCmd = container.Config?.Cmd ?? []
+    if (
+      container.Config?.Image !== imageFor(spec) ||
+      container.Config?.WorkingDir !== '/workspace' ||
+      JSON.stringify(actualCmd) !== JSON.stringify(expectedCmd)
+    ) {
+      throw new Error('Room artifact web image, workdir, or command changed')
+    }
+
+    const expectedEnv = new Map<string, string>([
+      ['npm_config_cache', '/cache/npm'],
+      ['PNPM_HOME', '/cache/pnpm'],
+      ...Object.entries(spec.env ?? {})
+    ])
+    const actualEnv = new Map<string, string>()
+    for (const entry of container.Config?.Env ?? []) {
+      const separator = entry.indexOf('=')
+      if (separator > 0) actualEnv.set(entry.slice(0, separator), entry.slice(separator + 1))
+    }
+    if ([...expectedEnv].some(([key, value]) => actualEnv.get(key) !== value)) {
+      throw new Error('Room artifact web environment changed')
+    }
+
+    const expectedMounts = this.expectedRoomArtifactWebMounts(spec)
+      .map((mount) => ({
+        ...mount,
+        source: opts.volumeProof.sources.get(mount.volume) ?? ''
+      }))
+      .sort((a, b) => a.destination.localeCompare(b.destination))
+    const actualMounts = (container.Mounts ?? [])
+      .map((mount) => ({
+        destination: mount.Destination ?? '',
+        volume: mount.Name ?? '',
+        source: mount.Source ?? '',
+        type: mount.Type ?? '',
+        rw: mount.RW === true,
+        subpath: mount.SubPath ??
+          mount.VolumeOptions?.Subpath ??
+          mount.VolumeOptions?.SubPath ??
+          ''
+      }))
+      .sort((a, b) => a.destination.localeCompare(b.destination))
+    if (
+      actualMounts.length !== expectedMounts.length ||
+      actualMounts.some((mount, index) => {
+        const expected = expectedMounts[index]
+        return mount.destination !== expected?.destination ||
+          mount.volume !== expected.volume ||
+          mount.source !== expected.source ||
+          mount.type !== 'volume' ||
+          mount.rw !== true ||
+          mount.subpath !== '' ||
+          expected.source === ''
+      })
+    ) {
+      throw new Error('Room artifact web mount set changed')
+    }
+
+    const expectedMemory = spec.memoryMB ? spec.memoryMB * 1024 * 1024 : 0
+    const expectedNanoCpus = spec.cpus ? Math.round(spec.cpus * 1_000_000_000) : 0
+    const capDrop = (container.HostConfig?.CapDrop ?? []).map((cap) => cap.toUpperCase()).sort()
+    if (
+      (container.HostConfig?.Memory ?? 0) !== expectedMemory ||
+      (container.HostConfig?.NanoCpus ?? 0) !== expectedNanoCpus ||
+      !capDrop.includes('NET_RAW')
+    ) {
+      throw new Error('Room artifact web resource or capability limits changed')
+    }
+
+    const networkMode = container.HostConfig?.NetworkMode ?? ''
+    if (authority.kind === 'container') {
+      if (
+        networkMode !== `container:${authority.authorityName}` &&
+        networkMode !== `container:${authority.id}`
+      ) {
+        throw new Error('Room artifact web network authority changed')
+      }
+    } else if (networkMode !== authority.networkName) {
+      throw new Error('Room artifact web bridge network changed')
+    }
+
+    const running = container.State?.Running === true
+    const paused = container.State?.Paused === true
+    const status = container.State?.Status ?? ''
+    switch (opts.state) {
+      case 'running-unpaused':
+        if (status !== 'running' || !running || paused) {
+          throw new Error('Room artifact web is not exactly running and unpaused')
+        }
+        break
+      case 'paused':
+        if (!['running', 'paused'].includes(status) || !running || !paused) {
+          throw new Error('Room artifact web is not exactly paused')
+        }
+        break
+      case 'running-or-paused':
+        if (!['running', 'paused'].includes(status) || !running) {
+          throw new Error('Room artifact web is not live before pause')
+        }
+        break
+      case 'restorable':
+        if (!['created', 'running', 'paused', 'exited'].includes(status)) {
+          throw new Error('Room artifact web is not in a restorable state')
+        }
+        break
+      case 'created-or-stopped':
+        if (running || paused || !['created', 'exited'].includes(status)) {
+          throw new Error('Token-fenced Room artifact web was not inert before start')
+        }
+        break
+    }
+
+    if (running) {
+      if (authority.kind === 'container') {
+        if (exactLiveSandboxId(container, 'Room artifact web') !== authority.sandboxId) {
+          throw new Error('Room artifact web is not live in the exact fenced network namespace')
+        }
+      } else {
+        const networks = container.NetworkSettings?.Networks ?? {}
+        const names = Object.keys(networks)
+        if (
+          names.length !== 1 ||
+          names[0] !== authority.networkName ||
+          networks[authority.networkName]?.NetworkID !== authority.id
+        ) {
+          throw new Error('Room artifact web is not live on the exact fenced bridge network')
+        }
+      }
+    }
+
+    const runtimeSpecSha256 = createHash('sha256').update(JSON.stringify({
+      image: container.Config?.Image ?? '',
+      imageContentId,
+      workingDir: container.Config?.WorkingDir ?? '',
+      cmd: actualCmd,
+      entrypoint: container.Config?.Entrypoint ?? null,
+      user: container.Config?.User ?? '',
+      env: [...(container.Config?.Env ?? [])],
+      mounts: actualMounts,
+      memory: container.HostConfig?.Memory ?? 0,
+      nanoCpus: container.HostConfig?.NanoCpus ?? 0,
+      readonlyRootfs: container.HostConfig?.ReadonlyRootfs === true,
+      pidsLimit: container.HostConfig?.PidsLimit ?? 0,
+      capDrop,
+      securityOpt: [...(container.HostConfig?.SecurityOpt ?? [])].sort(),
+      volumeSetSha256: opts.volumeProof.setSha256,
+      networkAuthority: authority.id,
+      networkId: authority.networkId
+    })).digest('hex')
+    if (opts.fence && runtimeSpecSha256 !== opts.fence.runtimeSpecSha256) {
+      throw new Error('Room artifact web runtime fingerprint changed')
+    }
+    return {
+      containerId: id,
+      workspaceVolume: srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+      runtimeSpecSha256,
+      volumeSetSha256: opts.volumeProof.setSha256,
+      networkAuthorityId: authority.id,
+      networkId: authority.networkId,
+      ...(authority.kind === 'container' ? { networkSandboxId: authority.sandboxId } : {})
+    }
+  }
+
+  private roomArtifactWebIsRunningUnpaused(container: DockerContainerInspect): boolean {
+    return container.State?.Status === 'running' &&
+      container.State?.Running === true &&
+      container.State?.Paused === false
+  }
+
+  private async removeExactRoomArtifactWebForRestore(
+    spec: WebSpec,
+    fence: RoomArtifactWebRuntimeFence,
+    authority: RoomArtifactNetworkAuthority,
+    volumeProof: RoomArtifactVolumeProof
+  ): Promise<void> {
+    const current = await this.inspectContainer(fence.containerId)
+    if (current) {
+      this.assertRoomArtifactWebRuntime(spec, current, authority, {
+        fence,
+        volumeProof,
+        state: 'restorable'
+      })
+      try {
+        must(
+          await runDocker(['rm', '-f', fence.containerId], {
+            timeoutMs: 30_000,
+            maxStdoutBytes: 128,
+            maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+          }),
+          'remove exact stopped Room artifact web runtime'
+        )
+      } catch {
+        // Exact-ID absence below reconciles a lost remove response.
+      }
+      if (await this.inspectContainer(fence.containerId)) {
+        throw new Error('Exact stopped Room artifact web runtime could not be removed')
+      }
+    }
+    if (await this.inspectContainer(webName(spec.roomId))) {
+      throw new Error('Refusing to recreate across a concurrent same-name Room web replacement')
+    }
+  }
+
+  private roomArtifactRestoreCreateArgs(spec: WebSpec, restoreToken: string): string[] {
+    if (!/^[a-f0-9]{32}$/.test(restoreToken)) throw new Error('invalid Room artifact web restore token')
+    const args = buildWebCreateArgs(spec)
+    const imageIndex = args.length - 4
+    if (args[imageIndex] !== imageFor(spec)) {
+      throw new Error('Room artifact web create arguments have an unexpected command shape')
+    }
+    args.splice(
+      imageIndex,
+      0,
+      '--label',
+      `${ROOM_ARTIFACT_RESTORE_TOKEN_LABEL}=${restoreToken}`
+    )
+    return args
+  }
+
+  private async removeFailedRoomArtifactWebRestore(
+    spec: WebSpec,
+    restoreToken: string,
+    expectedId?: string
+  ): Promise<void> {
+    const container = await this.inspectContainer(expectedId ?? webName(spec.roomId))
+    if (!container) return
+    const labels = container.Config?.Labels ?? {}
+    const id = exactFullContainerId(container, spec.roomId)
+    if (
+      (expectedId === undefined && (container.Name ?? '').replace(/^\//, '') !== webName(spec.roomId)) ||
+      labels['devhotel.room'] !== spec.roomId ||
+      labels['devhotel.role'] !== 'web' ||
+      labels['devhotel.managed'] !== '1' ||
+      labels[ROOM_ARTIFACT_RESTORE_TOKEN_LABEL] !== restoreToken ||
+      (expectedId !== undefined && id !== expectedId)
+    ) {
+      throw new Error('Refusing to clean up a Room web runtime outside the exact restore token fence')
+    }
+    try {
+      await runDocker(['rm', '-f', id], {
+        timeoutMs: 30_000,
+        maxStdoutBytes: 128,
+        maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
+      })
+    } catch {
+      // Exact-ID absence below is authoritative.
+    }
+    if (await this.inspectContainer(id)) {
+      throw new Error('Token-fenced failed Room artifact web runtime still exists')
+    }
+  }
+
   private async removeRoomContainer(roomId: string, name: string, role: string): Promise<void> {
     const existing = await this.inspectContainer(name)
     if (!existing) return
@@ -4290,6 +4973,7 @@ interface ManagedRoomContainer {
 
 interface DockerVolumeInspect {
   Name?: string
+  CreatedAt?: string
   Driver?: string
   Scope?: string
   Mountpoint?: string
@@ -4298,6 +4982,7 @@ interface DockerVolumeInspect {
 }
 
 interface DockerNetworkInspect {
+  Id?: string
   Name?: string
   Driver?: string
   Labels?: Record<string, string> | null
@@ -4306,8 +4991,17 @@ interface DockerNetworkInspect {
 
 interface DockerContainerInspect {
   Id?: string
+  Image?: string
   Name?: string
-  Config?: { Labels?: Record<string, string> | null; Image?: string } | null
+  Config?: {
+    Labels?: Record<string, string> | null
+    Image?: string
+    WorkingDir?: string
+    Cmd?: string[] | null
+    Env?: string[] | null
+    Entrypoint?: string | string[] | null
+    User?: string
+  } | null
   State?: { Status?: string; Running?: boolean; Paused?: boolean; ExitCode?: number } | null
   HostConfig?: {
     NetworkMode?: string
@@ -4318,13 +5012,19 @@ interface DockerContainerInspect {
     CapDrop?: string[] | null
     SecurityOpt?: string[] | null
   } | null
-  NetworkSettings?: { SandboxID?: string; SandboxKey?: string } | null
+  NetworkSettings?: {
+    SandboxID?: string
+    SandboxKey?: string
+    Networks?: Record<string, { NetworkID?: string; EndpointID?: string } | null> | null
+  } | null
   Mounts?: Array<{
     Type?: string
     Name?: string
     Source?: string
     Destination?: string
     RW?: boolean
+    SubPath?: string
+    VolumeOptions?: { Subpath?: string; SubPath?: string } | null
   }> | null
 }
 
@@ -4332,6 +5032,49 @@ interface RoomArtifactWebFence {
   webId: string
   workspaceVolume: string
 }
+
+interface RoomArtifactExpectedMount {
+  destination: string
+  volume: string
+}
+
+interface RoomArtifactVolumeIdentity {
+  name: string
+  createdAt: string
+  driver: string
+  scope: string
+  mountpoint: string
+  labels: [string, string][]
+  options: [string, string][]
+}
+
+interface RoomArtifactVolumeProof {
+  sources: ReadonlyMap<string, string>
+  setSha256: string
+}
+
+type RoomArtifactNetworkAuthority =
+  | {
+      kind: 'container'
+      id: string
+      networkId: string
+      networkName: string
+      sandboxId: string
+      authorityName: string
+    }
+  | {
+      kind: 'network'
+      id: string
+      networkId: string
+      networkName: string
+    }
+
+type RoomArtifactRuntimeState =
+  | 'running-unpaused'
+  | 'paused'
+  | 'running-or-paused'
+  | 'restorable'
+  | 'created-or-stopped'
 
 type RoomArtifactFinalizeOutcome =
   | 'committed'
@@ -4355,6 +5098,32 @@ function exactContainerId(container: DockerContainerInspect, roomId: string): st
     throw new Error(`Room ${roomId} container did not report a valid immutable ID`)
   }
   return id
+}
+
+function exactFullContainerId(container: DockerContainerInspect, roomId: string): string {
+  const id = exactContainerId(container, roomId)
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`Room ${roomId} container did not report a full immutable ID`)
+  }
+  return id
+}
+
+function exactDockerObjectId(value: string | undefined, what: string): string {
+  const id = value?.trim() ?? ''
+  if (!/^[a-f0-9]{64}$/.test(id)) throw new Error(`${what} did not report a full immutable ID`)
+  return id
+}
+
+function exactLiveSandboxId(container: DockerContainerInspect, what: string): string {
+  const sandboxId = container.NetworkSettings?.SandboxID?.trim() ?? ''
+  if (!/^[a-f0-9]{64}$/.test(sandboxId)) {
+    throw new Error(`${what} did not report a valid live network namespace identity`)
+  }
+  return sandboxId
+}
+
+function canonicalStringRecord(record: Record<string, string> | null | undefined): [string, string][] {
+  return Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b))
 }
 
 interface EngineIdentity {

@@ -3,9 +3,16 @@ import { realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
-import { srcVolume, webName } from '../backend/naming'
+import {
+  androidRuntimeAnchorName,
+  cacheVolume,
+  roomNetworkName,
+  srcVolume,
+  webName,
+  wrapStartCommand
+} from '../backend/naming'
 import { OciCliBackend } from '../backend/ociCli'
-import { RoomArtifactPublicationError } from '../backend/types'
+import { RoomArtifactPublicationError, type WebSpec } from '../backend/types'
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { tempDir } from './fakes'
 
@@ -21,6 +28,15 @@ const FINALIZER_ID = 'c'.repeat(64)
 const STAGE_TOKEN = 'd'.repeat(32)
 const RELATIVE_PATH = 'docs/evidence/login-success.png'
 const ok = { code: 0, stdout: '', stderr: '' }
+const WEB_RUNTIME_FENCE = {
+  containerId: WEB_ID,
+  workspaceVolume: WORKSPACE,
+  runtimeSpecSha256: 'e'.repeat(64),
+  volumeSetSha256: '2'.repeat(64),
+  networkAuthorityId: 'f'.repeat(64),
+  networkId: '3'.repeat(64),
+  networkSandboxId: '1'.repeat(64)
+}
 
 interface HelperState {
   id: string
@@ -253,7 +269,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).resolves.toBeUndefined()
 
     expect(createCalls).toHaveLength(2)
@@ -345,7 +363,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({
       name: 'RoomArtifactPublicationError',
       reason
@@ -364,7 +384,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).resolves.toBeUndefined()
     expect(createCalls).toHaveLength(2)
     expect(helpers.size).toBe(0)
@@ -379,7 +401,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).resolves.toBeUndefined()
     expect(createCalls).toHaveLength(2)
     expect(helpers.size).toBe(0)
@@ -394,7 +418,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'publication-ambiguous' })
     expect(createCalls).toHaveLength(1)
     expect(helpers.has(PRIMARY_ID)).toBe(true)
@@ -408,7 +434,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'publication-ambiguous' })
     expect(helpers.has(PRIMARY_ID)).toBe(false)
     expect(helpers.has(FINALIZER_ID)).toBe(true)
@@ -425,7 +453,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).resolves.toBeUndefined()
 
     afterPrimaryStart = null
@@ -438,7 +468,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).resolves.toBeUndefined()
   })
 
@@ -457,7 +489,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'helper-failed' })
     expect(workspaceResidue.size).toBe(0)
     expect(helpers.size).toBe(0)
@@ -470,7 +504,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'publication-ambiguous' })
     expect(createCalls).toHaveLength(1)
 
@@ -482,7 +518,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'publication-ambiguous' })
   })
 
@@ -493,7 +531,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
       REVISION,
       hostPngPath,
       RELATIVE_PATH,
-      expected
+      expected,
+      undefined,
+      WEB_RUNTIME_FENCE
     )).rejects.toMatchObject({ reason: 'fence-changed' })
     expect(createCalls).toEqual([])
   })
@@ -527,7 +567,9 @@ describe('OciCliBackend atomic Room artifact publication', () => {
         REVISION,
         hostPngPath,
         RELATIVE_PATH,
-        expected
+        expected,
+        undefined,
+        WEB_RUNTIME_FENCE
       )
     } catch (error) {
       thrown = error
@@ -538,5 +580,495 @@ describe('OciCliBackend atomic Room artifact publication', () => {
     expect(rendered).not.toContain(hostPngPath.replaceAll('\\', '/'))
     expect(rendered).not.toContain('content.png')
     expect(rendered).toContain('[private screenshot stage]')
+  })
+})
+
+describe('OciCliBackend immutable Room artifact web runtime fence', () => {
+  const RUNTIME_ANCHOR_ID = '2'.repeat(64)
+  const NETWORK_ID = '3'.repeat(64)
+  const RUNTIME_SANDBOX_ID = '4'.repeat(64)
+  const RECREATED_WEB_ID = '5'.repeat(64)
+  const IMAGE_CONTENT_ID = `sha256:${'6'.repeat(64)}`
+  const RACE_REPLACEMENT_ID = '7'.repeat(64)
+  const SDK_VOLUME = `dh-${ROOM_ID}-sdk`
+  const CACHE_VOLUME = cacheVolume(ROOM_ID)
+  const spec: WebSpec = {
+    roomId: ROOM_ID,
+    internalPort: 6080,
+    nodeMajor: '17',
+    sourceType: 'managed-git',
+    sourceRef: 'https://example.invalid/android.git',
+    workspaceMode: 'hotel',
+    workspaceVolumeRevision: REVISION,
+    startCommand: 'sleep 2147483647',
+    env: { GRADLE_USER_HOME: '/cache/gradle' },
+    imageOverride: ANDROID_IMAGE,
+    androidRuntimeIsolation: true,
+    noDepsVolume: true,
+    extraVolumes: [{ volume: SDK_VOLUME, path: '/opt/android-sdk' }],
+    cpus: 0.5,
+    memoryMB: 256
+  }
+
+  interface RuntimeWebState {
+    id: string
+    name: string
+    present: boolean
+    status: 'created' | 'running' | 'paused' | 'exited'
+    running: boolean
+    paused: boolean
+    image: string
+    imageContentId: string
+    workingDir: string
+    cmd: string[]
+    env: string[]
+    entrypoint: string[]
+    workspace: string
+    networkMode: string
+    memory: number
+    nanoCpus: number
+    mountSources: Record<string, string>
+    mountSubpaths: Record<string, string>
+    restoreToken?: string
+  }
+
+  let web: RuntimeWebState
+  let createResponseLost: boolean
+  let startResponseLost: boolean
+  let createWithoutToken: boolean
+  let renameDuringFailedStart: boolean
+  let createCalls: string[][]
+  let networkId: string
+  let volumeCreatedAt: Record<string, string>
+  let raceAfterUnpause: boolean
+  let raceAfterStart: boolean
+  let replaceOnNextNetworkInspect: boolean
+  let replaceNetworkDuringAuthorityInspect: boolean
+
+  const volumeMountpoint = (name: string): string => `/var/lib/docker/volumes/${name}/_data`
+
+  const initialWeb = (): RuntimeWebState => ({
+    id: WEB_ID,
+    name: webName(ROOM_ID),
+    present: true,
+    status: 'running',
+    running: true,
+    paused: false,
+    image: ANDROID_IMAGE,
+    imageContentId: IMAGE_CONTENT_ID,
+    workingDir: '/workspace',
+    cmd: ['sh', '-lc', wrapStartCommand(spec.startCommand)],
+    env: [
+      'IMAGE_DEFAULT=retained-and-fingerprinted',
+      'npm_config_cache=/cache/npm',
+      'PNPM_HOME=/cache/pnpm',
+      'GRADLE_USER_HOME=/cache/gradle',
+      'DUPLICATE_ENV=first',
+      'DUPLICATE_ENV=second'
+    ],
+    entrypoint: ['/usr/local/bin/android-entrypoint'],
+    workspace: WORKSPACE,
+    networkMode: `container:${RUNTIME_ANCHOR_ID}`,
+    memory: 256 * 1024 * 1024,
+    nanoCpus: 500_000_000,
+    mountSources: {
+      [WORKSPACE]: volumeMountpoint(WORKSPACE),
+      [CACHE_VOLUME]: volumeMountpoint(CACHE_VOLUME),
+      [SDK_VOLUME]: volumeMountpoint(SDK_VOLUME)
+    },
+    mountSubpaths: {}
+  })
+
+  const runtimeAnchor = () => ({
+    Id: RUNTIME_ANCHOR_ID,
+    Name: `/${androidRuntimeAnchorName(ROOM_ID)}`,
+    Config: {
+      Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': 'android-runtime-anchor',
+        'devhotel.managed': '1'
+      }
+    },
+    State: { Status: 'running', Running: true, Paused: false },
+    HostConfig: { NetworkMode: roomNetworkName(ROOM_ID) },
+    NetworkSettings: {
+      SandboxID: RUNTIME_SANDBOX_ID,
+      Networks: {
+        [roomNetworkName(ROOM_ID)]: { NetworkID: networkId }
+      }
+    }
+  })
+
+  const webContainer = () => ({
+    Id: web.id,
+    Image: web.imageContentId,
+    Name: `/${web.name}`,
+    Config: {
+      Image: web.image,
+      WorkingDir: web.workingDir,
+      Cmd: web.cmd,
+      Env: web.env,
+      Entrypoint: web.entrypoint,
+      User: '',
+      Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': 'web',
+        'devhotel.managed': '1',
+        ...(web.restoreToken ? { 'devhotel.artifact-restore-token': web.restoreToken } : {})
+      }
+    },
+    State: {
+      Status: web.status,
+      Running: web.running,
+      Paused: web.paused
+    },
+    HostConfig: {
+      NetworkMode: web.networkMode,
+      ReadonlyRootfs: false,
+      PidsLimit: 0,
+      Memory: web.memory,
+      NanoCpus: web.nanoCpus,
+      CapDrop: ['NET_RAW'],
+      SecurityOpt: []
+    },
+    NetworkSettings: { SandboxID: web.running ? RUNTIME_SANDBOX_ID : '' },
+    Mounts: [
+      {
+        Type: 'volume', Name: web.workspace, Source: web.mountSources[web.workspace],
+        Destination: '/workspace', RW: true, SubPath: web.mountSubpaths[web.workspace]
+      },
+      {
+        Type: 'volume', Name: CACHE_VOLUME, Source: web.mountSources[CACHE_VOLUME],
+        Destination: '/cache', RW: true, SubPath: web.mountSubpaths[CACHE_VOLUME]
+      },
+      {
+        Type: 'volume', Name: SDK_VOLUME, Source: web.mountSources[SDK_VOLUME],
+        Destination: '/opt/android-sdk', RW: true, SubPath: web.mountSubpaths[SDK_VOLUME]
+      }
+    ]
+  })
+
+  beforeEach(() => {
+    web = initialWeb()
+    createResponseLost = false
+    startResponseLost = false
+    createWithoutToken = false
+    renameDuringFailedStart = false
+    createCalls = []
+    networkId = NETWORK_ID
+    volumeCreatedAt = {
+      [WORKSPACE]: '2026-08-30T10:00:00.000000000Z',
+      [CACHE_VOLUME]: '2026-08-30T10:00:01.000000000Z',
+      [SDK_VOLUME]: '2026-08-30T10:00:02.000000000Z'
+    }
+    raceAfterUnpause = false
+    raceAfterStart = false
+    replaceOnNextNetworkInspect = false
+    replaceNetworkDuringAuthorityInspect = false
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        const name = args[2]!
+        if (![WORKSPACE, CACHE_VOLUME, SDK_VOLUME].includes(name)) {
+          return { code: 1, stdout: '', stderr: 'No such volume' }
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Name: name,
+            CreatedAt: volumeCreatedAt[name],
+            Driver: 'local',
+            Scope: 'local',
+            Mountpoint: volumeMountpoint(name),
+            Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'volume',
+              'devhotel.managed': '1'
+            },
+            Options: null
+          }]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        const target = args[2]!
+        if (target !== roomNetworkName(ROOM_ID) && target !== networkId) {
+          return { code: 1, stdout: '', stderr: 'No such network' }
+        }
+        if (replaceOnNextNetworkInspect) {
+          replaceOnNextNetworkInspect = false
+          web = {
+            ...initialWeb(),
+            id: RACE_REPLACEMENT_ID,
+            workspace: srcVolume(ROOM_ID, REVISION + 1)
+          }
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Id: networkId,
+            Name: roomNetworkName(ROOM_ID),
+            Driver: 'bridge',
+            Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'network',
+              'devhotel.managed': '1'
+            },
+            Containers: {
+              [RUNTIME_ANCHOR_ID]: { Name: androidRuntimeAnchorName(ROOM_ID) }
+            }
+          }]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'inspect') {
+        const target = args[1]!
+        if (target === RUNTIME_ANCHOR_ID || target === androidRuntimeAnchorName(ROOM_ID)) {
+          if (replaceNetworkDuringAuthorityInspect) {
+            replaceNetworkDuringAuthorityInspect = false
+            networkId = '9'.repeat(64)
+          }
+          return { code: 0, stdout: JSON.stringify([runtimeAnchor()]), stderr: '' }
+        }
+        const foundById = target === web.id
+        const foundByName = target === webName(ROOM_ID) && web.name === webName(ROOM_ID)
+        return web.present && (foundById || foundByName)
+          ? { code: 0, stdout: JSON.stringify([webContainer()]), stderr: '' }
+          : { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'pause') {
+        if (!web.present || args[1] !== web.id) return { code: 1, stdout: '', stderr: 'wrong container' }
+        web.running = true
+        web.paused = true
+        web.status = 'paused'
+        return ok
+      }
+      if (args[0] === 'unpause') {
+        if (!web.present || args[1] !== web.id) return { code: 1, stdout: '', stderr: 'wrong container' }
+        web.running = true
+        web.paused = false
+        web.status = 'running'
+        if (raceAfterUnpause) replaceOnNextNetworkInspect = true
+        return ok
+      }
+      if (args[0] === 'rm') {
+        if (web.present && args.at(-1) === web.id) web.present = false
+        return ok
+      }
+      if (args[0] === 'create' && args[args.indexOf('--name') + 1] === webName(ROOM_ID)) {
+        createCalls.push(args)
+        const restoreLabel = args.find((arg) => arg.startsWith('devhotel.artifact-restore-token='))
+        web = {
+          ...initialWeb(),
+          id: RECREATED_WEB_ID,
+          status: 'created',
+          running: false,
+          paused: false,
+          restoreToken: createWithoutToken
+            ? undefined
+            : restoreLabel?.slice('devhotel.artifact-restore-token='.length)
+        }
+        if (createResponseLost) throw new Error('lost create response after exact container creation')
+        return { code: 0, stdout: `${RECREATED_WEB_ID}\n`, stderr: '' }
+      }
+      if (args[0] === 'start') {
+        if (!web.present || args[1] !== web.id) return { code: 1, stdout: '', stderr: 'wrong container' }
+        if (renameDuringFailedStart) {
+          web.name = 'concurrently-renamed-web'
+          throw new Error('lost start response before the runtime became live')
+        }
+        web.running = true
+        web.paused = false
+        web.status = 'running'
+        if (raceAfterStart) replaceOnNextNetworkInspect = true
+        if (startResponseLost) throw new Error('lost start response after exact container start')
+        return ok
+      }
+      return ok
+    })
+  })
+
+  it('captures, pauses, and restores only the immutable full web ID', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+
+    expect(fence).toMatchObject({
+      containerId: WEB_ID,
+      workspaceVolume: WORKSPACE,
+      networkAuthorityId: RUNTIME_ANCHOR_ID,
+      networkId: NETWORK_ID,
+      networkSandboxId: RUNTIME_SANDBOX_ID,
+      runtimeSpecSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      volumeSetSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+    })
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    await backend.restoreRoomArtifactWeb(spec, fence)
+
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'pause' && args[1] === WEB_ID)).toBe(true)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'unpause' && args[1] === WEB_ID)).toBe(true)
+    expect(web.running).toBe(true)
+    expect(web.paused).toBe(false)
+    expect(createCalls).toEqual([])
+  })
+
+  it.each([
+    ['workspace', (state: RuntimeWebState) => { state.workspace = srcVolume(ROOM_ID, REVISION + 1) }],
+    ['image', (state: RuntimeWebState) => { state.image = `${ANDROID_IMAGE}-replacement` }],
+    ['workdir', (state: RuntimeWebState) => { state.workingDir = '/tmp' }],
+    ['command', (state: RuntimeWebState) => { state.cmd = ['sh', '-lc', 'sleep infinity'] }],
+    ['environment', (state: RuntimeWebState) => { state.env = ['npm_config_cache=/wrong'] }],
+    ['limits', (state: RuntimeWebState) => { state.memory = 128 * 1024 * 1024 }],
+    ['network', (state: RuntimeWebState) => { state.networkMode = `container:${'9'.repeat(64)}` }],
+    ['mount source', (state: RuntimeWebState) => {
+      state.mountSources[WORKSPACE] = `${volumeMountpoint(WORKSPACE)}/nested`
+    }],
+    ['volume subpath', (state: RuntimeWebState) => { state.mountSubpaths[WORKSPACE] = 'nested' }]
+  ])('rejects a same-name owned web with the wrong %s before capture', async (_field, mutate) => {
+    mutate(web)
+    await expect(new OciCliBackend().captureRoomArtifactWebFence(spec)).rejects.toThrow()
+  })
+
+  it('rejects a same-name exact-spec replacement with a different immutable ID', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web = { ...initialWeb(), id: '9'.repeat(64) }
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/same-name/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+  })
+
+  it('rejects a same-ID runtime mutation through the captured runtime fingerprint', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.entrypoint = ['/concurrent/replacement-entrypoint']
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/fingerprint/)
+  })
+
+  it('keeps duplicate environment entry order in the runtime fingerprint', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    const first = web.env.indexOf('DUPLICATE_ENV=first')
+    const second = web.env.indexOf('DUPLICATE_ENV=second')
+    ;[web.env[first], web.env[second]] = [web.env[second]!, web.env[first]!]
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/fingerprint/)
+  })
+
+  it('rejects a changed immutable image content ID', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.imageContentId = `sha256:${'8'.repeat(64)}`
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/fingerprint/)
+  })
+
+  it('rejects a recreated same-name volume instance with a new CreatedAt identity', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    volumeCreatedAt[WORKSPACE] = '2026-08-31T10:00:00.000000000Z'
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/volume instance identity/)
+  })
+
+  it('rejects a recreated underlying Room bridge with the same name', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    networkId = '9'.repeat(64)
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/bridge network identity/)
+  })
+
+  it('rejects a disconnect-and-recreate race between network and authority inspection', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    replaceNetworkDuringAuthorityInspect = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/bridge identity/)
+    expect(networkId).toBe('9'.repeat(64))
+  })
+
+  it('freshly inspects the exact original ID after awaited unpause proofs', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    raceAfterUnpause = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow(/same-name/)
+    expect(web.id).toBe(RACE_REPLACEMENT_ID)
+    expect(web.workspace).toBe(srcVolume(ROOM_ID, REVISION + 1))
+  })
+
+  it('freshly inspects the exact recreated ID after awaited start proofs', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.running = false
+    web.paused = false
+    web.status = 'exited'
+    raceAfterStart = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow()
+    expect(web.id).toBe(RACE_REPLACEMENT_ID)
+    expect(web.workspace).toBe(srcVolume(ROOM_ID, REVISION + 1))
+  })
+
+  it('reconciles create and start response loss only with a one-time token and exact recreated ID', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.running = false
+    web.paused = false
+    web.status = 'exited'
+    createResponseLost = true
+    startResponseLost = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).resolves.toBeUndefined()
+
+    expect(createCalls).toHaveLength(1)
+    expect(createCalls[0]).toContainEqual(expect.stringMatching(/^devhotel\.artifact-restore-token=[a-f0-9]{32}$/))
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args.at(-1) === WEB_ID)).toBe(true)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start' && args[1] === RECREATED_WEB_ID)).toBe(true)
+    expect(web).toMatchObject({ id: RECREATED_WEB_ID, present: true, running: true, paused: false })
+  })
+
+  it('does not accept a create-response replacement without the one-time restore token', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.running = false
+    web.paused = false
+    web.status = 'exited'
+    createResponseLost = true
+    createWithoutToken = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow()
+    expect(web.present).toBe(true)
+    expect(mockedRunDocker.mock.calls.some(
+      ([args]) => args[0] === 'start' && args[1] === RECREATED_WEB_ID
+    )).toBe(false)
+  })
+
+  it('cleans its exact token-created ID even after a concurrent rename', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    await backend.pauseRoomArtifactWeb(spec, fence)
+    web.running = false
+    web.paused = false
+    web.status = 'exited'
+    renameDuringFailedStart = true
+
+    await expect(backend.restoreRoomArtifactWeb(spec, fence)).rejects.toThrow()
+    expect(mockedRunDocker.mock.calls.some(
+      ([args]) => args[0] === 'rm' && args.at(-1) === RECREATED_WEB_ID
+    )).toBe(true)
+    expect(web.present).toBe(false)
   })
 })

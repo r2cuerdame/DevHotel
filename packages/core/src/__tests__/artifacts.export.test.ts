@@ -124,6 +124,7 @@ describe('Room screenshot artifact export', () => {
     backend.publishRoomArtifactHandler = (input) => {
       privateStage = input.hostPngPath
       expect(backend.webPausedValue).toBe(true)
+      expect(input.webFence).toBe(backend.roomArtifactWebFenceValue)
       expect(readFileSync(input.hostPngPath)).toEqual(orch.readRoomArtifactContent('aaaa1111', artifact.id).content)
       expect(input.expected).toEqual({ sizeBytes: artifact.sizeBytes, sha256: artifact.sha256 })
     }
@@ -146,14 +147,26 @@ describe('Room screenshot artifact export', () => {
       roomId: 'aaaa1111',
       workspaceVolumeRevision: 2,
       relativePath: 'docs/evidence/login-success.png',
-      stageToken: expect.stringMatching(/^[a-f0-9]{32}$/)
+      stageToken: expect.stringMatching(/^[a-f0-9]{32}$/),
+      webFence: backend.roomArtifactWebFenceValue
     })
+    const captureAt = backend.calls.indexOf('captureRoomArtifactWebFence:aaaa1111:r2')
     const pauseAt = backend.calls.indexOf('pauseWeb:aaaa1111')
     const publishAt = backend.calls.indexOf('publishRoomArtifact:aaaa1111:r2:docs/evidence/login-success.png')
     const unpauseAt = backend.calls.indexOf('unpauseWeb:aaaa1111')
+    const restoreAt = backend.calls.findIndex((call) => call.startsWith('restoreRoomArtifactWeb:aaaa1111:'))
+    expect(captureAt).toBeGreaterThanOrEqual(0)
+    expect(pauseAt).toBeGreaterThan(captureAt)
     expect(pauseAt).toBeGreaterThanOrEqual(0)
     expect(publishAt).toBeGreaterThan(pauseAt)
+    expect(restoreAt).toBeGreaterThan(publishAt)
     expect(unpauseAt).toBeGreaterThan(publishAt)
+    expect(backend.captureRoomArtifactWebFenceCalls).toHaveLength(1)
+    expect(backend.pauseRoomArtifactWebCalls).toHaveLength(1)
+    expect(backend.restoreRoomArtifactWebCalls).toHaveLength(1)
+    expect(backend.pauseRoomArtifactWebCalls[0]?.fence).toBe(backend.roomArtifactWebFenceValue)
+    expect(backend.restoreRoomArtifactWebCalls[0]?.fence).toBe(backend.roomArtifactWebFenceValue)
+    expect(backend.restoreRoomArtifactWebCalls[0]?.spec).toBe(backend.pauseRoomArtifactWebCalls[0]?.spec)
     expect(backend.execInRoomCalls).toEqual([])
     expect(backend.calls.some((call) => call.startsWith('copyIntoRoom:'))).toBe(false)
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ stateRevision: 5, syncStatus: 'modified' })
@@ -201,6 +214,44 @@ describe('Room screenshot artifact export', () => {
     expect(backend.calls).not.toContain('pauseWeb:aaaa1111')
     expect(backend.calls).not.toContain('unpauseWeb:aaaa1111')
     expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+  })
+
+  it('retains the durable intent and contains the Room when its immutable web fence cannot be captured', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    backend.captureRoomArtifactWebFenceHandler = () => {
+      throw new Error('conventional web name no longer identifies the expected workspace')
+    }
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/no-fence.png' }, 'agent')
+    ).rejects.toMatchObject({ code: 'ARTIFACT_EXPORT_FENCE_CHANGED' })
+
+    expect(orch.settings.get(key)).not.toBeNull()
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(containment.managedContainerListCount()).toBe(2)
+    expect(backend.pauseRoomArtifactWebCalls).toEqual([])
+    expect(backend.publishRoomArtifactCalls).toEqual([])
+    expect(backend.restoreRoomArtifactWebCalls).toEqual([])
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 5,
+      status: 'broken',
+      hostPort: null
+    })
   })
 
   it('maps an unsafe atomic-publication parent without exposing helper diagnostics', async () => {
@@ -630,6 +681,92 @@ describe('Room screenshot artifact export', () => {
       hostPort: null
     })
     expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+  })
+
+  it('contains a committed same-name replacement backed by the wrong workspace and retains its recovery intent', async () => {
+    const context = setup()
+    const { backend, gateway, orch } = context
+    const artifact = publish(orch)
+    const key = 'artifactExportPending:aaaa1111'
+    const room = orch.rooms.get('aaaa1111')!
+    orch.rooms.update(room.id, { hostPort: 4321 })
+    await gateway.setRoute({ domain: room.domain, roomId: room.id, targetPort: 4321, https: false })
+    const containment = observeContainment(context)
+    let pendingAtPublication = ''
+    let deleteIfValueCalls = 0
+    const deleteIfValue = orch.settings.deleteIfValue.bind(orch.settings)
+    orch.settings.deleteIfValue = (settingKey, value) => {
+      deleteIfValueCalls += 1
+      return deleteIfValue(settingKey, value)
+    }
+    const replacementFence = {
+      containerId: 'b'.repeat(64),
+      workspaceVolume: 'dh-aaaa1111-src-r999',
+      runtimeSpecSha256: 'c'.repeat(64),
+      volumeSetSha256: 'e'.repeat(64),
+      networkAuthorityId: 'a'.repeat(64),
+      networkId: 'f'.repeat(64),
+      networkSandboxId: 'd'.repeat(64)
+    }
+    backend.publishRoomArtifactHandler = () => {
+      pendingAtPublication = orch.settings.get(key) ?? ''
+      // Model another actor replacing the conventional dh-aaaa1111-web name
+      // after publication with a container backed by a different workspace.
+      backend.roomArtifactWebFenceValue = replacementFence
+      backend.managedContainers = [{
+        roomId: 'aaaa1111',
+        role: 'job',
+        state: 'exited',
+        name: 'dh-aaaa1111-job-11111111-2222-4333-8444-888888888888'
+      }]
+    }
+    backend.restoreRoomArtifactWebHandler = (_spec, expectedFence) => {
+      const actualFence = backend.roomArtifactWebFenceValue!
+      expect(actualFence.containerId).not.toBe(expectedFence.containerId)
+      expect(actualFence.workspaceVolume).not.toBe(expectedFence.workspaceVolume)
+      throw new Error('same-name replacement does not match the captured artifact runtime fence')
+    }
+    let actualRuntimeRunning = true
+    backend.stopRoomPod = async (roomId) => {
+      containment.events.push('stop')
+      backend.calls.push(`stopRoomPod:${roomId}`)
+      actualRuntimeRunning = false
+    }
+
+    await expect(
+      orch.exportRoomArtifact('aaaa1111', artifact.id, { relativePath: 'docs/wrong-workspace.png' }, 'agent')
+    ).rejects.toMatchObject({
+      code: 'ARTIFACT_EXPORT_COMMITTED_RUNTIME_FAILED',
+      evidence: { committed: true, retrySafe: false, relativePath: 'docs/wrong-workspace.png' }
+    })
+
+    const originalFence = backend.publishRoomArtifactCalls[0]?.webFence
+    expect(originalFence).toBeDefined()
+    expect(originalFence).not.toBe(replacementFence)
+    expect(backend.pauseRoomArtifactWebCalls[0]?.fence).toBe(originalFence)
+    expect(backend.restoreRoomArtifactWebCalls[0]?.fence).toBe(originalFence)
+    expect(pendingAtPublication).not.toBe('')
+    expect(orch.settings.get(key)).toBe(pendingAtPublication)
+    expect(deleteIfValueCalls).toBe(0)
+    expect(() => orch.startRoomOperation('aaaa1111', 'agent')).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_EXPORT_RECOVERY_REQUIRED' })
+    )
+    expect(gateway.routes.has(room.domain)).toBe(false)
+    expect(containment.events.slice(0, 4)).toEqual(['route', 'logs', 'state', 'stop'])
+    expect(containment.managedContainerListCount()).toBe(2)
+    expect(backend.calls).toContain('stopRoomPod:aaaa1111')
+    expect(backend.calls).not.toContain('unpauseWeb:aaaa1111')
+    expect(backend.calls).toContain(
+      'removeManagedContainer:dh-aaaa1111-job-11111111-2222-4333-8444-888888888888'
+    )
+    expect(backend.managedContainers).toEqual([])
+    expect(actualRuntimeRunning).toBe(false)
+    expect(orch.rooms.get('aaaa1111')).toMatchObject({
+      stateRevision: 6,
+      syncStatus: 'modified',
+      status: 'broken',
+      hostPort: null
+    })
   })
 
   it('contains a committed runtime when recovery-intent release is rejected or fails', async () => {
