@@ -122,6 +122,49 @@ describe('screenshot artifact control API', () => {
     }
   })
 
+  it('preserves a validated token-shaped filename across every artifact response', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-artifact-filename-'))
+    roots.push(userData)
+    const filename = 'ghp_aaaaaaaaaaaaaaaaaaaa.png'
+    const tokenShapedArtifact = { ...artifact, filename }
+    const captureAndroidScreenshotArtifact = vi.fn(async () => tokenShapedArtifact)
+    const listRoomArtifacts = vi.fn(() => [tokenShapedArtifact])
+    const getRoomArtifact = vi.fn(() => tokenShapedArtifact)
+    const readRoomArtifactContent = vi.fn(() => ({ artifact: tokenShapedArtifact, content: png }))
+    const control = await startControlApi(
+      {
+        captureAndroidScreenshotArtifact,
+        listRoomArtifacts,
+        getRoomArtifact,
+        readRoomArtifactContent
+      } as unknown as RoomOrchestrator,
+      userData,
+      'test'
+    )
+    const headers = {
+      authorization: `Bearer ${control.info.token}`,
+      'content-type': 'application/json'
+    }
+    const base = `http://127.0.0.1:${control.info.port}/v1/rooms/aaaa1111/artifacts`
+    try {
+      const captured = await fetch(`${base}/screenshots`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ filename })
+      })
+      await expect(captured.json()).resolves.toMatchObject({ filename })
+      await expect((await fetch(base, { headers })).json()).resolves.toMatchObject({
+        artifacts: [{ filename }]
+      })
+      await expect((await fetch(`${base}/${artifactId}`, { headers })).json()).resolves.toMatchObject({ filename })
+
+      const content = await fetch(`${base}/${artifactId}/content`, { headers })
+      expect(content.headers.get('content-disposition')).toBe(`inline; filename="${filename}"`)
+    } finally {
+      control.stop()
+    }
+  })
+
   it('keeps artifact IDs Room-scoped and rejects oversized JSON before capture', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-artifact-isolation-'))
     roots.push(userData)

@@ -19,6 +19,7 @@ import {
   zArtifactId,
   zArtifactListLimit,
   zArtifactExportBody,
+  zRoomArtifact,
   zAttachDeviceBody,
   zCancelRequestBody,
   zCaptureScreenshotArtifactBody,
@@ -36,7 +37,8 @@ import {
   zSafeHostResyncBody,
   zUndoChangeBody,
   DeviceLeaseError,
-  type ControlInfo
+  type ControlInfo,
+  type RoomArtifact
 } from '@devhotel/shared'
 import {
   DevHotelError,
@@ -349,7 +351,7 @@ export async function startControlApi(
           const limit = rawLimit === null
             ? undefined
             : parseArtifactInput(zArtifactListLimit, Number(rawLimit))
-          sendJson(res, 200, { artifacts: orch.listRoomArtifacts(safeRoomId, limit) })
+          sendArtifactListJson(res, 200, orch.listRoomArtifacts(safeRoomId, limit))
           return
         }
         if (artifactSegment === 'screenshots' && !parts[5] && req.method === 'POST') {
@@ -357,14 +359,14 @@ export async function startControlApi(
             zCaptureScreenshotArtifactBody,
             await readBody(req, ARTIFACT_BODY_LIMIT_BYTES)
           )
-          sendJson(res, 201, await orch.captureAndroidScreenshotArtifact(safeRoomId, body, 'agent'))
+          sendArtifactJson(res, 201, await orch.captureAndroidScreenshotArtifact(safeRoomId, body, 'agent'))
           return
         }
         const artifactId = artifactSegment
           ? parseArtifactInput(zArtifactId, artifactSegment)
           : undefined
         if (artifactId && !parts[5] && req.method === 'GET') {
-          sendJson(res, 200, orch.getRoomArtifact(safeRoomId, artifactId))
+          sendArtifactJson(res, 200, orch.getRoomArtifact(safeRoomId, artifactId))
           return
         }
         if (artifactId && parts[5] === 'content' && !parts[6] && req.method === 'GET') {
@@ -610,13 +612,33 @@ function inspectionForAgent(inspection: RoomInspection): RoomInspection {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  // One last structured boundary protects every Control API response and,
-  // transitively, every MCP tool. Pairing fields are masked by key and all
-  // string values pass through the same central redactor as logs/events.
-  const text = JSON.stringify(redactStructuredSecrets(body))
+function writeJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body)
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) })
   res.end(text)
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  // One last structured boundary protects every general Control API response
+  // and, transitively, every MCP tool.
+  writeJson(res, status, redactStructuredSecrets(body))
+}
+
+function artifactForJson(value: RoomArtifact): RoomArtifact {
+  const artifact = zRoomArtifact.parse(value)
+  // Artifact metadata remains defense-in-depth redacted at this boundary, but
+  // the strict public filename must stay identical to the value accepted and
+  // stored by Core. Treating it as prose corrupts token-shaped basenames.
+  const redacted = redactStructuredSecrets(artifact)
+  return zRoomArtifact.parse({ ...redacted, filename: artifact.filename })
+}
+
+function sendArtifactJson(res: ServerResponse, status: number, artifact: RoomArtifact): void {
+  writeJson(res, status, artifactForJson(artifact))
+}
+
+function sendArtifactListJson(res: ServerResponse, status: number, artifacts: RoomArtifact[]): void {
+  writeJson(res, status, { artifacts: artifacts.map(artifactForJson) })
 }
 
 function sendPng(res: ServerResponse, filename: string, sha256: string, content: Buffer): void {
