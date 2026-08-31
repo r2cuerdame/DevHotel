@@ -1517,18 +1517,28 @@ export class OciCliBackend implements IsolationBackend {
     }
     await this.ensureImage(svcImage(svc, version))
     await this.ensureRoomVolume(roomId, svcVolume(roomId, svc))
-    const launched = must(
-      await runDocker(buildServiceArgs(roomId, svc, version, networkNamespace)),
-      `run ${svc} container`
-    )
-    const createdId = launched.stdout.trim()
-    if (!/^[a-f0-9]{64}$/.test(createdId)) {
-      throw new Error(`${svc} create did not return one immutable container ID`)
-    }
+    const creationToken = randomUUID()
+    let createdId: string | undefined
     try {
+      const launched = await runDocker(
+        buildServiceArgs(roomId, svc, version, networkNamespace, creationToken),
+        {
+          timeoutMs: null,
+          maxStdoutBytes: 128,
+          maxStderrBytes: 8 * 1024,
+          killOnOutputLimit: false
+        }
+      )
+      const candidateId = launched.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidateId)) createdId = candidateId
+      must(launched, `run ${svc} container`)
+      if (!createdId) throw new Error(`${svc} create did not return one immutable container ID`)
       const inspected = await this.inspectContainer(createdId)
       if (!inspected) throw new Error(`${svc} immutable container disappeared during creation`)
       const created = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`, inspected)
+      if (created.Config?.Labels?.['devhotel.creation-token'] !== creationToken) {
+        throw new Error(`${svc} immutable creation token changed during creation`)
+      }
       if (exactContainerId(created, roomId) !== createdId) {
         throw new Error(`${svc} immutable container changed during creation`)
       }
@@ -1545,7 +1555,7 @@ export class OciCliBackend implements IsolationBackend {
       }
     } catch (error) {
       try {
-        await this.removeFailedCreatedService(roomId, svc, createdId)
+        await this.removeFailedCreatedService(roomId, svc, creationToken, createdId)
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], `${svc} creation validation and exact cleanup both failed`)
       }
@@ -1560,6 +1570,17 @@ export class OciCliBackend implements IsolationBackend {
     const id = exactContainerId(existing, roomId)
     const androidRuntime = await this.inspectContainer(androidRuntimeAnchorName(roomId))
     let runtimeSandboxId: string | null = null
+    const rejectAfterAndroidCleanup = async (error: unknown): Promise<never> => {
+      try {
+        await this.removeMisboundStartedService(roomId, svc, id)
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Android ${svc} start validation and exact cleanup both failed`
+        )
+      }
+      throw error
+    }
     if (androidRuntime) {
       const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
       if (!androidControl) {
@@ -1578,12 +1599,16 @@ export class OciCliBackend implements IsolationBackend {
       }
       this.assertContainerNetworkMode(androidRuntime, roomNetworkName(roomId), 'Android runtime anchor')
       runtimeSandboxId = this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
-      this.assertContainerNetworkNamespace(
-        existing,
-        androidRuntimeAnchorName(roomId),
-        runtimeId,
-        `Android ${svc} service`
-      )
+      try {
+        this.assertContainerNetworkNamespace(
+          existing,
+          androidRuntimeAnchorName(roomId),
+          runtimeId,
+          `Android ${svc} service`
+        )
+      } catch (error) {
+        await rejectAfterAndroidCleanup(error)
+      }
     } else {
       const androidControl = await this.inspectNetwork(androidControlNetworkName(roomId))
       if (androidControl) {
@@ -1591,25 +1616,25 @@ export class OciCliBackend implements IsolationBackend {
         throw new Error('Android runtime anchor is missing; refusing to start a service in the control namespace')
       }
     }
-    must(await runDocker(['start', id]), `start ${svc}`)
-    const started = await this.inspectContainer(id)
-    if (!started || started.State?.Status !== 'running') throw new Error(`${svc} start incomplete: ${name}`)
-    await this.assertRoomContainer(roomId, name, `svc-${svc}`, started)
-    if (exactContainerId(started, roomId) !== id) throw new Error(`${svc} immutable container changed during start`)
-    if (
-      runtimeSandboxId &&
-      this.exactRunningSandboxId(started, `Android ${svc} service`) !== runtimeSandboxId
-    ) {
-      const mismatch = new Error(`Android ${svc} service started outside the exact runtime namespace`)
+    const startAndValidate = async (): Promise<void> => {
+      must(await runDocker(['start', id]), `start ${svc}`)
+      const started = await this.inspectContainer(id)
+      if (!started || started.State?.Status !== 'running') throw new Error(`${svc} start incomplete: ${name}`)
+      await this.assertRoomContainer(roomId, name, `svc-${svc}`, started)
+      if (exactContainerId(started, roomId) !== id) throw new Error(`${svc} immutable container changed during start`)
+      if (
+        runtimeSandboxId &&
+        this.exactRunningSandboxId(started, `Android ${svc} service`) !== runtimeSandboxId
+      ) throw new Error(`Android ${svc} service started outside the exact runtime namespace`)
+    }
+    if (androidRuntime) {
       try {
-        await this.removeMisboundStartedService(roomId, svc, id)
-      } catch (cleanupError) {
-        throw new AggregateError(
-          [mismatch, cleanupError],
-          `Android ${svc} namespace validation and exact cleanup both failed`
-        )
+        await startAndValidate()
+      } catch (error) {
+        await rejectAfterAndroidCleanup(error)
       }
-      throw mismatch
+    } else {
+      await startAndValidate()
     }
   }
 
@@ -2195,17 +2220,41 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  async captureEmulatorScreen(roomId: string): Promise<string> {
+  async captureEmulatorScreen(
+    roomId: string,
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<string> {
+    throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
+    const topology = await this.assertFencedEmulatorTopology(roomId)
+    const timeoutMs = Math.min(opts.timeoutMs ?? 60_000, 120_000)
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new Error('emulator screen capture timeout must be a positive safe integer')
+    }
+    const stdout = boundedCommandOutput(SCREENSHOT_MAX_BASE64_BYTES)
+    const stderr = boundedCommandOutput(64 * 1024)
     const result = await runDocker([
       'exec',
-      emulatorName(roomId),
+      topology.emulatorId,
       'sh',
       '-c',
       "ffmpeg -y -loglevel error -f x11grab -i :0 -frames:v 1 -f image2pipe -vcodec png - | base64 | tr -d '\\n'"
-    ])
-    must(result, 'capture emulator screen')
-    const png = result.stdout.trim()
+    ], {
+      timeoutMs,
+      signal: opts.signal,
+      maxStdoutBytes: SCREENSHOT_MAX_BASE64_BYTES,
+      maxStderrBytes: 64 * 1024,
+      onStdout: (chunk) => stdout.push(chunk),
+      onStderr: (chunk) => stderr.push(chunk)
+    })
+    await this.assertFencedEmulatorTopology(roomId, topology)
+    throwIfAborted(opts.signal)
+    if (result.outputLimitExceeded || stdout.exceeded || stderr.exceeded) {
+      throw new Error('emulator screen capture exceeded its safety limit')
+    }
+    const completed = { ...result, stdout: stdout.text(), stderr: stderr.text() }
+    must(completed, 'capture emulator screen')
+    const png = completed.stdout.trim()
     if (png.length < 100) throw new Error('emulator screen capture returned no image')
     return png
   }
@@ -2216,9 +2265,14 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
-    const result = await runDocker(['inspect', '--format', '{{.State.Status}}', emulatorName(roomId)])
-    if (result.code !== 0) return 'missing'
-    return result.stdout.trim() === 'running' ? 'running' : 'exited'
+    await this.assertPinnedEngineIdentity()
+    const existing = await this.inspectContainer(emulatorName(roomId))
+    if (!existing) return 'missing'
+    const owned = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator', existing)
+    exactContainerId(owned, roomId)
+    if (owned.State?.Status !== 'running') return 'exited'
+    await this.assertFencedEmulatorTopology(roomId)
+    return 'running'
   }
 
   async imageExists(image: string): Promise<boolean> {
@@ -2678,17 +2732,28 @@ export class OciCliBackend implements IsolationBackend {
   private async removeFailedCreatedService(
     roomId: string,
     svc: 'postgres' | 'redis',
-    expectedId: string
+    creationToken: string,
+    expectedId?: string
   ): Promise<void> {
     const name = svcName(roomId, svc)
-    const existing = await this.inspectContainer(expectedId)
+    const existing = await this.inspectContainer(expectedId ?? name)
     if (!existing) return
-    await this.assertRoomContainer(roomId, name, `svc-${svc}`, existing)
-    if (exactContainerId(existing, roomId) !== expectedId) {
+    const labels = existing.Config?.Labels ?? {}
+    const owned = (existing.Name ?? '').replace(/^\//, '') === name &&
+      labels['devhotel.room'] === roomId &&
+      labels['devhotel.role'] === `svc-${svc}` &&
+      labels['devhotel.managed'] === '1' &&
+      labels['devhotel.creation-token'] === creationToken
+    if (!owned) {
+      if (expectedId) throw new Error(`Refusing to clean up a ${svc} container whose creation ownership changed`)
+      return
+    }
+    const id = exactContainerId(existing, roomId)
+    if (expectedId && id !== expectedId) {
       throw new Error(`Refusing to clean up a replacement ${svc} container`)
     }
-    must(await runDocker(['rm', '-f', expectedId]), `remove failed ${svc} container`)
-    if (await this.inspectContainer(expectedId)) {
+    must(await runDocker(['rm', '-f', id]), `remove failed ${svc} container`)
+    if (await this.inspectContainer(id)) {
       throw new Error(`The exact failed ${svc} container still exists after cleanup`)
     }
   }
@@ -2698,10 +2763,8 @@ export class OciCliBackend implements IsolationBackend {
     svc: 'postgres' | 'redis',
     expectedId: string
   ): Promise<void> {
-    const name = svcName(roomId, svc)
     const existing = await this.inspectContainer(expectedId)
     if (!existing) return
-    await this.assertRoomContainer(roomId, name, `svc-${svc}`, existing)
     if (exactContainerId(existing, roomId) !== expectedId) {
       throw new Error(`Refusing to clean up a replacement ${svc} container after namespace mismatch`)
     }

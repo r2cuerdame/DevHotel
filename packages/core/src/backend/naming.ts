@@ -229,7 +229,8 @@ export function buildServiceArgs(
   roomId: string,
   svc: ServiceKind,
   version: string,
-  networkNamespace = anchorName(roomId)
+  networkNamespace = anchorName(roomId),
+  creationToken?: string
 ): string[] {
   const common = [
     'run',
@@ -245,7 +246,8 @@ export function buildServiceArgs(
     '-l',
     `devhotel.role=svc-${svc}`,
     '-l',
-    'devhotel.managed=1'
+    'devhotel.managed=1',
+    ...(creationToken ? ['-l', `devhotel.creation-token=${creationToken}`] : [])
   ]
   if (svc === 'postgres') {
     return [

@@ -172,9 +172,16 @@ describe('Android runtime namespace', () => {
     ]))
     expect(web).not.toContain('container:dh-r1-anchor')
 
-    const service = buildServiceArgs('r1', 'redis', '8', androidRuntimeAnchorName('r1'))
+    const service = buildServiceArgs(
+      'r1',
+      'redis',
+      '8',
+      androidRuntimeAnchorName('r1'),
+      '11111111-1111-4111-8111-111111111111'
+    )
     expect(service).toEqual(expect.arrayContaining([
-      '--network', 'container:dh-r1-android-runtime-anchor'
+      '--network', 'container:dh-r1-android-runtime-anchor',
+      'devhotel.creation-token=11111111-1111-4111-8111-111111111111'
     ]))
     expect(service).not.toContain('container:dh-r1-anchor')
   })

@@ -573,6 +573,7 @@ describe('OciCliBackend Room networks', () => {
   it('keeps generic services on the generic anchor namespace', async () => {
     const serviceId = 'e'.repeat(64)
     let serviceCreated = false
+    let creationToken = ''
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'inspect') {
         if (serviceCreated && (args[1] === 'dh-r1-svc-redis' || args[1] === serviceId)) {
@@ -584,7 +585,8 @@ describe('OciCliBackend Room networks', () => {
               Config: { Labels: {
                 'devhotel.room': 'r1',
                 'devhotel.role': 'svc-redis',
-                'devhotel.managed': '1'
+                'devhotel.managed': '1',
+                'devhotel.creation-token': creationToken
               } },
               State: { Status: 'running' }
             }]),
@@ -608,6 +610,7 @@ describe('OciCliBackend Room networks', () => {
         }
       }
       if (args[0] === 'run') {
+        creationToken = args.find((arg) => arg.startsWith('devhotel.creation-token='))!.split('=')[1]!
         serviceCreated = true
         return { code: 0, stdout: `${serviceId}\n`, stderr: '' }
       }
@@ -619,11 +622,79 @@ describe('OciCliBackend Room networks', () => {
     expect(run).toEqual(expect.arrayContaining(['--network', 'container:dh-r1-anchor']))
   })
 
+  it('cleans failed service allocations by exact creation token and never deletes a name replacement', async () => {
+    const serviceId = 'e'.repeat(64)
+    let service: Record<string, unknown> | null = null
+    let launch: 'nonzero' | 'malformed' | 'collision' = 'nonzero'
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        const name = args[1]!
+        if (service && (name === serviceId || name === 'dh-r1-svc-redis')) {
+          return { code: 0, stdout: JSON.stringify([service]), stderr: '' }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return { code: 1, stdout: '', stderr: 'No such network' }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Name: 'dh-r1-svc-redis-data',
+            Labels: { 'devhotel.room': 'r1', 'devhotel.role': 'volume', 'devhotel.managed': '1' }
+          }]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'run') {
+        const token = args.find((arg) => arg.startsWith('devhotel.creation-token='))!.split('=')[1]!
+        service = {
+          Id: serviceId,
+          Name: '/dh-r1-svc-redis',
+          Config: { Labels: {
+            'devhotel.room': 'r1',
+            'devhotel.role': 'svc-redis',
+            'devhotel.managed': '1',
+            ...(launch === 'collision' ? {} : { 'devhotel.creation-token': token })
+          } },
+          State: { Status: 'running' }
+        }
+        if (launch === 'nonzero') return { code: 1, stdout: `${serviceId}\n`, stderr: 'start failed' }
+        if (launch === 'malformed') return { code: 0, stdout: 'truncated-id\n', stderr: '' }
+        return { code: 1, stdout: '', stderr: 'name already in use' }
+      }
+      if (args[0] === 'rm' && args[2] === serviceId) {
+        service = null
+        return ok
+      }
+      return ok
+    })
+
+    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/run redis container/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(service).toBe(null)
+
+    mockedRunDocker.mockClear()
+    launch = 'malformed'
+    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/immutable container ID/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(service).toBe(null)
+
+    mockedRunDocker.mockClear()
+    launch = 'collision'
+    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/run redis container/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm')).toBe(false)
+    expect(service === null).toBe(false)
+  })
+
   it('binds an Android service to the exact runtime ID and removes a sandbox-mismatched create', async () => {
     const runtimeId = 'a'.repeat(64)
     const serviceId = 'b'.repeat(64)
     const runtimeSandboxId = 'c'.repeat(64)
     let serviceExists = false
+    let creationToken = ''
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'network' && args[1] === 'inspect' && args[2] === androidControlNetworkName('r1')) {
         return {
@@ -660,7 +731,8 @@ describe('OciCliBackend Room networks', () => {
               Config: { Labels: {
                 'devhotel.room': 'r1',
                 'devhotel.role': 'svc-redis',
-                'devhotel.managed': '1'
+                'devhotel.managed': '1',
+                'devhotel.creation-token': creationToken
               } },
               State: { Status: 'running' },
               HostConfig: { NetworkMode: `container:${runtimeId}` },
@@ -683,6 +755,7 @@ describe('OciCliBackend Room networks', () => {
         }
       }
       if (args[0] === 'run') {
+        creationToken = args.find((arg) => arg.startsWith('devhotel.creation-token='))!.split('=')[1]!
         serviceExists = true
         return { code: 0, stdout: `${serviceId}\n`, stderr: '' }
       }
@@ -703,6 +776,7 @@ describe('OciCliBackend Room networks', () => {
   it('does not revive a stopped Android service bound to a replaced runtime anchor ID', async () => {
     const runtimeId = 'a'.repeat(64)
     const serviceId = 'b'.repeat(64)
+    let serviceExists = true
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'network' && args[1] === 'inspect' && args[2] === androidControlNetworkName('r1')) {
         return {
@@ -710,6 +784,10 @@ describe('OciCliBackend Room networks', () => {
           stdout: networkInspect('r1', androidControlNetworkName('r1')),
           stderr: ''
         }
+      }
+      if (args[0] === 'rm' && args[2] === serviceId) {
+        serviceExists = false
+        return ok
       }
       if (args[0] !== 'inspect') return ok
       if (args[1] === androidRuntimeAnchorName('r1')) {
@@ -730,7 +808,7 @@ describe('OciCliBackend Room networks', () => {
           stderr: ''
         }
       }
-      if (args[1] === 'dh-r1-svc-redis') {
+      if (serviceExists && (args[1] === 'dh-r1-svc-redis' || args[1] === serviceId)) {
         return {
           code: 0,
           stdout: JSON.stringify([{
@@ -752,6 +830,8 @@ describe('OciCliBackend Room networks', () => {
 
     await expect(backend().startService('r1', 'redis')).rejects.toThrow(/exact Android runtime namespace/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
   })
 
   it('fails closed when a runtime anchor exists without its Android control network', async () => {
@@ -810,6 +890,9 @@ describe('OciCliBackend Room networks', () => {
     let serviceExists = true
     let serviceStatus = 'exited'
     let cleanupFails = false
+    let startFails = false
+    let startedStatus = 'running'
+    let corruptOwnership = false
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
         return {
@@ -849,7 +932,7 @@ describe('OciCliBackend Room networks', () => {
             Config: { Labels: {
               'devhotel.room': 'r1',
               'devhotel.role': 'svc-redis',
-              'devhotel.managed': '1'
+              'devhotel.managed': corruptOwnership && serviceStatus !== 'exited' ? '0' : '1'
             } },
             State: { Status: serviceStatus },
             HostConfig: { NetworkMode: `container:${runtimeId}` },
@@ -861,8 +944,8 @@ describe('OciCliBackend Room networks', () => {
         }
       }
       if (args[0] === 'start' && args[1] === serviceId) {
-        serviceStatus = 'running'
-        return ok
+        serviceStatus = startedStatus
+        return startFails ? { code: 1, stdout: '', stderr: 'start failed after transition' } : ok
       }
       if (args[0] === 'rm' && args[2] === serviceId) {
         if (cleanupFails) return { code: 1, stdout: '', stderr: 'cleanup denied' }
@@ -883,7 +966,33 @@ describe('OciCliBackend Room networks', () => {
     serviceStatus = 'exited'
     cleanupFails = true
     await expect(backend().startService('r1', 'redis'))
-      .rejects.toThrow(/namespace validation and exact cleanup both failed/)
+      .rejects.toThrow(/start validation and exact cleanup both failed/)
     expect(serviceExists).toBe(true)
+
+    mockedRunDocker.mockClear()
+    cleanupFails = false
+    startFails = true
+    serviceStatus = 'exited'
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/start redis/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    serviceExists = true
+    serviceStatus = 'exited'
+    startFails = false
+    startedStatus = 'paused'
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/start incomplete/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    serviceExists = true
+    serviceStatus = 'exited'
+    startedStatus = 'running'
+    corruptOwnership = true
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/ownership metadata/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
   })
 })

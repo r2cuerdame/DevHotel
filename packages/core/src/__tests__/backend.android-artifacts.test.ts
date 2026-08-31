@@ -783,6 +783,160 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toBe(true)
   })
 
+  it('captures emulator screen bytes only from one exact topology and withholds them after replacement', async () => {
+    const ids = {
+      anchor: 'a'.repeat(64),
+      runtime: 'b'.repeat(64),
+      web: 'c'.repeat(64),
+      emulator: 'd'.repeat(64),
+      replacement: 'e'.repeat(64),
+      controlSandbox: 'f'.repeat(64),
+      runtimeSandbox: '1'.repeat(64)
+    }
+    let liveEmulatorId = ids.emulator
+    let replaceAfterExec = false
+    let foreignEmulatorName = false
+    let emulatorSandbox = ids.controlSandbox
+    const participant = (name: string, role: string, id: string, sandboxId: string, networkMode: string) => ({
+      Id: id,
+      Name: `/${name}`,
+      Config: { Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': role,
+        'devhotel.managed': foreignEmulatorName && role === 'svc-emulator' ? '0' : '1'
+      } },
+      State: { Status: 'running' },
+      HostConfig: { NetworkMode: networkMode },
+      NetworkSettings: { SandboxID: sandboxId }
+    })
+    mockedRunDocker.mockImplementation(async (args, opts) => {
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Name: args[2],
+            Driver: 'bridge',
+            Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
+            Containers: control
+              ? { [ids.anchor]: { Name: anchorName(ROOM_ID) } }
+              : { [ids.runtime]: { Name: androidRuntimeAnchorName(ROOM_ID) } }
+          }]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'inspect') {
+        const name = args[1]!
+        if (name === anchorName(ROOM_ID) || name === ids.anchor) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([participant(
+              anchorName(ROOM_ID),
+              'anchor',
+              ids.anchor,
+              ids.controlSandbox,
+              androidControlNetworkName(ROOM_ID)
+            )]),
+            stderr: ''
+          }
+        }
+        if (name === androidRuntimeAnchorName(ROOM_ID) || name === ids.runtime) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([participant(
+              androidRuntimeAnchorName(ROOM_ID),
+              'android-runtime-anchor',
+              ids.runtime,
+              ids.runtimeSandbox,
+              roomNetworkName(ROOM_ID)
+            )]),
+            stderr: ''
+          }
+        }
+        if (name === webName(ROOM_ID) || name === ids.web) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([participant(
+              webName(ROOM_ID),
+              'web',
+              ids.web,
+              ids.runtimeSandbox,
+              `container:${androidRuntimeAnchorName(ROOM_ID)}`
+            )]),
+            stderr: ''
+          }
+        }
+        if (name === emulatorName(ROOM_ID)) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([participant(
+              emulatorName(ROOM_ID),
+              'svc-emulator',
+              liveEmulatorId,
+              emulatorSandbox,
+              `container:${anchorName(ROOM_ID)}`
+            )]),
+            stderr: ''
+          }
+        }
+        if (name === ids.emulator && liveEmulatorId === ids.emulator) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([participant(
+              emulatorName(ROOM_ID),
+              'svc-emulator',
+              ids.emulator,
+              emulatorSandbox,
+              `container:${anchorName(ROOM_ID)}`
+            )]),
+            stderr: ''
+          }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'exec') {
+        opts?.onStdout?.('a'.repeat(128))
+        if (replaceAfterExec) liveEmulatorId = ids.replacement
+        return ok
+      }
+      return ok
+    })
+
+    const controller = new AbortController()
+    await expect(new OciCliBackend().captureEmulatorScreen(
+      ROOM_ID,
+      { signal: controller.signal, timeoutMs: 45_000 }
+    )).resolves.toBe('a'.repeat(128))
+    const execCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'exec')!
+    expect(execCall[0][1]).toBe(ids.emulator)
+    expect(execCall[1]).toMatchObject({
+      signal: controller.signal,
+      timeoutMs: 45_000,
+      maxStdoutBytes: SCREENSHOT_BASE64_LIMIT,
+      maxStderrBytes: 64 * 1024
+    })
+
+    mockedRunDocker.mockClear()
+    replaceAfterExec = true
+    await expect(new OciCliBackend().captureEmulatorScreen(ROOM_ID))
+      .rejects.toThrow(/topology participant disappeared/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec' && args[1] === ids.emulator)).toBe(true)
+
+    mockedRunDocker.mockClear()
+    liveEmulatorId = ids.emulator
+    replaceAfterExec = false
+    emulatorSandbox = '2'.repeat(64)
+    await expect(new OciCliBackend().captureEmulatorScreen(ROOM_ID))
+      .rejects.toThrow(/not live in the exact control anchor/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    emulatorSandbox = ids.controlSandbox
+    foreignEmulatorName = true
+    await expect(new OciCliBackend().emulatorState(ROOM_ID)).rejects.toThrow(/ownership metadata/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec')).toBe(false)
+  })
+
   it('refuses extra control endpoints and an emulator attached to a different anchor', async () => {
     const ids = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), runtime: 'c'.repeat(64), web: 'd'.repeat(64) }
     let extraControlMember = true
