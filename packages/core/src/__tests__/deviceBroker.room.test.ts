@@ -775,6 +775,99 @@ describe('Android automation targets the attached device without a hand-written 
     expect(backend.execInRoomCalls.some((call) => call.cmd.at(-1)?.includes('emulator-5554'))).toBe(false)
   }, 15_000)
 
+  it('clears stale debug outputs before the build and verifies only its captured target', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    const attached = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    if (attached.state !== 'granted') throw new Error('unreachable')
+    adb.execs = []
+    backend.execInRoomCalls = []
+    let staleOutputPresent = true
+    let workspaceSwappedAfterCapture = false
+    let buildRan = false
+    let discoveries = 0
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
+        expect(buildRan).toBe(false)
+        staleOutputPresent = false
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (command === 'cd /workspace && gradle assembleDebug --no-daemon') {
+        expect(staleOutputPresent).toBe(false)
+        buildRan = true
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (command.includes('find /workspace')) {
+        discoveries += 1
+        if (workspaceSwappedAfterCapture) {
+          return { code: 0, stdout: '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
+        }
+        const current = '/workspace/app/build/outputs/apk/debug/output-metadata.json\n'
+        const stale = staleOutputPresent
+          ? '/workspace/deleted/build/outputs/apk/debug/output-metadata.json\n'
+          : ''
+        return { code: 0, stdout: `${stale}${current}`, stderr: '' }
+      }
+      if (command.startsWith("cat '/workspace/app/")) {
+        workspaceSwappedAfterCapture = true
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      if (command.startsWith("cat '/workspace/deleted/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.stale.app', elements: [{ outputFile: 'stale-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const installEvidence = { fence: '', foregroundApplicationId: 'com.example.app', locale: 'en-US' }
+    adb.execResultFor = (_serial, args) => installEvidenceResult(args, installEvidence)
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(entry.captured).toEqual({ applicationId: 'com.example.app' })
+    expect(buildRan).toBe(true)
+    expect(discoveries).toBe(1)
+    expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([
+      'copyFromRoom:/workspace/app/build/outputs/apk/debug/app-debug.apk'
+    ])
+    expect(backend.calls.some((call) => call.includes('/workspace/deleted/'))).toBe(false)
+    expect(orch.androidInstalls.list('aaaa1111', {
+      kind: 'physical', targetId: attached.device.id, deviceId: attached.device.id, leaseId: attached.lease.id
+    })).toEqual([expect.objectContaining({ applicationId: 'com.example.app', changeId: entry.id })])
+  }, 15_000)
+
+  it('fails android-run closed before build when stale debug outputs cannot be cleared', async () => {
+    const { orch, adb, backend } = setup()
+    await orch.refreshAndroidDevices()
+    await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-a' })
+    adb.execs = []
+    let buildRan = false
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
+        return { code: 1, stdout: 'partial private path', stderr: 'permission denied' }
+      }
+      if (command === 'cd /workspace && gradle assembleDebug --no-daemon') buildRan = true
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry.status).toBe('failed')
+    expect(entry.verify?.detail).toMatch(/prior Android debug outputs could not be cleared safely/)
+    expect(entry.verify?.detail).not.toMatch(/partial private path|permission denied/)
+    expect(buildRan).toBe(false)
+    expect(adb.execs.some((call) => ['install', 'install-multiple', 'install-multi-package'].includes(call.args[0] ?? ''))).toBe(false)
+  })
+
   it.each([
     { race: 'user-switch' as const, expectedCode: 'ANDROID_APP_USER_CHANGED', keepsReceipt: true },
     { race: 'replacement' as const, expectedCode: 'ANDROID_APP_REPLACED', keepsReceipt: false }

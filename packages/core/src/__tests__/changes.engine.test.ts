@@ -137,20 +137,7 @@ describe('Android emulator changes', () => {
 
   it('retries tracked foreground verification while an emulator app is still starting', async () => {
     let foregroundProbes = 0
-    backend.execInRoomHandler = (_roomId, cmd) => {
-      const command = cmd.at(-1) ?? ''
-      if (command.includes('find /workspace')) {
-        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\n', stderr: '' }
-      }
-      if (command.startsWith("cat '/workspace/")) {
-        return {
-          code: 0,
-          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
-          stderr: ''
-        }
-      }
-      return { code: 0, stdout: '', stderr: '' }
-    }
+    backend.execInRoomHandler = () => { throw new Error('verification must not rescan mutable build metadata') }
 
     const changeCtx = ctx()
     changeCtx.isTrackedAndroidAppForeground = async () => {
@@ -163,7 +150,7 @@ describe('Android emulator changes', () => {
       const verifying = androidRunChange.verify(
         changeCtx,
         {},
-        null,
+        { applicationId: 'com.example.app' },
         { id: 'verify-delayed-emulator-app', createdAt: '2026-08-30T00:00:00.000Z' }
       )
       for (let turn = 0; foregroundProbes === 0 && turn < 20; turn++) await Promise.resolve()
@@ -858,6 +845,9 @@ describe('android Build & Run line-ending preflight', () => {
       }
       if (script === LINE_ENDING_SCAN_SCRIPT) {
         return { code: 0, stdout: `${SCAN_SENTINEL}\0./scripts/sign.sh\0`, stderr: '' }
+      }
+      if (script.includes("find . -xdev -type d -path '*/build/outputs/apk/debug'")) {
+        return { code: 0, stdout: '', stderr: '' }
       }
       if (script.startsWith('cd /workspace && ')) {
         return { code: 1, stdout: '', stderr: 'Execution failed for task :app:signDebug' }

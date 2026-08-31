@@ -4,10 +4,15 @@ import { sleep } from '../types'
 
 const BUILD_TIMEOUT_MS = 15 * 60_000
 const MAX_ANDROID_APPLICATION_ID_LENGTH = 223
+const CLEAR_DEBUG_APK_OUTPUTS = "cd /workspace && find . -xdev -type d -path '*/build/outputs/apk/debug' -prune -exec rm -rf -- {} +"
 
 interface BuiltApp {
   appId: string
   apkPath: string
+}
+
+interface AndroidRunCapture {
+  applicationId: string
 }
 
 function assertApplicationId(value: string, source: 'build metadata' | 'request'): string {
@@ -88,6 +93,43 @@ async function builtApps(ctx: ChangeCtx): Promise<BuiltApp[]> {
   return apps
 }
 
+async function clearPriorDebugOutputs(ctx: ChangeCtx): Promise<void> {
+  // GNU find does not follow symlinks by default. Restrict deletion to real
+  // debug-output directories below the Room-local workspace and never accept
+  // partial cleanup diagnostics as build provenance.
+  const cleared = await ctx.backend.execInRoom(
+    ctx.roomId,
+    ['sh', '-lc', CLEAR_DEBUG_APK_OUTPUTS],
+    { timeoutMs: 30_000, maxStdoutBytes: 16 * 1024, maxStderrBytes: 16 * 1024 }
+  ).catch(() => {
+    throw new Error('prior Android debug outputs could not be cleared safely')
+  })
+  if (
+    cleared.code !== 0 ||
+    cleared.stdout.length > 0 ||
+    cleared.stderr.length > 0 ||
+    cleared.outputLimitExceeded === true
+  ) {
+    throw new Error('prior Android debug outputs could not be cleared safely')
+  }
+}
+
+function capturedTarget(captured: unknown, requestedApplicationId?: string): AndroidRunCapture | null {
+  if (!captured || typeof captured !== 'object' || Array.isArray(captured)) return null
+  const record = captured as { applicationId?: unknown }
+  if (Object.keys(record).length !== 1 || typeof record.applicationId !== 'string') return null
+  try {
+    const applicationId = assertApplicationId(record.applicationId, 'build metadata')
+    if (
+      requestedApplicationId !== undefined &&
+      applicationId !== assertApplicationId(requestedApplicationId, 'request')
+    ) return null
+    return { applicationId }
+  } catch {
+    return null
+  }
+}
+
 function pickTarget(apps: BuiltApp[], applicationId?: string): BuiltApp {
   if (!applicationId) {
     const first = apps[0]
@@ -150,6 +192,8 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
   async apply(ctx, p, steps, operation) {
     const apply = async (): Promise<void> => {
       const room = ctx.room()
+      steps.push('Clear prior debug APK outputs')
+      await clearPriorDebugOutputs(ctx)
       steps.push(`Run ${room.startCommand}`)
       const build = await ctx.backend.execInRoom(room.id, ['sh', '-lc', `cd /workspace && ${room.startCommand}`], {
         timeoutMs: BUILD_TIMEOUT_MS
@@ -162,6 +206,7 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       const apps = await builtApps(ctx)
       if (apps.length === 0) throw new Error('no output-metadata.json produced')
       const target = pickTarget(apps, p.applicationId)
+      steps.setCaptured({ applicationId: target.appId } satisfies AndroidRunCapture)
 
       if (ctx.physicalAndroidDevice) {
         steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
@@ -206,13 +251,12 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
       await apply()
     }
   },
-  async verify(ctx, p) {
-    let appId: string
-    try {
-      appId = pickTarget(await builtApps(ctx), p.applicationId).appId
-    } catch {
+  async verify(ctx, p, captured) {
+    const target = capturedTarget(captured, p.applicationId)
+    if (!target) {
       return { ok: false, detail: 'Android run verification could not read validated build metadata' }
     }
+    const appId = target.applicationId
     try {
       if (!ctx.isTrackedAndroidAppForeground) return androidProbeFailure(ctx, appId)
       for (let i = 0; i < 6; i++) {
