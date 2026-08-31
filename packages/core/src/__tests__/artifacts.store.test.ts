@@ -100,6 +100,21 @@ describe('Room screenshot artifact store', () => {
     ])
   })
 
+  it('preserves an already validated token-shaped filename', () => {
+    const { store } = setup()
+    const artifact = store.publishScreenshot({
+      roomId: 'aaaa1111',
+      filename: 'ghp_aaaaaaaaaaaaaaaaaaaa.png',
+      png: screenshotPng(),
+      actor: 'agent',
+      createdAt: '2026-08-31T00:00:00.000Z',
+      metadata: metadata('aaaa1111')
+    })
+
+    expect(artifact.filename).toBe('ghp_aaaaaaaaaaaaaaaaaaaa.png')
+    expect(store.readContent('aaaa1111', artifact.id).artifact.filename).toBe('ghp_aaaaaaaaaaaaaaaaaaaa.png')
+  })
+
   it('refuses tampered content instead of serving it', () => {
     const { store, userData } = setup()
     const artifact = store.publishScreenshot({

@@ -23,24 +23,22 @@ interface ArtifactRow {
 function rowToArtifact(row: ArtifactRow): RoomArtifact {
   let metadata: unknown
   try {
-    metadata = JSON.parse(row.metadata_json)
+    metadata = redactStructuredSecrets(JSON.parse(row.metadata_json))
   } catch {
     throw new Error(`Artifact ${row.id} has invalid metadata JSON`)
   }
-  return zRoomArtifact.parse(
-    redactStructuredSecrets({
-      id: row.id,
-      roomId: row.room_id,
-      kind: row.kind,
-      filename: row.filename,
-      mediaType: row.media_type,
-      sizeBytes: row.size_bytes,
-      sha256: row.sha256,
-      actor: row.actor,
-      createdAt: row.created_at,
-      metadata
-    })
-  )
+  return zRoomArtifact.parse({
+    id: row.id,
+    roomId: row.room_id,
+    kind: row.kind,
+    filename: row.filename,
+    mediaType: row.media_type,
+    sizeBytes: row.size_bytes,
+    sha256: row.sha256,
+    actor: row.actor,
+    createdAt: row.created_at,
+    metadata
+  })
 }
 
 export interface ArtifactInsert {

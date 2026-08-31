@@ -113,20 +113,22 @@ export class RoomArtifactStore {
     }
 
     const id = randomUUID()
-    const record = zRoomArtifact.parse(
-      redactStructuredSecrets({
-        id,
-        roomId: input.roomId,
-        kind: 'android-screenshot',
-        filename,
-        mediaType: 'image/png',
-        sizeBytes: validated.png.byteLength,
-        sha256: sha256(validated.png),
-        actor: input.actor,
-        createdAt: input.createdAt,
-        metadata
-      })
-    )
+    // Metadata is the only prose-bearing portion of this receipt and was
+    // redacted above. Keep the already validated filename byte-for-byte:
+    // prose redaction can turn a valid token-shaped basename into an invalid
+    // one after the public request boundary has accepted it.
+    const record = zRoomArtifact.parse({
+      id,
+      roomId: input.roomId,
+      kind: 'android-screenshot',
+      filename,
+      mediaType: 'image/png',
+      sizeBytes: validated.png.byteLength,
+      sha256: sha256(validated.png),
+      actor: input.actor,
+      createdAt: input.createdAt,
+      metadata
+    })
     const root = this.ensureRoot(input.roomId)
     const temporary = join(root, `.tmp-${id}`)
     const final = join(root, id)
