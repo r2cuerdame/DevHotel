@@ -19,7 +19,7 @@ export const restartWebChange: ChangeDefinition<Record<string, never>> = {
   },
   async apply(ctx, _p, steps) {
     steps.push('Restart web container')
-    await ctx.backend.restartWeb(ctx.roomId)
+    await ctx.backend.restartWeb(ctx.roomId, ctx.webSpec())
   },
   verify(ctx) {
     return verifyWebUp(ctx)

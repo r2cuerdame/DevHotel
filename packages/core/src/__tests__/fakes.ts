@@ -246,10 +246,10 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`webRunningUnpaused:${roomId}`)
     return this.webRunningUnpausedValue
   }
-  async restartWeb(roomId: string) {
+  async restartWeb(roomId: string, _spec?: WebSpec) {
     this.calls.push(`restartWeb:${roomId}`)
   }
-  async recreateWeb(spec: WebSpec) {
+  async recreateWeb(spec: WebSpec, _expectedWebId?: string) {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
     this.webPausedValue = false

@@ -11,6 +11,7 @@ import {
   ANCHOR_IMAGE,
   EMULATOR_AVD_OVERRIDE_PATH,
   EMULATOR_IMAGE,
+  NETWORK_AUTHORITY_SANDBOX_LABEL,
   RELAY_PORT,
   anchorName,
   androidControlNetworkName,
@@ -42,6 +43,7 @@ import {
   webName,
   wrapStartCommand,
   workspaceSnapshotVolume,
+  type NetworkNamespaceAuthority,
 } from './naming'
 import type {
   AnchorSpec,
@@ -1012,6 +1014,8 @@ export interface OciCliBackendOptions {
   identityFile?: string
   /** Durable, non-destructive adoption record for pre-label Room volumes. */
   legacyVolumeAdoptionFile?: string
+  /** Durable proof for an exact retained joiner restarted after its network authority. */
+  networkRecoveryAttestationDir?: string
   /** Must confirm both the DB Room record and its on-disk Room manifest. */
   canAdoptLegacyVolume?: (roomId: string, name: string) => boolean
   /** Test seam; production uses a fresh 256-bit random token per anchor. */
@@ -1021,6 +1025,7 @@ export interface OciCliBackendOptions {
 export class OciCliBackend implements IsolationBackend {
   private readonly identityFile: string | undefined
   private readonly legacyVolumeAdoptionFile: string | undefined
+  private readonly networkRecoveryAttestationDir: string | undefined
   private readonly canAdoptLegacyVolume: ((roomId: string, name: string) => boolean) | undefined
   private expectedEngineIdentity: EngineIdentity | null | undefined
   private legacyVolumeAdoptions: LegacyVolumeAdoptionRegistry | undefined
@@ -1028,8 +1033,14 @@ export class OciCliBackend implements IsolationBackend {
   private readonly relayTokens = new Map<string, string>()
 
   constructor(opts: OciCliBackendOptions = {}) {
+    if (opts.networkRecoveryAttestationDir && !isAbsolute(opts.networkRecoveryAttestationDir)) {
+      throw new Error('network recovery attestation directory must be absolute')
+    }
     this.identityFile = opts.identityFile
     this.legacyVolumeAdoptionFile = opts.legacyVolumeAdoptionFile
+    this.networkRecoveryAttestationDir = opts.networkRecoveryAttestationDir
+      ? resolve(opts.networkRecoveryAttestationDir)
+      : undefined
     this.canAdoptLegacyVolume = opts.canAdoptLegacyVolume
     this.relayTokenFactory = opts.relayTokenFactory ?? (() => randomBytes(32).toString('hex'))
   }
@@ -1101,7 +1112,8 @@ export class OciCliBackend implements IsolationBackend {
         )
       }
       if (spec.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(spec.roomId)
-      must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
+      const webNetworkAuthority = await this.exactWebNetworkNamespace(spec)
+      must(await runDocker(buildWebCreateArgs(spec, webNetworkAuthority)), 'create web container')
       if (startWeb) await this.startWeb(spec.roomId)
       const hostPort = spec.standalone ? null : await this.readHostPort(spec.roomId)
       if (relayToken) this.relayTokens.set(spec.roomId, relayToken)
@@ -1148,10 +1160,60 @@ export class OciCliBackend implements IsolationBackend {
     return { hostPort: opts.standalone ? null : await this.readHostPort(roomId) }
   }
 
-  async startWeb(roomId: string): Promise<void> {
+  async startWeb(roomId: string, expectedWebId?: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
-    await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['start', webName(roomId)]), 'start web container')
+    const name = webName(roomId)
+    const web = await this.assertRoomContainer(roomId, name, 'web')
+    const id = exactFullContainerId(web, roomId)
+    if (expectedWebId !== undefined && id !== expectedWebId) {
+      throw new Error('Room web immutable ID changed before start')
+    }
+    const mode = web.HostConfig?.NetworkMode ?? ''
+    if (!mode.startsWith('container:')) {
+      if (web.State?.Status === 'running') return
+      must(await runDocker(['start', id]), 'start web container')
+      return
+    }
+    const candidates = [
+      {
+        name: androidRuntimeAnchorName(roomId),
+        role: 'android-runtime-anchor',
+        network: roomNetworkName(roomId)
+      },
+      {
+        name: anchorName(roomId),
+        role: 'anchor',
+        network: null
+      }
+    ] as const
+    for (const candidate of candidates) {
+      const authority = await this.inspectContainer(candidate.name)
+      if (!authority) continue
+      const authorityId = exactFullContainerId(authority, roomId)
+      if (mode !== `container:${candidate.name}` && mode !== `container:${authorityId}`) continue
+      await this.assertRoomContainer(roomId, candidate.name, candidate.role, authority)
+      const authorityNetwork = candidate.network ?? authority.HostConfig?.NetworkMode ?? ''
+      if (
+        candidate.role === 'anchor' &&
+        authorityNetwork !== roomNetworkName(roomId) &&
+        authorityNetwork !== androidControlNetworkName(roomId)
+      ) {
+        throw new Error('Room web network authority is not attached to an owned Room network')
+      }
+      await this.startExactJoinedContainer(
+        roomId,
+        name,
+        'web',
+        candidate.name,
+        candidate.role,
+        authorityNetwork,
+        'Room web',
+        id,
+        authorityId
+      )
+      return
+    }
+    throw new Error('Room web did not retain an exact owned network authority')
   }
 
   async stopRoomPod(roomId: string): Promise<void> {
@@ -1205,15 +1267,18 @@ export class OciCliBackend implements IsolationBackend {
       volumeProof,
       state: 'running-unpaused'
     })
+    await this.assertRoomArtifactNetworkAuthorityStable(spec, authority)
     const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, captured)
     const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, captured)
     const current = await this.inspectContainer(captured.containerId)
     if (!current) throw new Error('Room artifact web runtime disappeared during fence capture')
-    return this.assertRoomArtifactWebRuntime(spec, current, currentAuthority, {
+    const finalFence = this.assertRoomArtifactWebRuntime(spec, current, currentAuthority, {
       fence: captured,
       volumeProof: currentVolumeProof,
       state: 'running-unpaused'
     })
+    await this.assertRoomArtifactNetworkAuthorityStable(spec, currentAuthority)
+    return finalFence
   }
 
   async pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
@@ -1229,6 +1294,7 @@ export class OciCliBackend implements IsolationBackend {
       volumeProof,
       state: 'running-or-paused'
     })
+    await this.assertRoomArtifactNetworkAuthorityStable(spec, authority)
     if (before.State?.Paused !== true) {
       try {
         must(
@@ -1252,6 +1318,7 @@ export class OciCliBackend implements IsolationBackend {
       volumeProof: currentVolumeProof,
       state: 'paused'
     })
+    await this.assertRoomArtifactNetworkAuthorityStable(spec, currentAuthority)
   }
 
   async restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void> {
@@ -1268,6 +1335,7 @@ export class OciCliBackend implements IsolationBackend {
         volumeProof,
         state: 'restorable'
       })
+      await this.assertRoomArtifactNetworkAuthorityStable(spec, authority)
       if (this.roomArtifactWebIsRunningUnpaused(original)) {
         const currentVolumeProof = await this.assertRoomArtifactExpectedVolumes(spec, fence)
         const currentAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
@@ -1278,6 +1346,7 @@ export class OciCliBackend implements IsolationBackend {
           volumeProof: currentVolumeProof,
           state: 'running-unpaused'
         })
+        await this.assertRoomArtifactNetworkAuthorityStable(spec, currentAuthority)
         return
       }
       if (original.State?.Running === true && original.State?.Paused === true) {
@@ -1303,6 +1372,7 @@ export class OciCliBackend implements IsolationBackend {
             volumeProof: currentVolumeProof,
             state: 'restorable'
           })
+          await this.assertRoomArtifactNetworkAuthorityStable(spec, currentAuthority)
           if (this.roomArtifactWebIsRunningUnpaused(resumed)) {
             this.assertRoomArtifactWebRuntime(spec, resumed, currentAuthority, {
               fence,
@@ -1322,11 +1392,17 @@ export class OciCliBackend implements IsolationBackend {
     }
 
     // Revalidate the immutable network authority after removing the original.
-    await this.assertRoomArtifactNetworkAuthority(spec, fence)
+    const restoreAuthority = await this.assertRoomArtifactNetworkAuthority(spec, fence)
     await this.assertRoomArtifactExpectedVolumes(spec, fence)
     await this.ensureImage(imageFor(spec))
     const restoreToken = randomUUID().replaceAll('-', '')
-    const createArgs = this.roomArtifactRestoreCreateArgs(spec, restoreToken)
+    const createArgs = this.roomArtifactRestoreCreateArgs(
+      spec,
+      restoreToken,
+      restoreAuthority.kind === 'container'
+        ? { id: restoreAuthority.id, sandboxId: restoreAuthority.sandboxId }
+        : undefined
+    )
     let createError: unknown
     let recreatedId: string | undefined
     try {
@@ -1362,6 +1438,7 @@ export class OciCliBackend implements IsolationBackend {
         volumeProof: currentCreateVolumeProof,
         state: 'created-or-stopped'
       })
+      await this.assertRoomArtifactNetworkAuthorityStable(spec, currentCreateAuthority)
       recreatedId = reconciledFence.containerId
 
       let startError: unknown
@@ -1390,6 +1467,7 @@ export class OciCliBackend implements IsolationBackend {
             volumeProof: currentStartVolumeProof,
             state: 'running-unpaused'
           })
+          await this.assertRoomArtifactNetworkAuthorityStable(spec, currentStartAuthority)
           return
         } catch (error) {
           startError = startError
@@ -1425,13 +1503,34 @@ export class OciCliBackend implements IsolationBackend {
     )
   }
 
-  async restartWeb(roomId: string): Promise<void> {
+  async restartWeb(roomId: string, spec?: WebSpec): Promise<void> {
     await this.assertPinnedEngineIdentity()
-    await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['restart', '-t', '8', webName(roomId)]), 'restart web container')
+    const name = webName(roomId)
+    const web = await this.assertRoomContainer(roomId, name, 'web')
+    const id = exactFullContainerId(web, roomId)
+    const mode = web.HostConfig?.NetworkMode ?? ''
+    if (mode.startsWith('container:') && !/^container:[a-f0-9]{64}$/.test(mode)) {
+      if (!spec || spec.roomId !== roomId) {
+        throw new Error('Legacy Room web requires its trusted runtime spec for immutable network migration')
+      }
+      await this.recreateWeb(spec, id)
+      return
+    }
+    if (!isStoppedContainerState(web.State?.Status ?? '')) {
+      must(await runDocker(['stop', '-t', '8', id]), 'stop exact web container for restart')
+      const stopped = await this.inspectContainer(id)
+      if (!stopped || stopped.State?.Status !== 'exited') {
+        throw new Error('web container restart could not prove its exact stopped state')
+      }
+      await this.assertRoomContainer(roomId, name, 'web', stopped)
+      if (exactFullContainerId(stopped, roomId) !== id) {
+        throw new Error('web container changed immutable ID during restart')
+      }
+    }
+    await this.startWeb(roomId, id)
   }
 
-  async recreateWeb(spec: WebSpec): Promise<void> {
+  async recreateWeb(spec: WebSpec, expectedWebId?: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(imageFor(spec))
     await this.ensureRoomNetwork(spec.roomId)
@@ -1446,9 +1545,43 @@ export class OciCliBackend implements IsolationBackend {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
     if (spec.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(spec.roomId)
-    await this.removeRoomContainer(spec.roomId, webName(spec.roomId), 'web')
-    must(await runDocker(buildWebCreateArgs(spec)), 'create web container')
-    await this.startWeb(spec.roomId)
+    await this.removeExactRoomContainerForRecreation(
+      spec.roomId,
+      webName(spec.roomId),
+      'web',
+      expectedWebId
+    )
+    const webNetworkAuthority = await this.exactWebNetworkNamespace(spec)
+    const recreationToken = randomUUID().replaceAll('-', '')
+    let createdId: string | undefined
+    try {
+      const created = must(
+        await runDocker(this.roomArtifactRestoreCreateArgs(spec, recreationToken, webNetworkAuthority)),
+        'create token-fenced web container'
+      )
+      const candidateId = created.stdout.trim()
+      if (!/^[a-f0-9]{64}$/.test(candidateId)) {
+        throw new Error('web recreation did not return one immutable container ID')
+      }
+      createdId = candidateId
+      const inspected = await this.inspectContainer(createdId)
+      if (!inspected) throw new Error('token-fenced web container disappeared during recreation')
+      await this.assertRoomContainer(spec.roomId, webName(spec.roomId), 'web', inspected)
+      if (
+        exactFullContainerId(inspected, spec.roomId) !== createdId ||
+        inspected.Config?.Labels?.[ROOM_ARTIFACT_RESTORE_TOKEN_LABEL] !== recreationToken
+      ) {
+        throw new Error('token-fenced web container identity changed during recreation')
+      }
+      await this.startWeb(spec.roomId, createdId)
+    } catch (error) {
+      try {
+        await this.removeFailedRoomArtifactWebRestore(spec, recreationToken, createdId)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'web recreation and exact cleanup both failed')
+      }
+      throw error
+    }
   }
 
   async recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }> {
@@ -2766,7 +2899,7 @@ export class OciCliBackend implements IsolationBackend {
       if (androidRuntime.State?.Status !== 'running') {
         throw new Error('Android runtime anchor must be running before a managed service is created')
       }
-      androidRuntimeId = exactContainerId(androidRuntime, roomId)
+      androidRuntimeId = exactFullContainerId(androidRuntime, roomId)
       androidRuntimeSandboxId = this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
       networkNamespace = androidRuntimeId
     } else {
@@ -2782,7 +2915,14 @@ export class OciCliBackend implements IsolationBackend {
     let createdId: string | undefined
     try {
       const launched = await runDocker(
-        buildServiceArgs(roomId, svc, version, networkNamespace, creationToken),
+        buildServiceArgs(
+          roomId,
+          svc,
+          version,
+          networkNamespace,
+          creationToken,
+          androidRuntimeSandboxId ?? undefined
+        ),
         {
           timeoutMs: null,
           maxStdoutBytes: 128,
@@ -2810,7 +2950,13 @@ export class OciCliBackend implements IsolationBackend {
           androidRuntimeId,
           `Android ${svc} service`
         )
-        if (this.exactRunningSandboxId(created, `Android ${svc} service`) !== androidRuntimeSandboxId) {
+        if (this.exactRunningJoinedSandboxId(
+          created,
+          androidRuntimeAnchorName(roomId),
+          androidRuntimeId,
+          androidRuntimeSandboxId,
+          `Android ${svc} service`
+        ) !== androidRuntimeSandboxId) {
           throw new Error(`Android ${svc} service was created outside the exact runtime namespace`)
         }
         await this.assertCurrentAndroidRuntimeAnchor(
@@ -2833,10 +2979,9 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const name = svcName(roomId, svc)
     const existing = await this.assertRoomContainer(roomId, name, `svc-${svc}`)
-    const id = exactContainerId(existing, roomId)
+    const id = exactFullContainerId(existing, roomId)
     const androidRuntime = await this.inspectContainer(androidRuntimeAnchorName(roomId))
     let runtimeId: string | null = null
-    let runtimeSandboxId: string | null = null
     const rejectAfterAndroidCleanup = async (error: unknown): Promise<never> => {
       try {
         await this.removeMisboundStartedService(roomId, svc, id)
@@ -2860,12 +3005,12 @@ export class OciCliBackend implements IsolationBackend {
         'android-runtime-anchor',
         androidRuntime
       )
-      runtimeId = exactContainerId(androidRuntime, roomId)
+      runtimeId = exactFullContainerId(androidRuntime, roomId)
       if (androidRuntime.State?.Status !== 'running') {
         throw new Error('Android runtime anchor must be running before a managed service is started')
       }
       this.assertContainerNetworkMode(androidRuntime, roomNetworkName(roomId), 'Android runtime anchor')
-      runtimeSandboxId = this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
+      this.exactRunningSandboxId(androidRuntime, 'Android runtime anchor')
       try {
         this.assertContainerNetworkNamespace(
           existing,
@@ -2883,28 +3028,28 @@ export class OciCliBackend implements IsolationBackend {
         throw new Error('Android runtime anchor is missing; refusing to start a service in the control namespace')
       }
     }
-    const startAndValidate = async (): Promise<void> => {
-      must(await runDocker(['start', id]), `start ${svc}`)
-      const started = await this.inspectContainer(id)
-      if (!started || started.State?.Status !== 'running') throw new Error(`${svc} start incomplete: ${name}`)
-      await this.assertRoomContainer(roomId, name, `svc-${svc}`, started)
-      if (exactContainerId(started, roomId) !== id) throw new Error(`${svc} immutable container changed during start`)
-      if (
-        runtimeSandboxId &&
-        this.exactRunningSandboxId(started, `Android ${svc} service`) !== runtimeSandboxId
-      ) throw new Error(`Android ${svc} service started outside the exact runtime namespace`)
-      if (runtimeId && runtimeSandboxId) {
-        await this.assertCurrentAndroidRuntimeAnchor(roomId, runtimeId, runtimeSandboxId)
-      }
-    }
     if (androidRuntime) {
       try {
-        await startAndValidate()
+        await this.startExactJoinedContainer(
+          roomId,
+          name,
+          `svc-${svc}`,
+          androidRuntimeAnchorName(roomId),
+          'android-runtime-anchor',
+          roomNetworkName(roomId),
+          `Android ${svc} service`,
+          id,
+          runtimeId!
+        )
       } catch (error) {
         await rejectAfterAndroidCleanup(error)
       }
     } else {
-      await startAndValidate()
+      must(await runDocker(['start', id]), `start ${svc}`)
+      const started = await this.inspectContainer(id)
+      if (!started || started.State?.Status !== 'running') throw new Error(`${svc} start incomplete: ${name}`)
+      await this.assertRoomContainer(roomId, name, `svc-${svc}`, started)
+      if (exactFullContainerId(started, roomId) !== id) throw new Error(`${svc} immutable container changed during start`)
     }
   }
 
@@ -3249,7 +3394,7 @@ export class OciCliBackend implements IsolationBackend {
         throw new Error(`Android execution topology participant disappeared: ${name}`)
       }
       const owned = await this.assertRoomContainer(roomId, name, role, inspected ?? undefined)
-      const id = exactContainerId(owned, roomId)
+      const id = exactFullContainerId(owned, roomId)
       if (expectedId && id !== expectedId) {
         throw new Error(`Android execution topology participant changed immutable ID: ${name}`)
       }
@@ -3263,14 +3408,56 @@ export class OciCliBackend implements IsolationBackend {
     )
     const web = await participant(webName(roomId), 'web', expected?.webId)
     const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
-    const anchorId = exactContainerId(anchor, roomId)
-    const runtimeAnchorId = exactContainerId(runtimeAnchor, roomId)
-    const webId = exactContainerId(web, roomId)
-    const emulatorId = exactContainerId(emulator, roomId)
+    const anchorId = exactFullContainerId(anchor, roomId)
+    const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
+    const webId = exactFullContainerId(web, roomId)
+    const emulatorId = exactFullContainerId(emulator, roomId)
     const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
     const runtimeSandboxId = this.exactRunningSandboxId(runtimeAnchor, 'Android runtime anchor')
-    const webSandboxId = this.exactRunningSandboxId(web, 'Android web')
-    const emulatorSandboxId = this.exactRunningSandboxId(emulator, 'Android emulator')
+    const webAuthorityLabel = web.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+    const webNeedsRecoveryAttestation =
+      (web.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+      webAuthorityLabel !== runtimeSandboxId
+    const webHasRecoveryAttestation = webNeedsRecoveryAttestation &&
+      this.matchesNetworkRecoveryAttestation(
+        roomId,
+        runtimeAnchor,
+        web,
+        runtimeAnchorId,
+        webId,
+        runtimeSandboxId
+      )
+    const webSandboxId = this.exactRunningJoinedSandboxId(
+      web,
+      androidRuntimeAnchorName(roomId),
+      runtimeAnchorId,
+      runtimeSandboxId,
+      'Android web',
+      false,
+      webHasRecoveryAttestation
+    )
+    const emulatorAuthorityLabel = emulator.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+    const emulatorNeedsRecoveryAttestation =
+      (emulator.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+      emulatorAuthorityLabel !== controlSandboxId
+    const emulatorHasRecoveryAttestation = emulatorNeedsRecoveryAttestation &&
+      this.matchesNetworkRecoveryAttestation(
+        roomId,
+        anchor,
+        emulator,
+        anchorId,
+        emulatorId,
+        controlSandboxId
+      )
+    const emulatorSandboxId = this.exactRunningJoinedSandboxId(
+      emulator,
+      anchorName(roomId),
+      anchorId,
+      controlSandboxId,
+      'Android emulator',
+      false,
+      emulatorHasRecoveryAttestation
+    )
     if (
       expected &&
       (controlSandboxId !== expected.controlSandboxId || runtimeSandboxId !== expected.runtimeSandboxId)
@@ -3311,12 +3498,37 @@ export class OciCliBackend implements IsolationBackend {
         `Android ${svc} service`
       )
       if (
-        service.State?.Status === 'running' &&
-        this.exactRunningSandboxId(service, `Android ${svc} service`) !== runtimeSandboxId
+        service.State?.Status === 'running'
       ) {
-        throw new Error(`Android ${svc} service is not live in the exact runtime anchor network namespace`)
+        const serviceId = exactFullContainerId(service, roomId)
+        const serviceAuthorityLabel = service.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+        const serviceNeedsRecoveryAttestation =
+          (service.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+          serviceAuthorityLabel !== runtimeSandboxId
+        const serviceHasRecoveryAttestation = serviceNeedsRecoveryAttestation &&
+          this.matchesNetworkRecoveryAttestation(
+            roomId,
+            runtimeAnchor,
+            service,
+            runtimeAnchorId,
+            serviceId,
+            runtimeSandboxId
+          )
+        if (this.exactRunningJoinedSandboxId(
+          service,
+          androidRuntimeAnchorName(roomId),
+          runtimeAnchorId,
+          runtimeSandboxId,
+          `Android ${svc} service`,
+          false,
+          serviceHasRecoveryAttestation
+        ) !== runtimeSandboxId) {
+          throw new Error(`Android ${svc} service is not live in the exact runtime anchor network namespace`)
+        }
       }
     }
+    await this.assertCurrentAndroidControlAnchor(roomId, anchorId, controlSandboxId)
+    await this.assertCurrentAndroidRuntimeAnchor(roomId, runtimeAnchorId, runtimeSandboxId)
     return { anchorId, runtimeAnchorId, webId, emulatorId, controlSandboxId, runtimeSandboxId }
   }
 
@@ -3327,13 +3539,14 @@ export class OciCliBackend implements IsolationBackend {
    */
   private async assertFencedEmulatorRecoveryTopology(
     roomId: string,
-    expected?: FencedEmulatorRecoveryTopology
+    expected?: FencedEmulatorRecoveryTopology,
+    observedStart?: ObservedEmulatorRecoveryStart
   ): Promise<FencedEmulatorRecoveryTopology> {
     const participant = async (name: string, role: string, expectedId?: string): Promise<DockerContainerInspect> => {
       const inspected = expectedId ? await this.inspectContainer(expectedId) : undefined
       if (expectedId && !inspected) throw new Error(`Android recovery participant disappeared: ${role}`)
       const owned = await this.assertRoomContainer(roomId, name, role, inspected ?? undefined)
-      if (expectedId && exactContainerId(owned, roomId) !== expectedId) {
+      if (expectedId && exactFullContainerId(owned, roomId) !== expectedId) {
         throw new Error(`Android recovery participant changed immutable ID: ${role}`)
       }
       return owned
@@ -3346,20 +3559,61 @@ export class OciCliBackend implements IsolationBackend {
     )
     const web = await participant(webName(roomId), 'web', expected?.webId)
     const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
-    const anchorId = exactContainerId(anchor, roomId)
-    const runtimeAnchorId = exactContainerId(runtimeAnchor, roomId)
-    const webId = exactContainerId(web, roomId)
-    const emulatorId = exactContainerId(emulator, roomId)
+    const anchorId = exactFullContainerId(anchor, roomId)
+    const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
+    const webId = exactFullContainerId(web, roomId)
+    const emulatorId = exactFullContainerId(emulator, roomId)
     const runtimeAnchorState = runtimeAnchor.State?.Status ?? ''
     const webState = web.State?.Status ?? ''
+    const controlStartedAt = exactDockerStartedAt(anchor, 'Android recovery control anchor')
+    const emulatorStartedAt = exactDockerStartedAt(emulator, 'Android recovery emulator')
+    const emulatorAuthorityLabel = emulator.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+    const runtimeSandboxId = runtimeAnchorState === 'running'
+      ? this.exactRunningSandboxId(runtimeAnchor, 'Android recovery runtime anchor')
+      : null
     if (
       expected &&
-      (runtimeAnchorState !== expected.runtimeAnchorState || webState !== expected.webState)
+      (
+        runtimeAnchorState !== expected.runtimeAnchorState ||
+        webState !== expected.webState ||
+        runtimeSandboxId !== expected.runtimeSandboxId ||
+        controlStartedAt !== expected.controlStartedAt ||
+        emulatorStartedAt !== expected.emulatorStartedAt ||
+        emulatorAuthorityLabel !== expected.emulatorAuthorityLabel
+      )
     ) {
       throw new Error('Android recovery started or changed a retained Room workload')
     }
     const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android recovery control anchor')
-    if (this.exactRunningSandboxId(emulator, 'Android recovery emulator') !== controlSandboxId) {
+    const emulatorNeedsRecoveryAttestation =
+      (emulator.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+      emulatorAuthorityLabel !== controlSandboxId
+    const observedCurrentRecoveryStart = !!observedStart &&
+      observedStart.authorityId === anchorId &&
+      observedStart.authoritySandboxId === controlSandboxId &&
+      observedStart.authorityStartedAt === controlStartedAt &&
+      observedStart.joinerId === emulatorId &&
+      observedStart.previousJoinerStartedAt !== emulatorStartedAt
+    const emulatorHasRecoveryAttestation = emulatorNeedsRecoveryAttestation && (
+      observedCurrentRecoveryStart ||
+      this.matchesNetworkRecoveryAttestation(
+        roomId,
+        anchor,
+        emulator,
+        anchorId,
+        emulatorId,
+        controlSandboxId
+      )
+    )
+    if (this.exactRunningJoinedSandboxId(
+      emulator,
+      anchorName(roomId),
+      anchorId,
+      controlSandboxId,
+      'Android recovery emulator',
+      false,
+      emulatorHasRecoveryAttestation
+    ) !== controlSandboxId) {
       throw new Error('Android recovery emulator left its exact control network namespace')
     }
     this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android recovery control anchor')
@@ -3370,6 +3624,33 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchorId,
       'Android recovery web'
     )
+    if (webState === 'running' || webState === 'paused') {
+      if (!runtimeSandboxId) throw new Error('Android recovery web retained no live runtime namespace authority')
+      const webAuthorityLabel = web.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+      const webNeedsRecoveryAttestation =
+        (web.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+        webAuthorityLabel !== runtimeSandboxId
+      const webHasRecoveryAttestation = webNeedsRecoveryAttestation &&
+        this.matchesNetworkRecoveryAttestation(
+          roomId,
+          runtimeAnchor,
+          web,
+          runtimeAnchorId,
+          webId,
+          runtimeSandboxId
+        )
+      if (this.exactRunningJoinedSandboxId(
+        web,
+        androidRuntimeAnchorName(roomId),
+        runtimeAnchorId,
+        runtimeSandboxId,
+        'Android recovery web',
+        true,
+        webHasRecoveryAttestation
+      ) !== runtimeSandboxId) {
+        throw new Error('Android recovery web left its exact runtime network namespace')
+      }
+    }
     const emulatorNetworkMode = emulator.HostConfig?.NetworkMode ?? ''
     if (emulatorNetworkMode !== `container:${anchorName(roomId)}` && emulatorNetworkMode !== `container:${anchorId}`) {
       throw new Error('Android recovery emulator no longer names the exact control anchor')
@@ -3388,12 +3669,31 @@ export class OciCliBackend implements IsolationBackend {
       anchor,
       runtimeAnchor
     )
+    await this.assertCurrentAndroidRecoveryEmulator(
+      roomId,
+      emulatorId,
+      anchorId,
+      controlSandboxId,
+      emulatorStartedAt,
+      emulatorHasRecoveryAttestation
+    )
+    await this.assertCurrentAndroidRecoveryRuntimeAnchor(
+      roomId,
+      runtimeAnchorId,
+      runtimeAnchorState,
+      runtimeSandboxId
+    )
+    await this.assertCurrentAndroidControlAnchor(roomId, anchorId, controlSandboxId, controlStartedAt)
     return {
       anchorId,
       runtimeAnchorId,
       webId,
       emulatorId,
       controlSandboxId,
+      controlStartedAt,
+      emulatorStartedAt,
+      emulatorAuthorityLabel,
+      runtimeSandboxId,
       runtimeAnchorState,
       webState
     }
@@ -3446,7 +3746,7 @@ export class OciCliBackend implements IsolationBackend {
   private async assertAndroidControlAnchorForEmulator(roomId: string): Promise<DockerContainerInspect> {
     const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
     if (anchor.State?.Status !== 'running') throw new Error('Android control anchor is not running')
-    const anchorId = exactContainerId(anchor, roomId)
+    const anchorId = exactFullContainerId(anchor, roomId)
     this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android control anchor')
     const control = await this.inspectNetwork(androidControlNetworkName(roomId))
     if (!control) throw new Error('Android control network is missing')
@@ -3522,7 +3822,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
     const anchor = await this.assertAndroidControlAnchorForEmulator(roomId)
-    const anchorId = exactContainerId(anchor, roomId)
+    const anchorId = exactFullContainerId(anchor, roomId)
     const anchorSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
     const abortToken = randomUUID()
     const name = emulatorName(roomId)
@@ -3533,7 +3833,11 @@ export class OciCliBackend implements IsolationBackend {
     // decorated, and the AVD is born at the requested LCD size/orientation.
     try {
       const createResult = await runDocker(
-        buildEmulatorArgs(roomId, opts, { networkNamespace: anchorId, abortToken }),
+        buildEmulatorArgs(roomId, opts, {
+          networkNamespace: anchorId,
+          networkAuthoritySandboxId: anchorSandboxId,
+          abortToken
+        }),
         {
           timeoutMs: null,
           maxStdoutBytes: 128,
@@ -3579,9 +3883,16 @@ export class OciCliBackend implements IsolationBackend {
       const started = await this.inspectContainer(emulatorId)
       this.assertOwnedEmulatorCreate(started, roomId, name, abortToken, emulatorId, anchorId)
       if (started?.State?.Status !== 'running') throw new Error('emulator did not enter the running state')
-      if (this.exactRunningSandboxId(started, 'Android emulator') !== anchorSandboxId) {
+      if (this.exactRunningJoinedSandboxId(
+        started,
+        anchorName(roomId),
+        anchorId,
+        anchorSandboxId,
+        'Android emulator'
+      ) !== anchorSandboxId) {
         throw new Error('emulator started outside the exact control anchor network namespace')
       }
+      await this.assertCurrentAndroidControlAnchor(roomId, anchorId, anchorSandboxId)
     } catch (error) {
       try {
         await this.removeAbortedEmulatorCreate(roomId, name, abortToken, emulatorId)
@@ -3621,7 +3932,7 @@ export class OciCliBackend implements IsolationBackend {
       const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, inspected)
       retained.push({
         ...participant,
-        id: exactContainerId(owned, roomId),
+        id: exactFullContainerId(owned, roomId),
         state: owned.State?.Status,
         container: owned
       })
@@ -3655,22 +3966,60 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchor!.container
     )
 
+    let observedEmulatorStart: ObservedEmulatorRecoveryStart | undefined
     for (const participant of retained) {
       if (participant.role !== 'anchor' && participant.role !== 'svc-emulator') continue
       const current = await this.inspectContainer(participant.id)
       if (!current) throw new Error(`Android locale recovery participant disappeared: ${participant.role}`)
       const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, current)
-      if (exactContainerId(owned, roomId) !== participant.id) {
+      if (exactFullContainerId(owned, roomId) !== participant.id) {
         throw new Error(`Android locale recovery participant changed immutable ID: ${participant.role}`)
       }
       if (owned.State?.Status === 'running') continue
       if (owned.State?.Status !== 'exited') {
         throw new Error(`Android locale recovery participant is not restartable: ${participant.role}`)
       }
+      let authorityBeforeJoinerStart: {
+        sandboxId: string
+        startedAt: string
+      } | undefined
+      if (participant.role === 'svc-emulator') {
+        const authority = await this.inspectContainer(anchor!.id)
+        if (!authority) throw new Error('Android recovery control anchor disappeared before emulator start')
+        await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor', authority)
+        if (exactFullContainerId(authority, roomId) !== anchor!.id) {
+          throw new Error('Android recovery control anchor immutable ID changed before emulator start')
+        }
+        this.assertContainerNetworkMode(
+          authority,
+          androidControlNetworkName(roomId),
+          'Android recovery control anchor'
+        )
+        authorityBeforeJoinerStart = {
+          sandboxId: this.exactRunningSandboxId(authority, 'Android recovery control anchor'),
+          startedAt: exactDockerStartedAt(authority, 'Android recovery control anchor')
+        }
+      }
       must(await runDocker(['start', participant.id]), `start exact Android recovery ${participant.role}`)
+      if (participant.role === 'svc-emulator') {
+        if (!authorityBeforeJoinerStart) {
+          throw new Error('Android recovery control anchor was not witnessed before emulator start')
+        }
+        observedEmulatorStart = {
+          authorityId: anchor!.id,
+          authoritySandboxId: authorityBeforeJoinerStart.sandboxId,
+          authorityStartedAt: authorityBeforeJoinerStart.startedAt,
+          joinerId: participant.id,
+          previousJoinerStartedAt: participant.container.State?.StartedAt
+        }
+      }
     }
 
-    const recovered = await this.assertFencedEmulatorRecoveryTopology(roomId)
+    const recovered = await this.assertFencedEmulatorRecoveryTopology(
+      roomId,
+      undefined,
+      observedEmulatorStart
+    )
     if (
       recovered.anchorId !== anchor!.id ||
       recovered.runtimeAnchorId !== runtimeAnchor!.id ||
@@ -3680,6 +4029,25 @@ export class OciCliBackend implements IsolationBackend {
       recovered.webState !== web!.state
     ) {
       throw new Error('Android locale recovery changed a retained Room workload or immutable participant')
+    }
+    const stable = await this.assertFencedEmulatorRecoveryTopology(
+      roomId,
+      recovered,
+      observedEmulatorStart
+    )
+    if (
+      observedEmulatorStart &&
+      stable.emulatorAuthorityLabel !== stable.controlSandboxId
+    ) {
+      this.writeNetworkRecoveryAttestation(roomId, {
+        authorityId: stable.anchorId,
+        authoritySandboxId: stable.controlSandboxId,
+        authorityStartedAt: stable.controlStartedAt,
+        joinerId: stable.emulatorId,
+        joinerStartedAt: stable.emulatorStartedAt,
+        authorityLabel: stable.emulatorAuthorityLabel
+      })
+      await this.assertFencedEmulatorRecoveryTopology(roomId, stable)
     }
   }
 
@@ -3891,6 +4259,150 @@ export class OciCliBackend implements IsolationBackend {
     renameSync(temp, this.legacyVolumeAdoptionFile)
   }
 
+  private networkRecoveryAttestationPath(roomId: string, joinerId: string): string | undefined {
+    if (!this.networkRecoveryAttestationDir) return undefined
+    if (!/^[a-z0-9]{8}$/.test(roomId)) throw new Error('invalid Room ID for network recovery attestation')
+    if (!/^[a-f0-9]{64}$/.test(joinerId)) {
+      throw new Error('invalid joiner ID for network recovery attestation')
+    }
+    return join(this.networkRecoveryAttestationDir, `${roomId}-${joinerId}.json`)
+  }
+
+  private readNetworkRecoveryAttestation(
+    roomId: string,
+    joinerId: string
+  ): NetworkRecoveryAttestation | null {
+    const path = this.networkRecoveryAttestationPath(roomId, joinerId)
+    if (!path) return null
+    const root = this.networkRecoveryAttestationDir!
+    if (!existsSync(root)) return null
+    const rootStat = lstatSync(root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new Error('network recovery attestation root is unsafe')
+    }
+    if (!existsSync(path)) return null
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024) {
+      throw new Error('network recovery attestation is not a bounded regular file')
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      throw new Error('network recovery attestation is unreadable')
+    }
+    if (
+      !isNetworkRecoveryAttestation(parsed) ||
+      parsed.roomId !== roomId ||
+      parsed.joiner.id !== joinerId
+    ) {
+      throw new Error('network recovery attestation is invalid')
+    }
+    const engine = this.expectedEngineIdentity
+    if (
+      !engine ||
+      parsed.engine.context !== engine.context ||
+      parsed.engine.engineId !== engine.engineId
+    ) {
+      throw new Error('network recovery attestation does not match the pinned Docker engine')
+    }
+    return parsed
+  }
+
+  private matchesNetworkRecoveryAttestation(
+    roomId: string,
+    authority: DockerContainerInspect,
+    joiner: DockerContainerInspect,
+    authorityId: string,
+    joinerId: string,
+    authoritySandboxId: string
+  ): boolean {
+    return this.matchesNetworkRecoveryAttestationTokens(
+      roomId,
+      authorityId,
+      authoritySandboxId,
+      exactDockerStartedAt(authority, 'network namespace authority'),
+      joiner,
+      joinerId
+    )
+  }
+
+  private matchesNetworkRecoveryAttestationTokens(
+    roomId: string,
+    authorityId: string,
+    authoritySandboxId: string,
+    authorityStartedAt: string,
+    joiner: DockerContainerInspect,
+    joinerId: string
+  ): boolean {
+    const attestation = this.readNetworkRecoveryAttestation(roomId, joinerId)
+    if (!attestation) return false
+    if (!isCanonicalDockerStartedAt(authorityStartedAt)) return false
+    const joinerStartedAt = exactDockerStartedAt(joiner, 'joined Room container')
+    const authorityLabel = joiner.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+    return (
+      attestation.authority.id === authorityId &&
+      attestation.authority.sandboxId === authoritySandboxId &&
+      attestation.authority.startedAt === authorityStartedAt &&
+      attestation.joiner.id === joinerId &&
+      attestation.joiner.startedAt === joinerStartedAt &&
+      attestation.joiner.authorityLabel === authorityLabel
+    )
+  }
+
+  private writeNetworkRecoveryAttestation(
+    roomId: string,
+    proof: NetworkRecoveryProof
+  ): void {
+    const path = this.networkRecoveryAttestationPath(roomId, proof.joinerId)
+    const engine = this.expectedEngineIdentity
+    if (!path || !engine) {
+      throw new Error('durable network recovery attestation storage is unavailable')
+    }
+    if (
+      !/^[a-f0-9]{64}$/.test(proof.authorityId) ||
+      !/^[a-f0-9]{64}$/.test(proof.authoritySandboxId) ||
+      !isCanonicalDockerStartedAt(proof.authorityStartedAt) ||
+      !/^[a-f0-9]{64}$/.test(proof.joinerId) ||
+      !isCanonicalDockerStartedAt(proof.joinerStartedAt) ||
+      (proof.authorityLabel !== '' && !/^[a-f0-9]{64}$/.test(proof.authorityLabel))
+    ) {
+      throw new Error('network recovery proof is invalid')
+    }
+    const root = this.networkRecoveryAttestationDir!
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const rootStat = lstatSync(root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new Error('network recovery attestation root is unsafe')
+    }
+    const attestation: NetworkRecoveryAttestation = {
+      schema: 1,
+      engine: { ...engine },
+      roomId,
+      authority: {
+        id: proof.authorityId,
+        sandboxId: proof.authoritySandboxId,
+        startedAt: proof.authorityStartedAt
+      },
+      joiner: {
+        id: proof.joinerId,
+        startedAt: proof.joinerStartedAt,
+        authorityLabel: proof.authorityLabel
+      }
+    }
+    const temporary = join(root, `.${roomId}.${process.pid}.${randomUUID()}.tmp`)
+    try {
+      writeFileSync(temporary, JSON.stringify(attestation, null, 2) + '\n', {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600
+      })
+      renameSync(temporary, path)
+    } finally {
+      if (existsSync(temporary)) rmSync(temporary, { force: true })
+    }
+  }
+
   private async isRecordedLegacyVolume(
     roomId: string,
     name: string,
@@ -4091,6 +4603,174 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
+  /**
+   * Docker containers using `--network container:<id>` do not own a libnetwork
+   * sandbox, so current Moby releases leave their inspected SandboxID empty.
+   * The immutable donor ID plus its creation label is authoritative in that
+   * case. A retained joiner restarted after a donor restart may instead use a
+   * durable, engine-pinned recovery attestation. Older engines that report a
+   * joined SandboxID must still report the donor's exact live value.
+   */
+  private exactRunningJoinedSandboxId(
+    container: DockerContainerInspect,
+    expectedName: string,
+    expectedId: string,
+    expectedSandboxId: string,
+    what: string,
+    allowPaused = false,
+    hasCurrentRecoveryAttestation = false
+  ): string {
+    if (!/^[a-f0-9]{64}$/.test(expectedId)) {
+      throw new Error(`${what} network namespace authority did not report a full immutable ID`)
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedSandboxId)) {
+      throw new Error(`${what} network namespace authority did not report a valid live identity`)
+    }
+    if (
+      container.State?.Status !== 'running' &&
+      (!allowPaused || container.State?.Status !== 'paused')
+    ) {
+      throw new Error(`${what} is not running in a live network namespace`)
+    }
+    const mode = container.HostConfig?.NetworkMode ?? ''
+    const immutableMode = `container:${expectedId}`
+    const legacyNameMode = `container:${expectedName}`
+    if (mode !== immutableMode && mode !== legacyNameMode) {
+      throw new Error(`${what} is not attached to the exact Android runtime namespace`)
+    }
+    const authorityLabel = container.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+    if (authorityLabel !== '' && !/^[a-f0-9]{64}$/.test(authorityLabel)) {
+      throw new Error(`${what} retained an invalid network namespace authority label`)
+    }
+    const sandboxId = container.NetworkSettings?.SandboxID?.trim() ?? ''
+    if (sandboxId === '') {
+      if (mode !== immutableMode) {
+        throw new Error(`${what} did not retain an exact immutable network namespace authority`)
+      }
+      if (authorityLabel !== expectedSandboxId && !hasCurrentRecoveryAttestation) {
+        throw new Error(`${what} did not retain its exact network namespace authority label`)
+      }
+      return expectedSandboxId
+    }
+    if (!/^[a-f0-9]{64}$/.test(sandboxId)) {
+      throw new Error(`${what} did not report a valid live network namespace identity`)
+    }
+    return sandboxId
+  }
+
+  private async startExactJoinedContainer(
+    roomId: string,
+    joinerName: string,
+    joinerRole: string,
+    authorityName: string,
+    authorityRole: string,
+    authorityNetworkName: string,
+    what: string,
+    expectedJoinerId: string,
+    expectedAuthorityId: string
+  ): Promise<void> {
+    const initialJoiner = await this.assertRoomContainer(roomId, joinerName, joinerRole)
+    const joinerId = exactFullContainerId(initialJoiner, roomId)
+    if (joinerId !== expectedJoinerId) {
+      throw new Error(`${what} immutable ID changed before start`)
+    }
+    const authority = await this.assertRoomContainer(roomId, authorityName, authorityRole)
+    const authorityId = exactFullContainerId(authority, roomId)
+    if (authorityId !== expectedAuthorityId) {
+      throw new Error(`${what} network authority immutable ID changed before start`)
+    }
+    this.assertContainerNetworkMode(authority, authorityNetworkName, `${what} network authority`)
+    const authoritySandboxId = this.exactRunningSandboxId(authority, `${what} network authority`)
+    const authorityStartedAt = exactDockerStartedAt(authority, `${what} network authority`)
+    this.assertContainerNetworkNamespace(initialJoiner, authorityName, authorityId, what)
+
+    const assertAuthorityStable = async (): Promise<void> => {
+      const current = await this.inspectContainer(authorityId)
+      if (!current) throw new Error(`${what} network authority disappeared during start`)
+      await this.assertRoomContainer(roomId, authorityName, authorityRole, current)
+      if (exactFullContainerId(current, roomId) !== authorityId) {
+        throw new Error(`${what} network authority immutable ID changed during start`)
+      }
+      this.assertContainerNetworkMode(current, authorityNetworkName, `${what} network authority`)
+      if (
+        this.exactRunningSandboxId(current, `${what} network authority`) !== authoritySandboxId ||
+        exactDockerStartedAt(current, `${what} network authority`) !== authorityStartedAt
+      ) {
+        throw new Error(`${what} network authority changed during start`)
+      }
+    }
+
+    const validateJoiner = async (
+      expectedStartedAt: string | undefined,
+      allowObservedStart: boolean
+    ): Promise<{ container: DockerContainerInspect; startedAt: string; authorityLabel: string; needsProof: boolean }> => {
+      const current = await this.inspectContainer(joinerId)
+      if (!current) throw new Error(`${what} disappeared during start`)
+      await this.assertRoomContainer(roomId, joinerName, joinerRole, current)
+      if (exactFullContainerId(current, roomId) !== joinerId) {
+        throw new Error(`${what} immutable ID changed during start`)
+      }
+      const startedAt = exactDockerStartedAt(current, what)
+      if (expectedStartedAt !== undefined && startedAt !== expectedStartedAt) {
+        throw new Error(`${what} start identity changed during validation`)
+      }
+      const authorityLabel = current.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+      const needsProof =
+        (current.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+        authorityLabel !== authoritySandboxId
+      const durableProof = needsProof && !allowObservedStart && this.matchesNetworkRecoveryAttestationTokens(
+        roomId,
+        authorityId,
+        authoritySandboxId,
+        authorityStartedAt,
+        current,
+        joinerId
+      )
+      if (this.exactRunningJoinedSandboxId(
+        current,
+        authorityName,
+        authorityId,
+        authoritySandboxId,
+        what,
+        false,
+        needsProof && (allowObservedStart || durableProof)
+      ) !== authoritySandboxId) {
+        throw new Error(`${what} started outside its exact network authority`)
+      }
+      return { container: current, startedAt, authorityLabel, needsProof }
+    }
+
+    if (initialJoiner.State?.Status === 'running') {
+      await validateJoiner(undefined, false)
+      await assertAuthorityStable()
+      return
+    }
+    if (!['created', 'exited'].includes(initialJoiner.State?.Status ?? '')) {
+      throw new Error(`${what} is not restartable`)
+    }
+    const previousStartedAt = initialJoiner.State?.StartedAt
+    must(await runDocker(['start', joinerId]), `start exact ${what}`)
+    const started = await validateJoiner(undefined, true)
+    if (started.needsProof && started.startedAt === previousStartedAt) {
+      throw new Error(`${what} did not report a fresh start identity`)
+    }
+    await validateJoiner(started.startedAt, true)
+    await assertAuthorityStable()
+
+    if (started.needsProof) {
+      this.writeNetworkRecoveryAttestation(roomId, {
+        authorityId,
+        authoritySandboxId,
+        authorityStartedAt,
+        joinerId,
+        joinerStartedAt: started.startedAt,
+        authorityLabel: started.authorityLabel
+      })
+      await validateJoiner(started.startedAt, false)
+      await assertAuthorityStable()
+    }
+  }
+
   private exactRunningSandboxId(container: DockerContainerInspect, what: string): string {
     if (container.State?.Status !== 'running') {
       throw new Error(`${what} is not running in a live network namespace`)
@@ -4100,6 +4780,21 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`${what} did not report a valid live network namespace identity`)
     }
     return sandboxId
+  }
+
+  private async exactWebNetworkNamespace(spec: WebSpec): Promise<NetworkNamespaceAuthority | undefined> {
+    if (spec.standalone) return undefined
+    const android = spec.androidRuntimeIsolation === true
+    const authorityName = android ? androidRuntimeAnchorName(spec.roomId) : anchorName(spec.roomId)
+    const authorityRole = android ? 'android-runtime-anchor' : 'anchor'
+    const authority = await this.assertRoomContainer(spec.roomId, authorityName, authorityRole)
+    if (authority.State?.Status !== 'running') {
+      throw new Error(`${android ? 'Android runtime anchor' : 'Room anchor'} is not running`)
+    }
+    return {
+      id: exactFullContainerId(authority, spec.roomId),
+      sandboxId: this.exactRunningSandboxId(authority, android ? 'Android runtime anchor' : 'Room anchor')
+    }
   }
 
   private async assertCurrentAndroidRuntimeAnchor(
@@ -4117,12 +4812,90 @@ export class OciCliBackend implements IsolationBackend {
       'android-runtime-anchor',
       current
     )
-    if (exactContainerId(current, roomId) !== expectedId) {
+    if (exactFullContainerId(current, roomId) !== expectedId) {
       throw new Error('Android runtime anchor immutable ID changed before service validation completed')
     }
     this.assertContainerNetworkMode(current, roomNetworkName(roomId), 'Android runtime anchor')
     if (this.exactRunningSandboxId(current, 'Android runtime anchor') !== expectedSandboxId) {
       throw new Error('Android runtime anchor network namespace changed before service validation completed')
+    }
+  }
+
+  private async assertCurrentAndroidControlAnchor(
+    roomId: string,
+    expectedId: string,
+    expectedSandboxId: string,
+    expectedStartedAt?: string
+  ): Promise<void> {
+    const current = await this.inspectContainer(expectedId)
+    if (!current) throw new Error('Android control anchor disappeared before validation completed')
+    await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor', current)
+    if (exactFullContainerId(current, roomId) !== expectedId) {
+      throw new Error('Android control anchor immutable ID changed before validation completed')
+    }
+    this.assertContainerNetworkMode(current, androidControlNetworkName(roomId), 'Android control anchor')
+    if (this.exactRunningSandboxId(current, 'Android control anchor') !== expectedSandboxId) {
+      throw new Error('Android control anchor network namespace changed before validation completed')
+    }
+    if (
+      expectedStartedAt !== undefined &&
+      exactDockerStartedAt(current, 'Android control anchor') !== expectedStartedAt
+    ) {
+      throw new Error('Android control anchor start identity changed before validation completed')
+    }
+  }
+
+  private async assertCurrentAndroidRecoveryEmulator(
+    roomId: string,
+    expectedId: string,
+    authorityId: string,
+    authoritySandboxId: string,
+    expectedStartedAt: string,
+    hasCurrentRecoveryAttestation: boolean
+  ): Promise<void> {
+    const current = await this.inspectContainer(expectedId)
+    if (!current) throw new Error('Android recovery emulator disappeared before validation completed')
+    await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator', current)
+    if (exactFullContainerId(current, roomId) !== expectedId) {
+      throw new Error('Android recovery emulator immutable ID changed before validation completed')
+    }
+    if (exactDockerStartedAt(current, 'Android recovery emulator') !== expectedStartedAt) {
+      throw new Error('Android recovery emulator start identity changed before validation completed')
+    }
+    if (this.exactRunningJoinedSandboxId(
+      current,
+      anchorName(roomId),
+      authorityId,
+      authoritySandboxId,
+      'Android recovery emulator',
+      false,
+      hasCurrentRecoveryAttestation
+    ) !== authoritySandboxId) {
+      throw new Error('Android recovery emulator changed its control network namespace before validation completed')
+    }
+  }
+
+  private async assertCurrentAndroidRecoveryRuntimeAnchor(
+    roomId: string,
+    expectedId: string,
+    expectedState: string,
+    expectedSandboxId: string | null
+  ): Promise<void> {
+    const current = await this.inspectContainer(expectedId)
+    if (!current) throw new Error('Android recovery runtime anchor disappeared before validation completed')
+    await this.assertRoomContainer(roomId, androidRuntimeAnchorName(roomId), 'android-runtime-anchor', current)
+    if (
+      exactFullContainerId(current, roomId) !== expectedId ||
+      current.State?.Status !== expectedState
+    ) {
+      throw new Error('Android recovery runtime anchor identity or state changed before validation completed')
+    }
+    this.assertContainerNetworkMode(current, roomNetworkName(roomId), 'Android recovery runtime anchor')
+    if (
+      expectedSandboxId &&
+      this.exactRunningSandboxId(current, 'Android recovery runtime anchor') !== expectedSandboxId
+    ) {
+      throw new Error('Android recovery runtime anchor network namespace changed before validation completed')
     }
   }
 
@@ -4372,7 +5145,35 @@ export class OciCliBackend implements IsolationBackend {
     if (currentNetwork.Containers?.[authorityId]?.Name !== authorityName) {
       throw new Error('Room artifact network does not contain the exact runtime authority endpoint')
     }
-    return { kind: 'container', id: authorityId, networkId, sandboxId, networkName, authorityName }
+    return {
+      kind: 'container',
+      id: authorityId,
+      networkId,
+      sandboxId,
+      networkName,
+      authorityName,
+      startedAt: exactDockerStartedAt(authority, 'Room artifact network authority')
+    }
+  }
+
+  private async assertRoomArtifactNetworkAuthorityStable(
+    spec: WebSpec,
+    expected: RoomArtifactNetworkAuthority
+  ): Promise<void> {
+    const current = await this.assertRoomArtifactNetworkAuthority(spec)
+    const commonChanged =
+      current.kind !== expected.kind ||
+      current.id !== expected.id ||
+      current.networkId !== expected.networkId ||
+      current.networkName !== expected.networkName
+    const containerChanged = current.kind === 'container' && expected.kind === 'container' && (
+      current.sandboxId !== expected.sandboxId ||
+      current.authorityName !== expected.authorityName ||
+      current.startedAt !== expected.startedAt
+    )
+    if (commonChanged || containerChanged) {
+      throw new Error('Room artifact network authority changed after web runtime proof')
+    }
   }
 
   private assertRoomArtifactWebRuntime(
@@ -4521,7 +5322,28 @@ export class OciCliBackend implements IsolationBackend {
 
     if (running) {
       if (authority.kind === 'container') {
-        if (exactLiveSandboxId(container, 'Room artifact web') !== authority.sandboxId) {
+        const authorityLabel = container.Config?.Labels?.[NETWORK_AUTHORITY_SANDBOX_LABEL]?.trim() ?? ''
+        const needsRecoveryAttestation =
+          (container.NetworkSettings?.SandboxID?.trim() ?? '') === '' &&
+          authorityLabel !== authority.sandboxId
+        const hasRecoveryAttestation = needsRecoveryAttestation &&
+          this.matchesNetworkRecoveryAttestationTokens(
+            spec.roomId,
+            authority.id,
+            authority.sandboxId,
+            authority.startedAt,
+            container,
+            id
+          )
+        if (this.exactRunningJoinedSandboxId(
+          container,
+          authority.authorityName,
+          authority.id,
+          authority.sandboxId,
+          'Room artifact web',
+          true,
+          hasRecoveryAttestation
+        ) !== authority.sandboxId) {
           throw new Error('Room artifact web is not live in the exact fenced network namespace')
         }
       } else {
@@ -4589,6 +5411,7 @@ export class OciCliBackend implements IsolationBackend {
         volumeProof,
         state: 'restorable'
       })
+      await this.assertRoomArtifactNetworkAuthorityStable(spec, authority)
       try {
         must(
           await runDocker(['rm', '-f', fence.containerId], {
@@ -4610,9 +5433,13 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  private roomArtifactRestoreCreateArgs(spec: WebSpec, restoreToken: string): string[] {
+  private roomArtifactRestoreCreateArgs(
+    spec: WebSpec,
+    restoreToken: string,
+    networkAuthority?: NetworkNamespaceAuthority
+  ): string[] {
     if (!/^[a-f0-9]{32}$/.test(restoreToken)) throw new Error('invalid Room artifact web restore token')
-    const args = buildWebCreateArgs(spec)
+    const args = buildWebCreateArgs(spec, networkAuthority)
     const imageIndex = args.length - 4
     if (args[imageIndex] !== imageFor(spec)) {
       throw new Error('Room artifact web create arguments have an unexpected command shape')
@@ -4662,9 +5489,32 @@ export class OciCliBackend implements IsolationBackend {
   private async removeRoomContainer(roomId: string, name: string, role: string): Promise<void> {
     const existing = await this.inspectContainer(name)
     if (!existing) return
-    await this.assertRoomContainer(roomId, name, role)
+    await this.assertRoomContainer(roomId, name, role, existing)
     must(await runDocker(['rm', '-f', name]), `remove Room ${roomId} container ${name}`)
     if (await this.inspectContainer(name)) throw new Error(`Room ${roomId} container cleanup incomplete: ${name}`)
+  }
+
+  private async removeExactRoomContainerForRecreation(
+    roomId: string,
+    name: string,
+    role: string,
+    expectedId?: string
+  ): Promise<void> {
+    const existing = await this.inspectContainer(name)
+    if (!existing) {
+      if (expectedId !== undefined) throw new Error(`Room ${roomId} expected web disappeared before recreation`)
+      return
+    }
+    const owned = await this.assertRoomContainer(roomId, name, role, existing)
+    const id = exactFullContainerId(owned, roomId)
+    if (expectedId !== undefined && id !== expectedId) {
+      throw new Error(`Room ${roomId} web immutable ID changed before recreation`)
+    }
+    must(await runDocker(['rm', '-f', id]), `remove exact Room ${roomId} container ${name}`)
+    if (await this.inspectContainer(id)) throw new Error(`Room ${roomId} exact container cleanup incomplete: ${name}`)
+    if (await this.inspectContainer(name)) {
+      throw new Error(`Room ${roomId} web was replaced concurrently during recreation`)
+    }
   }
 
   private async assertPausedRoomArtifactWeb(
@@ -5188,7 +6038,7 @@ interface DockerContainerInspect {
     Entrypoint?: string | string[] | null
     User?: string
   } | null
-  State?: { Status?: string; Running?: boolean; Paused?: boolean; ExitCode?: number } | null
+  State?: { Status?: string; Running?: boolean; Paused?: boolean; ExitCode?: number; StartedAt?: string } | null
   HostConfig?: {
     NetworkMode?: string
     ReadonlyRootfs?: boolean
@@ -5247,6 +6097,7 @@ type RoomArtifactNetworkAuthority =
       networkName: string
       sandboxId: string
       authorityName: string
+      startedAt: string
     }
   | {
       kind: 'network'
@@ -5284,8 +6135,20 @@ interface FencedEmulatorRecoveryTopology {
   webId: string
   emulatorId: string
   controlSandboxId: string
+  controlStartedAt: string
+  emulatorStartedAt: string
+  emulatorAuthorityLabel: string
+  runtimeSandboxId: string | null
   runtimeAnchorState: string
   webState: string
+}
+
+interface ObservedEmulatorRecoveryStart {
+  authorityId: string
+  authoritySandboxId: string
+  authorityStartedAt: string
+  joinerId: string
+  previousJoinerStartedAt: string | undefined
 }
 
 function exactContainerId(container: DockerContainerInspect, roomId: string): string {
@@ -5318,6 +6181,20 @@ function exactLiveSandboxId(container: DockerContainerInspect, what: string): st
   return sandboxId
 }
 
+function isCanonicalDockerStartedAt(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^(?:19[7-9]\d|2\d{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+}
+
+function exactDockerStartedAt(container: DockerContainerInspect, what: string): string {
+  const startedAt = container.State?.StartedAt?.trim() ?? ''
+  if (!isCanonicalDockerStartedAt(startedAt)) {
+    throw new Error(`${what} did not report a canonical live start identity`)
+  }
+  return startedAt
+}
+
 function canonicalStringRecord(record: Record<string, string> | null | undefined): [string, string][] {
   return Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b))
 }
@@ -5326,6 +6203,62 @@ interface EngineIdentity {
   schema: 1
   context: string
   engineId: string
+}
+
+interface NetworkRecoveryAttestation {
+  schema: 1
+  engine: EngineIdentity
+  roomId: string
+  authority: {
+    id: string
+    sandboxId: string
+    startedAt: string
+  }
+  joiner: {
+    id: string
+    startedAt: string
+    authorityLabel: string
+  }
+}
+
+interface NetworkRecoveryProof {
+  authorityId: string
+  authoritySandboxId: string
+  authorityStartedAt: string
+  joinerId: string
+  joinerStartedAt: string
+  authorityLabel: string
+}
+
+function isNetworkRecoveryAttestation(value: unknown): value is NetworkRecoveryAttestation {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<NetworkRecoveryAttestation>
+  const engine = candidate.engine
+  const authority = candidate.authority
+  const joiner = candidate.joiner
+  return (
+    candidate.schema === 1 &&
+    typeof candidate.roomId === 'string' &&
+    /^[a-z0-9]{8}$/.test(candidate.roomId) &&
+    !!engine &&
+    engine.schema === 1 &&
+    typeof engine.context === 'string' &&
+    engine.context.length > 0 &&
+    typeof engine.engineId === 'string' &&
+    engine.engineId.length > 0 &&
+    !!authority &&
+    typeof authority.id === 'string' &&
+    /^[a-f0-9]{64}$/.test(authority.id) &&
+    typeof authority.sandboxId === 'string' &&
+    /^[a-f0-9]{64}$/.test(authority.sandboxId) &&
+    isCanonicalDockerStartedAt(authority.startedAt) &&
+    !!joiner &&
+    typeof joiner.id === 'string' &&
+    /^[a-f0-9]{64}$/.test(joiner.id) &&
+    isCanonicalDockerStartedAt(joiner.startedAt) &&
+    typeof joiner.authorityLabel === 'string' &&
+    (joiner.authorityLabel === '' || /^[a-f0-9]{64}$/.test(joiner.authorityLabel))
+  )
 }
 
 interface LegacyVolumeAdoptionRegistry {

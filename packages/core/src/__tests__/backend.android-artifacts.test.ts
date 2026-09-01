@@ -8,6 +8,7 @@ import {
   androidControlNetworkName,
   androidRuntimeAnchorName,
   emulatorName,
+  NETWORK_AUTHORITY_SANDBOX_LABEL,
   roomNetworkName,
   webName,
   workspaceSnapshotVolume
@@ -21,7 +22,10 @@ import {
 import { tempDir } from './fakes'
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 
-vi.mock('../backend/cli', () => ({ runDocker: vi.fn() }))
+vi.mock('../backend/cli', () => ({
+  getPinnedDockerRuntime: vi.fn(() => ({ context: 'test-context' })),
+  runDocker: vi.fn()
+}))
 
 const mockedRunDocker = vi.mocked(runDocker)
 const ROOM_ID = 'room1abc'
@@ -375,6 +379,10 @@ describe('OciCliBackend Android artifact export', () => {
     const controlSandboxId = 'c'.repeat(64)
     let emulator: Record<string, unknown> | null = null
     let failCreate = false
+    let startedEmulatorSandboxId = ''
+    let emulatorAuthorityLabel: string | undefined = controlSandboxId
+    let controlAnchorSandboxId = controlSandboxId
+    let driftControlSandboxAfterStart = false
     const anchor = {
       Id: anchorId,
       Name: `/${anchorName(ROOM_ID)}`,
@@ -403,9 +411,16 @@ describe('OciCliBackend Android artifact export', () => {
       }
       if (args[0] === 'inspect') {
         if (args[1] === anchorName(ROOM_ID) || args[1] === anchorId) {
-          return { code: 0, stdout: JSON.stringify([anchor]), stderr: '' }
+          return {
+            code: 0,
+            stdout: JSON.stringify([{ ...anchor, NetworkSettings: { SandboxID: controlAnchorSandboxId } }]),
+            stderr: ''
+          }
         }
         if (emulator && (args[1] === emulatorId || args[1] === emulatorName(ROOM_ID))) {
+          if (driftControlSandboxAfterStart && (emulator.State as { Status?: string }).Status === 'running') {
+            controlAnchorSandboxId = '8'.repeat(64)
+          }
           return { code: 0, stdout: JSON.stringify([emulator]), stderr: '' }
         }
         return { code: 1, stdout: '', stderr: 'No such container' }
@@ -419,6 +434,9 @@ describe('OciCliBackend Android artifact export', () => {
             'devhotel.room': ROOM_ID,
             'devhotel.role': 'svc-emulator',
             'devhotel.managed': '1',
+            ...(emulatorAuthorityLabel
+              ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: emulatorAuthorityLabel }
+              : {}),
             'devhotel.abort-token': token
           } },
           State: { Status: 'created' },
@@ -433,7 +451,7 @@ describe('OciCliBackend Android artifact export', () => {
         emulator = {
           ...(emulator ?? {}),
           State: { Status: 'running' },
-          NetworkSettings: { SandboxID: controlSandboxId }
+          NetworkSettings: { SandboxID: startedEmulatorSandboxId }
         }
         return ok
       }
@@ -452,6 +470,7 @@ describe('OciCliBackend Android artifact export', () => {
     const create = calls.find((args) => args[0] === 'create')!
     const createOpts = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')?.[1]
     expect(create).toEqual(expect.arrayContaining(['--network', `container:${anchorId}`]))
+    expect(create).toContain(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=${controlSandboxId}`)
     expect(createOpts).toMatchObject({ timeoutMs: null, killOnOutputLimit: false })
     expect(createOpts?.signal).toBeUndefined()
     expect(calls.filter((args) => args[0] === 'cp')).toHaveLength(2)
@@ -461,6 +480,48 @@ describe('OciCliBackend Android artifact export', () => {
 
     mockedRunDocker.mockClear()
     emulator = null
+    emulatorAuthorityLabel = undefined
+    await expect(new OciCliBackend().createEmulator(ROOM_ID, {
+      device: 'Samsung Galaxy S10',
+      version: '14.0'
+    })).rejects.toThrow(/network namespace authority label/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    emulator = null
+    emulatorAuthorityLabel = '9'.repeat(64)
+    await expect(new OciCliBackend().createEmulator(ROOM_ID, {
+      device: 'Samsung Galaxy S10',
+      version: '14.0'
+    })).rejects.toThrow(/network namespace authority label/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    emulator = null
+    emulatorAuthorityLabel = controlSandboxId
+    startedEmulatorSandboxId = ''
+    driftControlSandboxAfterStart = true
+    await expect(new OciCliBackend().createEmulator(ROOM_ID, {
+      device: 'Samsung Galaxy S10',
+      version: '14.0'
+    })).rejects.toThrow(/control anchor network namespace changed/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    emulator = null
+    driftControlSandboxAfterStart = false
+    controlAnchorSandboxId = controlSandboxId
+    emulatorAuthorityLabel = controlSandboxId
+    startedEmulatorSandboxId = 'd'.repeat(64)
+    await expect(new OciCliBackend().createEmulator(ROOM_ID, {
+      device: 'Samsung Galaxy S10',
+      version: '14.0'
+    })).rejects.toThrow(/outside the exact control anchor network namespace/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    emulator = null
+    startedEmulatorSandboxId = ''
     failCreate = true
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
       device: 'Samsung Galaxy S10',
@@ -485,7 +546,7 @@ describe('OciCliBackend Android artifact export', () => {
     let helper: Record<string, unknown> | null = null
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
-    let emulatorSandboxId = ids.sandbox
+    let emulatorSandboxId = ''
     let driftEmulatorSandboxAfterCreate = false
     let abortOnRemove: AbortController | null = null
     let abortAfterHelperInspect: AbortController | null = null
@@ -500,17 +561,30 @@ describe('OciCliBackend Android artifact export', () => {
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
-      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      Config: { Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': role,
+        'devhotel.managed': '1',
+        ...(role === 'svc-emulator'
+          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.sandbox }
+          : role === 'web'
+            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            : {})
+      } },
       State: { Status: 'running', Paused: paused },
-      ...(role === 'anchor' || role === 'svc-emulator'
-        ? { NetworkSettings: { SandboxID: role === 'svc-emulator' ? emulatorSandboxId : ids.sandbox } }
-        : role === 'android-runtime-anchor' || role === 'web'
+      ...(role === 'anchor'
+        ? { NetworkSettings: { SandboxID: ids.sandbox } }
+        : role === 'android-runtime-anchor'
           ? { NetworkSettings: { SandboxID: ids.runtimeSandbox } }
-          : {}),
+          : role === 'svc-emulator'
+            ? { NetworkSettings: { SandboxID: emulatorSandboxId } }
+            : role === 'web'
+              ? { NetworkSettings: { SandboxID: '' } }
+              : {}),
       ...(role === 'anchor' ? { HostConfig: { NetworkMode: androidControlNetworkName(ROOM_ID) } } : {}),
       ...(role === 'android-runtime-anchor' ? { HostConfig: { NetworkMode: roomNetworkName(ROOM_ID) } } : {}),
-      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${androidRuntimeAnchorName(ROOM_ID)}` } } : {}),
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
+      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${ids.runtime}` } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ids.anchor}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
@@ -749,7 +823,7 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toBe(true)
     driftEmulatorSandboxAfterCreate = false
-    emulatorSandboxId = ids.sandbox
+    emulatorSandboxId = ''
 
     mockedRunDocker.mockClear()
     abortOnRemove = new AbortController()
@@ -866,17 +940,28 @@ describe('OciCliBackend Android artifact export', () => {
             ? ids.runtime
             : ids.web,
       Name: `/${name}`,
-      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      Config: { Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': role,
+        'devhotel.managed': '1',
+        ...(role === 'svc-emulator'
+          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'd'.repeat(64) }
+          : role === 'web'
+            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            : {})
+      } },
       State: { Status: 'running', Paused: paused },
-      ...(role === 'anchor' || role === 'svc-emulator'
+      ...(role === 'anchor'
         ? { NetworkSettings: { SandboxID: 'd'.repeat(64) } }
-        : role === 'android-runtime-anchor' || role === 'web'
+        : role === 'android-runtime-anchor'
           ? { NetworkSettings: { SandboxID: ids.runtimeSandbox } }
-          : {}),
+          : role === 'svc-emulator' || role === 'web'
+            ? { NetworkSettings: { SandboxID: '' } }
+            : {}),
       ...(role === 'anchor' ? { HostConfig: { NetworkMode: androidControlNetworkName(ROOM_ID) } } : {}),
       ...(role === 'android-runtime-anchor' ? { HostConfig: { NetworkMode: roomNetworkName(ROOM_ID) } } : {}),
-      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${androidRuntimeAnchorName(ROOM_ID)}` } } : {}),
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
+      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${ids.runtime}` } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ids.anchor}` } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
@@ -968,14 +1053,19 @@ describe('OciCliBackend Android artifact export', () => {
     let liveEmulatorId = ids.emulator
     let replaceAfterExec = false
     let foreignEmulatorName = false
-    let emulatorSandbox = ids.controlSandbox
+    let emulatorSandbox = ''
     const participant = (name: string, role: string, id: string, sandboxId: string, networkMode: string) => ({
       Id: id,
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
         'devhotel.role': role,
-        'devhotel.managed': foreignEmulatorName && role === 'svc-emulator' ? '0' : '1'
+        'devhotel.managed': foreignEmulatorName && role === 'svc-emulator' ? '0' : '1',
+        ...(role === 'svc-emulator'
+          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.controlSandbox }
+          : role === 'web'
+            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            : {})
       } },
       State: { Status: 'running' },
       HostConfig: { NetworkMode: networkMode },
@@ -1032,8 +1122,8 @@ describe('OciCliBackend Android artifact export', () => {
               webName(ROOM_ID),
               'web',
               ids.web,
-              ids.runtimeSandbox,
-              `container:${androidRuntimeAnchorName(ROOM_ID)}`
+              '',
+              `container:${ids.runtime}`
             )]),
             stderr: ''
           }
@@ -1046,7 +1136,7 @@ describe('OciCliBackend Android artifact export', () => {
               'svc-emulator',
               liveEmulatorId,
               emulatorSandbox,
-              `container:${anchorName(ROOM_ID)}`
+              `container:${ids.anchor}`
             )]),
             stderr: ''
           }
@@ -1059,7 +1149,7 @@ describe('OciCliBackend Android artifact export', () => {
               'svc-emulator',
               ids.emulator,
               emulatorSandbox,
-              `container:${anchorName(ROOM_ID)}`
+              `container:${ids.anchor}`
             )]),
             stderr: ''
           }
@@ -1103,7 +1193,7 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec')).toBe(false)
 
     mockedRunDocker.mockClear()
-    emulatorSandbox = ids.controlSandbox
+    emulatorSandbox = ''
     foreignEmulatorName = true
     await expect(new OciCliBackend().emulatorState(ROOM_ID)).rejects.toThrow(/ownership metadata/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'exec')).toBe(false)
@@ -1112,6 +1202,11 @@ describe('OciCliBackend Android artifact export', () => {
   it('refuses crossed recovery endpoints and accepts absent endpoints for retained stopped workloads', async () => {
     const ids = { anchor: 'a'.repeat(64), emulator: 'b'.repeat(64), runtime: 'c'.repeat(64), web: 'd'.repeat(64) }
     const networkIds = { control: '1'.repeat(64), runtime: '2'.repeat(64) }
+    const root = tempDir()
+    const backend = () => new OciCliBackend({
+      identityFile: join(root, 'runtime', 'docker-engine.json'),
+      networkRecoveryAttestationDir: join(root, 'runtime', 'network-recovery-attestations')
+    })
     let extraControlMember = true
     let crossConnectedControl = false
     let anchorState = 'running'
@@ -1119,18 +1214,48 @@ describe('OciCliBackend Android artifact export', () => {
     let runtimeAnchorState = 'running'
     let webState = 'running'
     let emulatorNetworkMode = `container:${'f'.repeat(64)}`
-    let emulatorSandboxId = 'e'.repeat(64)
+    let emulatorSandboxId = ''
+    let controlSandboxId = 'e'.repeat(64)
+    let rotateControlSandboxOnStart = false
+    let driftControlImmediatelyAfterEmulatorStart = false
+    let driftControlSandboxAfterEmulatorStart = false
+    let anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    let emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    let restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
+    let emulatorAuthorityLabel = 'e'.repeat(64)
+    const runtimeStartedAt = '2026-09-02T00:00:00.300000001Z'
+    const webStartedAt = '2026-09-02T00:00:00.400000001Z'
     const container = (name: string, role: string, id: string, sandboxId: string, networkMode?: string) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
-      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
-      State: { Status: role === 'anchor'
-        ? anchorState
-        : role === 'svc-emulator'
-          ? emulatorState
-          : role === 'android-runtime-anchor'
-            ? runtimeAnchorState
-            : webState },
+      Config: { Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': role,
+        'devhotel.managed': '1',
+        ...(role === 'svc-emulator'
+          ? (emulatorAuthorityLabel
+              ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: emulatorAuthorityLabel }
+              : {})
+          : role === 'web'
+            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'f'.repeat(64) }
+            : {})
+      } },
+      State: {
+        Status: role === 'anchor'
+          ? anchorState
+          : role === 'svc-emulator'
+            ? emulatorState
+            : role === 'android-runtime-anchor'
+              ? runtimeAnchorState
+              : webState,
+        StartedAt: role === 'anchor'
+          ? anchorStartedAt
+          : role === 'svc-emulator'
+            ? emulatorStartedAt
+            : role === 'android-runtime-anchor'
+              ? runtimeStartedAt
+              : webStartedAt
+      },
       NetworkSettings: {
         SandboxID: sandboxId,
         ...(role === 'android-runtime-anchor'
@@ -1140,9 +1265,27 @@ describe('OciCliBackend Android artifact export', () => {
       ...(networkMode ? { HostConfig: { NetworkMode: networkMode } } : {})
     }])
     mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') {
+        return { code: 0, stdout: JSON.stringify({ ID: 'engine-recovery-test' }), stderr: '' }
+      }
       if (args[0] === 'start') {
-        if (args[1] === ids.anchor) anchorState = 'running'
-        if (args[1] === ids.emulator) emulatorState = 'running'
+        if (args[1] === ids.anchor) {
+          anchorState = 'running'
+          if (rotateControlSandboxOnStart) {
+            controlSandboxId = '8'.repeat(64)
+            anchorStartedAt = '2026-09-02T00:00:02.000000001Z'
+          }
+        }
+        if (args[1] === ids.emulator) {
+          emulatorState = 'running'
+          if (rotateControlSandboxOnStart) {
+            emulatorStartedAt = restartedEmulatorStartedAt
+          }
+          if (driftControlImmediatelyAfterEmulatorStart) {
+            controlSandboxId = '7'.repeat(64)
+            anchorStartedAt = '2026-09-02T00:00:04.000000001Z'
+          }
+        }
         return ok
       }
       if (args[0] === 'network' && args[1] === 'inspect') {
@@ -1176,7 +1319,7 @@ describe('OciCliBackend Android artifact export', () => {
             anchorName(ROOM_ID),
             'anchor',
             ids.anchor,
-            'e'.repeat(64),
+            controlSandboxId,
             androidControlNetworkName(ROOM_ID)
           ),
           stderr: ''
@@ -1202,16 +1345,19 @@ describe('OciCliBackend Android artifact export', () => {
         return {
           code: 0,
           stdout: container(
-            webName(ROOM_ID),
-            'web',
-            ids.web,
-            'f'.repeat(64),
-            `container:${androidRuntimeAnchorName(ROOM_ID)}`
+              webName(ROOM_ID),
+              'web',
+              ids.web,
+              '',
+              `container:${ids.runtime}`
           ),
           stderr: ''
         }
       }
       if (args[0] === 'inspect' && (args[1] === emulatorName(ROOM_ID) || args[1] === ids.emulator)) {
+        if (driftControlSandboxAfterEmulatorStart && emulatorState === 'running') {
+          controlSandboxId = '9'.repeat(64)
+        }
         return {
           code: 0,
           stdout: container(
@@ -1229,30 +1375,31 @@ describe('OciCliBackend Android artifact export', () => {
         : ok
     })
 
-    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
-      .rejects.toThrow(/only the exact owned control anchor/)
+    await expect(backend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact Android runtime namespace/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
 
     extraControlMember = false
-    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
-      .rejects.toThrow(/exact owned anchor network namespace/)
+    await expect(backend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact Android runtime namespace/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
 
     emulatorNetworkMode = `container:${anchorName(ROOM_ID)}`
     emulatorSandboxId = '9'.repeat(64)
-    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+    await expect(backend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/not live in the exact control anchor/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
-    emulatorSandboxId = 'e'.repeat(64)
+    emulatorNetworkMode = `container:${ids.anchor}`
+    emulatorSandboxId = ''
     crossConnectedControl = true
-    await expect(new OciCliBackend().execFencedEmulatorRecoveryAdb(ROOM_ID, ['get-state']))
+    await expect(backend().execFencedEmulatorRecoveryAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
-    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
       .rejects.toThrow(/endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
@@ -1261,25 +1408,137 @@ describe('OciCliBackend Android artifact export', () => {
     emulatorState = 'exited'
     runtimeAnchorState = 'exited'
     webState = 'exited'
-    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
       .rejects.toThrow(/endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
     crossConnectedControl = false
     extraControlMember = true
-    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID))
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
       .rejects.toThrow(/only the exact owned control anchor endpoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
     extraControlMember = false
-    await expect(new OciCliBackend().startExistingEmulatorForRecovery(ROOM_ID)).resolves.toBeUndefined()
+    anchorState = 'running'
+    emulatorState = 'running'
+    controlSandboxId = '8'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:02.000000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/exact network namespace authority label/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    controlSandboxId = 'e'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    restartedEmulatorStartedAt = emulatorStartedAt
+    rotateControlSandboxOnStart = true
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/exact network namespace authority label/)
+    expect(existsSync(join(
+      root,
+      'runtime',
+      'network-recovery-attestations',
+      `${ROOM_ID}-${ids.emulator}.json`
+    ))).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'running'
+    emulatorState = 'running'
+    controlSandboxId = '8'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:02.000000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
+    rotateControlSandboxOnStart = false
+    driftControlSandboxAfterEmulatorStart = false
+    emulatorAuthorityLabel = ''
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/exact network namespace authority label/)
+    expect(existsSync(join(
+      root,
+      'runtime',
+      'network-recovery-attestations',
+      `${ROOM_ID}-${ids.emulator}.json`
+    ))).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    controlSandboxId = 'e'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
+    driftControlImmediatelyAfterEmulatorStart = true
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/exact network namespace authority label/)
+    expect(existsSync(join(
+      root,
+      'runtime',
+      'network-recovery-attestations',
+      `${ROOM_ID}-${ids.emulator}.json`
+    ))).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    controlSandboxId = 'e'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
+    rotateControlSandboxOnStart = true
+    driftControlImmediatelyAfterEmulatorStart = false
+    driftControlSandboxAfterEmulatorStart = true
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/control anchor network namespace changed/)
+    expect(existsSync(join(
+      root,
+      'runtime',
+      'network-recovery-attestations',
+      `${ROOM_ID}-${ids.emulator}.json`
+    ))).toBe(false)
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    controlSandboxId = 'e'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    rotateControlSandboxOnStart = true
+    driftControlSandboxAfterEmulatorStart = false
+    emulatorAuthorityLabel = ''
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID)).resolves.toBeUndefined()
     expect(mockedRunDocker.mock.calls
       .filter(([args]) => args[0] === 'start')
       .map(([args]) => args[1])).toEqual([ids.anchor, ids.emulator])
     expect(runtimeAnchorState).toBe('exited')
     expect(webState).toBe('exited')
+    expect(existsSync(join(
+      root,
+      'runtime',
+      'network-recovery-attestations',
+      `${ROOM_ID}-${ids.emulator}.json`
+    ))).toBe(true)
+
+    mockedRunDocker.mockClear()
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID)).resolves.toBeUndefined()
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    runtimeAnchorState = 'running'
+    webState = 'running'
+    mockedRunDocker.mockClear()
+    await expect(backend().emulatorState(ROOM_ID)).resolves.toBe('running')
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+
+    controlSandboxId = '6'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:05.000000001Z'
+    mockedRunDocker.mockClear()
+    await expect(backend().emulatorState(ROOM_ID))
+      .rejects.toThrow(/exact network namespace authority label/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
   })
 
   it('aborted helper cleanup removes only the exact labeled container ID and ignores name reuse', async () => {
@@ -1296,17 +1555,28 @@ describe('OciCliBackend Android artifact export', () => {
     const roomContainer = (name: string, role: string, id: string) => ({
       Id: id,
       Name: `/${name}`,
-      Config: { Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': role, 'devhotel.managed': '1' } },
+      Config: { Labels: {
+        'devhotel.room': ROOM_ID,
+        'devhotel.role': role,
+        'devhotel.managed': '1',
+        ...(role === 'svc-emulator'
+          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: sandboxId }
+          : role === 'web'
+            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId }
+            : {})
+      } },
       State: { Status: 'running' },
-      ...(role === 'anchor' || role === 'svc-emulator'
+      ...(role === 'anchor'
         ? { NetworkSettings: { SandboxID: sandboxId } }
-        : role === 'android-runtime-anchor' || role === 'web'
+        : role === 'android-runtime-anchor'
           ? { NetworkSettings: { SandboxID: runtimeSandboxId } }
-          : {}),
+          : role === 'svc-emulator' || role === 'web'
+            ? { NetworkSettings: { SandboxID: '' } }
+            : {}),
       ...(role === 'anchor' ? { HostConfig: { NetworkMode: androidControlNetworkName(ROOM_ID) } } : {}),
       ...(role === 'android-runtime-anchor' ? { HostConfig: { NetworkMode: roomNetworkName(ROOM_ID) } } : {}),
-      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${androidRuntimeAnchorName(ROOM_ID)}` } } : {}),
-      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${anchorName(ROOM_ID)}` } } : {})
+      ...(role === 'web' ? { HostConfig: { NetworkMode: `container:${ownedIds.runtime}` } } : {}),
+      ...(role === 'svc-emulator' ? { HostConfig: { NetworkMode: `container:${ownedIds.anchor}` } } : {})
     })
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'rm') {

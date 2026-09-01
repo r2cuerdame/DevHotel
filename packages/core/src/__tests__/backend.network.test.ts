@@ -1,17 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { runDocker } from '../backend/cli'
 import { OciCliBackend } from '../backend/ociCli'
 import {
   androidControlNetworkName,
   androidRuntimeAnchorName,
+  anchorName,
   buildAnchorArgs,
   buildRoomNetworkCreateArgs,
-  roomNetworkName
+  NETWORK_AUTHORITY_SANDBOX_LABEL,
+  roomNetworkName,
+  webName
 } from '../backend/naming'
 import type { WebSpec } from '../backend/types'
+import { tempDir } from './fakes'
 
-vi.mock('../backend/cli', () => ({ runDocker: vi.fn() }))
+vi.mock('../backend/cli', () => ({
+  getPinnedDockerRuntime: vi.fn(() => ({ context: 'test-context' })),
+  runDocker: vi.fn()
+}))
 
 const mockedRunDocker = vi.mocked(runDocker)
 const ok = { code: 0, stdout: '', stderr: '' }
@@ -224,7 +233,8 @@ describe('OciCliBackend Room networks', () => {
             'devhotel.managed': '1'
           } },
           State: { Status: 'running' },
-          HostConfig: { NetworkMode: args[args.indexOf('--network') + 1] }
+          HostConfig: { NetworkMode: args[args.indexOf('--network') + 1] },
+          NetworkSettings: { SandboxID: name === androidRuntimeAnchorName('r1') ? 'c'.repeat(64) : 'e'.repeat(64) }
         })
         return ok
       }
@@ -265,8 +275,9 @@ describe('OciCliBackend Room networks', () => {
       '--network', roomNetworkName('r1')
     ]))
     expect(calls[webAt]).toEqual(expect.arrayContaining([
-      '--network', `container:${androidRuntimeAnchorName('r1')}`
+      '--network', `container:${'b'.repeat(64)}`
     ]))
+    expect(calls[webAt]).toContain(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=${'c'.repeat(64)}`)
     expect(controlNetworkAt).toBeGreaterThanOrEqual(0)
     expect(controlAnchorAt).toBeGreaterThan(controlNetworkAt)
     expect(runtimeAnchorAt).toBeGreaterThan(controlNetworkAt)
@@ -310,7 +321,8 @@ describe('OciCliBackend Room networks', () => {
             'devhotel.managed': '1'
           } },
           State: { Status: 'running' },
-          HostConfig: { NetworkMode: args[args.indexOf('--network') + 1] }
+          HostConfig: { NetworkMode: args[args.indexOf('--network') + 1] },
+          NetworkSettings: { SandboxID: (runtime ? 'c' : 'd').repeat(64) }
         })
         return ok
       }
@@ -689,12 +701,13 @@ describe('OciCliBackend Room networks', () => {
     expect(service === null).toBe(false)
   })
 
-  it('binds an Android service to the exact runtime ID and removes a sandbox-mismatched create', async () => {
+  it('accepts an empty joined sandbox on the exact runtime ID and removes a non-empty mismatch', async () => {
     const runtimeId = 'a'.repeat(64)
     const serviceId = 'b'.repeat(64)
     const runtimeSandboxId = 'c'.repeat(64)
     let serviceExists = false
     let creationToken = ''
+    let serviceSandboxId = ''
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'network' && args[1] === 'inspect' && args[2] === androidControlNetworkName('r1')) {
         return {
@@ -704,7 +717,7 @@ describe('OciCliBackend Room networks', () => {
         }
       }
       if (args[0] === 'inspect') {
-        if (args[1] === androidRuntimeAnchorName('r1')) {
+        if (args[1] === androidRuntimeAnchorName('r1') || args[1] === runtimeId) {
           return {
             code: 0,
             stdout: JSON.stringify([{
@@ -732,11 +745,12 @@ describe('OciCliBackend Room networks', () => {
                 'devhotel.room': 'r1',
                 'devhotel.role': 'svc-redis',
                 'devhotel.managed': '1',
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId,
                 'devhotel.creation-token': creationToken
               } },
               State: { Status: 'running' },
               HostConfig: { NetworkMode: `container:${runtimeId}` },
-              NetworkSettings: { SandboxID: 'd'.repeat(64) }
+              NetworkSettings: { SandboxID: serviceSandboxId }
             }]),
             stderr: ''
           }
@@ -766,9 +780,16 @@ describe('OciCliBackend Room networks', () => {
       return ok
     })
 
-    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/outside the exact runtime namespace/)
+    await expect(backend().createService('r1', 'redis', '8')).resolves.toBeUndefined()
     const run = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'run')?.[0]
     expect(run).toEqual(expect.arrayContaining(['--network', `container:${runtimeId}`]))
+    expect(run).toContain(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=${runtimeSandboxId}`)
+    expect(serviceExists).toBe(true)
+
+    mockedRunDocker.mockClear()
+    serviceExists = false
+    serviceSandboxId = 'd'.repeat(64)
+    await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/outside the exact runtime namespace/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
   })
@@ -818,11 +839,12 @@ describe('OciCliBackend Room networks', () => {
                 'devhotel.room': 'r1',
                 'devhotel.role': 'svc-redis',
                 'devhotel.managed': '1',
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId,
                 'devhotel.creation-token': creationToken
               } },
               State: { Status: 'running' },
               HostConfig: { NetworkMode: `container:${runtimeId}` },
-              NetworkSettings: { SandboxID: runtimeSandboxId }
+              NetworkSettings: { SandboxID: '' }
             }]),
             stderr: ''
           }
@@ -967,7 +989,168 @@ describe('OciCliBackend Room networks', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'run' || args[0] === 'start')).toBe(false)
   })
 
-  it('removes the exact service if its running sandbox is misbound after start', async () => {
+  it('persists exact web and service rejoin proofs across an Android wake', async () => {
+    const roomId = 'room1abc'
+    const ids = {
+      anchor: 'a'.repeat(64),
+      runtime: 'b'.repeat(64),
+      web: 'c'.repeat(64),
+      service: 'd'.repeat(64)
+    }
+    const originalRuntimeSandbox = 'e'.repeat(64)
+    const currentRuntimeSandbox = 'f'.repeat(64)
+    const root = tempDir()
+    const attestationDir = join(root, 'runtime', 'network-recovery-attestations')
+    const instance = () => new OciCliBackend({
+      identityFile: join(root, 'runtime', 'docker-engine.json'),
+      networkRecoveryAttestationDir: attestationDir
+    })
+    let anchorState = 'exited'
+    let runtimeState = 'exited'
+    let webState = 'exited'
+    let serviceState = 'exited'
+    let runtimeSandbox = originalRuntimeSandbox
+    let runtimeStartedAt = '2026-09-02T00:00:00.100000001Z'
+    let webStartedAt = '2026-09-02T00:00:00.200000001Z'
+    let serviceStartedAt = '2026-09-02T00:00:00.300000001Z'
+    const owned = (
+      name: string,
+      role: string,
+      id: string,
+      state: string,
+      startedAt: string,
+      networkMode: string,
+      sandboxId?: string,
+      authorityLabel?: string
+    ) => ({
+      Id: id,
+      Name: `/${name}`,
+      Config: { Labels: {
+        'devhotel.room': roomId,
+        'devhotel.role': role,
+        'devhotel.managed': '1',
+        ...(authorityLabel === undefined
+          ? {}
+          : { [NETWORK_AUTHORITY_SANDBOX_LABEL]: authorityLabel })
+      } },
+      State: { Status: state, StartedAt: startedAt },
+      HostConfig: { NetworkMode: networkMode },
+      ...(sandboxId === undefined ? {} : { NetworkSettings: { SandboxID: sandboxId } })
+    })
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') {
+        return { code: 0, stdout: JSON.stringify({ ID: 'engine-network-rejoin' }), stderr: '' }
+      }
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        const name = args[2]!
+        const members = name === androidControlNetworkName(roomId) && anchorState === 'running'
+          ? { [ids.anchor]: { Name: anchorName(roomId) } }
+          : name === roomNetworkName(roomId) && runtimeState === 'running'
+            ? { [ids.runtime]: { Name: androidRuntimeAnchorName(roomId) } }
+            : {}
+        return { code: 0, stdout: networkInspect(roomId, name, members), stderr: '' }
+      }
+      if (args[0] === 'inspect') {
+        if (args[1] === anchorName(roomId) || args[1] === ids.anchor) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([owned(
+              anchorName(roomId),
+              'anchor',
+              ids.anchor,
+              anchorState,
+              '2026-09-02T00:00:01.000000001Z',
+              androidControlNetworkName(roomId),
+              '1'.repeat(64)
+            )]),
+            stderr: ''
+          }
+        }
+        if (args[1] === androidRuntimeAnchorName(roomId) || args[1] === ids.runtime) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([owned(
+              androidRuntimeAnchorName(roomId),
+              'android-runtime-anchor',
+              ids.runtime,
+              runtimeState,
+              runtimeStartedAt,
+              roomNetworkName(roomId),
+              runtimeSandbox
+            )]),
+            stderr: ''
+          }
+        }
+        if (args[1] === webName(roomId) || args[1] === ids.web) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([owned(
+              webName(roomId),
+              'web',
+              ids.web,
+              webState,
+              webStartedAt,
+              `container:${ids.runtime}`,
+              webState === 'running' ? '' : undefined,
+              originalRuntimeSandbox
+            )]),
+            stderr: ''
+          }
+        }
+        if (args[1] === `dh-${roomId}-svc-redis` || args[1] === ids.service) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([owned(
+              `dh-${roomId}-svc-redis`,
+              'svc-redis',
+              ids.service,
+              serviceState,
+              serviceStartedAt,
+              `container:${ids.runtime}`,
+              serviceState === 'running' ? '' : undefined,
+              originalRuntimeSandbox
+            )]),
+            stderr: ''
+          }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'start') {
+        if (args[1] === anchorName(roomId)) anchorState = 'running'
+        if (args[1] === ids.runtime) {
+          runtimeState = 'running'
+          runtimeSandbox = currentRuntimeSandbox
+          runtimeStartedAt = '2026-09-02T00:00:02.000000001Z'
+        }
+        if (args[1] === ids.web) {
+          webState = 'running'
+          webStartedAt = '2026-09-02T00:00:03.000000001Z'
+        }
+        if (args[1] === ids.service) {
+          serviceState = 'running'
+          serviceStartedAt = '2026-09-02T00:00:04.000000001Z'
+        }
+        return ok
+      }
+      if (args[0] === 'port') return { code: 0, stdout: '127.0.0.1:45123\n', stderr: '' }
+      return ok
+    })
+
+    await expect(instance().startRoomPod(roomId, { androidRuntimeIsolation: true }))
+      .resolves.toEqual({ hostPort: 45123 })
+    expect(existsSync(join(attestationDir, `${roomId}-${ids.web}.json`))).toBe(true)
+
+    await expect(instance().startService(roomId, 'redis')).resolves.toBeUndefined()
+    expect(existsSync(join(attestationDir, `${roomId}-${ids.service}.json`))).toBe(true)
+
+    mockedRunDocker.mockClear()
+    await expect(instance().startWeb(roomId)).resolves.toBeUndefined()
+    await expect(instance().startService(roomId, 'redis')).resolves.toBeUndefined()
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+  })
+
+  it('starts an exact-ID service with an empty joined sandbox and removes a non-empty mismatch', async () => {
     const runtimeId = 'a'.repeat(64)
     const serviceId = 'b'.repeat(64)
     const runtimeSandboxId = 'c'.repeat(64)
@@ -977,6 +1160,8 @@ describe('OciCliBackend Room networks', () => {
     let startFails = false
     let startedStatus = 'running'
     let corruptOwnership = false
+    let runningServiceSandboxId = ''
+    let serviceStartedAt = '2026-09-02T00:00:00.100000001Z'
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
         return {
@@ -985,7 +1170,10 @@ describe('OciCliBackend Room networks', () => {
           stderr: ''
         }
       }
-      if (args[0] === 'inspect' && args[1] === androidRuntimeAnchorName('r1')) {
+      if (
+        args[0] === 'inspect' &&
+        (args[1] === androidRuntimeAnchorName('r1') || args[1] === runtimeId)
+      ) {
         return {
           code: 0,
           stdout: JSON.stringify([{
@@ -996,7 +1184,7 @@ describe('OciCliBackend Room networks', () => {
               'devhotel.role': 'android-runtime-anchor',
               'devhotel.managed': '1'
             } },
-            State: { Status: 'running' },
+            State: { Status: 'running', StartedAt: '2026-09-02T00:00:01.000000001Z' },
             HostConfig: { NetworkMode: roomNetworkName('r1') },
             NetworkSettings: { SandboxID: runtimeSandboxId }
           }]),
@@ -1016,12 +1204,13 @@ describe('OciCliBackend Room networks', () => {
             Config: { Labels: {
               'devhotel.room': 'r1',
               'devhotel.role': 'svc-redis',
-              'devhotel.managed': corruptOwnership && serviceStatus !== 'exited' ? '0' : '1'
+              'devhotel.managed': corruptOwnership && serviceStatus !== 'exited' ? '0' : '1',
+              [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId
             } },
-            State: { Status: serviceStatus },
+            State: { Status: serviceStatus, StartedAt: serviceStartedAt },
             HostConfig: { NetworkMode: `container:${runtimeId}` },
             ...(serviceStatus === 'running'
-              ? { NetworkSettings: { SandboxID: 'd'.repeat(64) } }
+              ? { NetworkSettings: { SandboxID: runningServiceSandboxId } }
               : {})
           }]),
           stderr: ''
@@ -1029,6 +1218,7 @@ describe('OciCliBackend Room networks', () => {
       }
       if (args[0] === 'start' && args[1] === serviceId) {
         serviceStatus = startedStatus
+        serviceStartedAt = '2026-09-02T00:00:02.000000001Z'
         return startFails ? { code: 1, stdout: '', stderr: 'start failed after transition' } : ok
       }
       if (args[0] === 'rm' && args[2] === serviceId) {
@@ -1041,7 +1231,13 @@ describe('OciCliBackend Room networks', () => {
         : ok
     })
 
-    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/outside the exact runtime namespace/)
+    await expect(backend().startService('r1', 'redis')).resolves.toBeUndefined()
+    expect(serviceExists).toBe(true)
+
+    mockedRunDocker.mockClear()
+    serviceStatus = 'exited'
+    runningServiceSandboxId = 'd'.repeat(64)
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/outside its exact network authority/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
 
@@ -1057,7 +1253,7 @@ describe('OciCliBackend Room networks', () => {
     cleanupFails = false
     startFails = true
     serviceStatus = 'exited'
-    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/start redis/)
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/start exact Android redis service/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
 
@@ -1066,7 +1262,7 @@ describe('OciCliBackend Room networks', () => {
     serviceStatus = 'exited'
     startFails = false
     startedStatus = 'paused'
-    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/start incomplete/)
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/not running in a live network namespace/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
 
@@ -1107,7 +1303,7 @@ describe('OciCliBackend Room networks', () => {
                 'devhotel.role': 'android-runtime-anchor',
                 'devhotel.managed': '1'
               } },
-              State: { Status: 'running' },
+              State: { Status: 'running', StartedAt: '2026-09-02T00:00:01.000000001Z' },
               HostConfig: { NetworkMode: roomNetworkName('r1') },
               NetworkSettings: { SandboxID: runtimeSandboxId }
             }]),
@@ -1124,13 +1320,16 @@ describe('OciCliBackend Room networks', () => {
               Config: { Labels: {
                 'devhotel.room': 'r1',
                 'devhotel.role': 'svc-redis',
-                'devhotel.managed': '1'
+                'devhotel.managed': '1',
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId
               } },
-              State: { Status: serviceStatus },
-              HostConfig: { NetworkMode: `container:${runtimeId}` },
-              ...(serviceStatus === 'running'
-                ? { NetworkSettings: { SandboxID: runtimeSandboxId } }
-                : {})
+              State: { Status: serviceStatus, StartedAt: serviceStatus === 'running'
+                ? '2026-09-02T00:00:02.000000001Z'
+                : '2026-09-02T00:00:00.100000001Z' },
+            HostConfig: { NetworkMode: `container:${runtimeId}` },
+            ...(serviceStatus === 'running'
+              ? { NetworkSettings: { SandboxID: '' } }
+              : {})
             }]),
             stderr: ''
           }
@@ -1148,8 +1347,149 @@ describe('OciCliBackend Room networks', () => {
       return ok
     })
 
-    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/runtime anchor disappeared/)
+    await expect(backend().startService('r1', 'redis')).rejects.toThrow(/network authority disappeared/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
+  })
+
+  it('migrates a legacy name-joined web through an exact token-fenced recreation', async () => {
+    const roomId = 'room1abc'
+    const oldWebId = 'a'.repeat(64)
+    const newWebId = 'b'.repeat(64)
+    const runtimeId = 'c'.repeat(64)
+    const runtimeSandboxId = 'd'.repeat(64)
+    let webId: string | null = oldWebId
+    let webStatus: 'created' | 'running' = 'running'
+    let webMode = `container:${androidRuntimeAnchorName(roomId)}`
+    let webStartedAt = '2026-09-02T00:00:00.200000001Z'
+    let webAuthorityLabel = ''
+    let recreationToken = ''
+    const spec: WebSpec = {
+      roomId,
+      internalPort: 6080,
+      nodeMajor: '22',
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      workspaceVolumeRevision: 0,
+      startCommand: 'sleep 1',
+      imageOverride: `android-build@sha256:${'e'.repeat(64)}`,
+      androidRuntimeIsolation: true,
+      noDepsVolume: true,
+      noCacheVolume: true
+    }
+    const runtime = () => ({
+      Id: runtimeId,
+      Name: `/${androidRuntimeAnchorName(roomId)}`,
+      Config: { Labels: {
+        'devhotel.room': roomId,
+        'devhotel.role': 'android-runtime-anchor',
+        'devhotel.managed': '1'
+      } },
+      State: { Status: 'running', StartedAt: '2026-09-02T00:00:00.100000001Z' },
+      HostConfig: { NetworkMode: roomNetworkName(roomId) },
+      NetworkSettings: { SandboxID: runtimeSandboxId }
+    })
+    const web = () => ({
+      Id: webId,
+      Name: `/${webName(roomId)}`,
+      Config: { Labels: {
+        'devhotel.room': roomId,
+        'devhotel.role': 'web',
+        'devhotel.managed': '1',
+        ...(webAuthorityLabel ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: webAuthorityLabel } : {}),
+        ...(recreationToken ? { 'devhotel.artifact-restore-token': recreationToken } : {})
+      } },
+      State: { Status: webStatus, StartedAt: webStartedAt },
+      HostConfig: { NetworkMode: webMode },
+      NetworkSettings: { SandboxID: '' }
+    })
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'image' && args[1] === 'inspect') return ok
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return { code: 0, stdout: networkInspect(roomId), stderr: '' }
+      }
+      if (args[0] === 'inspect') {
+        if (args[1] === runtimeId || args[1] === androidRuntimeAnchorName(roomId)) {
+          return { code: 0, stdout: JSON.stringify([runtime()]), stderr: '' }
+        }
+        if (webId && (args[1] === webId || args[1] === webName(roomId))) {
+          return { code: 0, stdout: JSON.stringify([web()]), stderr: '' }
+        }
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      if (args[0] === 'rm' && args[2] === oldWebId) {
+        webId = null
+        return ok
+      }
+      if (args[0] === 'create' && args.includes(webName(roomId))) {
+        webId = newWebId
+        webStatus = 'created'
+        webMode = args[args.indexOf('--network') + 1]!
+        webAuthorityLabel = args.find((arg) =>
+          arg.startsWith(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=`)
+        )?.split('=')[1] ?? ''
+        recreationToken = args.find((arg) =>
+          arg.startsWith('devhotel.artifact-restore-token=')
+        )?.split('=')[1] ?? ''
+        return { code: 0, stdout: `${newWebId}\n`, stderr: '' }
+      }
+      if (args[0] === 'start' && args[1] === newWebId) {
+        webStatus = 'running'
+        webStartedAt = '2026-09-02T00:00:01.200000001Z'
+        return ok
+      }
+      return ok
+    })
+
+    await expect(backend().restartWeb(roomId, spec)).resolves.toBeUndefined()
+    expect(webId).toBe(newWebId)
+    expect(webMode).toBe(`container:${runtimeId}`)
+    expect(webAuthorityLabel).toBe(runtimeSandboxId)
+    expect(recreationToken).toMatch(/^[a-f0-9]{32}$/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start' && args[1] === oldWebId)).toBe(false)
+  })
+
+  it('does not start a same-name web replacement during an exact restart', async () => {
+    const roomId = 'room1abc'
+    const originalId = 'a'.repeat(64)
+    const replacementId = 'b'.repeat(64)
+    let stopped = false
+    let replacementVisible = false
+    const inspected = (id: string, status: string) => ({
+      Id: id,
+      Name: `/${webName(roomId)}`,
+      Config: { Labels: {
+        'devhotel.room': roomId,
+        'devhotel.role': 'web',
+        'devhotel.managed': '1'
+      } },
+      State: { Status: status },
+      HostConfig: { NetworkMode: roomNetworkName(roomId) }
+    })
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        if (args[1] === originalId) {
+          const result = { code: 0, stdout: JSON.stringify([inspected(originalId, 'exited')]), stderr: '' }
+          replacementVisible = true
+          return result
+        }
+        if (args[1] === webName(roomId)) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([inspected(replacementVisible ? replacementId : originalId, stopped ? 'exited' : 'running')]),
+            stderr: ''
+          }
+        }
+      }
+      if (args[0] === 'stop' && args.at(-1) === originalId) {
+        stopped = true
+        return ok
+      }
+      return { code: 1, stdout: '', stderr: 'unexpected command' }
+    })
+
+    await expect(backend().restartWeb(roomId)).rejects.toThrow(/immutable ID changed before start/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
   })
 })

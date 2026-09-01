@@ -3,6 +3,18 @@ import { RELAY_PREAMBLE_PREFIX } from '../relayProtocol'
 
 export const ANCHOR_IMAGE = 'alpine/socat'
 export const RELAY_PORT = 3999
+export const NETWORK_AUTHORITY_SANDBOX_LABEL = 'devhotel.network-authority-sandbox'
+
+export interface NetworkNamespaceAuthority {
+  id: string
+  sandboxId: string
+}
+
+function networkAuthorityLabelArgs(sandboxId?: string): string[] {
+  if (sandboxId === undefined) return []
+  if (!/^[a-f0-9]{64}$/.test(sandboxId)) throw new Error('invalid network authority sandbox identity')
+  return ['-l', `${NETWORK_AUTHORITY_SANDBOX_LABEL}=${sandboxId}`]
+}
 
 export function anchorName(roomId: string): string {
   return `dh-${roomId}-anchor`
@@ -163,7 +175,7 @@ export function emulatorAvdOverride(
 export function buildEmulatorArgs(
   roomId: string,
   opts?: Partial<EmulatorOpts>,
-  lifecycle: { networkNamespace?: string; abortToken?: string } = {}
+  lifecycle: { networkNamespace?: string; networkAuthoritySandboxId?: string; abortToken?: string } = {}
 ): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
@@ -182,6 +194,7 @@ export function buildEmulatorArgs(
     'devhotel.role=svc-emulator',
     '-l',
     'devhotel.managed=1',
+    ...networkAuthorityLabelArgs(lifecycle.networkAuthoritySandboxId),
     ...(lifecycle.abortToken ? ['-l', `devhotel.abort-token=${lifecycle.abortToken}`] : []),
     '--device',
     '/dev/kvm',
@@ -230,7 +243,8 @@ export function buildServiceArgs(
   svc: ServiceKind,
   version: string,
   networkNamespace = anchorName(roomId),
-  creationToken?: string
+  creationToken?: string,
+  networkAuthoritySandboxId?: string
 ): string[] {
   const common = [
     'run',
@@ -247,6 +261,7 @@ export function buildServiceArgs(
     `devhotel.role=svc-${svc}`,
     '-l',
     'devhotel.managed=1',
+    ...networkAuthorityLabelArgs(networkAuthoritySandboxId),
     ...(creationToken ? ['-l', `devhotel.creation-token=${creationToken}`] : [])
   ]
   if (svc === 'postgres') {
@@ -412,7 +427,7 @@ export function wrapStartCommand(startCommand: string): string {
   return `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec sh -lc ${quoteShellWord(startCommand)}`
 }
 
-export function buildWebCreateArgs(spec: WebSpec): string[] {
+export function buildWebCreateArgs(spec: WebSpec, networkAuthority?: NetworkNamespaceAuthority): string[] {
   return [
     'create',
     '--name',
@@ -420,10 +435,13 @@ export function buildWebCreateArgs(spec: WebSpec): string[] {
     '--network',
     spec.standalone
       ? roomNetworkName(spec.roomId)
-      : `container:${spec.androidRuntimeIsolation ? androidRuntimeAnchorName(spec.roomId) : anchorName(spec.roomId)}`,
+      : `container:${networkAuthority?.id ?? (
+        spec.androidRuntimeIsolation ? androidRuntimeAnchorName(spec.roomId) : anchorName(spec.roomId)
+      )}`,
     '--cap-drop',
     'NET_RAW',
     ...labelArgs(spec.roomId, 'web'),
+    ...networkAuthorityLabelArgs(networkAuthority?.sandboxId),
     ...mountArgs(spec),
     ...envArgs(spec),
     ...limitArgs(spec),

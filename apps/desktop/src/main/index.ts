@@ -110,6 +110,7 @@ async function bootstrap(): Promise<void> {
   const backend = new OciCliBackend({
     identityFile: join(userData, 'runtime', 'docker-engine.json'),
     legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
+    networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
     canAdoptLegacyVolume: (roomId) =>
       ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml'))
   })
