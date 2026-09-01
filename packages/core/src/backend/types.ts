@@ -107,6 +107,8 @@ export interface RoomArtifactWebRuntimeFence {
   networkId: string
   /** Exact live namespace identity when the authority is another container. */
   networkSandboxId?: string
+  /** Canonical raw OCI start generation when the authority is another container. */
+  networkAuthorityStartedAt?: string
 }
 
 export type RoomArtifactPublicationFailureReason =

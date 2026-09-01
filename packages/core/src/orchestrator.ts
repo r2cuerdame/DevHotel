@@ -701,7 +701,7 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
   }
   const runtimeFence = record.runtimeFence as Record<string, unknown>
   if (!exactObjectKeys(runtimeFence, [
-    'containerId', 'networkAuthorityId', 'networkId', 'networkSandboxId',
+    'containerId', 'networkAuthorityId', 'networkAuthorityStartedAt', 'networkId', 'networkSandboxId',
     'runtimeSpecSha256', 'volumeSetSha256', 'workspaceVolume'
   ])) return null
   if (
@@ -711,6 +711,11 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
     typeof runtimeFence.runtimeSpecSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.runtimeSpecSha256) ||
     typeof runtimeFence.volumeSetSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.volumeSetSha256) ||
     typeof runtimeFence.networkAuthorityId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkAuthorityId) ||
+    typeof runtimeFence.networkAuthorityStartedAt !== 'string' ||
+    !/^(?:19[7-9]\d|2\d{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(
+      runtimeFence.networkAuthorityStartedAt
+    ) ||
+    !Number.isFinite(Date.parse(runtimeFence.networkAuthorityStartedAt)) ||
     typeof runtimeFence.networkId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkId) ||
     typeof runtimeFence.networkSandboxId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkSandboxId)
   ) return null

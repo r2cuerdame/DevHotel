@@ -5010,7 +5010,16 @@ export class OciCliBackend implements IsolationBackend {
       !fullId.test(fence.networkAuthorityId) ||
       !fullId.test(fence.networkId) ||
       (fence.networkSandboxId !== undefined && !fullId.test(fence.networkSandboxId)) ||
-      (!spec.standalone && fence.networkSandboxId === undefined)
+      (fence.networkAuthorityStartedAt !== undefined &&
+        !isCanonicalDockerStartedAt(fence.networkAuthorityStartedAt)) ||
+      (!spec.standalone && (
+        fence.networkSandboxId === undefined ||
+        fence.networkAuthorityStartedAt === undefined
+      )) ||
+      (spec.standalone && (
+        fence.networkSandboxId !== undefined ||
+        fence.networkAuthorityStartedAt !== undefined
+      ))
     ) {
       throw new Error('Room artifact web runtime fence is invalid for this exact spec')
     }
@@ -5126,8 +5135,12 @@ export class OciCliBackend implements IsolationBackend {
     }
     this.assertContainerNetworkMode(authority, networkName, 'Room artifact network authority')
     const sandboxId = exactLiveSandboxId(authority, 'Room artifact network authority')
+    const startedAt = exactDockerStartedAt(authority, 'Room artifact network authority')
     if (fence?.networkSandboxId && sandboxId !== fence.networkSandboxId) {
       throw new Error('Room artifact network namespace identity changed')
+    }
+    if (fence?.networkAuthorityStartedAt && startedAt !== fence.networkAuthorityStartedAt) {
+      throw new Error('Room artifact network authority start generation changed')
     }
     const authorityNetworks = authority.NetworkSettings?.Networks ?? {}
     if (
@@ -5152,7 +5165,7 @@ export class OciCliBackend implements IsolationBackend {
       sandboxId,
       networkName,
       authorityName,
-      startedAt: exactDockerStartedAt(authority, 'Room artifact network authority')
+      startedAt
     }
   }
 
@@ -5388,7 +5401,12 @@ export class OciCliBackend implements IsolationBackend {
       volumeSetSha256: opts.volumeProof.setSha256,
       networkAuthorityId: authority.id,
       networkId: authority.networkId,
-      ...(authority.kind === 'container' ? { networkSandboxId: authority.sandboxId } : {})
+      ...(authority.kind === 'container'
+        ? {
+            networkSandboxId: authority.sandboxId,
+            networkAuthorityStartedAt: authority.startedAt
+          }
+        : {})
     }
   }
 

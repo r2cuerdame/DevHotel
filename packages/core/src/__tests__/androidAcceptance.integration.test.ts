@@ -716,7 +716,8 @@ describe('Android acceptance orchestration', () => {
       volumeSetSha256: 'b'.repeat(64),
       networkAuthorityId: 'a'.repeat(64),
       networkId: 'c'.repeat(64),
-      networkSandboxId: 'd'.repeat(64)
+      networkSandboxId: 'd'.repeat(64),
+      networkAuthorityStartedAt: '2026-09-02T00:00:00.100000001Z'
     }
     let competingClaim = false
     test.backend.captureRoomArtifactWebFenceHandler = () => {

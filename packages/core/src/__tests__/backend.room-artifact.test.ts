@@ -36,7 +36,8 @@ const WEB_RUNTIME_FENCE = {
   volumeSetSha256: '2'.repeat(64),
   networkAuthorityId: 'f'.repeat(64),
   networkId: '3'.repeat(64),
-  networkSandboxId: '1'.repeat(64)
+  networkSandboxId: '1'.repeat(64),
+  networkAuthorityStartedAt: '2026-09-02T00:00:00.100000001Z'
 }
 
 interface HelperState {
@@ -917,6 +918,7 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
       networkAuthorityId: RUNTIME_ANCHOR_ID,
       networkId: NETWORK_ID,
       networkSandboxId: RUNTIME_SANDBOX_ID,
+      networkAuthorityStartedAt: authorityStartedAt,
       runtimeSpecSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       volumeSetSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
     })
@@ -934,6 +936,18 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
     driftAuthorityAfterNextWebInspect = true
     await expect(new OciCliBackend().captureRoomArtifactWebFence(spec))
       .rejects.toThrow(/network authority changed after web runtime proof/)
+  })
+
+  it('persists the runtime authority start generation across artifact calls', async () => {
+    const backend = new OciCliBackend()
+    const fence = await backend.captureRoomArtifactWebFence(spec)
+    authorityStartedAt = '2026-09-02T00:00:01.100000001Z'
+
+    await expect(backend.pauseRoomArtifactWeb(spec, fence))
+      .rejects.toThrow(/network authority start generation changed/)
+    await expect(backend.restoreRoomArtifactWeb(spec, fence))
+      .rejects.toThrow(/network authority start generation changed/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'pause' || args[0] === 'unpause')).toBe(false)
   })
 
   it('rejects a non-empty joined sandbox that differs from its exact runtime authority', async () => {
