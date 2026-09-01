@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   ANCHOR_IMAGE,
+  NETWORK_AUTHORITY_SANDBOX_LABEL,
+  NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
   anchorName,
   androidControlNetworkName,
@@ -184,6 +186,44 @@ describe('Android runtime namespace', () => {
       'devhotel.creation-token=11111111-1111-4111-8111-111111111111'
     ]))
     expect(service).not.toContain('container:dh-r1-anchor')
+  })
+
+  it('pins the full network authority generation on every joined workload', () => {
+    const authority = {
+      id: 'a'.repeat(64),
+      sandboxId: 'b'.repeat(64),
+      startedAt: '2026-09-02T00:00:00.123456789Z'
+    }
+    const expectedLabels = [
+      `${NETWORK_AUTHORITY_SANDBOX_LABEL}=${authority.sandboxId}`,
+      `${NETWORK_AUTHORITY_STARTED_AT_LABEL}=${authority.startedAt}`
+    ]
+    const web = buildWebCreateArgs(spec({ androidRuntimeIsolation: true }), authority)
+    const emulator = buildEmulatorArgs(
+      'r1',
+      { device: 'Samsung Galaxy S10', version: '14.0' },
+      {
+        networkNamespace: authority.id,
+        networkAuthoritySandboxId: authority.sandboxId,
+        networkAuthorityStartedAt: authority.startedAt
+      }
+    )
+    const service = buildServiceArgs(
+      'r1',
+      'redis',
+      '8',
+      authority.id,
+      '11111111-1111-4111-8111-111111111111',
+      authority.sandboxId,
+      authority.startedAt
+    )
+
+    for (const args of [web, emulator, service]) {
+      const network = args.indexOf('--network')
+      expect(args[network + 1]).toBe(`container:${authority.id}`)
+      const labels = args.flatMap((arg, index) => arg === '-l' ? [args[index + 1] ?? ''] : [])
+      expect(labels).toEqual(expect.arrayContaining(expectedLabels))
+    }
   })
 })
 

@@ -1,10 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
+import {
+  NETWORK_AUTHORITY_SANDBOX_LABEL,
+  NETWORK_AUTHORITY_STARTED_AT_LABEL,
+  anchorName,
+  roomNetworkName
+} from '../backend/naming'
 import { OciCliBackend } from '../backend/ociCli'
 
 vi.mock('../backend/cli', () => ({ runDocker: vi.fn() }))
 
 const mockedRunDocker = vi.mocked(runDocker)
+const SERVICE_NETWORK_ID = '1'.repeat(64)
 
 function row(id: string, name: string, role: string, state: string): string {
   return JSON.stringify({
@@ -90,7 +97,11 @@ describe('OciCliBackend.stopRoomPod', () => {
   })
 })
 
-function redisInspect(status: string): string {
+const SERVICE_AUTHORITY_ID = 'a'.repeat(64)
+const SERVICE_AUTHORITY_SANDBOX_ID = 'b'.repeat(64)
+const SERVICE_AUTHORITY_STARTED_AT = '2026-09-02T00:00:00.100000001Z'
+
+function redisInspect(status: string, startedAt = '2026-09-02T00:00:00.200000001Z'): string {
   return JSON.stringify([
     {
       Id: 'c'.repeat(64),
@@ -99,10 +110,14 @@ function redisInspect(status: string): string {
         Labels: {
           'devhotel.room': 'r1',
           'devhotel.role': 'svc-redis',
-          'devhotel.managed': '1'
+          'devhotel.managed': '1',
+          [NETWORK_AUTHORITY_SANDBOX_LABEL]: SERVICE_AUTHORITY_SANDBOX_ID,
+          [NETWORK_AUTHORITY_STARTED_AT_LABEL]: SERVICE_AUTHORITY_STARTED_AT
         }
       },
-      State: { Status: status }
+      State: { Status: status, StartedAt: startedAt },
+      HostConfig: { NetworkMode: `container:${SERVICE_AUTHORITY_ID}` },
+      NetworkSettings: { SandboxID: status === 'running' ? '' : undefined }
     }
   ])
 }
@@ -135,9 +150,45 @@ describe('OciCliBackend service stop/start', () => {
       if (args[0] === 'inspect' && args[1] === 'dh-r1-android-runtime-anchor') {
         return { code: 1, stdout: '', stderr: 'No such container' }
       }
+      if (args[0] === 'inspect' && (args[1] === anchorName('r1') || args[1] === SERVICE_AUTHORITY_ID)) {
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Id: SERVICE_AUTHORITY_ID,
+            Name: `/${anchorName('r1')}`,
+            Config: { Labels: {
+              'devhotel.room': 'r1',
+              'devhotel.role': 'anchor',
+              'devhotel.managed': '1'
+            } },
+            State: { Status: 'running', StartedAt: SERVICE_AUTHORITY_STARTED_AT },
+            HostConfig: { NetworkMode: roomNetworkName('r1') },
+            NetworkSettings: {
+              SandboxID: SERVICE_AUTHORITY_SANDBOX_ID,
+              Networks: {
+                [roomNetworkName('r1')]: { NetworkID: SERVICE_NETWORK_ID }
+              }
+            }
+          }]),
+          stderr: ''
+        }
+      }
       if (args[0] === 'inspect') return { code: 0, stdout: redisInspect(state), stderr: '' }
       if (args[0] === 'network' && args[1] === 'inspect') {
-        return { code: 1, stdout: '', stderr: 'No such network' }
+        if (args[2] !== roomNetworkName('r1')) {
+          return { code: 1, stdout: '', stderr: 'No such network' }
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify([{
+            Id: SERVICE_NETWORK_ID,
+            Name: roomNetworkName('r1'),
+            Driver: 'bridge',
+            Labels: { 'devhotel.room': 'r1', 'devhotel.role': 'network', 'devhotel.managed': '1' },
+            Containers: { [SERVICE_AUTHORITY_ID]: { Name: anchorName('r1') } }
+          }]),
+          stderr: ''
+        }
       }
       if (args[0] === 'start') state = 'running'
       return { code: 0, stdout: '', stderr: '' }

@@ -9,6 +9,7 @@ import {
   androidRuntimeAnchorName,
   emulatorName,
   NETWORK_AUTHORITY_SANDBOX_LABEL,
+  NETWORK_AUTHORITY_STARTED_AT_LABEL,
   roomNetworkName,
   webName,
   workspaceSnapshotVolume
@@ -377,12 +378,18 @@ describe('OciCliBackend Android artifact export', () => {
     const anchorId = 'a'.repeat(64)
     const emulatorId = 'b'.repeat(64)
     const controlSandboxId = 'c'.repeat(64)
+    const controlNetworkId = '1'.repeat(64)
+    const controlStartedAt = '2026-09-02T00:00:00.100000001Z'
+    const emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
     let emulator: Record<string, unknown> | null = null
     let failCreate = false
     let startedEmulatorSandboxId = ''
     let emulatorAuthorityLabel: string | undefined = controlSandboxId
+    let emulatorAuthorityStartedAtLabel: string | undefined = controlStartedAt
     let controlAnchorSandboxId = controlSandboxId
+    let controlAnchorStartedAt = controlStartedAt
     let driftControlSandboxAfterStart = false
+    let driftControlStartedAtAfterStart = false
     const anchor = {
       Id: anchorId,
       Name: `/${anchorName(ROOM_ID)}`,
@@ -391,9 +398,12 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': 'anchor',
         'devhotel.managed': '1'
       } },
-      State: { Status: 'running' },
+      State: { Status: 'running', StartedAt: controlStartedAt },
       HostConfig: { NetworkMode: androidControlNetworkName(ROOM_ID) },
-      NetworkSettings: { SandboxID: controlSandboxId }
+      NetworkSettings: {
+        SandboxID: controlSandboxId,
+        Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: controlNetworkId } }
+      }
     }
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'image' && args[1] === 'inspect') return ok
@@ -401,6 +411,7 @@ describe('OciCliBackend Android artifact export', () => {
         return {
           code: 0,
           stdout: JSON.stringify([{
+            Id: controlNetworkId,
             Name: androidControlNetworkName(ROOM_ID),
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
@@ -413,13 +424,23 @@ describe('OciCliBackend Android artifact export', () => {
         if (args[1] === anchorName(ROOM_ID) || args[1] === anchorId) {
           return {
             code: 0,
-            stdout: JSON.stringify([{ ...anchor, NetworkSettings: { SandboxID: controlAnchorSandboxId } }]),
+            stdout: JSON.stringify([{
+              ...anchor,
+              State: { Status: 'running', StartedAt: controlAnchorStartedAt },
+              NetworkSettings: {
+                SandboxID: controlAnchorSandboxId,
+                Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: controlNetworkId } }
+              }
+            }]),
             stderr: ''
           }
         }
         if (emulator && (args[1] === emulatorId || args[1] === emulatorName(ROOM_ID))) {
           if (driftControlSandboxAfterStart && (emulator.State as { Status?: string }).Status === 'running') {
             controlAnchorSandboxId = '8'.repeat(64)
+          }
+          if (driftControlStartedAtAfterStart && (emulator.State as { Status?: string }).Status === 'running') {
+            controlAnchorStartedAt = '2026-09-02T00:00:01.100000001Z'
           }
           return { code: 0, stdout: JSON.stringify([emulator]), stderr: '' }
         }
@@ -437,6 +458,9 @@ describe('OciCliBackend Android artifact export', () => {
             ...(emulatorAuthorityLabel
               ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: emulatorAuthorityLabel }
               : {}),
+            ...(emulatorAuthorityStartedAtLabel
+              ? { [NETWORK_AUTHORITY_STARTED_AT_LABEL]: emulatorAuthorityStartedAtLabel }
+              : {}),
             'devhotel.abort-token': token
           } },
           State: { Status: 'created' },
@@ -450,7 +474,7 @@ describe('OciCliBackend Android artifact export', () => {
       if (args[0] === 'start') {
         emulator = {
           ...(emulator ?? {}),
-          State: { Status: 'running' },
+          State: { Status: 'running', StartedAt: emulatorStartedAt },
           NetworkSettings: { SandboxID: startedEmulatorSandboxId }
         }
         return ok
@@ -471,6 +495,7 @@ describe('OciCliBackend Android artifact export', () => {
     const createOpts = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')?.[1]
     expect(create).toEqual(expect.arrayContaining(['--network', `container:${anchorId}`]))
     expect(create).toContain(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=${controlSandboxId}`)
+    expect(create).toContain(`${NETWORK_AUTHORITY_STARTED_AT_LABEL}=${controlStartedAt}`)
     expect(createOpts).toMatchObject({ timeoutMs: null, killOnOutputLimit: false })
     expect(createOpts?.signal).toBeUndefined()
     expect(calls.filter((args) => args[0] === 'cp')).toHaveLength(2)
@@ -481,24 +506,27 @@ describe('OciCliBackend Android artifact export', () => {
     mockedRunDocker.mockClear()
     emulator = null
     emulatorAuthorityLabel = undefined
+    emulatorAuthorityStartedAtLabel = undefined
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
       device: 'Samsung Galaxy S10',
       version: '14.0'
-    })).rejects.toThrow(/network namespace authority label/)
+    })).rejects.toThrow(/network namespace authority generation/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
 
     mockedRunDocker.mockClear()
     emulator = null
     emulatorAuthorityLabel = '9'.repeat(64)
+    emulatorAuthorityStartedAtLabel = controlStartedAt
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
       device: 'Samsung Galaxy S10',
       version: '14.0'
-    })).rejects.toThrow(/network namespace authority label/)
+    })).rejects.toThrow(/network namespace authority generation/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
 
     mockedRunDocker.mockClear()
     emulator = null
     emulatorAuthorityLabel = controlSandboxId
+    emulatorAuthorityStartedAtLabel = controlStartedAt
     startedEmulatorSandboxId = ''
     driftControlSandboxAfterStart = true
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
@@ -511,7 +539,9 @@ describe('OciCliBackend Android artifact export', () => {
     emulator = null
     driftControlSandboxAfterStart = false
     controlAnchorSandboxId = controlSandboxId
+    controlAnchorStartedAt = controlStartedAt
     emulatorAuthorityLabel = controlSandboxId
+    emulatorAuthorityStartedAtLabel = controlStartedAt
     startedEmulatorSandboxId = 'd'.repeat(64)
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
       device: 'Samsung Galaxy S10',
@@ -521,6 +551,18 @@ describe('OciCliBackend Android artifact export', () => {
 
     mockedRunDocker.mockClear()
     emulator = null
+    startedEmulatorSandboxId = ''
+    driftControlStartedAtAfterStart = true
+    await expect(new OciCliBackend().createEmulator(ROOM_ID, {
+      device: 'Samsung Galaxy S10',
+      version: '14.0'
+    })).rejects.toThrow(/control anchor start identity changed/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', emulatorId], { timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    emulator = null
+    driftControlStartedAtAfterStart = false
+    controlAnchorStartedAt = controlStartedAt
     startedEmulatorSandboxId = ''
     failCreate = true
     await expect(new OciCliBackend().createEmulator(ROOM_ID, {
@@ -541,8 +583,16 @@ describe('OciCliBackend Android artifact export', () => {
       sandbox: 'd'.repeat(64),
       helper: 'e'.repeat(64),
       runtime: 'f'.repeat(64),
-      runtimeSandbox: '1'.repeat(64)
+      runtimeSandbox: '1'.repeat(64),
+      controlNetwork: '3'.repeat(64),
+      runtimeNetwork: '4'.repeat(64)
     }
+    const controlGenerationStartedAt = '2026-09-02T00:00:00.100000001Z'
+    const runtimeGenerationStartedAt = '2026-09-02T00:00:00.200000001Z'
+    let emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
+    let webStartedAt = '2026-09-02T00:00:00.400000001Z'
+    let controlStartedAt = controlGenerationStartedAt
+    let runtimeStartedAt = runtimeGenerationStartedAt
     let helper: Record<string, unknown> | null = null
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
@@ -556,6 +606,8 @@ describe('OciCliBackend Android artifact export', () => {
     let cleanupFailureStderr: string | null = null
     let holdStartUntilAbort = false
     let replaceEmulatorAfterStart = false
+    let restartEmulatorGenerationAfterStart = false
+    let restartWebGenerationAfterStart = false
     let emulatorReplaced = false
     let receivedBytes = 0
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
@@ -566,16 +618,42 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': role,
         'devhotel.managed': '1',
         ...(role === 'svc-emulator'
-          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.sandbox }
+          ? {
+              [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.sandbox,
+              [NETWORK_AUTHORITY_STARTED_AT_LABEL]: controlGenerationStartedAt
+            }
           : role === 'web'
-            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            ? {
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox,
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeGenerationStartedAt
+              }
             : {})
       } },
-      State: { Status: 'running', Paused: paused },
+      State: {
+        Status: 'running',
+        Paused: paused,
+        StartedAt: role === 'anchor'
+          ? controlStartedAt
+          : role === 'android-runtime-anchor'
+            ? runtimeStartedAt
+            : role === 'svc-emulator'
+              ? emulatorStartedAt
+              : webStartedAt
+      },
       ...(role === 'anchor'
-        ? { NetworkSettings: { SandboxID: ids.sandbox } }
+        ? {
+            NetworkSettings: {
+              SandboxID: ids.sandbox,
+              Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: ids.controlNetwork } }
+            }
+          }
         : role === 'android-runtime-anchor'
-          ? { NetworkSettings: { SandboxID: ids.runtimeSandbox } }
+          ? {
+              NetworkSettings: {
+                SandboxID: ids.runtimeSandbox,
+                Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: ids.runtimeNetwork } }
+              }
+            }
           : role === 'svc-emulator'
             ? { NetworkSettings: { SandboxID: emulatorSandboxId } }
             : role === 'web'
@@ -588,11 +666,12 @@ describe('OciCliBackend Android artifact export', () => {
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
-        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        const control = args[2] === androidControlNetworkName(ROOM_ID) || args[2] === ids.controlNetwork
         return {
           code: 0,
           stdout: JSON.stringify([{
-            Name: args[2],
+            Id: control ? ids.controlNetwork : ids.runtimeNetwork,
+            Name: control ? androidControlNetworkName(ROOM_ID) : roomNetworkName(ROOM_ID),
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control
@@ -674,6 +753,10 @@ describe('OciCliBackend Android artifact export', () => {
         }
         opts?.onStdout?.(Buffer.alloc(SCREENSHOT_BASE64_LIMIT - 1, 0x61))
         if (replaceEmulatorAfterStart) emulatorReplaced = true
+        if (restartEmulatorGenerationAfterStart) {
+          emulatorStartedAt = '2026-09-02T00:00:02.300000001Z'
+        }
+        if (restartWebGenerationAfterStart) webStartedAt = '2026-09-02T00:00:02.400000001Z'
         return ok
       }
       if (args[0] === 'rm') {
@@ -749,6 +832,20 @@ describe('OciCliBackend Android artifact export', () => {
     })
 
     mockedRunDocker.mockClear()
+    runtimeStartedAt = '2026-09-02T00:00:01.200000001Z'
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact network namespace authority generation/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+    runtimeStartedAt = runtimeGenerationStartedAt
+
+    mockedRunDocker.mockClear()
+    controlStartedAt = '2026-09-02T00:00:01.100000001Z'
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact network namespace authority generation/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+    controlStartedAt = controlGenerationStartedAt
+
+    mockedRunDocker.mockClear()
     replaceEmulatorAfterStart = true
     let replacementError = ''
     try {
@@ -766,6 +863,22 @@ describe('OciCliBackend Android artifact export', () => {
     expect(topologyPostflightAt).toBeGreaterThan(helperCleanupAt)
     replaceEmulatorAfterStart = false
     emulatorReplaced = false
+
+    mockedRunDocker.mockClear()
+    restartEmulatorGenerationAfterStart = true
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/network namespace changed while the helper was created/)
+    expect(helper).toBeNull()
+    restartEmulatorGenerationAfterStart = false
+    emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
+
+    mockedRunDocker.mockClear()
+    restartWebGenerationAfterStart = true
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/network namespace changed while the helper was created/)
+    expect(helper).toBeNull()
+    restartWebGenerationAfterStart = false
+    webStartedAt = '2026-09-02T00:00:00.400000001Z'
 
     mockedRunDocker.mockClear()
     holdStartUntilAbort = true
@@ -928,8 +1041,14 @@ describe('OciCliBackend Android artifact export', () => {
       emulator: 'c'.repeat(64),
       runtime: 'e'.repeat(64),
       helper: 'f'.repeat(64),
-      runtimeSandbox: '1'.repeat(64)
+      runtimeSandbox: '1'.repeat(64),
+      controlNetwork: '2'.repeat(64),
+      runtimeNetwork: '3'.repeat(64)
     }
+    const controlStartedAt = '2026-09-02T00:00:00.100000001Z'
+    const runtimeStartedAt = '2026-09-02T00:00:00.200000001Z'
+    const emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
+    const webStartedAt = '2026-09-02T00:00:00.400000001Z'
     let helper: Record<string, unknown> | null = null
     const inspect = (name: string, role: string, paused = false) => JSON.stringify([{
       Id: role === 'anchor'
@@ -945,16 +1064,42 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': role,
         'devhotel.managed': '1',
         ...(role === 'svc-emulator'
-          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'd'.repeat(64) }
+          ? {
+              [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'd'.repeat(64),
+              [NETWORK_AUTHORITY_STARTED_AT_LABEL]: controlStartedAt
+            }
           : role === 'web'
-            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            ? {
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox,
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeStartedAt
+              }
             : {})
       } },
-      State: { Status: 'running', Paused: paused },
+      State: {
+        Status: 'running',
+        Paused: paused,
+        StartedAt: role === 'anchor'
+          ? controlStartedAt
+          : role === 'android-runtime-anchor'
+            ? runtimeStartedAt
+            : role === 'svc-emulator'
+              ? emulatorStartedAt
+              : webStartedAt
+      },
       ...(role === 'anchor'
-        ? { NetworkSettings: { SandboxID: 'd'.repeat(64) } }
+        ? {
+            NetworkSettings: {
+              SandboxID: 'd'.repeat(64),
+              Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: ids.controlNetwork } }
+            }
+          }
         : role === 'android-runtime-anchor'
-          ? { NetworkSettings: { SandboxID: ids.runtimeSandbox } }
+          ? {
+              NetworkSettings: {
+                SandboxID: ids.runtimeSandbox,
+                Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: ids.runtimeNetwork } }
+              }
+            }
           : role === 'svc-emulator' || role === 'web'
             ? { NetworkSettings: { SandboxID: '' } }
             : {}),
@@ -965,11 +1110,12 @@ describe('OciCliBackend Android artifact export', () => {
     }])
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
-        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        const control = args[2] === androidControlNetworkName(ROOM_ID) || args[2] === ids.controlNetwork
         return {
           code: 0,
           stdout: JSON.stringify([{
-            Name: args[2],
+            Id: control ? ids.controlNetwork : ids.runtimeNetwork,
+            Name: control ? androidControlNetworkName(ROOM_ID) : roomNetworkName(ROOM_ID),
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control
@@ -1048,8 +1194,14 @@ describe('OciCliBackend Android artifact export', () => {
       emulator: 'd'.repeat(64),
       replacement: 'e'.repeat(64),
       controlSandbox: 'f'.repeat(64),
-      runtimeSandbox: '1'.repeat(64)
+      runtimeSandbox: '1'.repeat(64),
+      controlNetwork: '2'.repeat(64),
+      runtimeNetwork: '3'.repeat(64)
     }
+    const controlStartedAt = '2026-09-02T00:00:00.100000001Z'
+    const runtimeStartedAt = '2026-09-02T00:00:00.200000001Z'
+    const emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
+    const webStartedAt = '2026-09-02T00:00:00.400000001Z'
     let liveEmulatorId = ids.emulator
     let replaceAfterExec = false
     let foreignEmulatorName = false
@@ -1062,22 +1214,45 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': role,
         'devhotel.managed': foreignEmulatorName && role === 'svc-emulator' ? '0' : '1',
         ...(role === 'svc-emulator'
-          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.controlSandbox }
+          ? {
+              [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.controlSandbox,
+              [NETWORK_AUTHORITY_STARTED_AT_LABEL]: controlStartedAt
+            }
           : role === 'web'
-            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox }
+            ? {
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: ids.runtimeSandbox,
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeStartedAt
+              }
             : {})
       } },
-      State: { Status: 'running' },
+      State: {
+        Status: 'running',
+        StartedAt: role === 'anchor'
+          ? controlStartedAt
+          : role === 'android-runtime-anchor'
+            ? runtimeStartedAt
+            : role === 'svc-emulator'
+              ? emulatorStartedAt
+              : webStartedAt
+      },
       HostConfig: { NetworkMode: networkMode },
-      NetworkSettings: { SandboxID: sandboxId }
+      NetworkSettings: {
+        SandboxID: sandboxId,
+        ...(role === 'anchor'
+          ? { Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: ids.controlNetwork } } }
+          : role === 'android-runtime-anchor'
+            ? { Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: ids.runtimeNetwork } } }
+            : {})
+      }
     })
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'network' && args[1] === 'inspect') {
-        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        const control = args[2] === androidControlNetworkName(ROOM_ID) || args[2] === ids.controlNetwork
         return {
           code: 0,
           stdout: JSON.stringify([{
-            Name: args[2],
+            Id: control ? ids.controlNetwork : ids.runtimeNetwork,
+            Name: control ? androidControlNetworkName(ROOM_ID) : roomNetworkName(ROOM_ID),
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control
@@ -1219,12 +1394,14 @@ describe('OciCliBackend Android artifact export', () => {
     let rotateControlSandboxOnStart = false
     let driftControlImmediatelyAfterEmulatorStart = false
     let driftControlSandboxAfterEmulatorStart = false
+    let driftWebStartedAtAfterEmulatorStart = false
     let anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
     let emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
     let restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
-    let emulatorAuthorityLabel = 'e'.repeat(64)
+    let emulatorAuthorityLabel: string | undefined = 'e'.repeat(64)
+    let emulatorAuthorityStartedAtLabel: string | undefined = '2026-09-02T00:00:00.100000001Z'
     const runtimeStartedAt = '2026-09-02T00:00:00.300000001Z'
-    const webStartedAt = '2026-09-02T00:00:00.400000001Z'
+    let webStartedAt = '2026-09-02T00:00:00.400000001Z'
     const container = (name: string, role: string, id: string, sandboxId: string, networkMode?: string) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
@@ -1233,11 +1410,19 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': role,
         'devhotel.managed': '1',
         ...(role === 'svc-emulator'
-          ? (emulatorAuthorityLabel
-              ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: emulatorAuthorityLabel }
-              : {})
+          ? {
+              ...(emulatorAuthorityLabel
+                ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: emulatorAuthorityLabel }
+                : {}),
+              ...(emulatorAuthorityStartedAtLabel
+                ? { [NETWORK_AUTHORITY_STARTED_AT_LABEL]: emulatorAuthorityStartedAtLabel }
+                : {})
+            }
           : role === 'web'
-            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'f'.repeat(64) }
+            ? {
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: 'f'.repeat(64),
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeStartedAt
+              }
             : {})
       } },
       State: {
@@ -1260,7 +1445,9 @@ describe('OciCliBackend Android artifact export', () => {
         SandboxID: sandboxId,
         ...(role === 'android-runtime-anchor'
           ? { Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: networkIds.runtime } } }
-          : {})
+          : role === 'anchor'
+            ? { Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: networkIds.control } } }
+            : {})
       },
       ...(networkMode ? { HostConfig: { NetworkMode: networkMode } } : {})
     }])
@@ -1285,16 +1472,20 @@ describe('OciCliBackend Android artifact export', () => {
             controlSandboxId = '7'.repeat(64)
             anchorStartedAt = '2026-09-02T00:00:04.000000001Z'
           }
+          if (driftWebStartedAtAfterEmulatorStart) {
+            webStartedAt = '2026-09-02T00:00:04.400000001Z'
+          }
         }
         return ok
       }
       if (args[0] === 'network' && args[1] === 'inspect') {
-        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        const control = args[2] === androidControlNetworkName(ROOM_ID) || args[2] === networkIds.control
+        const networkName = control ? androidControlNetworkName(ROOM_ID) : roomNetworkName(ROOM_ID)
         return {
           code: 0,
           stdout: JSON.stringify([{
             Id: control ? networkIds.control : networkIds.runtime,
-            Name: args[2],
+            Name: networkName,
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control
@@ -1395,12 +1586,12 @@ describe('OciCliBackend Android artifact export', () => {
     emulatorSandboxId = ''
     crossConnectedControl = true
     await expect(backend().execFencedEmulatorRecoveryAdb(ROOM_ID, ['get-state']))
-      .rejects.toThrow(/endpoint sets are not disjoint/)
+      .rejects.toThrow(/container ownership metadata is invalid|endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/endpoint sets are not disjoint/)
+      .rejects.toThrow(/container ownership metadata is invalid|endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
@@ -1409,14 +1600,14 @@ describe('OciCliBackend Android artifact export', () => {
     runtimeAnchorState = 'exited'
     webState = 'exited'
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/endpoint sets are not disjoint/)
+      .rejects.toThrow(/container ownership metadata is invalid|endpoint sets are not disjoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
     crossConnectedControl = false
     extraControlMember = true
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/only the exact owned control anchor endpoint/)
+      .rejects.toThrow(/unprovable endpoint|only the exact owned control anchor endpoint/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
@@ -1427,7 +1618,7 @@ describe('OciCliBackend Android artifact export', () => {
     anchorStartedAt = '2026-09-02T00:00:02.000000001Z'
     emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/exact network namespace authority label/)
+      .rejects.toThrow(/exact network namespace authority generation/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
 
     mockedRunDocker.mockClear()
@@ -1439,7 +1630,7 @@ describe('OciCliBackend Android artifact export', () => {
     restartedEmulatorStartedAt = emulatorStartedAt
     rotateControlSandboxOnStart = true
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/exact network namespace authority label/)
+      .rejects.toThrow(/exact network namespace authority generation/)
     expect(existsSync(join(
       root,
       'runtime',
@@ -1455,9 +1646,9 @@ describe('OciCliBackend Android artifact export', () => {
     emulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
     rotateControlSandboxOnStart = false
     driftControlSandboxAfterEmulatorStart = false
-    emulatorAuthorityLabel = ''
+    emulatorAuthorityLabel = undefined
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/exact network namespace authority label/)
+      .rejects.toThrow(/exact network namespace authority generation/)
     expect(existsSync(join(
       root,
       'runtime',
@@ -1471,10 +1662,27 @@ describe('OciCliBackend Android artifact export', () => {
     controlSandboxId = 'e'.repeat(64)
     anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
     emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
+    webStartedAt = '2026-09-02T00:00:00.400000001Z'
+    restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
+    rotateControlSandboxOnStart = true
+    driftWebStartedAtAfterEmulatorStart = true
+    emulatorAuthorityLabel = '8'.repeat(64)
+    emulatorAuthorityStartedAtLabel = undefined
+    await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
+      .rejects.toThrow(/changed a retained Room workload/)
+    driftWebStartedAtAfterEmulatorStart = false
+    webStartedAt = '2026-09-02T00:00:00.400000001Z'
+
+    mockedRunDocker.mockClear()
+    anchorState = 'exited'
+    emulatorState = 'exited'
+    controlSandboxId = 'e'.repeat(64)
+    anchorStartedAt = '2026-09-02T00:00:00.100000001Z'
+    emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
     restartedEmulatorStartedAt = '2026-09-02T00:00:03.000000001Z'
     driftControlImmediatelyAfterEmulatorStart = true
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID))
-      .rejects.toThrow(/exact network namespace authority label/)
+      .rejects.toThrow(/exact network namespace authority generation/)
     expect(existsSync(join(
       root,
       'runtime',
@@ -1509,7 +1717,8 @@ describe('OciCliBackend Android artifact export', () => {
     emulatorStartedAt = '2026-09-02T00:00:00.200000001Z'
     rotateControlSandboxOnStart = true
     driftControlSandboxAfterEmulatorStart = false
-    emulatorAuthorityLabel = ''
+    emulatorAuthorityLabel = '8'.repeat(64)
+    emulatorAuthorityStartedAtLabel = undefined
     await expect(backend().startExistingEmulatorForRecovery(ROOM_ID)).resolves.toBeUndefined()
     expect(mockedRunDocker.mock.calls
       .filter(([args]) => args[0] === 'start')
@@ -1537,7 +1746,7 @@ describe('OciCliBackend Android artifact export', () => {
     anchorStartedAt = '2026-09-02T00:00:05.000000001Z'
     mockedRunDocker.mockClear()
     await expect(backend().emulatorState(ROOM_ID))
-      .rejects.toThrow(/exact network namespace authority label/)
+      .rejects.toThrow(/exact network namespace authority generation/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
   })
 
@@ -1547,10 +1756,16 @@ describe('OciCliBackend Android artifact export', () => {
       emulator: 'b'.repeat(64),
       helper: 'c'.repeat(64),
       runtime: 'e'.repeat(64),
-      web: 'f'.repeat(64)
+      web: 'f'.repeat(64),
+      controlNetwork: '2'.repeat(64),
+      runtimeNetwork: '3'.repeat(64)
     }
     const sandboxId = 'd'.repeat(64)
     const runtimeSandboxId = '1'.repeat(64)
+    const controlStartedAt = '2026-09-02T00:00:00.100000001Z'
+    const runtimeStartedAt = '2026-09-02T00:00:00.200000001Z'
+    const emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
+    const webStartedAt = '2026-09-02T00:00:00.400000001Z'
     let helperInspect: Record<string, unknown> | null = null
     const roomContainer = (name: string, role: string, id: string) => ({
       Id: id,
@@ -1560,16 +1775,41 @@ describe('OciCliBackend Android artifact export', () => {
         'devhotel.role': role,
         'devhotel.managed': '1',
         ...(role === 'svc-emulator'
-          ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: sandboxId }
+          ? {
+              [NETWORK_AUTHORITY_SANDBOX_LABEL]: sandboxId,
+              [NETWORK_AUTHORITY_STARTED_AT_LABEL]: controlStartedAt
+            }
           : role === 'web'
-            ? { [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId }
+            ? {
+                [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId,
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeStartedAt
+              }
             : {})
       } },
-      State: { Status: 'running' },
+      State: {
+        Status: 'running',
+        StartedAt: role === 'anchor'
+          ? controlStartedAt
+          : role === 'android-runtime-anchor'
+            ? runtimeStartedAt
+            : role === 'svc-emulator'
+              ? emulatorStartedAt
+              : webStartedAt
+      },
       ...(role === 'anchor'
-        ? { NetworkSettings: { SandboxID: sandboxId } }
+        ? {
+            NetworkSettings: {
+              SandboxID: sandboxId,
+              Networks: { [androidControlNetworkName(ROOM_ID)]: { NetworkID: ownedIds.controlNetwork } }
+            }
+          }
         : role === 'android-runtime-anchor'
-          ? { NetworkSettings: { SandboxID: runtimeSandboxId } }
+          ? {
+              NetworkSettings: {
+                SandboxID: runtimeSandboxId,
+                Networks: { [roomNetworkName(ROOM_ID)]: { NetworkID: ownedIds.runtimeNetwork } }
+              }
+            }
           : role === 'svc-emulator' || role === 'web'
             ? { NetworkSettings: { SandboxID: '' } }
             : {}),
@@ -1584,11 +1824,12 @@ describe('OciCliBackend Android artifact export', () => {
         return ok
       }
       if (args[0] === 'network' && args[1] === 'inspect') {
-        const control = args[2] === androidControlNetworkName(ROOM_ID)
+        const control = args[2] === androidControlNetworkName(ROOM_ID) || args[2] === ownedIds.controlNetwork
         return {
           code: 0,
           stdout: JSON.stringify([{
-            Name: args[2],
+            Id: control ? ownedIds.controlNetwork : ownedIds.runtimeNetwork,
+            Name: control ? androidControlNetworkName(ROOM_ID) : roomNetworkName(ROOM_ID),
             Driver: 'bridge',
             Labels: { 'devhotel.room': ROOM_ID, 'devhotel.role': 'network', 'devhotel.managed': '1' },
             Containers: control

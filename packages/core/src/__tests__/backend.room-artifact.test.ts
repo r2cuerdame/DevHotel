@@ -7,6 +7,7 @@ import {
   androidRuntimeAnchorName,
   cacheVolume,
   NETWORK_AUTHORITY_SANDBOX_LABEL,
+  NETWORK_AUTHORITY_STARTED_AT_LABEL,
   roomNetworkName,
   srcVolume,
   webName,
@@ -632,6 +633,7 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
     mountSources: Record<string, string>
     mountSubpaths: Record<string, string>
     restoreToken?: string
+    startedAt: string
   }
 
   let web: RuntimeWebState
@@ -681,7 +683,8 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
       [CACHE_VOLUME]: volumeMountpoint(CACHE_VOLUME),
       [SDK_VOLUME]: volumeMountpoint(SDK_VOLUME)
     },
-    mountSubpaths: {}
+    mountSubpaths: {},
+    startedAt: '2026-09-02T00:00:00.200000001Z'
   })
 
   const runtimeAnchor = () => ({
@@ -725,13 +728,15 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
         'devhotel.role': 'web',
         'devhotel.managed': '1',
         [NETWORK_AUTHORITY_SANDBOX_LABEL]: RUNTIME_SANDBOX_ID,
+        [NETWORK_AUTHORITY_STARTED_AT_LABEL]: WEB_RUNTIME_FENCE.networkAuthorityStartedAt,
         ...(web.restoreToken ? { 'devhotel.artifact-restore-token': web.restoreToken } : {})
       }
     },
     State: {
       Status: web.status,
       Running: web.running,
-      Paused: web.paused
+      Paused: web.paused,
+      StartedAt: web.startedAt
     },
     HostConfig: {
       NetworkMode: web.networkMode,
@@ -868,6 +873,7 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
         web.running = true
         web.paused = false
         web.status = 'running'
+        web.startedAt = '2026-09-02T00:00:00.300000001Z'
         if (raceAfterUnpause) replaceOnNextNetworkInspect = true
         return ok
       }
@@ -948,6 +954,16 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
     await expect(backend.restoreRoomArtifactWeb(spec, fence))
       .rejects.toThrow(/network authority start generation changed/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'pause' || args[0] === 'unpause')).toBe(false)
+  })
+
+  it('rejects a stale creation label when the donor reuses the same sandbox in a new start generation', async () => {
+    authorityStartedAt = '2026-09-02T00:00:01.100000001Z'
+
+    await expect(new OciCliBackend().captureRoomArtifactWebFence(spec))
+      .rejects.toThrow(/network namespace authority generation/)
+    expect(mockedRunDocker.mock.calls.some(
+      ([args]) => args[0] === 'pause' || args[0] === 'create' || args[0] === 'start'
+    )).toBe(false)
   })
 
   it('rejects a non-empty joined sandbox that differs from its exact runtime authority', async () => {
@@ -1083,6 +1099,9 @@ describe('OciCliBackend immutable Room artifact web runtime fence', () => {
       '--network', `container:${RUNTIME_ANCHOR_ID}`
     ]))
     expect(createCalls[0]).toContain(`${NETWORK_AUTHORITY_SANDBOX_LABEL}=${RUNTIME_SANDBOX_ID}`)
+    expect(createCalls[0]).toContain(
+      `${NETWORK_AUTHORITY_STARTED_AT_LABEL}=${WEB_RUNTIME_FENCE.networkAuthorityStartedAt}`
+    )
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args.at(-1) === WEB_ID)).toBe(true)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start' && args[1] === RECREATED_WEB_ID)).toBe(true)
     expect(web).toMatchObject({ id: RECREATED_WEB_ID, present: true, running: true, paused: false })
