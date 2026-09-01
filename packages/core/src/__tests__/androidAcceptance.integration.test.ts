@@ -673,7 +673,7 @@ describe('Android acceptance orchestration', () => {
       expect(observedIntent).not.toBeNull()
       expect(Buffer.byteLength(observedIntent!, 'utf8')).toBeLessThanOrEqual(8 * 1024)
       expect(JSON.parse(observedIntent!)).toMatchObject({
-        version: 2,
+        version: 3,
         phase: 'mutating',
         ownerWorkerId: `pid:${process.pid}`,
         roomStateRevision: 7,
@@ -773,7 +773,7 @@ describe('Android acceptance orchestration', () => {
     const retained = test.orch.settings.get(key)
     expect(retained).not.toBeNull()
     expect(JSON.parse(retained!)).toMatchObject({
-      version: 2,
+      version: 3,
       phase: 'reserved',
       ownerWorkerId: `pid:${process.pid}`
     })
@@ -787,7 +787,8 @@ describe('Android acceptance orchestration', () => {
     expect(test.adb.execs).toEqual([])
 
     deleteSpy.mockRestore()
-    const deadOwner = { ...JSON.parse(retained!), ownerWorkerId: 'pid:0' }
+    const deadOwner = { ...JSON.parse(retained!), version: 2, ownerWorkerId: 'pid:0' }
+    delete deadOwner.runtimeFence.networkAuthorityStartedAt
     test.orch.settings.set(key, JSON.stringify(deadOwner))
     test.backend.calls.length = 0
     test.openSessionSpy.mockClear()
@@ -828,7 +829,7 @@ describe('Android acceptance orchestration', () => {
 
     const retained = test.orch.settings.get(key)
     expect(retained).not.toBeNull()
-    expect(JSON.parse(retained!)).toMatchObject({ version: 2, phase: 'mutating' })
+    expect(JSON.parse(retained!)).toMatchObject({ version: 3, phase: 'mutating' })
     expect(test.backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
     expect(test.backend.calls.filter((call) => call.startsWith('removeWorkspaceSnapshot:'))).toHaveLength(1)
 
@@ -872,6 +873,138 @@ describe('Android acceptance orchestration', () => {
     expect(test.calls.launch).toBe(4)
     expect(test.calls.applyLocales).toBe(4)
     expect(test.orch.listAndroidAcceptanceReports(ROOM_ID)).toEqual([])
+  })
+
+  it.each([1, 2] as const)(
+    'stops a legacy v%s runtime while completing its exact snapshot and device recovery',
+    async (legacyVersion) => {
+      const test = setup({ restoreFailure: true })
+      const key = `androidAcceptanceRestorePending:${ROOM_ID}`
+
+      await expect(test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+        applicationId: APP_ID,
+        steps: [{ id: `legacy-v${legacyVersion}-recovery`, status: 'pass', logRunIds: [test.runId] }]
+      }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_FAILED' })
+
+      const currentRaw = test.orch.settings.get(key)
+      expect(currentRaw).not.toBeNull()
+      const legacy = JSON.parse(currentRaw!)
+      legacy.version = legacyVersion
+      delete legacy.runtimeFence.networkAuthorityStartedAt
+      if (legacyVersion === 1) {
+        delete legacy.phase
+        delete legacy.ownerWorkerId
+      }
+      const legacyRaw = JSON.stringify(legacy)
+      test.orch.settings.set(key, legacyRaw)
+
+      const room = test.orch.rooms.get(ROOM_ID)!
+      test.orch.rooms.update(ROOM_ID, { status: 'ready' })
+      test.gateway.routes.set(room.domain, {
+        domain: room.domain,
+        roomId: ROOM_ID,
+        targetPort: room.hostPort ?? 45000,
+        https: room.https
+      })
+      test.behavior.restoreFailure = false
+      test.backend.calls.length = 0
+      test.backend.restoreRoomArtifactWebCalls.length = 0
+      test.calls.launch = 0
+      test.calls.applyLocales = 0
+      const internal = test.orch as unknown as {
+        reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent: boolean): Promise<void>
+      }
+
+      await internal.reconcileInterruptedAndroidAcceptanceRestores(true)
+
+      expect(test.orch.settings.get(key)).toBeNull()
+      expect(test.backend.restoreRoomArtifactWebCalls).toEqual([])
+      expect(test.backend.calls).toContain(`removeWorkspaceSnapshot:${legacy.token}`)
+      expect(test.backend.calls).toContain(`startExistingEmulatorForRecovery:${ROOM_ID}`)
+      expect(test.backend.calls).toContain(`stopRoomPod:${ROOM_ID}`)
+      expect(test.calls.launch).toBe(1)
+      expect(test.calls.applyLocales).toBe(1)
+      expect(test.gateway.routes.has(room.domain)).toBe(false)
+      expect(test.orch.rooms.get(ROOM_ID)).toMatchObject({ status: 'sleeping', hostPort: null })
+      expect(test.orch.listAndroidAcceptanceReports(ROOM_ID)).toEqual([])
+      await expect(test.orch.execInRoom(ROOM_ID, ['sh', '-lc', 'touch blocked']))
+        .rejects.toThrow(/runtime is stopped/i)
+      await expect(test.orch.androidEmulatorAction(ROOM_ID, 'home'))
+        .rejects.toMatchObject({ code: 'ANDROID_ROOM_ASLEEP' })
+      expect(test.backend.calls.some((call) => call.startsWith('execInRoom:'))).toBe(false)
+    }
+  )
+
+  it('rolls back the legacy gate release when durable sleeping-state containment cannot commit', async () => {
+    const test = setup({ restoreFailure: true })
+    const key = `androidAcceptanceRestorePending:${ROOM_ID}`
+    await expect(test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      steps: [{ id: 'legacy-containment-rollback', status: 'pass', logRunIds: [test.runId] }]
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_FAILED' })
+
+    const legacy = JSON.parse(test.orch.settings.get(key)!)
+    legacy.version = 2
+    delete legacy.runtimeFence.networkAuthorityStartedAt
+    const legacyRaw = JSON.stringify(legacy)
+    test.orch.settings.set(key, legacyRaw)
+    test.orch.rooms.update(ROOM_ID, { status: 'attention' })
+    test.behavior.restoreFailure = false
+    const update = test.orch.rooms.update.bind(test.orch.rooms)
+    vi.spyOn(test.orch.rooms, 'update').mockImplementation((roomId, patch) => {
+      if (patch.status === 'sleeping') throw new Error('simulated containment persistence failure')
+      return update(roomId, patch)
+    })
+    const internal = test.orch as unknown as {
+      reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent: boolean): Promise<void>
+    }
+
+    await internal.reconcileInterruptedAndroidAcceptanceRestores(true)
+
+    expect(test.orch.settings.get(key)).toBe(legacyRaw)
+    expect(test.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    await expect(test.orch.execInRoom(ROOM_ID, ['sh', '-lc', 'touch blocked']))
+      .rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED' })
+  })
+
+  it('retains the legacy hard gate across every writer when terminal Room stop cannot be proved', async () => {
+    const test = setup({ restoreFailure: true })
+    const key = `androidAcceptanceRestorePending:${ROOM_ID}`
+    await expect(test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      steps: [{ id: 'legacy-stop-failure', status: 'pass', logRunIds: [test.runId] }]
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_FAILED' })
+
+    const legacy = JSON.parse(test.orch.settings.get(key)!)
+    legacy.version = 2
+    delete legacy.runtimeFence.networkAuthorityStartedAt
+    const legacyRaw = JSON.stringify(legacy)
+    test.orch.settings.set(key, legacyRaw)
+    test.behavior.restoreFailure = false
+    const stop = test.backend.stopRoomPod.bind(test.backend)
+    vi.spyOn(test.backend, 'stopRoomPod').mockImplementation(async (roomId) => {
+      await stop(roomId)
+      throw new Error('simulated unproved terminal stop')
+    })
+    const internal = test.orch as unknown as {
+      reconcileInterruptedAndroidAcceptanceRestores(staleJobsAbsent: boolean): Promise<void>
+    }
+
+    await internal.reconcileInterruptedAndroidAcceptanceRestores(true)
+
+    expect(test.orch.settings.get(key)).toBe(legacyRaw)
+    expect(test.backend.calls).toContain(`stopRoomPod:${ROOM_ID}`)
+    await expect(test.orch.spawnInteractiveExec(ROOM_ID, ['sh']))
+      .rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED' })
+    await expect(test.orch.pushRoomFile(ROOM_ID, '/workspace/blocked.txt', Buffer.from('blocked').toString('base64')))
+      .rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED' })
+    await expect(test.orch.restartWeb(ROOM_ID, 'agent'))
+      .rejects.toMatchObject({ code: 'ANDROID_ACCEPTANCE_RESTORE_REQUIRED' })
+    expect(test.backend.calls.some((call) =>
+      call.startsWith('spawnInteractiveExec:') ||
+      call.startsWith('copyIntoRoom:') ||
+      call.startsWith('restartWeb:')
+    )).toBe(false)
   })
 
   it('publishes final physical metadata from unchanged composite proofs with zero external writers', async () => {

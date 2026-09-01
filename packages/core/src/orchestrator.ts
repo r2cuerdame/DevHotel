@@ -577,7 +577,7 @@ type EmulatorAndroidTrackedInstallSeal = AndroidTrackedInstallSeal & {
 }
 
 interface PendingAndroidAcceptanceRestore {
-  version: 1 | 2
+  version: 1 | 2 | 3
   phase: 'reserved' | 'mutating'
   ownerWorkerId: string | null
   token: string
@@ -590,11 +590,11 @@ interface PendingAndroidAcceptanceRestore {
   runtimeFence: RoomArtifactWebRuntimeFence
 }
 
-type PendingAndroidAcceptanceRestoreV2 = Omit<
+type PendingAndroidAcceptanceRestoreV3 = Omit<
   PendingAndroidAcceptanceRestore,
   'version' | 'ownerWorkerId'
 > & {
-  version: 2
+  version: 3
   ownerWorkerId: string
 }
 
@@ -631,8 +631,8 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
   const currentKeys = [...legacyKeys, 'phase', 'ownerWorkerId'] as const
   if (
     (record.version === 1 && !exactObjectKeys(record, legacyKeys)) ||
-    (record.version === 2 && !exactObjectKeys(record, currentKeys)) ||
-    (record.version !== 1 && record.version !== 2)
+    ((record.version === 2 || record.version === 3) && !exactObjectKeys(record, currentKeys)) ||
+    (record.version !== 1 && record.version !== 2 && record.version !== 3)
   ) return null
   if (
     typeof record.token !== 'string' || !/^[a-f0-9]{32}$/.test(record.token) ||
@@ -643,7 +643,7 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
     typeof record.applicationId !== 'string' || !zAndroidApplicationId.safeParse(record.applicationId).success
   ) return null
   if (
-    record.version === 2 &&
+    record.version !== 1 &&
     (
       (record.phase !== 'reserved' && record.phase !== 'mutating') ||
       typeof record.ownerWorkerId !== 'string' || !/^pid:\d{1,10}$/.test(record.ownerWorkerId)
@@ -700,10 +700,21 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
     return null
   }
   const runtimeFence = record.runtimeFence as Record<string, unknown>
-  if (!exactObjectKeys(runtimeFence, [
-    'containerId', 'networkAuthorityId', 'networkAuthorityStartedAt', 'networkId', 'networkSandboxId',
+  const legacyRuntimeFenceKeys = [
+    'containerId', 'networkAuthorityId', 'networkId', 'networkSandboxId',
     'runtimeSpecSha256', 'volumeSetSha256', 'workspaceVolume'
-  ])) return null
+  ] as const
+  const currentRuntimeFenceKeys = [...legacyRuntimeFenceKeys, 'networkAuthorityStartedAt'] as const
+  const legacyRuntimeFence = exactObjectKeys(runtimeFence, legacyRuntimeFenceKeys)
+  const currentRuntimeFence = exactObjectKeys(runtimeFence, currentRuntimeFenceKeys)
+  // v1/v2 records predate the authority-start generation. They remain
+  // parseable so startup can restore the exact device state and contain the
+  // ambiguous runtime instead of leaving a permanent mutation/shutdown gate.
+  // Every newly persisted v3 record must carry the stronger generation.
+  if (
+    (record.version === 3 && !currentRuntimeFence) ||
+    (record.version !== 3 && !legacyRuntimeFence && !currentRuntimeFence)
+  ) return null
   if (
     typeof runtimeFence.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.containerId) ||
     typeof runtimeFence.workspaceVolume !== 'string' || runtimeFence.workspaceVolume.length > 128 ||
@@ -711,11 +722,13 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
     typeof runtimeFence.runtimeSpecSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.runtimeSpecSha256) ||
     typeof runtimeFence.volumeSetSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.volumeSetSha256) ||
     typeof runtimeFence.networkAuthorityId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkAuthorityId) ||
-    typeof runtimeFence.networkAuthorityStartedAt !== 'string' ||
-    !/^(?:19[7-9]\d|2\d{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(
-      runtimeFence.networkAuthorityStartedAt
-    ) ||
-    !Number.isFinite(Date.parse(runtimeFence.networkAuthorityStartedAt)) ||
+    (currentRuntimeFence && (
+      typeof runtimeFence.networkAuthorityStartedAt !== 'string' ||
+      !/^(?:19[7-9]\d|2\d{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(
+        runtimeFence.networkAuthorityStartedAt
+      ) ||
+      !Number.isFinite(Date.parse(runtimeFence.networkAuthorityStartedAt))
+    )) ||
     typeof runtimeFence.networkId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkId) ||
     typeof runtimeFence.networkSandboxId !== 'string' || !/^[a-f0-9]{64}$/.test(runtimeFence.networkSandboxId)
   ) return null
@@ -739,7 +752,7 @@ function parsePendingAndroidAcceptanceRestore(raw: string): PendingAndroidAccept
   }
 }
 
-function serializePendingAndroidAcceptanceRestore(value: PendingAndroidAcceptanceRestoreV2): string {
+function serializePendingAndroidAcceptanceRestore(value: PendingAndroidAcceptanceRestoreV3): string {
   const raw = JSON.stringify(value)
   const parsed = parsePendingAndroidAcceptanceRestore(raw)
   if (!parsed || !isDeepStrictEqual(parsed, value)) {
@@ -1487,13 +1500,13 @@ export class RoomOrchestrator {
           throw new Error('Android acceptance restore intent is malformed or belongs to another Room')
         }
         if (pending.phase === 'reserved') {
-          // The v2 reservation precedes every recoverable target/runtime
+          // The v2/v3 reservation precedes every recoverable target/runtime
           // mutation. A screen witness may have emitted bounded diagnostic
           // markers, but startup has already proved all retained one-shot jobs
           // absent. Only a provably dead owner may release the exact value;
           // live or unknown owners remain hard-gated across processes.
           if (
-            pending.version !== 2 ||
+            pending.version === 1 ||
             pending.ownerWorkerId === null ||
             workerProcessLiveness(pending.ownerWorkerId) !== false ||
             !this.settings.deleteIfValue(key, raw)
@@ -1613,14 +1626,24 @@ export class RoomOrchestrator {
     // is the recovery authority; attention keeps normal work gated while
     // allowing the exact target session to be reopened.
     if (room.status === 'sleeping') this.rooms.update(roomId, { status: 'attention' })
-    const runtimeBackend = this.exactRoomRuntimeFenceBackend()
-    const runtimeSpec = this.webSpecFor(room)
+    const generationBoundRuntime = pending.runtimeFence.networkAuthorityStartedAt !== undefined
     let runtimeRestoreFailure: unknown = null
-    try {
-      await runtimeBackend.restoreRoomArtifactWeb(runtimeSpec, pending.runtimeFence)
-    } catch (error) {
-      runtimeRestoreFailure = error
+    if (!generationBoundRuntime) {
+      // An old v1/v2 intent cannot prove that its network-namespace donor is
+      // still the generation captured before the crash. Never infer that
+      // missing identity from the current same-name container. Revoke ingress
+      // and log attachment, then settle only the independently fenced snapshot
+      // and device state below. Successful settlement must stop and re-prove
+      // every owned Room container before this legacy gate is released.
       this.containPendingAndroidAcceptanceRuntime(roomId)
+    } else {
+      try {
+        const runtimeBackend = this.exactRoomRuntimeFenceBackend()
+        await runtimeBackend.restoreRoomArtifactWeb(this.webSpecFor(room), pending.runtimeFence)
+      } catch (error) {
+        runtimeRestoreFailure = error
+        this.containPendingAndroidAcceptanceRuntime(roomId)
+      }
     }
     let snapshotCleanupFailure: unknown = null
     try {
@@ -1687,11 +1710,37 @@ export class RoomOrchestrator {
       deviceRestoreFailure = error
     }
 
-    if (deviceRestoreFailure || runtimeRestoreFailure || snapshotCleanupFailure) {
+    let runtimeContainmentFailure: unknown = null
+    if (!generationBoundRuntime) {
+      try {
+        // Device recovery may have restarted the exact retained emulator. Stop
+        // the complete owned Room topology last, by the backend's immutable ID
+        // inventory, and require its final no-active-container proof. This is
+        // the terminal fence that makes releasing the legacy mutation gate safe.
+        await this.backend.stopRoomPod(roomId)
+      } catch (error) {
+        runtimeContainmentFailure = error
+      }
+    }
+
+    if (deviceRestoreFailure || runtimeRestoreFailure || snapshotCleanupFailure || runtimeContainmentFailure) {
       throw new AggregateError(
-        [deviceRestoreFailure, runtimeRestoreFailure, snapshotCleanupFailure].filter((error) => error !== null),
+        [
+          deviceRestoreFailure,
+          runtimeRestoreFailure,
+          snapshotCleanupFailure,
+          runtimeContainmentFailure
+        ].filter((error) => error !== null),
         'Interrupted Android acceptance restoration remains incomplete'
       )
+    }
+    if (!generationBoundRuntime) {
+      this.commitStoppedLegacyAndroidAcceptanceRestore(roomId, key, raw, pending)
+      this.olog(
+        roomId,
+        'legacy Android acceptance device state was restored and its generation-ambiguous runtime was durably contained'
+      )
+      return
     }
     if (!this.settings.deleteIfValue(key, raw)) {
       throw new Error('Android acceptance restore intent ownership changed before completion')
@@ -2077,6 +2126,41 @@ export class RoomOrchestrator {
     this.gateway.removeRoute(room.domain)
     if (room.status === 'running' || room.status === 'ready') {
       this.rooms.update(roomId, { status: 'attention' })
+    }
+  }
+
+  private commitStoppedLegacyAndroidAcceptanceRestore(
+    roomId: string,
+    key: string,
+    raw: string,
+    pending: PendingAndroidAcceptanceRestore
+  ): void {
+    if (this.sqlite.isTransaction) {
+      throw new Error('Legacy Android acceptance containment cannot join an unrelated transaction')
+    }
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      const room = this.rooms.get(roomId)
+      if (
+        !room ||
+        room.provider !== 'android' ||
+        room.stateRevision !== pending.roomStateRevision ||
+        room.workspaceVolumeRevision !== pending.workspaceVolumeRevision ||
+        pending.runtimeFence.networkAuthorityStartedAt !== undefined
+      ) {
+        throw new Error('Legacy Android acceptance containment Room generation changed')
+      }
+      if (!this.settings.deleteIfValue(key, raw)) {
+        throw new Error('Legacy Android acceptance restore intent ownership changed before containment')
+      }
+      // stopRoomPod already proved the entire owned topology inactive. Keep
+      // the persisted sleeping state atomic with the CAS so a crash leaves
+      // either the old gate or a truthful terminal runtime expectation.
+      this.rooms.update(roomId, { status: 'sleeping', hostPort: null })
+      this.sqlite.exec('COMMIT')
+    } catch (error) {
+      if (this.sqlite.isTransaction) this.sqlite.exec('ROLLBACK')
+      throw error
     }
   }
 
@@ -5473,8 +5557,8 @@ export class RoomOrchestrator {
       const pendingRestoreKey = pendingAndroidAcceptanceRestoreKey(roomId)
       const pendingRestoreToken = randomUUID().replaceAll('-', '')
       const acceptanceSourceSnapshot = workspaceSnapshotVolume(roomId, pendingRestoreToken)
-      const pendingRestore: PendingAndroidAcceptanceRestoreV2 = {
-        version: 2,
+      const pendingRestore: PendingAndroidAcceptanceRestoreV3 = {
+        version: 3,
         phase: 'reserved',
         ownerWorkerId: `pid:${process.pid}`,
         token: pendingRestoreToken,
