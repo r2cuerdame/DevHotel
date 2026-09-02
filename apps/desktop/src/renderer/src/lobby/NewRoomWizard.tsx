@@ -9,6 +9,22 @@ type WebPmKind = 'npm' | 'pnpm'
 type CreatableProvider = Extract<ProviderKind, 'web' | 'android' | 'windows'>
 type VmwareTemplate = { grantId: string; label: string; snapshots: string[] }
 
+/**
+ * The registry answers *why* a provider is unavailable as a code; the wizard says it in
+ * the user's language. Never render `unavailableReason` — that string is the agent-facing
+ * (English) copy carried by the control API.
+ */
+function windowsUnavailableKey(info: ProviderInfo | undefined): keyof Translation {
+  switch (info?.unavailableCode) {
+    case 'host-not-windows':
+      return 'windows.unsupported'
+    case 'vmware-missing':
+      return 'windows.notDetected'
+    default:
+      return 'windows.setupRequiredCard'
+  }
+}
+
 export function NewRoomWizard(): React.JSX.Element {
   const openWizard = useStore((s) => s.openWizard)
   const planRoom = useStore((s) => s.planRoom)
@@ -25,6 +41,7 @@ export function NewRoomWizard(): React.JSX.Element {
   const [plan, setPlan] = useState<RoomPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [providerInfos, setProviderInfos] = useState<ProviderInfo[]>([])
+  const [githubAccount, setGithubAccount] = useState<string | null>(null)
   const [vmwareTemplate, setVmwareTemplate] = useState<VmwareTemplate | null>(null)
   const [snapshot, setSnapshot] = useState('')
   const [vmwareStatus, setVmwareStatus] = useState<VmwareSetupStatusInfo | null>(null)
@@ -38,6 +55,14 @@ export function NewRoomWizard(): React.JSX.Element {
       .providers()
       .then((list) => {
         if (active) setProviderInfos(list)
+      })
+      .catch(() => undefined)
+    // Whether a private repository can be cloned is a fact about the GitHub Service,
+    // so the wizard asks it instead of guessing.
+    void api.hotel
+      .githubStatus()
+      .then((status) => {
+        if (active) setGithubAccount(status.credentialState === 'connected' ? status.account : null)
       })
       .catch(() => undefined)
     return () => {
@@ -238,9 +263,7 @@ export function NewRoomWizard(): React.JSX.Element {
                 >
                   <b>{windowsInfo?.label ?? t('windows.vmwareRoom')}</b>
                   <small>
-                    {windowsInfo?.available
-                      ? t('windows.roomHint')
-                      : windowsInfo?.unavailableReason ?? t('windows.setupRequiredCard')}
+                    {windowsInfo?.available ? t('windows.roomHint') : t(windowsUnavailableKey(windowsInfo))}
                   </small>
                 </button>
               </div>
@@ -277,6 +300,11 @@ export function NewRoomWizard(): React.JSX.Element {
                   onChange={(e) => setSourceRef(e.target.value)}
                   autoFocus
                 />
+                <small className="field-hint">
+                  {githubAccount
+                    ? t('wizard.repoPrivateConnected', { account: githubAccount })
+                    : t('wizard.repoPrivateHint')}
+                </small>
               </div>
             )}
             {provider !== 'windows' && sourceType === 'linked-folder' && (

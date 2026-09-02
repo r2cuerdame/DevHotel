@@ -46,12 +46,14 @@ import {
   workspaceSnapshotVolume,
   type NetworkNamespaceAuthority,
 } from './naming'
+import { CLONE_IMAGE, gitCloneRun } from './gitClone'
 import type {
   AnchorSpec,
   ExecOpts,
   ExecOutputChunk,
   ExecResult,
   ExportedArtifact,
+  GitCredential,
   FencedEmulatorBootResult,
   IsolationBackend,
   ManagedNetwork,
@@ -61,7 +63,6 @@ import type {
   WebSpec
 } from './types'
 
-const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
 /**
  * Opt-in phase timing for one fenced ADB command, written to a file because the
@@ -1209,7 +1210,7 @@ export class OciCliBackend implements IsolationBackend {
 
   async createRoomPod(
     spec: WebSpec,
-    opts: { initializeManagedSource?: boolean; startWeb?: boolean } = {}
+    opts: { initializeManagedSource?: boolean; startWeb?: boolean; gitCredential?: GitCredential | null } = {}
   ): Promise<{ hostPort: number | null }> {
     await this.assertPinnedEngineIdentity()
     await this.adoptLegacyRoomVolumes(spec.roomId)
@@ -1229,7 +1230,7 @@ export class OciCliBackend implements IsolationBackend {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
     if (spec.sourceType === 'managed-git' && initializeManagedSource) {
-      await this.cloneIntoVolume(spec.roomId, spec.sourceRef, spec.workspaceVolumeRevision)
+      await this.cloneIntoVolume(spec.roomId, spec.sourceRef, spec.workspaceVolumeRevision, undefined, opts.gitCredential)
     }
     let relayToken: string | null = null
     try {
@@ -2654,17 +2655,20 @@ export class OciCliBackend implements IsolationBackend {
     roomId: string,
     gitUrl: string,
     workspaceVolumeRevision = 0,
-    log?: (line: string) => void
+    log?: (line: string) => void,
+    credential?: GitCredential | null
   ): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(CLONE_IMAGE, log)
     const target = srcVolume(roomId, workspaceVolumeRevision)
     await this.ensureRoomVolume(roomId, target)
+    const run = gitCloneRun(['-v', `${target}:/workspace`, '-w', '/workspace'], gitUrl, [], credential)
     must(
-      await runDocker(
-        ['run', '--rm', '-v', `${target}:/workspace`, '-w', '/workspace', CLONE_IMAGE, 'clone', gitUrl, '.'],
-        { timeoutMs: LONG_TIMEOUT_MS, onLine: log },
-      ),
+      await runDocker(run.args, {
+        timeoutMs: LONG_TIMEOUT_MS,
+        onLine: log,
+        ...(run.input === undefined ? {} : { input: run.input })
+      }),
       `clone ${gitUrl}`,
     )
   }

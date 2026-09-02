@@ -59,6 +59,8 @@ export const ja: Translation = {
   'wizard.sourceEmpty': '空のルーム',
   'wizard.sourceEmptyHint': 'まっさらな状態から始める',
   'wizard.repoUrl': 'リポジトリ URL',
+  'wizard.repoPrivateHint': 'プライベートリポジトリですか？Hotel サービスで GitHub を接続するか、https://user:token@… の形式で貼り付けてください。トークンはこのクローンにのみ使われ、保存されません。',
+  'wizard.repoPrivateConnected': 'プライベートな GitHub リポジトリは、接続済みの GitHub サービス資格情報（{account}）でクローンします。',
   'wizard.projectFolder': 'プロジェクトフォルダー',
   'wizard.browse': '参照…',
   'wizard.projectName': 'プロジェクト名',

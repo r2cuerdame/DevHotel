@@ -261,6 +261,12 @@ read-only into that helper.
 
 ### Rooms
 
+Private repositories: a `sourceRef` may carry `https://user:token@host/repo.git`. The credential
+is used for that Room's clones and is then dropped — the stored `sourceRef`, `manifest.yaml`, the
+logs and the diagnostic bundle keep the clean URL. For `github.com`, a Room clones with the
+credential connected to the GitHub Service even when the URL carries none.
+
+
 | Method & path | Body / query | Result |
 |---|---|---|
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |

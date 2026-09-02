@@ -562,7 +562,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_run',
       description:
-        "One-shot Android dev loop: build the room workspace, install EVERY built module APK, launch the chosen applicationId (default: first module), then return the change result plus a screenshot. Target selection follows the Room attachment: without a physical lease this uses the Room emulator; while the Room holds an attached physical-device lease it installs, launches, and captures that shared phone instead. Release the device before an emulator-only run. Long call — the Gradle build alone can take minutes.",
+        "One-shot Android dev loop: build the room workspace, install EVERY built module APK, launch the chosen applicationId (default: first module), then return the change result plus a screenshot. Target selection follows the Room attachment: without a physical lease this uses the Room emulator; while the Room holds an attached physical-device lease it installs, launches, and captures that shared phone instead. Release the device before an emulator-only run. The result's `after` carries the facts the next call needs — `adbSerial` for an emulator run (never connect a second serial to the same device, it runs everything twice) or `device` for a leased phone, plus `launchedApplicationId` and `installedApplicationIds`. Long call — the Gradle build alone can take minutes.",
       schema: {
         roomId: zRoomId,
         applicationId: z.string().optional().describe('which built module to launch, e.g. "com.example.app"; defaults to the first')

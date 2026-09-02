@@ -91,6 +91,8 @@ export const ko: Translation = {
   'wizard.sourceEmpty': '빈 Room',
   'wizard.sourceEmptyHint': '아무것도 없이 시작',
   'wizard.repoUrl': '저장소 URL',
+  'wizard.repoPrivateHint': '비공개 저장소인가요? Hotel 서비스에서 GitHub를 연결하거나 https://사용자:토큰@… 형식으로 붙여넣으세요. 토큰은 이번 클론에만 쓰이고 저장되지 않습니다.',
+  'wizard.repoPrivateConnected': '비공개 GitHub 저장소는 연결된 GitHub 서비스 자격 증명({account})으로 클론합니다.',
   'wizard.projectFolder': '프로젝트 폴더',
   'wizard.browse': '찾아보기…',
   'wizard.projectName': '프로젝트 이름',

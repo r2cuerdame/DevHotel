@@ -73,6 +73,12 @@ export interface ChangeStep {
   push(step: string): void
   /** replace the entry's captured safety-state from inside apply (e.g. a backup taken mid-apply) */
   setCaptured(blob: unknown): void
+  /**
+   * Merge facts the change *produced* into the entry's `after` — the device it
+   * used, the ids it installed. A caller that has to guess these ends up
+   * addressing the emulator by a second name and running everything twice.
+   */
+  setResult(result: Record<string, unknown>): void
 }
 
 export interface ChangeOperation {

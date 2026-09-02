@@ -1027,3 +1027,36 @@ describe('normalize-line-endings verification', () => {
     expect(entry.verify?.detail).toContain('web process exited')
   })
 })
+
+describe('a change that reports what it produced', () => {
+  it('merges its result into the entry so the next call need not guess', async () => {
+    const engine = new ChangeEngine()
+    engine.register({
+      kind: 'reports-result',
+      plan: () => ({
+        title: 'Reports a result',
+        component: 'Test',
+        before: null,
+        after: { requested: 'app' },
+        undoable: false,
+        undoStrategy: 'none',
+        autoRollback: false
+      }),
+      async apply(_ctx, _p, steps) {
+        steps.setResult({ adbSerial: 'emulator-5554', installedApplicationIds: ['com.a', 'com.b'] })
+      },
+      async verify() {
+        return { ok: true, detail: 'ok' }
+      }
+    })
+
+    const entry = await engine.execute(ctx(), 'reports-result', {}, 'agent')
+
+    // The planned `after` survives; the produced facts join it.
+    expect(entry.after).toEqual({
+      requested: 'app',
+      adbSerial: 'emulator-5554',
+      installedApplicationIds: ['com.a', 'com.b']
+    })
+  })
+})

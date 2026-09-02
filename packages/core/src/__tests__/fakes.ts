@@ -9,6 +9,7 @@ import type {
   ExecOpts,
   ExecResult,
   ExportedArtifact,
+  GitCredential,
   FencedEmulatorBootResult,
   IsolationBackend,
   RoomArtifactExpectation,
@@ -141,7 +142,12 @@ export class FakeBackend implements IsolationBackend {
   async health() {
     return { ok: true, detail: 'fake docker' }
   }
-  async createRoomPod(spec: WebSpec, opts?: { initializeManagedSource?: boolean; startWeb?: boolean }) {
+  lastGitCredential: GitCredential | null | undefined = undefined
+  async createRoomPod(
+    spec: WebSpec,
+    opts?: { initializeManagedSource?: boolean; startWeb?: boolean; gitCredential?: GitCredential | null }
+  ) {
+    this.lastGitCredential = opts?.gitCredential
     this.calls.push(`createRoomPod:${spec.roomId}`)
     if (opts?.initializeManagedSource === false) this.calls.push(`createRoomPod:source-ready:${spec.roomId}`)
     if (opts?.startWeb === false) this.calls.push(`createRoomPod:web-stopped:${spec.roomId}`)

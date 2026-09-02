@@ -59,6 +59,8 @@ export const zhCN: Translation = {
   'wizard.sourceEmpty': '空房间',
   'wizard.sourceEmptyHint': '从零开始',
   'wizard.repoUrl': '仓库 URL',
+  'wizard.repoPrivateHint': '私有仓库？请在 Hotel 服务中连接 GitHub，或粘贴 https://user:token@… — 令牌仅用于本次克隆，不会被保存。',
+  'wizard.repoPrivateConnected': '私有 GitHub 仓库将使用已连接的 GitHub 服务凭据（{account}）克隆。',
   'wizard.projectFolder': '项目文件夹',
   'wizard.browse': '浏览…',
   'wizard.projectName': '项目名称',

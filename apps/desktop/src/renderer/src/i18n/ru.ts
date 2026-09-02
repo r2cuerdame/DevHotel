@@ -59,6 +59,8 @@ export const ru: Translation = {
   'wizard.sourceEmpty': 'Пустой номер',
   'wizard.sourceEmptyHint': 'Начать с нуля',
   'wizard.repoUrl': 'URL репозитория',
+  'wizard.repoPrivateHint': 'Приватный репозиторий? Подключите GitHub в службах отеля или вставьте https://user:token@… — токен используется только для этого клонирования и не сохраняется.',
+  'wizard.repoPrivateConnected': 'Приватные репозитории GitHub клонируются с подключёнными учётными данными службы GitHub ({account}).',
   'wizard.projectFolder': 'Папка проекта',
   'wizard.browse': 'Обзор…',
   'wizard.projectName': 'Название проекта',

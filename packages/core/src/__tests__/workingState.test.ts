@@ -45,6 +45,55 @@ describe('Room-owned working state', () => {
     rmSync(sourceDir, { recursive: true, force: true })
   })
 
+  it('does not call a Room diverged because a command was run in it', async () => {
+    const room = await orch.createRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      project: 'demo',
+      nickname: 'dev',
+      actor: 'user'
+    })
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('synced')
+
+    await orch.execInRoom(room.id, ['sh', '-lc', 'ls'], undefined, 'agent')
+
+    // The revision moves — a later undo has to know something ran — but the
+    // label the human reads must still match what the sync gate would decide.
+    const after = orch.rooms.get(room.id)!
+    expect(after.stateRevision).toBeGreaterThan(room.stateRevision)
+    expect(after.syncStatus).toBe('synced')
+  })
+
+  it('keeps a Room synced when a change only wrote generated output', async () => {
+    const room = await orch.createRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      project: 'demo',
+      nickname: 'dev',
+      actor: 'user'
+    })
+    // Build outputs are pruned from the content identity, so the fingerprint is
+    // unchanged — and the label must follow the fingerprint, not the change kind.
+    await orch.applyChange(room.id, { kind: 'deps-install', clean: false }, 'agent')
+
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('synced')
+  })
+
+  it('marks a Room modified when the workspace really changed', async () => {
+    const room = await orch.createRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      project: 'demo',
+      nickname: 'dev',
+      actor: 'user'
+    })
+    backend.workspaceFingerprintValue = 'a-different-workspace'
+
+    await orch.applyChange(room.id, { kind: 'deps-install', clean: false }, 'agent')
+
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('modified')
+  })
+
   it('imports a new Local Folder through the backend and runs on an owned volume', async () => {
     const room = await orch.createRoom({
       sourceType: 'linked-folder',

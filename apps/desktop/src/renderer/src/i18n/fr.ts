@@ -59,6 +59,8 @@ export const fr: Translation = {
   'wizard.sourceEmpty': 'Chambre vide',
   'wizard.sourceEmptyHint': 'Partir de zéro',
   'wizard.repoUrl': 'URL du dépôt',
+  'wizard.repoPrivateHint': "Dépôt privé ? Connectez GitHub dans les Services de l'hôtel, ou collez https://user:token@… — le jeton ne sert qu'à ce clonage et n'est jamais conservé.",
+  'wizard.repoPrivateConnected': 'Les dépôts GitHub privés sont clonés avec les identifiants du service GitHub connecté ({account}).',
   'wizard.projectFolder': 'Dossier du projet',
   'wizard.browse': 'Parcourir…',
   'wizard.projectName': 'Nom du projet',

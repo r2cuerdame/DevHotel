@@ -452,6 +452,12 @@ code,
   color: var(--dim);
 }
 
+.field-hint {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .source-choice[data-active='true'] {
   border-color: var(--brass);
 }

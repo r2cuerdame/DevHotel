@@ -150,11 +150,24 @@ export class RoomArtifactPublicationError extends Error {
   }
 }
 
+/**
+ * A credential for one clone, resolved at clone time and never stored in the Room
+ * record. It reaches git through the container's stdin — never argv, never a file,
+ * never the URL — so it cannot leak into `docker inspect`, logs or manifest.yaml.
+ */
+export interface GitCredential {
+  username: string
+  secret: string
+}
+
+/** Answers "which credential clones this URL", or null when the clone should stay anonymous. */
+export type GitCredentialResolver = (gitUrl: string) => Promise<GitCredential | null>
+
 export interface IsolationBackend {
   health(): Promise<{ ok: boolean; detail: string }>
   createRoomPod(
     spec: WebSpec,
-    opts?: { initializeManagedSource?: boolean; startWeb?: boolean }
+    opts?: { initializeManagedSource?: boolean; startWeb?: boolean; gitCredential?: GitCredential | null }
   ): Promise<{ hostPort: number | null }>
   /** Secret needed by the host gateway to cross this Room's published relay gate. */
   relayToken(roomId: string): Promise<string>
@@ -233,7 +246,13 @@ export interface IsolationBackend {
   listManagedNetworks(): Promise<ManagedNetwork[]>
   /** Remove a network already verified as DevHotel-managed. */
   removeManagedNetwork(name: string): Promise<void>
-  cloneIntoVolume(roomId: string, gitUrl: string, workspaceVolumeRevision?: number, log?: (line: string) => void): Promise<void>
+  cloneIntoVolume(
+    roomId: string,
+    gitUrl: string,
+    workspaceVolumeRevision?: number,
+    log?: (line: string) => void,
+    credential?: GitCredential | null
+  ): Promise<void>
   /** Import a canonical Host folder through a short-lived read-only mount into a new owned workspace generation. */
   importHostFolder(
     roomId: string,

@@ -9,6 +9,9 @@ const BEARER = /((?:bearer|basic|token)\s+)[a-z0-9._~+/=-]{8,}/gi
 
 const CONNECTION_STRING = /((?:postgres(?:ql)?|mysql|redis|rediss|mongodb(?:\+srv)?|amqp|mssql):\/\/[^:\s/]+:)([^@\s]+)(@)/gi
 
+/** `https://user:secret@host` — a repository or webhook URL pasted with its credential inline. */
+const URL_USERINFO = /((?:https?|ssh|git):\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi
+
 const PEM_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
 
 const WELL_KNOWN_TOKENS = [
@@ -109,6 +112,7 @@ export class SecretRedactor {
     out = out.replace(KEYED_VALUE, `$1${MASK}`)
     out = out.replace(BEARER, `$1${MASK}`)
     out = out.replace(CONNECTION_STRING, `$1${MASK}$3`)
+    out = out.replace(URL_USERINFO, `$1${MASK}$3`)
     for (const re of WELL_KNOWN_TOKENS) out = out.replace(re, MASK)
     out = out.replace(ENV_LINE, `$1${MASK}`)
     for (const value of [...this.sensitiveValues.keys()].sort((a, b) => b.length - a.length)) {
