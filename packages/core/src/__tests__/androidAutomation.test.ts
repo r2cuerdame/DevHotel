@@ -8,6 +8,10 @@ import {
   isPhysicalAcceptanceProofReadCommand,
   isPhysicalAutomationReadCommand,
   parseAndroidUiHierarchy,
+  SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS,
+  SCREEN_WITNESS_BOOTSTRAP_RETRY_MS,
+  SCREEN_WITNESS_NON_ACTION_BUDGET_MS,
+  SCREEN_WITNESS_READY_TIMEOUT_MS,
   type AndroidAutomationSessionOptions
 } from '../devices/androidAutomation'
 import { androidAppInstallsRepo } from '../store/androidAppInstallsRepo'
@@ -3570,5 +3574,23 @@ describe('tracked Android automation session', () => {
     expect(installs.get('aaaa1111', firstLease, APP_ID)).toBeNull()
     expect(installs.get('bbbb2222', firstLease, APP_ID)).toBeNull()
     expect(installs.get('bbbb2222', secondLease, APP_ID)?.apkSha256).toBe('c'.repeat(64))
+  })
+})
+
+describe('screen witness budgets', () => {
+  /** Measured against a managed emulator on Docker Desktop: one marker is a whole helper. */
+  const MEASURED_MARKER_ROUND_TRIP_MS = 4_500
+
+  it('gives the bootstrap enough room for every attempt it is allowed to make', () => {
+    // Each bootstrap marker is a whole fenced helper container round trip —
+    // measured at ~4.5s against a managed emulator on Docker Desktop. A budget
+    // that cannot cover the retries it permits aborts the witness before it has
+    // tried, which is how every screen-sensitive action started failing with
+    // ANDROID_SCREEN_WITNESS_FAILED on a healthy emulator.
+    expect(SCREEN_WITNESS_READY_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS * (MEASURED_MARKER_ROUND_TRIP_MS + SCREEN_WITNESS_BOOTSTRAP_RETRY_MS)
+    )
+    // …and still fit inside the window that surrounds the caller's action.
+    expect(SCREEN_WITNESS_READY_TIMEOUT_MS).toBeLessThan(SCREEN_WITNESS_NON_ACTION_BUDGET_MS)
   })
 })
