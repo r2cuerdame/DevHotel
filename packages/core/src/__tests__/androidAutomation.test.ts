@@ -8,6 +8,7 @@ import {
   isPhysicalAcceptanceProofReadCommand,
   isPhysicalAutomationReadCommand,
   parseAndroidUiHierarchy,
+  DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS,
   SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS,
   SCREEN_WITNESS_BOOTSTRAP_RETRY_MS,
   SCREEN_WITNESS_NON_ACTION_BUDGET_MS,
@@ -3592,5 +3593,17 @@ describe('screen witness budgets', () => {
     )
     // …and still fit inside the window that surrounds the caller's action.
     expect(SCREEN_WITNESS_READY_TIMEOUT_MS).toBeLessThan(SCREEN_WITNESS_NON_ACTION_BUDGET_MS)
+  })
+
+  it('gives a witnessed action room for the round trips it is made of', () => {
+    // `android_dump_ui` alone spends an active-user proof, the dump, a
+    // tracked-install proof and a foreground proof — each one a fenced helper
+    // container. A budget sized for a single adb call expires mid-action and is
+    // then reported as if the active user had changed underneath.
+    expect(DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      8 * MEASURED_MARKER_ROUND_TRIP_MS
+    )
+    // The validator refuses anything above two minutes.
+    expect(DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS).toBeLessThanOrEqual(120_000)
   })
 })

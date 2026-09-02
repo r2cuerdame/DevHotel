@@ -3664,14 +3664,17 @@ export class OciCliBackend implements IsolationBackend {
       }
       return owned
     }
-    const anchor = await participant(anchorName(roomId), 'anchor', expected?.anchorId)
-    const runtimeAnchor = await participant(
-      androidRuntimeAnchorName(roomId),
-      'android-runtime-anchor',
-      expected?.runtimeAnchorId
-    )
-    const web = await participant(webName(roomId), 'web', expected?.webId)
-    const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    // Each participant proof is an independent read of one container, and this
+    // runs three times on every fenced ADB command. Serially that is twelve
+    // `docker inspect` round trips at ~0.36s each; overlapping the four reads
+    // within a proof changes nothing about what is proved, only how long the
+    // caller waits for answers it was going to get anyway.
+    const [anchor, runtimeAnchor, web, emulator] = await Promise.all([
+      participant(anchorName(roomId), 'anchor', expected?.anchorId),
+      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId),
+      participant(webName(roomId), 'web', expected?.webId),
+      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    ])
     const anchorId = exactFullContainerId(anchor, roomId)
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
@@ -3892,14 +3895,13 @@ export class OciCliBackend implements IsolationBackend {
       }
       return owned
     }
-    const anchor = await participant(anchorName(roomId), 'anchor', expected?.anchorId)
-    const runtimeAnchor = await participant(
-      androidRuntimeAnchorName(roomId),
-      'android-runtime-anchor',
-      expected?.runtimeAnchorId
-    )
-    const web = await participant(webName(roomId), 'web', expected?.webId)
-    const emulator = await participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    // Same independent reads as the live topology proof; same reason to overlap them.
+    const [anchor, runtimeAnchor, web, emulator] = await Promise.all([
+      participant(anchorName(roomId), 'anchor', expected?.anchorId),
+      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId),
+      participant(webName(roomId), 'web', expected?.webId),
+      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+    ])
     const anchorId = exactFullContainerId(anchor, roomId)
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
