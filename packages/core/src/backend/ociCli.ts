@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -63,6 +63,23 @@ import type {
 
 const CLONE_IMAGE = 'alpine/git'
 const DU_IMAGE = 'alpine'
+/**
+ * Opt-in phase timing for one fenced ADB command, written to a file because the
+ * packaged app has no console anyone can read. Off unless DEVHOTEL_FENCE_TIMING
+ * names a path, so it costs a single env lookup in normal operation.
+ */
+function fenceTiming(): ((phase: string, ms: number, detail?: string) => void) | null {
+  const path = process.env['DEVHOTEL_FENCE_TIMING']
+  if (!path) return null
+  return (phase, ms, detail) => {
+    try {
+      appendFileSync(path, `${new Date().toISOString()}\t${phase}\t${ms}\t${detail ?? ''}\n`, 'utf8')
+    } catch {
+      // Timing must never break the command it is measuring.
+    }
+  }
+}
+
 const LONG_TIMEOUT_MS = 600_000
 const ONE_SHOT_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 const ONE_SHOT_MAX_STDERR_BYTES = 4 * 1024 * 1024
@@ -3475,10 +3492,21 @@ export class OciCliBackend implements IsolationBackend {
     ) {
       throw new Error('fenced emulator installs require a private staged APK capability')
     }
+    const timing = fenceTiming()
+    const commandStartedAt = Date.now()
+    let phaseAt = commandStartedAt
+    const mark = (phase: string, detail?: string): void => {
+      if (!timing) return
+      const now = Date.now()
+      timing(phase, now - phaseAt, detail)
+      phaseAt = now
+    }
+    mark('engine-identity', mode === 'command' ? args[0] : mode)
     let topology: FencedEmulatorTopology | undefined
     let recoveryTopology: FencedEmulatorRecoveryTopology | undefined
     if (recoveryOnly) recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId)
     else topology = await this.assertFencedEmulatorTopology(roomId)
+    mark('topology-proof')
     const provedTopology = (recoveryTopology ?? topology)!
     const emulatorId = provedTopology.emulatorId
     const emulatorImageId = provedTopology.emulatorImageId
@@ -3568,6 +3596,7 @@ export class OciCliBackend implements IsolationBackend {
       if (!helperId) {
         throw new Error('fenced emulator ADB helper create did not return one immutable container ID')
       }
+      mark('docker-create')
       const createdHelper = await this.inspectContainer(helperId)
       if (!createdHelper || !this.isOwnedFencedJob(createdHelper, roomId, name, abortToken)) {
         throw new Error('fenced emulator ADB helper ownership could not be verified before start')
@@ -3587,7 +3616,9 @@ export class OciCliBackend implements IsolationBackend {
       if (createdHelper.State?.Status !== 'created') {
         throw new Error('fenced emulator ADB helper was not inert before its controlled action')
       }
+      mark('verify-helper')
       await reproveTopology()
+      mark('reprove-before-start')
       throwIfAborted(opts.signal)
     } catch (error) {
       try {
@@ -3622,6 +3653,7 @@ export class OciCliBackend implements IsolationBackend {
     } catch (error) {
       executionError = error
     }
+    mark('docker-start-attached', mode === 'command' ? args.join(' ').slice(0, 80) : mode)
     try {
       await this.removeAbortedFencedJob(roomId, name, abortToken, helperId)
     } catch (cleanupError) {
@@ -3630,7 +3662,10 @@ export class OciCliBackend implements IsolationBackend {
       }
       throw cleanupError
     }
+    mark('remove-helper')
     await reproveTopology()
+    mark('reprove-after')
+    if (timing) timing('TOTAL', Date.now() - commandStartedAt, mode === 'command' ? args[0] : mode)
     if (executionError) throw executionError
     throwIfAborted(opts.signal)
     if (!result) throw new Error('fenced emulator helper did not return an execution result')
@@ -3651,9 +3686,12 @@ export class OciCliBackend implements IsolationBackend {
     const participant = async (
       name: string,
       role: string,
-      expectedId?: string
+      expectedId?: string,
+      prefetched?: Map<string, DockerContainerInspect>
     ): Promise<DockerContainerInspect> => {
-      const inspected = expectedId ? await this.inspectContainer(expectedId) : undefined
+      const inspected = expectedId
+        ? prefetched?.get(expectedId) ?? (await this.inspectContainer(expectedId))
+        : prefetched?.get(name)
       if (expectedId && !inspected) {
         throw new Error(`Android execution topology participant disappeared: ${name}`)
       }
@@ -3669,11 +3707,18 @@ export class OciCliBackend implements IsolationBackend {
     // `docker inspect` round trips at ~0.36s each; overlapping the four reads
     // within a proof changes nothing about what is proved, only how long the
     // caller waits for answers it was going to get anyway.
+    // One `docker inspect` for the whole topology; the proofs below are unchanged.
+    const prefetched = await this.inspectContainers([
+      expected?.anchorId ?? anchorName(roomId),
+      expected?.runtimeAnchorId ?? androidRuntimeAnchorName(roomId),
+      expected?.webId ?? webName(roomId),
+      expected?.emulatorId ?? emulatorName(roomId)
+    ])
     const [anchor, runtimeAnchor, web, emulator] = await Promise.all([
-      participant(anchorName(roomId), 'anchor', expected?.anchorId),
-      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId),
-      participant(webName(roomId), 'web', expected?.webId),
-      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+      participant(anchorName(roomId), 'anchor', expected?.anchorId, prefetched),
+      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId, prefetched),
+      participant(webName(roomId), 'web', expected?.webId, prefetched),
+      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId, prefetched)
     ])
     const anchorId = exactFullContainerId(anchor, roomId)
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
@@ -3886,8 +3931,15 @@ export class OciCliBackend implements IsolationBackend {
     expected?: FencedEmulatorRecoveryTopology,
     observedStart?: ObservedEmulatorRecoveryStart
   ): Promise<FencedEmulatorRecoveryTopology> {
-    const participant = async (name: string, role: string, expectedId?: string): Promise<DockerContainerInspect> => {
-      const inspected = expectedId ? await this.inspectContainer(expectedId) : undefined
+    const participant = async (
+      name: string,
+      role: string,
+      expectedId?: string,
+      prefetched?: Map<string, DockerContainerInspect>
+    ): Promise<DockerContainerInspect> => {
+      const inspected = expectedId
+        ? prefetched?.get(expectedId) ?? (await this.inspectContainer(expectedId))
+        : prefetched?.get(name)
       if (expectedId && !inspected) throw new Error(`Android recovery participant disappeared: ${role}`)
       const owned = await this.assertRoomContainer(roomId, name, role, inspected ?? undefined)
       if (expectedId && exactFullContainerId(owned, roomId) !== expectedId) {
@@ -3896,11 +3948,18 @@ export class OciCliBackend implements IsolationBackend {
       return owned
     }
     // Same independent reads as the live topology proof; same reason to overlap them.
+    // One `docker inspect` for the whole topology; the proofs below are unchanged.
+    const prefetched = await this.inspectContainers([
+      expected?.anchorId ?? anchorName(roomId),
+      expected?.runtimeAnchorId ?? androidRuntimeAnchorName(roomId),
+      expected?.webId ?? webName(roomId),
+      expected?.emulatorId ?? emulatorName(roomId)
+    ])
     const [anchor, runtimeAnchor, web, emulator] = await Promise.all([
-      participant(anchorName(roomId), 'anchor', expected?.anchorId),
-      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId),
-      participant(webName(roomId), 'web', expected?.webId),
-      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId)
+      participant(anchorName(roomId), 'anchor', expected?.anchorId, prefetched),
+      participant(androidRuntimeAnchorName(roomId), 'android-runtime-anchor', expected?.runtimeAnchorId, prefetched),
+      participant(webName(roomId), 'web', expected?.webId, prefetched),
+      participant(emulatorName(roomId), 'svc-emulator', expected?.emulatorId, prefetched)
     ])
     const anchorId = exactFullContainerId(anchor, roomId)
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
@@ -5647,6 +5706,42 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`inspect network ${name} returned no network`)
     }
     return parsed[0]
+  }
+
+  /**
+   * Inspect several containers in one `docker inspect`. Identical data to asking
+   * for them one at a time — docker takes a list — but one process instead of
+   * four. The Android topology proof reads four containers and runs three times
+   * per fenced ADB command, so this is the difference between twelve process
+   * spawns and three for exactly the same evidence.
+   *
+   * A target that does not exist is simply absent from the result; callers
+   * decide whether that is fatal, as they already do for a single inspect.
+   */
+  private async inspectContainers(targets: readonly string[]): Promise<Map<string, DockerContainerInspect>> {
+    const found = new Map<string, DockerContainerInspect>()
+    if (targets.length === 0) return found
+    const result = await runDocker(['inspect', ...targets])
+    if (result.code !== 0) {
+      const detail = `${result.stderr}\n${result.stdout}`
+      // Docker reports missing targets on stderr and still prints the rest.
+      if (!/no such object|no such container|not found/i.test(detail)) {
+        must(result, `inspect containers ${targets.join(', ')}`)
+      }
+    }
+    let parsed: DockerContainerInspect[]
+    try {
+      parsed = JSON.parse(result.stdout) as DockerContainerInspect[]
+    } catch {
+      throw new Error(`inspect containers ${targets.join(', ')} returned invalid JSON`)
+    }
+    if (!Array.isArray(parsed)) throw new Error('docker inspect did not return a list')
+    for (const container of parsed) {
+      const name = (container.Name ?? '').replace(/^\//, '')
+      if (name) found.set(name, container)
+      if (container.Id) found.set(container.Id, container)
+    }
+    return found
   }
 
   private async inspectContainer(name: string): Promise<DockerContainerInspect | null> {
