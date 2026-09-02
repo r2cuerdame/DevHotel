@@ -878,7 +878,7 @@ describe('tracked Android automation session', () => {
           stderr: ''
         }
       }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: 'mCurrentFocus=Window{1 u0 com.android.launcher/.Launcher}\n', stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -907,8 +907,38 @@ describe('tracked Android automation session', () => {
 
     await expect(session.forceStop(APP_ID)).rejects.toMatchObject({ code: 'ANDROID_FORCE_STOP_FAILED' })
     const foregroundProbeIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('dumpsys window'))
-    expect(calls[foregroundProbeIndex]).toEqual(['shell', 'sh', '-c', 'exec dumpsys window windows'])
+    expect(calls[foregroundProbeIndex]).toEqual(['shell', 'sh', '-c', 'exec dumpsys window displays'])
     expect(stdoutLimits[foregroundProbeIndex]).toBe(1024 * 1024)
+  })
+
+  it('asks the one dumpsys section that still carries the focus line on API 34', async () => {
+    // Observed on a live Android 14 (API 34) managed emulator: `dumpsys window
+    // windows` stops at 32000 bytes, before `mCurrentFocus=`, so a visibly
+    // foreground app reported as "no window has focus" and every launch failed.
+    // `dumpsys window displays` carries exactly one focus line at a quarter the size.
+    const sections: string[] = []
+    const { session } = setup((args) => {
+      if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
+      if (args[1] === 'sh' && args[3]?.includes('dumpsys window')) {
+        sections.push(args[3])
+        // What the truncated `windows` section actually returns on API 34.
+        if (args[3].includes('window windows')) return { code: 0, stdout: 'x'.repeat(32_000), stderr: '' }
+        return {
+          code: 0,
+          stdout: `  mCurrentFocus=Window{7cf796c u0 ${APP_ID}/com.purpleship.appdied.MainActivity}\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await session.forceStop(APP_ID).catch(() => undefined)
+
+    expect(sections).not.toHaveLength(0)
+    for (const section of sections) {
+      expect(section).toBe('exec dumpsys window displays')
+      expect(section).not.toContain('window windows')
+    }
   })
 
   it('rejects a second focus record after a first record that filled the old guest-side cap', async () => {
@@ -919,7 +949,7 @@ describe('tracked Android automation session', () => {
     expect(Buffer.byteLength(`${first}\n`, 'utf8')).toBe(2048)
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `${first}\nmCurrentFocus=null\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -931,7 +961,7 @@ describe('tracked Android automation session', () => {
   it('maps an oversized full foreground dump to unknown without exposing partial output', async () => {
     const { session } = setup((args) => {
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: 'x'.repeat((1024 * 1024) + 1), stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3147,7 +3177,7 @@ describe('tracked Android automation session', () => {
         const pid = pgrepCalls === 1 ? 100 : pgrepCalls === 2 ? 101 : 102
         return { code: 0, stdout: `${pid}\n`, stderr: '' }
       }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3198,7 +3228,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3240,7 +3270,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: '', stderr: '' }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3271,7 +3301,7 @@ describe('tracked Android automation session', () => {
         }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3322,7 +3352,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3365,7 +3395,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3427,7 +3457,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `${reinstalled ? '103:4242:123456:1788157200:1788157202' : BASE_APK_STAT}\n`, stderr: '' }
       }
       if (args[1] === 'pgrep') return { code: 0, stdout: '100\n', stderr: '' }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
@@ -3482,7 +3512,7 @@ describe('tracked Android automation session', () => {
         pgrepCalls += 1
         return { code: 0, stdout: pgrepCalls === 1 ? '200\n100\n' : '100\n200\n', stderr: '' }
       }
-      if (args[1] === 'sh' && args[3] === 'exec dumpsys window windows') {
+      if (args[1] === 'sh' && args[3] === 'exec dumpsys window displays') {
         return { code: 0, stdout: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
