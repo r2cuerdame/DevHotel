@@ -447,15 +447,13 @@ mode=$5
 shift 5
 socket_path=$state/server.sock
 socket=localfilesystem:$socket_path
-adb=/opt/android-sdk/platform-tools/adb
-rm -rf -- "$state"
-mkdir -m 700 -p "$state/home" "$state/tmp"
+adb=/opt/android/platform-tools/adb
 run_adb() {
   env -i \
     HOME="$state/home" \
     TMPDIR="$state/tmp" \
-    PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
-    ANDROID_SDK_ROOT=/opt/android-sdk \
+    PATH=/opt/android/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android \
     ADB_SERVER_SOCKET="$socket" \
     "$adb" -L "$socket" "$@"
 }
@@ -463,8 +461,8 @@ run_adb_bounded() {
   timeout -k 1 2 env -i \
     HOME="$state/home" \
     TMPDIR="$state/tmp" \
-    PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
-    ANDROID_SDK_ROOT=/opt/android-sdk \
+    PATH=/opt/android/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android \
     ADB_SERVER_SOCKET="$socket" \
     "$adb" -L "$socket" "$@"
 }
@@ -473,29 +471,63 @@ cleanup() {
   if [ -n "\${stderr_reader:-}" ]; then kill "$stderr_reader" >/dev/null 2>&1 || true; fi
   if [ -n "\${stdout_reader:-}" ]; then wait "$stdout_reader" >/dev/null 2>&1 || true; fi
   if [ -n "\${stderr_reader:-}" ]; then wait "$stderr_reader" >/dev/null 2>&1 || true; fi
-  run_adb kill-server >/dev/null 2>&1 || true
+  if [ -S "$socket_path" ]; then
+    if [ "$mode" = wait-for-boot ]; then
+      run_adb_bounded kill-server >/dev/null 2>&1 || true
+    else
+      run_adb kill-server >/dev/null 2>&1 || true
+    fi
+  fi
   rm -rf -- "$state"
 }
 trap cleanup EXIT HUP INT TERM
-[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
-if [ "$mode" = wait-for-boot ]; then
-  boot_deadline=$(( $(date +%s) + command_timeout ))
-  run_adb_bounded start-server >/dev/null 2>&1
-else
-  run_adb start-server >/dev/null 2>&1
-fi
-[ -S "$socket_path" ] || exit 71
-[ "$(stat -c %u "$socket_path")" = "$(id -u)" ] || exit 72
 if [ "$mode" = wait-for-boot ]; then
   last_state=missing
   last_boot=empty
   last_code=1
+  boot_timeout() {
+    printf 'devhotel-emulator-boot-v1\\ttimeout\\t%s\\t%s\\t%s\\n' "$last_state" "$last_boot" "$last_code"
+    exit 74
+  }
+  # Boot mode must always finish with one normalized receipt. In particular,
+  # an adb client startup timeout is not evidence that its same-socket server
+  # failed to start, so retry that one private server until the boot deadline.
+  set +e
+  rm -rf -- "$state"
+  state_code=$?
+  if [ "$state_code" -eq 0 ]; then
+    mkdir -m 700 -p "$state/home" "$state/tmp"
+    state_code=$?
+  fi
+  if [ "$state_code" -ne 0 ]; then
+    last_state=unknown
+    boot_timeout
+  fi
+  if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
+    last_state=unknown
+    boot_timeout
+  fi
+  boot_deadline=$(( $(date +%s) + command_timeout ))
+  while [ "$(date +%s)" -lt "$boot_deadline" ] && [ ! -S "$socket_path" ]; do
+    run_adb_bounded start-server >/dev/null 2>&1
+    last_code=$?
+    [ -S "$socket_path" ] && break
+    sleep 0.25
+  done
+  [ -S "$socket_path" ] || boot_timeout
+  socket_owner=$(stat -c %u "$socket_path" 2>/dev/null)
+  socket_owner_code=$?
+  helper_owner=$(id -u 2>/dev/null)
+  helper_owner_code=$?
+  if [ "$socket_owner_code" -ne 0 ] || [ "$helper_owner_code" -ne 0 ] || [ "$socket_owner" != "$helper_owner" ]; then
+    last_state=unknown
+    last_code=1
+    boot_timeout
+  fi
   while [ "$(date +%s)" -lt "$boot_deadline" ]; do
-    set +e
     observed_state=$(run_adb_bounded -s emulator-5554 get-state 2>/dev/null)
     last_code=$?
-    set -e
-    observed_state=$(printf '%s' "$observed_state" | tr -d '\r\n')
+    observed_state=$(printf '%s' "$observed_state" | tr -d '\\r\\n')
     case "$observed_state" in
       device|offline|unauthorized) last_state=$observed_state ;;
       '') last_state=missing ;;
@@ -503,27 +535,30 @@ if [ "$mode" = wait-for-boot ]; then
     esac
     last_boot=empty
     if [ "$last_state" = device ] && [ "$last_code" -eq 0 ]; then
-      set +e
       observed_boot=$(run_adb_bounded -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null)
       last_code=$?
-      set -e
-      observed_boot=$(printf '%s' "$observed_boot" | tr -d '\r\n')
+      observed_boot=$(printf '%s' "$observed_boot" | tr -d '\\r\\n')
       case "$observed_boot" in
         1) last_boot=1 ;;
         '') last_boot=empty ;;
         *) last_boot=other ;;
       esac
       if [ "$last_boot" = 1 ] && [ "$last_code" -eq 0 ]; then
-        printf 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+        printf 'devhotel-emulator-boot-v1\\tready\\tdevice\\t1\\t0\\n'
         exit 0
       fi
     fi
     sleep 0.25
   done
-  printf 'devhotel-emulator-boot-v1\ttimeout\t%s\t%s\t%s\n' "$last_state" "$last_boot" "$last_code"
-  exit 74
+  boot_timeout
 fi
 [ "$mode" = command ] || exit 75
+rm -rf -- "$state"
+mkdir -m 700 -p "$state/home" "$state/tmp"
+[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
+run_adb start-server >/dev/null 2>&1
+[ -S "$socket_path" ] || exit 71
+[ "$(stat -c %u "$socket_path")" = "$(id -u)" ] || exit 72
 ready=0
 i=0
 while [ "$i" -lt 20 ]; do
@@ -543,8 +578,8 @@ set +e
 timeout -k 1 "$command_timeout" env -i \
   HOME="$state/home" \
   TMPDIR="$state/tmp" \
-  PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
-  ANDROID_SDK_ROOT=/opt/android-sdk \
+  PATH=/opt/android/platform-tools:/usr/bin:/bin \
+  ANDROID_SDK_ROOT=/opt/android \
   ADB_SERVER_SOCKET="$socket" \
   "$adb" -L "$socket" -s emulator-5554 "$@" > "$stdout_pipe" 2> "$stderr_pipe"
 status=$?
@@ -3444,7 +3479,9 @@ export class OciCliBackend implements IsolationBackend {
     let recoveryTopology: FencedEmulatorRecoveryTopology | undefined
     if (recoveryOnly) recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId)
     else topology = await this.assertFencedEmulatorTopology(roomId)
-    const emulatorId = (recoveryTopology ?? topology)!.emulatorId
+    const provedTopology = (recoveryTopology ?? topology)!
+    const emulatorId = provedTopology.emulatorId
+    const emulatorImageId = provedTopology.emulatorImageId
     const reproveTopology = async (): Promise<void> => {
       if (recoveryOnly) {
         recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId, recoveryTopology)
@@ -3452,7 +3489,6 @@ export class OciCliBackend implements IsolationBackend {
         topology = await this.assertFencedEmulatorTopology(roomId, topology)
       }
     }
-    await this.ensureImage(ANDROID_IMAGE)
     const id = randomUUID()
     const name = jobName(roomId, id)
     const abortToken = randomUUID()
@@ -3478,6 +3514,11 @@ export class OciCliBackend implements IsolationBackend {
       '--rm',
       '--name',
       name,
+      // The emulator image defaults to uid 1300, but the Host-private APK
+      // capability is intentionally 0400. Keep the former root helper access
+      // while retaining ALL-cap drop, no-new-privileges and a read-only rootfs.
+      '--user',
+      '0:0',
       '--network',
       `container:${emulatorId}`,
       '--cap-drop',
@@ -3500,7 +3541,7 @@ export class OciCliBackend implements IsolationBackend {
       `ADB_SERVER_SOCKET=localfilesystem:${state}/server.sock`,
       '--entrypoint',
       '/bin/sh',
-      ANDROID_IMAGE,
+      emulatorImageId,
       '-c',
       FENCED_EMULATOR_ADB_SCRIPT,
       'devhotel-fenced-adb',
@@ -3536,6 +3577,12 @@ export class OciCliBackend implements IsolationBackend {
       }
       if (createdHelper.HostConfig?.NetworkMode !== `container:${emulatorId}`) {
         throw new Error('fenced emulator ADB helper is not attached to the exact emulator network namespace')
+      }
+      if (createdHelper.Config?.User !== '0:0') {
+        throw new Error('fenced emulator ADB helper did not retain its exact private-stage user')
+      }
+      if (exactDockerImageContentId(createdHelper.Image, 'Fenced emulator ADB helper') !== emulatorImageId) {
+        throw new Error('fenced emulator ADB helper did not retain the proved emulator image content identity')
       }
       if (createdHelper.State?.Status !== 'created') {
         throw new Error('fenced emulator ADB helper was not inert before its controlled action')
@@ -3629,6 +3676,7 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
     const emulatorId = exactFullContainerId(emulator, roomId)
+    const emulatorImageId = exactDockerImageContentId(emulator.Image, 'Android emulator')
     const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
     const runtimeSandboxId = this.exactRunningSandboxId(runtimeAnchor, 'Android runtime anchor')
     const controlStartedAt = exactDockerStartedAt(anchor, 'Android control anchor')
@@ -3685,6 +3733,9 @@ export class OciCliBackend implements IsolationBackend {
     )
     const webStartedAt = exactDockerStartedAt(web, 'Android web')
     const emulatorStartedAt = exactDockerStartedAt(emulator, 'Android emulator')
+    if (expected && emulatorImageId !== expected.emulatorImageId) {
+      throw new Error('Android emulator image content identity changed while the helper was created')
+    }
     if (
       expected &&
       (
@@ -3810,6 +3861,7 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchorId,
       webId,
       emulatorId,
+      emulatorImageId,
       controlSandboxId,
       runtimeSandboxId,
       controlStartedAt,
@@ -3852,6 +3904,7 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
     const emulatorId = exactFullContainerId(emulator, roomId)
+    const emulatorImageId = exactDockerImageContentId(emulator.Image, 'Android recovery emulator')
     const runtimeAnchorState = runtimeAnchor.State?.Status ?? ''
     const webState = web.State?.Status ?? ''
     const controlStartedAt = exactDockerStartedAt(anchor, 'Android recovery control anchor')
@@ -3866,6 +3919,9 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeStartedAt = runtimeAnchorState === 'running'
       ? exactDockerStartedAt(runtimeAnchor, 'Android recovery runtime anchor')
       : null
+    if (expected && emulatorImageId !== expected.emulatorImageId) {
+      throw new Error('Android recovery emulator image content identity changed while the helper was created')
+    }
     if (
       expected &&
       (
@@ -4034,6 +4090,7 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchorId,
       webId,
       emulatorId,
+      emulatorImageId,
       controlSandboxId,
       controlStartedAt,
       webStartedAt,
@@ -6820,6 +6877,7 @@ interface FencedEmulatorTopology {
   runtimeAnchorId: string
   webId: string
   emulatorId: string
+  emulatorImageId: string
   controlSandboxId: string
   runtimeSandboxId: string
   controlStartedAt: string
@@ -6835,6 +6893,7 @@ interface FencedEmulatorRecoveryTopology {
   runtimeAnchorId: string
   webId: string
   emulatorId: string
+  emulatorImageId: string
   controlSandboxId: string
   controlStartedAt: string
   webStartedAt: string
@@ -6877,6 +6936,14 @@ function exactFullContainerId(container: DockerContainerInspect, roomId: string)
 function exactDockerObjectId(value: string | undefined, what: string): string {
   const id = value?.trim() ?? ''
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error(`${what} did not report a full immutable ID`)
+  return id
+}
+
+function exactDockerImageContentId(value: string | undefined, what: string): string {
+  const id = value?.trim() ?? ''
+  if (!/^sha256:[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`${what} did not report a full immutable image content identity`)
+  }
   return id
 }
 
