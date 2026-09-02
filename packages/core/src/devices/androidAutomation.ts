@@ -153,7 +153,20 @@ export const SCREEN_WITNESS_BOOTSTRAP_RETRY_MS = 250
 const SCREEN_WITNESS_MARKER_ROUND_TRIP_BUDGET_MS = 6_000
 const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$2"; exit "$status"`
 const MAX_USER_SWITCH_WITNESS_BYTES = 16 * 1024
-const DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS = 60_000
+/**
+ * A witnessed "action" is not one adb call. `android_dump_ui` alone spends an
+ * active-user proof, the dump, a tracked-install proof and a foreground proof,
+ * and every one of those is a fenced helper container round trip (~4.5s measured
+ * against a managed emulator on Docker Desktop). A flat 60s budget expired
+ * mid-action and was then reported as ANDROID_SCREEN_WITNESS_FAILED — as if the
+ * active user had changed underneath, which is a very different accusation from
+ * "my own action ran out of time".
+ */
+const SCREEN_WITNESS_ACTION_ROUND_TRIPS = 16
+export const DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS = Math.min(
+  SCREEN_WITNESS_ACTION_ROUND_TRIPS * SCREEN_WITNESS_MARKER_ROUND_TRIP_BUDGET_MS,
+  120_000
+)
 export const SCREEN_WITNESS_READY_TIMEOUT_MS =
   SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS *
   (SCREEN_WITNESS_MARKER_ROUND_TRIP_BUDGET_MS + SCREEN_WITNESS_BOOTSTRAP_RETRY_MS)
@@ -427,6 +440,46 @@ function automationError(
   evidence?: unknown
 ): DevHotelError {
   return new DevHotelError(code, message, { recoveryHint, httpStatus, evidence })
+}
+
+/**
+ * What the active-user witness observed before it refused. Tags and marker
+ * payloads are DevHotel's own; guest output never appears here.
+ */
+function witnessDiagnostic(
+  reader: {
+    issuedBegins: Set<string>
+    transcript: Buffer
+    readerSettled: boolean
+    witnessOverflow: boolean
+    witnessStderrBytes: number
+  } | null,
+  completed: { result: ExecResult | null; error: unknown },
+  failure: unknown
+): Record<string, unknown> {
+  const stage = failure instanceof Error ? failure.message : String(failure)
+  if (!reader) return { stage }
+  const lines = reader.transcript.toString('utf8').split(/\r?\n/).filter((line) => line.length > 0)
+  const records = lines.flatMap((line) => {
+    const match = /^[A-Z]\/([^:]+):\s(.*)$/.exec(line)
+    return match ? [{ tag: match[1]!, payload: match[2]! }] : []
+  })
+  const tags = [...new Set(records.map((record) => record.tag))].sort()
+  return {
+    stage,
+    issuedBegins: reader.issuedBegins.size,
+    readerLines: lines.length,
+    // Lines logcat emitted that are not tag records at all — buffer banners.
+    nonRecordLines: lines.length - records.length,
+    records: records.length,
+    tags,
+    matchedIssuedBegin: records.some((record) => reader.issuedBegins.has(record.payload)),
+    readerSettled: reader.readerSettled,
+    readerOverflow: reader.witnessOverflow,
+    readerStderrBytes: reader.witnessStderrBytes,
+    readerExitCode: completed.result ? completed.result.code : null,
+    readerError: completed.error instanceof Error ? completed.error.message : null
+  }
 }
 
 function waitTimeoutError(applicationId: string): DevHotelError {
@@ -2477,11 +2530,17 @@ export class AndroidAutomationSession {
       witnessFailure.code === 'ANDROID_WAIT_TIMEOUT'
     ) throw witnessFailure
     if (witnessFailure) {
+      // An error nobody can diagnose is a bad error. The witness reads a private
+      // marker stream, so when it refuses, say what it saw: how many records
+      // arrived, which tags, how many begins were issued, and why the reader
+      // stopped. Payloads are DevHotel-generated UUID markers and log tags, so
+      // this carries no guest content — the transcript itself is never included.
       throw automationError(
         'ANDROID_SCREEN_WITNESS_FAILED',
         'The screen-sensitive Android action crossed an unverified active-user boundary.',
         'Retry while no other actor is changing Android users or interfering with the bounded witness.',
-        409
+        409,
+        witnessDiagnostic(activeReader, completedReader, witnessFailure)
       )
     }
     if (actionThrew) throw actionError
