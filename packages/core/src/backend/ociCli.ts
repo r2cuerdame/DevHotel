@@ -1218,7 +1218,9 @@ export class OciCliBackend implements IsolationBackend {
         'Room web',
         id,
         authorityId,
-        expectedAuthority
+        expectedAuthority,
+        undefined,
+        async () => this.removeFailedStartedWeb(roomId, id)
       )
       return
     }
@@ -4956,7 +4958,7 @@ export class OciCliBackend implements IsolationBackend {
       expectedAuthorityStartedAt,
       what
     )
-    return (container.NetworkSettings?.SandboxID?.trim() ?? '') === '' && !hasCurrentLabels
+    return !hasCurrentLabels
   }
 
   private exactRunningJoinedSandboxId(
@@ -5009,6 +5011,9 @@ export class OciCliBackend implements IsolationBackend {
     if (!/^[a-f0-9]{64}$/.test(sandboxId)) {
       throw new Error(`${what} did not report a valid live network namespace identity`)
     }
+    if (needsRecoveryAttestation && !hasCurrentRecoveryAttestation) {
+      throw new Error(`${what} did not retain its exact network namespace authority generation`)
+    }
     return sandboxId
   }
 
@@ -5023,7 +5028,8 @@ export class OciCliBackend implements IsolationBackend {
     expectedJoinerId: string,
     expectedAuthorityId: string,
     expectedAuthority?: NetworkNamespaceAuthority,
-    assertAuthorityContextStable?: () => Promise<void>
+    assertAuthorityContextStable?: () => Promise<void>,
+    cleanupFailedStartedJoiner?: () => Promise<void>
   ): Promise<void> {
     const initialJoiner = await this.assertRoomContainer(roomId, joinerName, joinerRole)
     const joinerId = exactFullContainerId(initialJoiner, roomId)
@@ -5137,27 +5143,42 @@ export class OciCliBackend implements IsolationBackend {
     if (!['created', 'exited'].includes(initialJoiner.State?.Status ?? '')) {
       throw new Error(`${what} is not restartable`)
     }
-    const previousStartedAt = initialJoiner.State?.StartedAt
-    await assertAuthorityContextStable?.()
-    must(await runDocker(['start', joinerId]), `start exact ${what}`)
-    const started = await validateJoiner(undefined, true)
-    if (started.needsProof && started.startedAt === previousStartedAt) {
-      throw new Error(`${what} did not report a fresh start identity`)
-    }
-    await validateJoiner(started.startedAt, true)
-    await assertAuthorityStable()
-
-    if (started.needsProof) {
-      this.writeNetworkRecoveryAttestation(roomId, {
-        authorityId,
-        authoritySandboxId,
-        authorityStartedAt,
-        joinerId,
-        joinerStartedAt: started.startedAt,
-        authorityLabel: started.authorityLabel
-      })
-      await validateJoiner(started.startedAt, false)
+    let exactStartAttempted = false
+    try {
+      const previousStartedAt = initialJoiner.State?.StartedAt
+      await assertAuthorityContextStable?.()
+      exactStartAttempted = true
+      must(await runDocker(['start', joinerId]), `start exact ${what}`)
+      const started = await validateJoiner(undefined, true)
+      if (started.needsProof && started.startedAt === previousStartedAt) {
+        throw new Error(`${what} did not report a fresh start identity`)
+      }
+      await validateJoiner(started.startedAt, true)
       await assertAuthorityStable()
+
+      if (started.needsProof) {
+        this.writeNetworkRecoveryAttestation(roomId, {
+          authorityId,
+          authoritySandboxId,
+          authorityStartedAt,
+          joinerId,
+          joinerStartedAt: started.startedAt,
+          authorityLabel: started.authorityLabel
+        })
+        await validateJoiner(started.startedAt, false)
+        await assertAuthorityStable()
+      }
+    } catch (error) {
+      if (!exactStartAttempted || !cleanupFailedStartedJoiner) throw error
+      try {
+        await cleanupFailedStartedJoiner()
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `${what} start validation and exact cleanup both failed`
+        )
+      }
+      throw error
     }
   }
 
@@ -6425,6 +6446,30 @@ export class OciCliBackend implements IsolationBackend {
     if (await this.inspectContainer(expectedId)) {
       throw new Error(`The exact misbound ${svc} container still exists after cleanup`)
     }
+  }
+
+  private async removeFailedStartedWeb(roomId: string, expectedId: string): Promise<void> {
+    const assertExactOwned = async (existing: DockerContainerInspect): Promise<void> => {
+      await this.assertRoomContainer(roomId, webName(roomId), 'web', existing)
+      if (exactFullContainerId(existing, roomId) !== expectedId) {
+        throw new Error('Refusing to clean up a replacement web container after start validation failed')
+      }
+    }
+
+    let existing = await this.inspectContainer(expectedId)
+    if (!existing) return
+    await assertExactOwned(existing)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await runDocker(['rm', '-f', expectedId], { timeoutMs: 30_000 })
+      } catch {
+        // Exact-ID re-inspection, not the transport response, decides cleanup.
+      }
+      existing = await this.inspectContainer(expectedId)
+      if (!existing) return
+      await assertExactOwned(existing)
+    }
+    throw new Error('The exact failed web container still exists after bounded cleanup')
   }
 
   private async listRoomContainers(roomId: string): Promise<ManagedRoomContainer[]> {

@@ -924,6 +924,7 @@ describe('OciCliBackend Room networks', () => {
     let serviceExists = false
     let creationToken = ''
     let serviceSandboxId = ''
+    let serviceAuthorityStartedAtLabel = runtimeStartedAt
     let controlNetworkId = CONTROL_NETWORK_ID
     let replaceControlOnServiceInspect = false
     mockedRunDocker.mockImplementation(async (args) => {
@@ -974,7 +975,7 @@ describe('OciCliBackend Room networks', () => {
                 'devhotel.role': 'svc-redis',
                 'devhotel.managed': '1',
                 [NETWORK_AUTHORITY_SANDBOX_LABEL]: runtimeSandboxId,
-                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: runtimeStartedAt,
+                [NETWORK_AUTHORITY_STARTED_AT_LABEL]: serviceAuthorityStartedAtLabel,
                 'devhotel.creation-token': creationToken
               } },
               State: { Status: 'running', StartedAt: '2026-09-02T00:00:02.000000001Z' },
@@ -1018,7 +1019,17 @@ describe('OciCliBackend Room networks', () => {
 
     mockedRunDocker.mockClear()
     serviceExists = false
+    serviceSandboxId = runtimeSandboxId
+    serviceAuthorityStartedAtLabel = '2026-09-02T00:00:00.500000001Z'
+    await expect(backend().createService('r1', 'redis', '8'))
+      .rejects.toThrow(/exact network namespace authority generation/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
+    expect(serviceExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    serviceExists = false
     serviceSandboxId = 'd'.repeat(64)
+    serviceAuthorityStartedAtLabel = runtimeStartedAt
     await expect(backend().createService('r1', 'redis', '8')).rejects.toThrow(/outside the exact Room namespace/)
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
     expect(serviceExists).toBe(false)
@@ -1257,7 +1268,10 @@ describe('OciCliBackend Room networks', () => {
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', serviceId])
   })
 
-  it('persists exact web and service rejoin proofs across an Android wake', async () => {
+  it.each([
+    ['empty joined SandboxID', ''],
+    ['non-empty joined SandboxID', 'e'.repeat(64)]
+  ])('persists exact web and service rejoin proofs across an Android wake with %s', async (_case, joinedSandboxId) => {
     const roomId = 'room1abc'
     const ids = {
       anchor: 'a'.repeat(64),
@@ -1279,12 +1293,17 @@ describe('OciCliBackend Room networks', () => {
     let anchorState = 'exited'
     let runtimeState = 'exited'
     let webState = 'exited'
+    let webExists = true
     let serviceState = 'exited'
     let serviceExists = true
     let runtimeSandbox = originalRuntimeSandbox
     let runtimeStartedAt = originalRuntimeStartedAt
     let webStartedAt = '2026-09-02T00:00:00.200000001Z'
     let serviceStartedAt = '2026-09-02T00:00:00.300000001Z'
+    let driftRuntimeAfterWebStart = false
+    let webStartResult = ok
+    let webRemoveResult = ok
+    let webRemoveDeletes = true
     const owned = (
       name: string,
       role: string,
@@ -1375,7 +1394,7 @@ describe('OciCliBackend Room networks', () => {
             stderr: ''
           }
         }
-        if (args[1] === webName(roomId) || args[1] === ids.web) {
+        if (webExists && (args[1] === webName(roomId) || args[1] === ids.web)) {
           return {
             code: 0,
             stdout: JSON.stringify([owned(
@@ -1385,7 +1404,7 @@ describe('OciCliBackend Room networks', () => {
               webState,
               webStartedAt,
               `container:${ids.runtime}`,
-              webState === 'running' ? '' : undefined,
+              webState === 'running' ? joinedSandboxId : undefined,
               originalRuntimeSandbox,
               originalRuntimeStartedAt
             )]),
@@ -1402,7 +1421,7 @@ describe('OciCliBackend Room networks', () => {
               serviceState,
               serviceStartedAt,
               `container:${ids.runtime}`,
-              serviceState === 'running' ? '' : undefined,
+              serviceState === 'running' ? joinedSandboxId : undefined,
               originalRuntimeSandbox,
               originalRuntimeStartedAt
             )]),
@@ -1421,6 +1440,10 @@ describe('OciCliBackend Room networks', () => {
         if (args[1] === ids.web) {
           webState = 'running'
           webStartedAt = '2026-09-02T00:00:03.000000001Z'
+          if (driftRuntimeAfterWebStart) {
+            runtimeStartedAt = '2026-09-02T00:00:06.000000001Z'
+          }
+          return webStartResult
         }
         if (args[1] === ids.service) {
           serviceState = 'running'
@@ -1431,6 +1454,10 @@ describe('OciCliBackend Room networks', () => {
       if (args[0] === 'rm' && args[2] === ids.service) {
         serviceExists = false
         return ok
+      }
+      if (args[0] === 'rm' && args[2] === ids.web) {
+        if (webRemoveDeletes) webExists = false
+        return webRemoveResult
       }
       if (args[0] === 'port') return { code: 0, stdout: '127.0.0.1:45123\n', stderr: '' }
       return ok
@@ -1453,8 +1480,52 @@ describe('OciCliBackend Room networks', () => {
     await expect(instance().startWeb(roomId)).rejects.toThrow(/network namespace authority generation/)
     await expect(instance().startService(roomId, 'redis')).rejects.toThrow(/network namespace authority generation/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+    expect(mockedRunDocker).not.toHaveBeenCalledWith(['rm', '-f', ids.web], { timeoutMs: 30_000 })
     expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', ids.service])
     expect(serviceExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    runtimeStartedAt = '2026-09-02T00:00:02.000000001Z'
+    webState = 'exited'
+    webStartedAt = '2026-09-02T00:00:00.500000001Z'
+    webExists = true
+    driftRuntimeAfterWebStart = true
+    await expect(instance().startWeb(roomId)).rejects.toThrow(/network authority changed during start/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', ids.web], { timeoutMs: 30_000 })
+    expect(webExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    runtimeStartedAt = '2026-09-02T00:00:02.000000001Z'
+    webState = 'exited'
+    webStartedAt = '2026-09-02T00:00:00.500000001Z'
+    webExists = true
+    webRemoveResult = { code: 1, stdout: '', stderr: 'lost remove response' }
+    await expect(instance().startWeb(roomId)).rejects.toThrow(/network authority changed during start/)
+    expect(webExists).toBe(false)
+
+    mockedRunDocker.mockClear()
+    runtimeStartedAt = '2026-09-02T00:00:02.000000001Z'
+    webState = 'exited'
+    webStartedAt = '2026-09-02T00:00:00.500000001Z'
+    webExists = true
+    webRemoveDeletes = false
+    await expect(instance().startWeb(roomId))
+      .rejects.toThrow(/Room web start validation and exact cleanup both failed/)
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm')).toHaveLength(2)
+    expect(webExists).toBe(true)
+
+    mockedRunDocker.mockClear()
+    runtimeStartedAt = '2026-09-02T00:00:02.000000001Z'
+    webState = 'exited'
+    webStartedAt = '2026-09-02T00:00:00.500000001Z'
+    webExists = true
+    driftRuntimeAfterWebStart = false
+    webStartResult = { code: 1, stdout: '', stderr: 'start response lost after transition' }
+    webRemoveResult = ok
+    webRemoveDeletes = true
+    await expect(instance().startWeb(roomId)).rejects.toThrow(/start exact Room web/)
+    expect(mockedRunDocker).toHaveBeenCalledWith(['rm', '-f', ids.web], { timeoutMs: 30_000 })
+    expect(webExists).toBe(false)
   })
 
   it('starts an exact-ID service with an empty joined sandbox and removes a non-empty mismatch', async () => {

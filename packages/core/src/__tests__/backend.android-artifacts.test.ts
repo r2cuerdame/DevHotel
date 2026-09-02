@@ -597,6 +597,7 @@ describe('OciCliBackend Android artifact export', () => {
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
     let emulatorSandboxId = ''
+    let webSandboxId = ''
     let driftEmulatorSandboxAfterCreate = false
     let abortOnRemove: AbortController | null = null
     let abortAfterHelperInspect: AbortController | null = null
@@ -657,7 +658,7 @@ describe('OciCliBackend Android artifact export', () => {
           : role === 'svc-emulator'
             ? { NetworkSettings: { SandboxID: emulatorSandboxId } }
             : role === 'web'
-              ? { NetworkSettings: { SandboxID: '' } }
+              ? { NetworkSettings: { SandboxID: webSandboxId } }
               : {}),
       ...(role === 'anchor' ? { HostConfig: { NetworkMode: androidControlNetworkName(ROOM_ID) } } : {}),
       ...(role === 'android-runtime-anchor' ? { HostConfig: { NetworkMode: roomNetworkName(ROOM_ID) } } : {}),
@@ -832,17 +833,21 @@ describe('OciCliBackend Android artifact export', () => {
     })
 
     mockedRunDocker.mockClear()
+    webSandboxId = ids.runtimeSandbox
     runtimeStartedAt = '2026-09-02T00:00:01.200000001Z'
     await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/exact network namespace authority generation/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+    webSandboxId = ''
     runtimeStartedAt = runtimeGenerationStartedAt
 
     mockedRunDocker.mockClear()
+    emulatorSandboxId = ids.sandbox
     controlStartedAt = '2026-09-02T00:00:01.100000001Z'
     await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/exact network namespace authority generation/)
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+    emulatorSandboxId = ''
     controlStartedAt = controlGenerationStartedAt
 
     mockedRunDocker.mockClear()
