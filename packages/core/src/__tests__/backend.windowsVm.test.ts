@@ -36,7 +36,9 @@ function canonical(candidate: string): string {
   return realpathSync.native(candidate)
 }
 
-function createHarness(opts: { cloneAliasesTemplate?: boolean; secondCloneFails?: boolean } = {}) {
+function createHarness(
+  opts: { cloneAliasesTemplate?: boolean; secondCloneFails?: boolean; guestIgnoresSoftStop?: boolean } = {}
+) {
   const root = tempRoot()
   const userData = path.join(root, 'user-data')
   const templateDir = path.join(root, 'template')
@@ -97,6 +99,15 @@ function createHarness(opts: { cloneAliasesTemplate?: boolean; secondCloneFails?
         await mkdir(path.dirname(target), { recursive: true })
         if (opts.cloneAliasesTemplate) await link(templateVmxPath, target)
         else await writeFile(target, readFileSync(templateVmxPath, 'utf8'), 'utf8')
+        // Workstation records every linked clone in the template's snapshot
+        // dictionary; the baseline must survive its own clone.
+        await writeFile(
+          path.join(templateDir, 'base.vmsd'),
+          `numSnapshots = "2"
+snapshot0.numClones = "${cloneCount}"
+`,
+          'utf8'
+        )
         return ok()
       }
       case 'disableSharedFolders':
@@ -108,6 +119,8 @@ function createHarness(opts: { cloneAliasesTemplate?: boolean; secondCloneFails?
       }
       case 'stop': {
         const vmx = args[1]
+        // A guest with no Tools (installing, hung, or bare) never answers a soft stop.
+        if (opts.guestIgnoresSoftStop && args[2] === 'soft') return { code: -1, stdout: '', stderr: 'timed out' }
         if (vmx) running.delete(path.resolve(vmx))
         return ok()
       }
@@ -405,8 +418,37 @@ describe('WindowsVmBackend owned lifecycle', () => {
 
     await expect(backend.validateBaseline('room1abc')).resolves.toMatchObject({ ok: false })
     await expect(backend.reset('room1abc')).rejects.toThrow(/fingerprint changed/)
+    // The refusal happened before anything was touched, so the Room is still the
+    // healthy Room it was; only an interrupted recreate may leave it broken.
     const marker = JSON.parse(await readFile(path.join(roomDir, 'ownership.json'), 'utf8')) as { status: string }
-    expect(marker.status).toBe('broken')
+    expect(marker.status).toBe('ready')
+  })
+
+  it('powers a Room off when the guest never answers the soft stop', async () => {
+    const { backend, calls, templateVmxPath, roomVmxPath } = createHarness({ guestIgnoresSoftStop: true })
+    await backend.create({ roomId: 'room1abc', templateVmxPath, snapshot: 'Clean Base' })
+    await backend.start('room1abc')
+
+    await backend.sleep('room1abc')
+
+    const stops = calls.filter((call) => call.args[0] === 'stop').map((call) => call.args)
+    expect(stops).toEqual([
+      ['stop', canonical(roomVmxPath), 'soft'],
+      ['stop', canonical(roomVmxPath), 'hard']
+    ])
+    await expect(backend.state('room1abc')).resolves.toBe('stopped')
+  })
+
+  it('survives its own clone: the template snapshot dictionary is not part of the baseline', async () => {
+    const { backend, templateVmxPath, roomDir } = createHarness()
+    await backend.create({ roomId: 'room1abc', templateVmxPath, snapshot: 'Clean Base' })
+
+    // Creating the linked clone rewrote the template's .vmsd. That is Workstation's
+    // own bookkeeping, not a change to the baseline the Room was cut from.
+    await expect(backend.validateBaseline('room1abc')).resolves.toMatchObject({ ok: true })
+    await expect(backend.reset('room1abc')).resolves.toMatchObject({ roomId: 'room1abc', snapshot: 'Clean Base' })
+    const marker = JSON.parse(await readFile(path.join(roomDir, 'ownership.json'), 'utf8')) as { status: string }
+    expect(marker.status).toBe('ready')
   })
 
   it('keeps a broken ownership marker when reset recloning fails', async () => {
