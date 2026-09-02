@@ -174,7 +174,12 @@ export class FakeBackend implements IsolationBackend {
       volumeSetSha256: 'b'.repeat(64),
       networkAuthorityId: 'a'.repeat(64),
       networkId: 'c'.repeat(64),
-      ...(!spec.standalone ? { networkSandboxId: 'd'.repeat(64) } : {})
+      ...(!spec.standalone
+        ? {
+            networkSandboxId: 'd'.repeat(64),
+            networkAuthorityStartedAt: '2026-09-02T00:00:00.100000001Z'
+          }
+        : {})
     }
     this.roomArtifactWebFenceValue = fence
     return fence
@@ -246,10 +251,10 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`webRunningUnpaused:${roomId}`)
     return this.webRunningUnpausedValue
   }
-  async restartWeb(roomId: string) {
+  async restartWeb(roomId: string, _spec?: WebSpec) {
     this.calls.push(`restartWeb:${roomId}`)
   }
-  async recreateWeb(spec: WebSpec) {
+  async recreateWeb(spec: WebSpec, _expectedWebId?: string) {
     this.calls.push(`recreateWeb:${spec.roomId}:node${spec.nodeMajor}:${spec.depsVolumeOverride ?? 'default'}`)
     this.lastWebSpec = spec
     this.webPausedValue = false

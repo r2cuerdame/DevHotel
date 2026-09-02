@@ -107,6 +107,8 @@ export interface RoomArtifactWebRuntimeFence {
   networkId: string
   /** Exact live namespace identity when the authority is another container. */
   networkSandboxId?: string
+  /** Canonical raw OCI start generation when the authority is another container. */
+  networkAuthorityStartedAt?: string
 }
 
 export type RoomArtifactPublicationFailureReason =
@@ -163,8 +165,8 @@ export interface IsolationBackend {
   webPaused(roomId: string): Promise<boolean>
   /** One owned-container inspect proving the web workload is both running and not paused. */
   webRunningUnpaused(roomId: string): Promise<boolean>
-  restartWeb(roomId: string): Promise<void>
-  recreateWeb(spec: WebSpec): Promise<void>
+  restartWeb(roomId: string, spec?: WebSpec): Promise<void>
+  recreateWeb(spec: WebSpec, expectedWebId?: string): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
   deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }>
   execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult>
