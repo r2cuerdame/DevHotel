@@ -1,6 +1,176 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-03
+
+### Windows Rooms, on VMware Workstation
+
+The third Room kind. A Room-owned Windows VM is a linked clone of a Workstation
+template snapshot, so a Room costs a snapshot rather than a full disk copy.
+
+- **Guided setup** finds Workstation, validates the template and its snapshot,
+  and says in your own language why it cannot proceed when it cannot — rather
+  than relaying the registry's English prose.
+- **Fail-closed VMX authoring.** The Room's VMX is written from a known-good
+  baseline (EFI, pciBridge, no shared folders, no dragged-in Host devices);
+  anything unrecognised stops the Room instead of being passed through.
+- **Lifecycle that survives a real machine.** Sleep asks the guest to shut down
+  and escalates to a hard stop only after 45 seconds, and Clean reset validates
+  before it starts so a refusal no longer leaves the Room marked broken.
+- **Opening the VMware console is a named capability**, not a side effect. It is
+  a real Host window that takes the cursor and keyboard while focused, so it is
+  user-only — an Agent asking for it is refused and the Agent REST surface has
+  no route for it — and every use is journaled to the Room's log.
+
+Guest exec and file ingress remain deliberately later capabilities.
+
+### Android Rooms drive themselves, and can prove what happened
+
+An Android Room could build and launch. It could not be asked what the screen
+then did, so an agent's only evidence was its own optimism.
+
+- **Primitives, all Room-scoped**: `android_run`, `android_launch_app`,
+  `android_force_stop`, `android_screenshot`, `android_dump_ui`,
+  `android_tap_text`, `android_wait_for_text`, `android_logcat`, and
+  `android_device_adb` for the bounded rest.
+- **Actions are witnessed, not assumed.** A tap or a wait is proven against the
+  device's own log rather than against the fact that a command exited zero, so
+  "it worked" and "adb accepted it" stop being the same sentence.
+- **Every adb command runs behind a fence.** A per-command helper container
+  joined to the emulator's network namespace, with all capabilities dropped, no
+  new privileges, a read-only root, an owner-checked private socket, and an
+  immutable-ID topology proof taken before and after. No TCP, no `localhost`,
+  no second serial.
+- **Screenshots outlive the call that took them.** Captures are published as
+  durable Room artifacts and MCP returns receipts; `list_room_artifacts`,
+  `read_room_artifact` and `export_room_artifact` fetch pixels when pixels are
+  actually wanted, so an image can no longer be lost to a message limit.
+
+### A screenshot in every language the app claims to support
+
+`android_locale_screenshot_matrix` walks an app's locales and captures each one.
+
+- It uses Android's **app-scoped** `LocaleManager` (API 33+). It never runs
+  `adb root`, never restarts adbd or the framework, never changes system
+  properties, and never clears application data — the device's own locale is
+  not touched.
+- There is deliberately no public persistent locale setter. Every matrix
+  restores the original app locale and re-proves the restore before returning.
+- A matrix interrupted by a crash leaves a recovery intent rather than a
+  half-changed app, and the intent gates mutations until it is recovered or
+  explicitly abandoned with `abandon_android_locale_matrix_recovery`.
+
+See [Android locale matrix](./docs/android-locale-matrix.md).
+
+### An acceptance run leaves a receipt somebody else can check
+
+`android_create_acceptance_report` assembles an immutable, Room-scoped receipt
+from evidence DevHotel can reverify — never a transcript.
+
+- Two stages with different rules. `development` always uses the Room emulator
+  and rejects a physical target outright. `final-physical` requires an explicit
+  device id and the exact active lease whose purpose is `acceptance`; there is
+  no emulator fallback, so a report cannot quietly downgrade its own evidence.
+- Both stages authenticate the digest-pinned build image, the exact tracked APK
+  a verified `android_run` installed, its sealed Room-generation provenance, and
+  every cited evidence object.
+- A report contains no raw commands, no log text, no adb serials, no lease
+  capabilities, and no Host paths. Private inputs are authenticated by
+  installation-local HMAC identities instead of being published.
+
+See [Android acceptance reports](./docs/android-acceptance-reports.md).
+
+### One USB phone, many projects
+
+`adb` has no notion of ownership: two projects that both run `adb install` reach
+the same device, and the second silently overwrites the first one's app,
+foreground activity and logcat. The test that fails afterwards looks like a
+product bug.
+
+- A physical phone is now a **Hotel Service**, lent to exactly one Room at a
+  time under an exclusive lease that records who holds it, for which run, and
+  why. Everyone else queues with the owner and their own position visible.
+- **A dead worker does not strand the phone.** Leases carry heartbeat and
+  activity, and a lease whose owner is provably gone is reclaimed.
+- **The broker never cleans up after you.** No `adb uninstall`, no `pm clear`,
+  no data wipe — not on release, not on stale recovery. The verified build stays
+  installed, so a human can pick the phone up and open what was just verified.
+- **Wireless pairing without leaking the code.** Pairing codes, ports, endpoints
+  and mDNS service names are masked everywhere diagnostics can reach, including
+  inside structured responses, and pairing requires explicit consent rather than
+  happening because a device appeared.
+- Development stays on each Room's own emulator, which is never brokered. The
+  phone is for the final acceptance run.
+
+See [Android Device Broker](./docs/android-device-broker.md).
+
+### A Room that says it is ready is ready
+
+- Room status is revalidated against the live runtime before it is reported, so
+  a Room whose containers died while the app was closed no longer greets you as
+  `ready` and then fails on the first command.
+- Stale Rooms are recovered at startup instead of sitting in a state only a
+  restart could clear, and the preview refuses to attach to a runtime that is
+  not actually there.
+- **Docker 29 joined network namespaces are recovered.** A Room whose web
+  container shares the anchor's namespace could be left unstartable by an engine
+  restart; that topology is now repaired rather than diagnosed.
+
+### The emulator is asked, not assumed
+
+Four failures found by running the thing on a real machine rather than by
+reading it:
+
+- **`android_run` could not launch anything.** The focus probe read a `dumpsys`
+  section that no longer carries the focus line, so every launch failed with
+  "cannot tell which app has the screen". It now asks the section that still
+  has it.
+- **Boot was watched through a helper per poll.** Waiting for an emulator to
+  finish booting now holds one helper and one server for the whole deadline, and
+  reports what it actually saw — ADB state, `sys.boot_completed`, the last adb
+  and helper exit codes — instead of only that it gave up.
+- **The screen witness had a budget its own retries could not fit inside**, so
+  it timed out while still working correctly. Both the readiness budget and the
+  per-action budget are now derived from what a round trip actually costs.
+- **The Android topology is read in one `docker inspect`** instead of one per
+  container, and `DEVHOTEL_FENCE_TIMING=1` makes the cost of a fenced command
+  measurable rather than a matter of opinion.
+
+### Private repositories clone, and the token is never stored
+
+The repository URL field had no credential affordance, so a private repo simply
+could not be cloned. Pasting a token into it is the obvious answer and the wrong
+one on its own: the URL is persisted to the Room record, `manifest.yaml`, the
+gateway view and the logs.
+
+- A pasted `https://user:token@host/repo.git` is **split before anything is
+  stored**. The secret clones that Room; the Room keeps the clean URL.
+- For github.com, a clone uses the credential already connected to the GitHub
+  Service, so nothing has to be pasted at all.
+- The secret reaches git over the container's **stdin**, read by a single-quoted
+  credential helper — never argv (which `docker inspect` exposes), never the
+  environment, never disk.
+- Diagnostics mask URL userinfo, so a credential that reaches a log by some
+  other path does not survive being copied out of one.
+
+### Running a command is not proof that a Room diverged
+
+`execInRoom` and the terminal marked the workspace modified *before* running, so
+`ls` turned a Room amber and sent you looking for a conflict that was not there.
+
+- The state revision still moves — a later undo compares against it before
+  discarding work — but the sync label no longer does.
+- Change apply and undo stop inferring divergence from the kind of change, too.
+  `android_run` writes only build outputs, which are not part of a Room's
+  content identity, so they ask the fingerprint instead. The label you read and
+  the answer the sync gate gives can no longer disagree.
+
+### `android_run` says what it ran on and what it installed
+
+The result named neither, so the next call had to guess — and the obvious guess,
+`localhost:5555`, is the same emulator under a second serial, which makes Gradle
+run every instrumentation test twice. A run now reports `adbSerial` for an
+emulator, `device` for a leased phone (which is reached through the broker and
+never by serial), plus `launchedApplicationId` and `installedApplicationIds`.
 
 ### Host resync is one guarded decision
 
