@@ -107,7 +107,9 @@ const FINAL_LOCALE_PULSE_SCRIPT = [
   'uid_record="$(pm list packages -U --user "$user" "$app")"',
   'uid_owners="$(pm list packages -U --user "$user" --uid "$uid")"',
   'locale_value="$(cmd locale get-app-locales "$app" --user "$user")"',
-  'focus_value="$(dumpsys window windows)"',
+  // Same reason as the foreground probe: on API 34 the `windows` section is
+  // truncated before it reaches `mCurrentFocus=`, so the evidence would be blank.
+  'focus_value="$(dumpsys window displays)"',
   'set +e',
   'pids_value="$(pgrep -u "$uid" 2>/dev/null)"',
   'pgrep_status="$?"',
@@ -219,7 +221,7 @@ export function isPhysicalAcceptanceProofReadCommand(
       return args.length === 3 && args[0] === 'shell' && args[1] === 'sha256sum' && apk(args[2])
     case 'Android foreground probe':
       return args.length === 4 && args[0] === 'shell' && args[1] === 'sh' && args[2] === '-c' &&
-        args[3] === 'exec dumpsys window windows'
+        args[3] === 'exec dumpsys window displays'
     case 'Android live API level probe':
       return args.length === 3 && args[0] === 'shell' && args[1] === 'getprop' &&
         args[2] === 'ro.build.version.sdk'
@@ -1128,8 +1130,13 @@ export class AndroidAutomationSession {
   ): Promise<AndroidForegroundPackage | null | undefined> {
     let result: ExecResult
     try {
+      // `dumpsys window windows` is the wrong section to ask on a modern
+      // Android: on API 34 it truncates at 32000 bytes and the focus line —
+      // which sits at the end — is simply absent, so a correctly launched,
+      // visibly foreground app reads as "no window has focus". `displays`
+      // carries exactly one `mCurrentFocus=` line and is a quarter the size.
       result = await this.command(
-        ['shell', 'sh', '-c', 'exec dumpsys window windows'],
+        ['shell', 'sh', '-c', 'exec dumpsys window displays'],
         {
           operation: 'Android foreground probe',
           timeoutMs: 15_000,
