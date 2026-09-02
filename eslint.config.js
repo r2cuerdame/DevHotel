@@ -2,7 +2,20 @@ import js from '@eslint/js'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/out/**', '**/release/**', '**/node_modules/**', 'examples/**'] },
+  // Keep this in step with .gitignore: local packaging writes `release/` *and*
+  // `apps/desktop/release-<something>/`, and linting a bundled build turns a
+  // clean checkout into 139 errors that belong to nobody.
+  {
+    ignores: [
+      '**/dist/**',
+      '**/out/**',
+      '**/release/**',
+      '**/release-*/**',
+      '**/win-unpacked/**',
+      '**/node_modules/**',
+      'examples/**'
+    ]
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
