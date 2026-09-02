@@ -595,6 +595,11 @@ describe('OciCliBackend Android artifact export', () => {
     let controlStartedAt = controlGenerationStartedAt
     let runtimeStartedAt = runtimeGenerationStartedAt
     let helper: Record<string, unknown> | null = null
+    // A Room can hold a resident helper and a one-shot helper at once: boot
+    // waits, installs and abortable commands keep the one-shot path by design.
+    // `helper` stays the one-shot slot, so assertions about it keep their meaning.
+    const residentHelperId = '7'.repeat(64)
+    let residentHelper: Record<string, unknown> | null = null
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
     let helperUser = '0:0'
@@ -692,6 +697,9 @@ describe('OciCliBackend Android artifact export', () => {
         }
       }
       if (args[0] === 'inspect') {
+        if (residentHelper && (args[1] === residentHelperId || args[1] === (residentHelper['Name'] as string).slice(1))) {
+          return { code: 0, stdout: JSON.stringify([residentHelper]), stderr: '' }
+        }
         if (args[1] === webName(ROOM_ID) || args[1] === ids.web) {
           return { code: 0, stdout: inspect(webName(ROOM_ID), 'web', ids.web, true), stderr: '' }
         }
@@ -720,6 +728,24 @@ describe('OciCliBackend Android artifact export', () => {
       }
       if (args[0] === 'image' && args[1] === 'inspect') return ok
       if (args[0] === 'create') {
+        if (args.includes('devhotel-fenced-resident')) {
+          const residentName = args[args.indexOf('--name') + 1]!
+          const residentToken = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
+          residentHelper = {
+            Id: residentHelperId,
+            Image: TEST_EMULATOR_IMAGE_ID,
+            Name: `/${residentName}`,
+            Config: { User: '0:0', Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'job',
+              'devhotel.managed': '1',
+              'devhotel.abort-token': residentToken
+            } },
+            State: { Status: 'created' },
+            HostConfig: { NetworkMode: `container:${ids.emulator}` }
+          }
+          return { code: 0, stdout: `${residentHelperId}\n`, stderr: '' }
+        }
         const name = args[args.indexOf('--name') + 1]!
         const token = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
         helper = {
@@ -749,15 +775,11 @@ describe('OciCliBackend Android artifact export', () => {
           ? { code: -1, stdout: `${ids.helper}\n`, stderr: '', outputLimitExceeded: true }
           : { code: 0, stdout: `${ids.helper}\n`, stderr: '' }
       }
-      if (args[0] === 'exec') {
-        // The resident helper answers on the private server it already holds.
-        opts?.onStdout?.(Buffer.alloc(SCREENSHOT_BASE64_LIMIT - 1, 0x61))
-        return ok
-      }
+      if (args[0] === 'exec') return ok
       if (args[0] === 'start') {
-        // A detached start leaves the container running, and the resident proof
-        // depends on the next inspect seeing that. `start -a` is the one-shot path.
-        if (helper && !args.includes('-a')) helper['State'] = { Status: 'running' }
+        // Real docker leaves a detached start running, and the resident
+        // proof depends on the next inspect seeing that.
+        if (residentHelper && args[1] === residentHelperId) residentHelper['State'] = { Status: 'running' }
         if (bootStart) {
           opts?.onStdout?.(bootReceipt)
           if (replaceEmulatorAfterStart) emulatorReplaced = true
@@ -789,6 +811,10 @@ describe('OciCliBackend Android artifact export', () => {
         return ok
       }
       if (args[0] === 'rm') {
+        if (args[2] === residentHelperId) {
+          residentHelper = null
+          return ok
+        }
         if (cleanupFailureStderr) return { code: 1, stdout: '', stderr: cleanupFailureStderr }
         helper = null
         abortOnRemove?.abort()
@@ -817,20 +843,15 @@ describe('OciCliBackend Android artifact export', () => {
     const create = createCall[0]
     const start = startCall[0]
     const startOpts = startCall[1]
-    // The resident helper is created once per Room and commands run through
-    // `docker exec` into it, so the fencing flags are asserted on its create and
-    // the per-command argv on its exec. A shared helper cannot size its scratch
-    // per command, so the tmpfs is the ceiling one command may request.
     expect(create).toEqual(expect.arrayContaining([
       '--network', `container:${ids.emulator}`,
       '--user', '0:0',
       '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges',
-      '--read-only',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=23m',
       '--entrypoint', '/bin/sh',
       ids.emulatorImage
     ]))
-    expect(create.some((arg) => /^\/tmp:rw,nosuid,nodev,noexec,size=\d+m$/.test(arg))).toBe(true)
     expect(create).not.toContain(`container:${ids.anchor}`)
     expect(create).not.toContain(`container:${anchorName(ROOM_ID)}`)
     expect(create).not.toContain('/workspace')
@@ -841,23 +862,17 @@ describe('OciCliBackend Android artifact export', () => {
     expect(script).toContain('ANDROID_SDK_ROOT=/opt/android')
     expect(script).not.toContain('/opt/android-sdk')
     expect(script).toContain('localfilesystem:$socket_path')
-    // The device selector and the caps belong to one command, so they live on the
-    // exec that carries it rather than on the helper that outlives it.
-    const execCall = mockedRunDocker.mock.calls.find(([callArgs]) => callArgs[0] === 'exec')!
-    const execArgs = execCall[0]
-    const execScript = execArgs[execArgs.indexOf('-c') + 1]!
-    expect(execArgs).toEqual(expect.arrayContaining(['exec', '--user', '0:0', ids.helper]))
-    expect(execScript).toContain('-s emulator-5554 "$@"')
-    expect(execScript).toContain('head -c "$((stdout_limit + 1))" < "$stdout_pipe" &')
-    expect(execScript).toContain('head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &')
-    expect(execScript).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
-    expect(execArgs.slice(-3)).toEqual(['shell', 'getprop', 'sys.boot_completed'])
+    expect(script).toContain('"$adb" -L "$socket" -s emulator-5554')
     expect(script).toContain('[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ]')
     expect(script).toContain('[ -S "$socket_path" ]')
     expect(script).toContain('run_adb kill-server')
+    expect(script).toContain('head -c "$((stdout_limit + 1))" < "$stdout_pipe" &')
+    expect(script).toContain('head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &')
     expect(script).not.toContain('stdout_file=')
     expect(script).not.toContain('stderr_file=')
     expect(script).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
+    expect(create.slice(-4)).toEqual(['command', 'shell', 'getprop', 'sys.boot_completed'])
+    expect(create).toEqual(expect.arrayContaining(['shell', 'getprop', 'sys.boot_completed']))
     expect(createCall[1]).toMatchObject({
       timeoutMs: null,
       maxStdoutBytes: 128,
@@ -866,15 +881,13 @@ describe('OciCliBackend Android artifact export', () => {
     })
     expect(createCall[1]?.signal).toBeUndefined()
     expect(createCall[1]?.onAbort).toBeUndefined()
-    // The resident helper is started detached and outlives the command; the
-    // caller's timeout, abort signal and output caps ride on the exec that
-    // carries the command, which is where they can still bound it.
-    expect(start).toEqual(['start', ids.helper])
-    expect(execCall[1]).toMatchObject({
+    expect(start).toEqual(['start', '-a', ids.helper])
+    expect(startOpts).toMatchObject({
       timeoutMs: 20_000,
       signal: controller.signal,
       maxStdoutBytes: SCREENSHOT_BASE64_LIMIT,
-      maxStderrBytes: 64
+      maxStderrBytes: 64,
+      onAbort: expect.any(Function)
     })
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'image' || args[0] === 'pull')).toBe(false)
 
@@ -1215,6 +1228,11 @@ describe('OciCliBackend Android artifact export', () => {
     const emulatorStartedAt = '2026-09-02T00:00:00.300000001Z'
     const webStartedAt = '2026-09-02T00:00:00.400000001Z'
     let helper: Record<string, unknown> | null = null
+    // A Room can hold a resident helper and a one-shot helper at once: boot
+    // waits, installs and abortable commands keep the one-shot path by design.
+    // `helper` stays the one-shot slot, so assertions about it keep their meaning.
+    const residentHelperId = '7'.repeat(64)
+    let residentHelper: Record<string, unknown> | null = null
     const inspect = (name: string, role: string, paused = false) => JSON.stringify([{
       Id: role === 'anchor'
         ? ids.anchor
@@ -1292,6 +1310,9 @@ describe('OciCliBackend Android artifact export', () => {
         }
       }
       if (args[0] === 'inspect') {
+        if (residentHelper && (args[1] === residentHelperId || args[1] === (residentHelper['Name'] as string).slice(1))) {
+          return { code: 0, stdout: JSON.stringify([residentHelper]), stderr: '' }
+        }
         const name = args[1]!
         if (name === webName(ROOM_ID) || name === ids.web) {
           return { code: 0, stdout: inspect(webName(ROOM_ID), 'web', true), stderr: '' }
@@ -1314,6 +1335,23 @@ describe('OciCliBackend Android artifact export', () => {
       if (args[0] === 'create') {
         const name = args[args.indexOf('--name') + 1]!
         const token = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
+        if (args.includes('devhotel-fenced-resident')) {
+          residentHelper = {
+            Id: residentHelperId,
+            Image: TEST_EMULATOR_IMAGE_ID,
+            Name: `/${name}`,
+            Config: { User: '0:0', Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'job',
+              'devhotel.managed': '1',
+              'devhotel.abort-token': token
+            } },
+            State: { Status: 'created' },
+            HostConfig: { NetworkMode: `container:${ids.emulator}` }
+          }
+          return { code: 0, stdout: `${residentHelperId}
+`, stderr: '' }
+        }
         helper = {
           Id: ids.helper,
           Image: TEST_EMULATOR_IMAGE_ID,
@@ -1332,7 +1370,17 @@ describe('OciCliBackend Android artifact export', () => {
         }
         return { code: 0, stdout: `${ids.helper}\n`, stderr: '' }
       }
+      if (args[0] === 'exec') {
+        // The cap has to hold wherever the command runs, so the resident path
+        // over-produces exactly like the one-shot start does.
+        opts?.onStdout?.('abcdefgh')
+        opts?.onStdout?.('must-not-pass')
+        return ok
+      }
       if (args[0] === 'start') {
+        // Real docker leaves a detached start running, and the resident proof
+        // depends on the next inspect seeing that.
+        if (residentHelper && args[1] === residentHelperId) residentHelper['State'] = { Status: 'running' }
         opts?.onStdout?.('abcdefgh')
         opts?.onStdout?.('must-not-pass')
         return ok

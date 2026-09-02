@@ -3754,7 +3754,12 @@ export class OciCliBackend implements IsolationBackend {
     // A plain command against a proved emulator can run in the Room's resident
     // helper. An install cannot: it needs its own read-only bind mount of a
     // Host-private APK, so it keeps building a helper of its own.
-    if (mode === 'command' && !hostApkPath && !recoveryOnly) {
+    // A command the caller can abort keeps the one-shot helper: throwing the
+    // container away is what guarantees the command inside it actually stopped,
+    // and killing a `docker exec` client leaves its process running in a shared
+    // helper. The witness reader is exactly that kind of command. Everything
+    // else — the short proofs that dominate an action — reuses the helper.
+    if (mode === 'command' && !hostApkPath && !recoveryOnly && !opts.signal) {
       const resident = (await this.liveResidentFencedHelper(roomId, emulatorId, emulatorImageId)) ??
         (await this.startResidentFencedHelper(roomId, emulatorId, emulatorImageId, reproveTopology))
       if (resident) {
