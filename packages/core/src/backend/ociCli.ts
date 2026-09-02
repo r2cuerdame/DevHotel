@@ -89,6 +89,9 @@ const FENCED_EMULATOR_BOOT_TIMEOUT_MS = 5 * 60_000
 const FENCED_EMULATOR_BOOT_STDOUT_BYTES = 256
 const FENCED_EMULATOR_BOOT_STDERR_BYTES = 1024
 const FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS = 10_000
+/** How long a resident helper waits for another command before reaping itself. */
+const FENCED_EMULATOR_RESIDENT_IDLE_SECONDS = 120
+const FENCED_EMULATOR_RESIDENT_STATE = '/tmp/devhotel-fenced-resident'
 const FENCED_EMULATOR_BOOT_RECEIPT = /^devhotel-emulator-boot-v1\t(ready|timeout)\t(device|offline|unauthorized|missing|unknown)\t(1|empty|other)\t(0|[1-9]\d{0,2})$/
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
@@ -455,6 +458,75 @@ if [ "$destination_present" -eq 1 ]; then
 fi
 printf 'devhotel-room-artifact-finalize-v1\\tabsent\\n'
 exit ${ROOM_ARTIFACT_FINALIZE_ABSENT_EXIT}`
+
+/**
+ * A resident fenced helper: the same private ADB server the one-shot helper sets
+ * up, kept alive so the next command does not have to build a container to ask
+ * one question. It self-reaps after an idle period so a crashed DevHotel cannot
+ * leave a root shell sitting in the emulator's namespace forever.
+ *
+ * Every security property of the one-shot helper is a property of *this*
+ * container — private netns with no published ADB port, ALL caps dropped,
+ * no-new-privileges, read-only rootfs, owner-checked socket — and none of them
+ * came from rebuilding it per command.
+ */
+const FENCED_EMULATOR_RESIDENT_SCRIPT = `set -eu
+state=$1
+idle_seconds=$2
+socket_path=$state/server.sock
+socket=localfilesystem:$socket_path
+adb=/opt/android/platform-tools/adb
+run_adb() {
+  env -i \
+    HOME="$state/home" \
+    TMPDIR="$state/tmp" \
+    PATH=/opt/android/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android \
+    ADB_SERVER_SOCKET="$socket" \
+    "$adb" -L "$socket" "$@"
+}
+cleanup() {
+  if [ -S "$socket_path" ]; then run_adb kill-server >/dev/null 2>&1 || true; fi
+  rm -rf -- "$state"
+}
+trap cleanup EXIT HUP INT TERM
+rm -rf -- "$state"
+mkdir -m 700 -p "$state/home" "$state/tmp"
+[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
+run_adb start-server >/dev/null 2>&1
+[ -S "$socket_path" ] || exit 71
+[ "$(stat -c %u "$socket_path")" = "$(id -u)" ] || exit 72
+ready=0
+i=0
+while [ "$i" -lt 40 ]; do
+  if [ "$(run_adb -s emulator-5554 get-state 2>/dev/null || true)" = device ]; then ready=1; break; fi
+  i=$((i + 1))
+  sleep 0.25
+done
+[ "$ready" -eq 1 ] || exit 73
+printf 'devhotel-fenced-resident-ready\n'
+# Hold the server open. The touch file lets each command extend the lease.
+touch "$state/lease"
+while [ -e "$state/lease" ]; do
+  now=$(date +%s)
+  seen=$(stat -c %Y "$state/lease")
+  [ "$((now - seen))" -lt "$idle_seconds" ] || break
+  sleep 1
+done`
+
+/** One command against the resident helper's already-running private server. */
+const FENCED_EMULATOR_RESIDENT_COMMAND = `set -eu
+state=$1
+command_timeout=$2
+shift 2
+touch "$state/lease"
+exec timeout -k 1 "$command_timeout" env -i \
+  HOME="$state/home" \
+  TMPDIR="$state/tmp" \
+  PATH=/opt/android/platform-tools:/usr/bin:/bin \
+  ANDROID_SDK_ROOT=/opt/android \
+  ADB_SERVER_SOCKET="localfilesystem:$state/server.sock" \
+  /opt/android/platform-tools/adb -L "localfilesystem:$state/server.sock" -s emulator-5554 "$@"`
 
 const FENCED_EMULATOR_ADB_SCRIPT = `set -eu
 state=$1
@@ -1365,6 +1437,8 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async stopRoomPod(roomId: string): Promise<void> {
+    // The resident helper lives inside the emulator's namespace; it goes with it.
+    await this.reapResidentFencedHelper(roomId)
     await this.assertPinnedEngineIdentity()
     const containers = await this.listRoomContainers(roomId)
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
@@ -1773,6 +1847,8 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }> {
+    // The resident helper lives inside the emulator's namespace; it goes with it.
+    await this.reapResidentFencedHelper(roomId)
     await this.assertPinnedEngineIdentity()
     let reclaimedBytes = 0
     let ownedVolumes: string[] = []
@@ -3473,6 +3549,112 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
+  /**
+   * Resident fenced helpers, one per Room. A witnessed Android action issues
+   * dozens of ADB commands, and building a container for each one cost ~88% of
+   * every command — measured at 39 helpers and ~143s for a single UI dump,
+   * which no action budget can hold. The helper is built once and re-proved on
+   * every command; what changes is that it is not *rebuilt*.
+   */
+  private readonly residentFencedHelpers = new Map<string, { id: string; name: string; abortToken: string; emulatorId: string }>()
+
+  /**
+   * The resident helper for this Room, still provably ours and still joined to
+   * the emulator we just proved. Anything unexpected drops the record and falls
+   * back to building one — a stale helper is never reused on a hunch.
+   */
+  private async residentFencedHelperIsOurs(
+    roomId: string,
+    emulatorId: string,
+    emulatorImageId: string
+  ): Promise<boolean> {
+    const known = this.residentFencedHelpers.get(roomId)
+    if (!known || known.emulatorId !== emulatorId) return false
+    const container = await this.inspectContainer(known.id)
+    return container !== null &&
+      this.isOwnedFencedJob(container, roomId, known.name, known.abortToken) &&
+      exactContainerId(container, roomId) === known.id &&
+      container.State?.Status === 'running' &&
+      container.HostConfig?.NetworkMode === `container:${emulatorId}` &&
+      container.Config?.User === '0:0' &&
+      exactDockerImageContentId(container.Image, 'Fenced emulator ADB helper') === emulatorImageId
+  }
+
+  private async liveResidentFencedHelper(
+    roomId: string,
+    emulatorId: string,
+    emulatorImageId: string
+  ): Promise<string | null> {
+    const known = this.residentFencedHelpers.get(roomId)
+    if (!known) return null
+    if (await this.residentFencedHelperIsOurs(roomId, emulatorId, emulatorImageId)) return known.id
+    await this.reapResidentFencedHelper(roomId)
+    return null
+  }
+
+  /** Build the resident helper and prove it before anything is run through it. */
+  private async startResidentFencedHelper(
+    roomId: string,
+    emulatorId: string,
+    emulatorImageId: string,
+    reproveTopology: () => Promise<void>
+  ): Promise<string | null> {
+    const id = randomUUID()
+    const name = jobName(roomId, id)
+    const abortToken = randomUUID()
+    let helperId: string | undefined
+    try {
+      const created = await runDocker(
+        [
+          'create', '--name', name, '--user', '0:0',
+          '--network', `container:${emulatorId}`,
+          '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--read-only',
+          '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
+          '-l', `devhotel.room=${roomId}`, '-l', 'devhotel.role=job', '-l', 'devhotel.managed=1',
+          '-l', `devhotel.abort-token=${abortToken}`,
+          '-e', `ADB_SERVER_SOCKET=localfilesystem:${FENCED_EMULATOR_RESIDENT_STATE}/server.sock`,
+          '--entrypoint', '/bin/sh',
+          emulatorImageId,
+          '-c', FENCED_EMULATOR_RESIDENT_SCRIPT, 'devhotel-fenced-resident',
+          FENCED_EMULATOR_RESIDENT_STATE, String(FENCED_EMULATOR_RESIDENT_IDLE_SECONDS)
+        ],
+        { timeoutMs: 60_000, maxStdoutBytes: 128, maxStderrBytes: 8 * 1024, killOnOutputLimit: false }
+      )
+      const candidate = created.stdout.trim()
+      if (!/^[a-f0-9]{64}$/.test(candidate)) throw new Error('resident fenced helper create returned no immutable ID')
+      helperId = candidate
+      must(created, 'create resident fenced emulator ADB helper')
+      const inspected = await this.inspectContainer(helperId)
+      if (
+        !inspected ||
+        !this.isOwnedFencedJob(inspected, roomId, name, abortToken) ||
+        exactContainerId(inspected, roomId) !== helperId ||
+        inspected.HostConfig?.NetworkMode !== `container:${emulatorId}` ||
+        inspected.Config?.User !== '0:0' ||
+        exactDockerImageContentId(inspected.Image, 'Fenced emulator ADB helper') !== emulatorImageId ||
+        inspected.State?.Status !== 'created'
+      ) throw new Error('resident fenced helper ownership could not be verified before start')
+      await reproveTopology()
+      must(await runDocker(['start', helperId], { timeoutMs: 60_000 }), 'start resident fenced emulator ADB helper')
+      this.residentFencedHelpers.set(roomId, { id: helperId, name, abortToken, emulatorId })
+      return helperId
+    } catch (error) {
+      this.residentFencedHelpers.delete(roomId)
+      if (helperId) await this.removeAbortedFencedJob(roomId, name, abortToken, helperId).catch(() => undefined)
+      // A Room that cannot host a resident helper still works: the caller falls
+      // back to building one helper for this command.
+      return null
+    }
+  }
+
+  /** Drop a Room's resident helper — its emulator is going away. */
+  private async reapResidentFencedHelper(roomId: string): Promise<void> {
+    const known = this.residentFencedHelpers.get(roomId)
+    if (!known) return
+    this.residentFencedHelpers.delete(roomId)
+    await this.removeAbortedFencedJob(roomId, known.name, known.abortToken, known.id).catch(() => undefined)
+  }
+
   private async runFencedEmulatorAdb(
     roomId: string,
     args: string[],
@@ -3519,6 +3701,61 @@ export class OciCliBackend implements IsolationBackend {
         recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId, recoveryTopology)
       } else {
         topology = await this.assertFencedEmulatorTopology(roomId, topology)
+      }
+    }
+    const stdoutLimitEarly = Math.min(opts.maxStdoutBytes ?? 1024 * 1024, SCREENSHOT_MAX_BASE64_BYTES)
+    const stderrLimitEarly = Math.min(opts.maxStderrBytes ?? 64 * 1024, 64 * 1024)
+    const timeoutMsEarly = Math.min(opts.timeoutMs ?? 120_000, 10 * 60_000)
+    // A plain command against a proved emulator can run in the Room's resident
+    // helper. An install cannot: it needs its own read-only bind mount of a
+    // Host-private APK, so it keeps building a helper of its own.
+    if (mode === 'command' && !hostApkPath && !recoveryOnly) {
+      const resident = (await this.liveResidentFencedHelper(roomId, emulatorId, emulatorImageId)) ??
+        (await this.startResidentFencedHelper(roomId, emulatorId, emulatorImageId, reproveTopology))
+      if (resident) {
+        const stdoutBuf = boundedCommandOutput(stdoutLimitEarly)
+        const stderrBuf = boundedCommandOutput(stderrLimitEarly)
+        const execResult = await runDocker(
+          [
+            'exec', '--user', '0:0', resident, '/bin/sh', '-c',
+            FENCED_EMULATOR_RESIDENT_COMMAND, 'devhotel-fenced-resident-command',
+            FENCED_EMULATOR_RESIDENT_STATE,
+            String(Math.max(1, Math.ceil(timeoutMsEarly / 1000))),
+            ...args
+          ],
+          {
+            timeoutMs: timeoutMsEarly,
+            signal: opts.signal,
+            maxStdoutBytes: stdoutLimitEarly,
+            maxStderrBytes: stderrLimitEarly,
+            onStdout: (chunk) => {
+              const accepted = stdoutBuf.push(chunk)
+              if (accepted) opts.onStdout?.(accepted)
+            },
+            onStderr: (chunk) => {
+              const accepted = stderrBuf.push(chunk)
+              if (accepted) opts.onStderr?.(accepted)
+            }
+          }
+        )
+        // The helper is re-proved after the command exactly as the one-shot path
+        // re-proves its topology, so a namespace that changed under us is still
+        // caught before the result is accepted.
+        await reproveTopology()
+        if (!(await this.residentFencedHelperIsOurs(roomId, emulatorId, emulatorImageId))) {
+          await this.reapResidentFencedHelper(roomId)
+          throw new Error('resident fenced emulator ADB helper changed identity during its command')
+        }
+        const exceededResident = execResult.outputLimitExceeded === true || execResult.code === 97 ||
+          stdoutBuf.exceeded || stderrBuf.exceeded
+        if (timing) timing('TOTAL', Date.now() - commandStartedAt, `resident ${args[0]}`)
+        return {
+          code: exceededResident ? -1 : execResult.code,
+          stdout: opts.onStdout ? '' : stdoutBuf.text(),
+          stderr: opts.onStderr
+            ? ''
+            : `${stderrBuf.text()}${exceededResident ? '\nFenced emulator ADB output exceeded its safety limit.' : ''}`
+        }
       }
     }
     const id = randomUUID()
@@ -4583,6 +4820,8 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async removeEmulator(roomId: string): Promise<void> {
+    // The resident helper lives inside the emulator's namespace; it goes with it.
+    await this.reapResidentFencedHelper(roomId)
     await this.assertPinnedEngineIdentity()
     await this.removeRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
   }
