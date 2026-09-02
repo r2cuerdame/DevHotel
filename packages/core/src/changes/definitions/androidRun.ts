@@ -231,21 +231,17 @@ export const androidRunChange: ChangeDefinition<{ applicationId?: string }> = {
           steps.push(`Use the exclusive lease on ${ctx.physicalAndroidDevice.nickname}`)
         } else {
           steps.push('Wait for the emulator to finish booting')
-          let booted = false
-          const bootDeadline = Date.now() + 5 * 60_000
-          if (!ctx.execFencedAndroidTarget) throw new Error('The fenced Android target executor is unavailable')
-          while (Date.now() < bootDeadline) {
-            const probe = await ctx.execFencedAndroidTarget(
-              ['shell', 'getprop', 'sys.boot_completed'],
-              { timeoutMs: 20_000 }
-            )
-            if (probe.code === 0 && probe.stdout.trim() === '1') {
-              booted = true
-              break
-            }
-            await sleep(5000)
+          if (!ctx.waitForFencedEmulatorBoot) {
+            throw new Error('The fenced emulator boot witness is unavailable')
           }
-          if (!booted) throw new Error('emulator did not finish booting within 5 minutes')
+          const boot = await ctx.waitForFencedEmulatorBoot({ timeoutMs: 5 * 60_000 })
+          if (!boot.booted) {
+            throw new Error(
+              'emulator did not finish booting within 5 minutes ' +
+              `(ADB state ${boot.adbState}; sys.boot_completed ${boot.bootProperty}; ` +
+              `last ADB code ${boot.lastAdbCode}; helper code ${boot.helperCode})`
+            )
+          }
         }
 
         for (const app of apps) {

@@ -52,6 +52,7 @@ import type {
   ExecOutputChunk,
   ExecResult,
   ExportedArtifact,
+  FencedEmulatorBootResult,
   IsolationBackend,
   ManagedNetwork,
   RoomArtifactExpectation,
@@ -66,6 +67,11 @@ const LONG_TIMEOUT_MS = 600_000
 const ONE_SHOT_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 const ONE_SHOT_MAX_STDERR_BYTES = 4 * 1024 * 1024
 const SCREENSHOT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
+const FENCED_EMULATOR_BOOT_TIMEOUT_MS = 5 * 60_000
+const FENCED_EMULATOR_BOOT_STDOUT_BYTES = 256
+const FENCED_EMULATOR_BOOT_STDERR_BYTES = 1024
+const FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS = 10_000
+const FENCED_EMULATOR_BOOT_RECEIPT = /^devhotel-emulator-boot-v1\t(ready|timeout)\t(device|offline|unauthorized|missing|unknown)\t(1|empty|other)\t(0|[1-9]\d{0,2})$/
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
   '.git',
@@ -437,7 +443,8 @@ state=$1
 stdout_limit=$2
 stderr_limit=$3
 command_timeout=$4
-shift 4
+mode=$5
+shift 5
 socket_path=$state/server.sock
 socket=localfilesystem:$socket_path
 adb=/opt/android-sdk/platform-tools/adb
@@ -445,6 +452,15 @@ rm -rf -- "$state"
 mkdir -m 700 -p "$state/home" "$state/tmp"
 run_adb() {
   env -i \
+    HOME="$state/home" \
+    TMPDIR="$state/tmp" \
+    PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    ADB_SERVER_SOCKET="$socket" \
+    "$adb" -L "$socket" "$@"
+}
+run_adb_bounded() {
+  timeout -k 1 2 env -i \
     HOME="$state/home" \
     TMPDIR="$state/tmp" \
     PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
@@ -462,9 +478,52 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 [ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
-run_adb start-server >/dev/null 2>&1
+if [ "$mode" = wait-for-boot ]; then
+  boot_deadline=$(( $(date +%s) + command_timeout ))
+  run_adb_bounded start-server >/dev/null 2>&1
+else
+  run_adb start-server >/dev/null 2>&1
+fi
 [ -S "$socket_path" ] || exit 71
 [ "$(stat -c %u "$socket_path")" = "$(id -u)" ] || exit 72
+if [ "$mode" = wait-for-boot ]; then
+  last_state=missing
+  last_boot=empty
+  last_code=1
+  while [ "$(date +%s)" -lt "$boot_deadline" ]; do
+    set +e
+    observed_state=$(run_adb_bounded -s emulator-5554 get-state 2>/dev/null)
+    last_code=$?
+    set -e
+    observed_state=$(printf '%s' "$observed_state" | tr -d '\r\n')
+    case "$observed_state" in
+      device|offline|unauthorized) last_state=$observed_state ;;
+      '') last_state=missing ;;
+      *) last_state=unknown ;;
+    esac
+    last_boot=empty
+    if [ "$last_state" = device ] && [ "$last_code" -eq 0 ]; then
+      set +e
+      observed_boot=$(run_adb_bounded -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null)
+      last_code=$?
+      set -e
+      observed_boot=$(printf '%s' "$observed_boot" | tr -d '\r\n')
+      case "$observed_boot" in
+        1) last_boot=1 ;;
+        '') last_boot=empty ;;
+        *) last_boot=other ;;
+      esac
+      if [ "$last_boot" = 1 ] && [ "$last_code" -eq 0 ]; then
+        printf 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+        exit 0
+      fi
+    fi
+    sleep 0.25
+  done
+  printf 'devhotel-emulator-boot-v1\ttimeout\t%s\t%s\t%s\n' "$last_state" "$last_boot" "$last_code"
+  exit 74
+fi
+[ "$mode" = command ] || exit 75
 ready=0
 i=0
 while [ "$i" -lt 20 ]; do
@@ -495,6 +554,31 @@ wait "$stderr_reader"
 stderr_reader=
 set -e
 exit "$status"`
+
+function parseFencedEmulatorBootResult(result: ExecResult): FencedEmulatorBootResult {
+  const match = FENCED_EMULATOR_BOOT_RECEIPT.exec(result.stdout.trim())
+  const lastAdbCode = match ? Number(match[4]) : Number.NaN
+  if (!match || !Number.isSafeInteger(lastAdbCode) || lastAdbCode < 0 || lastAdbCode > 255) {
+    throw new Error('fenced emulator boot helper returned invalid bounded evidence')
+  }
+  const booted = match[1] === 'ready'
+  if (
+    (booted && (
+      result.code !== 0 || match[2] !== 'device' || match[3] !== '1' || lastAdbCode !== 0
+    )) ||
+    (!booted && result.code !== 74)
+  ) {
+    throw new Error('fenced emulator boot helper receipt did not match its exit status')
+  }
+  return {
+    booted,
+    adbState: match[2] as FencedEmulatorBootResult['adbState'],
+    bootProperty: match[3] as FencedEmulatorBootResult['bootProperty'],
+    lastAdbCode,
+    helperCode: result.code
+  }
+}
+
 function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
   const findFilter = entries === 'files' ? "\\( -type f -o -type l \\) " : ''
   return [
@@ -3253,6 +3337,27 @@ export class OciCliBackend implements IsolationBackend {
     return this.runFencedEmulatorAdb(roomId, args, opts)
   }
 
+  async waitForFencedEmulatorBoot(
+    roomId: string,
+    opts: Pick<ExecOpts, 'timeoutMs' | 'signal'> = {}
+  ): Promise<FencedEmulatorBootResult> {
+    throwIfAborted(opts.signal)
+    const result = await this.runFencedEmulatorAdb(
+      roomId,
+      [],
+      {
+        ...opts,
+        timeoutMs: opts.timeoutMs ?? FENCED_EMULATOR_BOOT_TIMEOUT_MS,
+        maxStdoutBytes: FENCED_EMULATOR_BOOT_STDOUT_BYTES,
+        maxStderrBytes: FENCED_EMULATOR_BOOT_STDERR_BYTES
+      },
+      undefined,
+      false,
+      'wait-for-boot'
+    )
+    return parseFencedEmulatorBootResult(result)
+  }
+
   async execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     return this.runFencedEmulatorAdb(roomId, args, opts, undefined, true)
@@ -3317,12 +3422,22 @@ export class OciCliBackend implements IsolationBackend {
     args: string[],
     opts: ExecOpts,
     hostApkPath?: string,
-    recoveryOnly = false
+    recoveryOnly = false,
+    mode: 'command' | 'wait-for-boot' = 'command'
   ): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
-    if (!args[0] || args[0].startsWith('-')) throw new Error('fenced emulator ADB requires a command without selectors')
-    if (!hostApkPath && ['install', 'install-multiple', 'install-multi-package'].includes(args[0])) {
+    if (mode === 'command' && (!args[0] || args[0].startsWith('-'))) {
+      throw new Error('fenced emulator ADB requires a command without selectors')
+    }
+    if (mode === 'wait-for-boot' && args.length !== 0) {
+      throw new Error('fenced emulator boot helper does not accept ADB arguments')
+    }
+    if (
+      mode === 'command' &&
+      !hostApkPath &&
+      ['install', 'install-multiple', 'install-multi-package'].includes(args[0]!)
+    ) {
       throw new Error('fenced emulator installs require a private staged APK capability')
     }
     let topology: FencedEmulatorTopology | undefined
@@ -3393,6 +3508,7 @@ export class OciCliBackend implements IsolationBackend {
       String(stdoutLimit),
       String(stderrLimit),
       String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      mode,
       ...args
     ]
     let helperId: string | undefined
@@ -3440,7 +3556,9 @@ export class OciCliBackend implements IsolationBackend {
     let executionError: unknown
     try {
       result = await runDocker(['start', '-a', helperId], {
-        timeoutMs,
+        timeoutMs: mode === 'wait-for-boot'
+          ? timeoutMs + FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS
+          : timeoutMs,
         signal: opts.signal,
         maxStdoutBytes: stdoutLimit,
         maxStderrBytes: stderrLimit,

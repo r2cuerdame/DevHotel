@@ -611,6 +611,9 @@ describe('OciCliBackend Android artifact export', () => {
     let restartWebGenerationAfterStart = false
     let emulatorReplaced = false
     let receivedBytes = 0
+    let bootStart = false
+    let bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+    let bootHelperCode = 0
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
       Name: `/${name}`,
@@ -737,6 +740,11 @@ describe('OciCliBackend Android artifact export', () => {
           : { code: 0, stdout: `${ids.helper}\n`, stderr: '' }
       }
       if (args[0] === 'start') {
+        if (bootStart) {
+          opts?.onStdout?.(bootReceipt)
+          if (replaceEmulatorAfterStart) emulatorReplaced = true
+          return { code: bootHelperCode, stdout: '', stderr: '' }
+        }
         if (holdStartUntilAbort) {
           opts?.onStdout?.('begin\n')
           return await new Promise<typeof ok>((_resolve, reject) => {
@@ -813,7 +821,7 @@ describe('OciCliBackend Android artifact export', () => {
     expect(script).not.toContain('stdout_file=')
     expect(script).not.toContain('stderr_file=')
     expect(script).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
-    expect(create.slice(-3)).toEqual(['shell', 'getprop', 'sys.boot_completed'])
+    expect(create.slice(-4)).toEqual(['command', 'shell', 'getprop', 'sys.boot_completed'])
     expect(create).toEqual(expect.arrayContaining(['shell', 'getprop', 'sys.boot_completed']))
     expect(createCall[1]).toMatchObject({
       timeoutMs: null,
@@ -831,6 +839,60 @@ describe('OciCliBackend Android artifact export', () => {
       maxStderrBytes: 64,
       onAbort: expect.any(Function)
     })
+
+    mockedRunDocker.mockClear()
+    bootStart = true
+    const boot = await new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 })
+    bootStart = false
+    expect(boot).toEqual({
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
+    })
+    const bootCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    expect(bootCalls.filter((args) => args[0] === 'create')).toHaveLength(1)
+    expect(bootCalls.filter((args) => args[0] === 'start')).toHaveLength(1)
+    expect(bootCalls.filter((args) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    const bootCreate = bootCalls.find((args) => args[0] === 'create')!
+    const bootScript = bootCreate[bootCreate.indexOf('-c') + 1]!
+    expect(bootCreate.slice(-1)).toEqual(['wait-for-boot'])
+    expect(bootScript).toContain('if [ "$mode" = wait-for-boot ]')
+    expect(bootScript).toContain('run_adb_bounded start-server')
+    expect(bootScript).toContain('while [ "$(date +%s)" -lt "$boot_deadline" ]')
+    expect(helper).toBeNull()
+    expect(mockedRunDocker.mock.calls.find(([args]) => args[0] === 'start')?.[1])
+      .toMatchObject({ timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\tunauthorized\tempty\t1\n'
+    bootHelperCode = 74
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .resolves.toEqual({
+        booted: false,
+        adbState: 'unauthorized',
+        bootProperty: 'empty',
+        lastAdbCode: 1,
+        helperCode: 74
+      })
+    bootStart = false
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'create')).toHaveLength(1)
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'start')).toHaveLength(1)
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(helper).toBeNull()
+
+    mockedRunDocker.mockClear()
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\tunauthorized\tempty\t999\n'
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .rejects.toThrow(/invalid bounded evidence/)
+    bootStart = false
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(helper).toBeNull()
+    bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+    bootHelperCode = 0
 
     mockedRunDocker.mockClear()
     webSandboxId = ids.runtimeSandbox
@@ -853,11 +915,13 @@ describe('OciCliBackend Android artifact export', () => {
     mockedRunDocker.mockClear()
     replaceEmulatorAfterStart = true
     let replacementError = ''
+    bootStart = true
     try {
-      await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'])
+      await new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 })
     } catch (error) {
       replacementError = error instanceof Error ? error.message : String(error)
     }
+    bootStart = false
     expect(replacementError).toMatch(/topology participant disappeared/)
     expect(replacementError).not.toContain('a'.repeat(32))
     expect(helper).toBeNull()
