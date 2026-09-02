@@ -967,7 +967,13 @@ describe('android Build & Run line-ending preflight', () => {
     const removalAttempts: string[] = []
     const bulkRemovals: string[] = []
     const changeCtx = ctx()
-    changeCtx.execFencedAndroidTarget = async () => ({ code: 0, stdout: '1\n', stderr: '' })
+    changeCtx.waitForFencedEmulatorBoot = async () => ({
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
+    })
     changeCtx.installTrackedAndroidArtifact = async (applicationId) => {
       installed.push(applicationId)
       if (applicationId === 'com.example.two') {

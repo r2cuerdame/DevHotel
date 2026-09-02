@@ -29,11 +29,6 @@ function logicalAdbArgs(args: string[]): string[] {
   ]
 }
 
-function roomAndroidArgs(command: string[]): string[] | null {
-  if (command[0] !== 'adb' || command[1] !== '-s' || command.length < 4) return null
-  return logicalAdbArgs(command.slice(3))
-}
-
 function installEvidenceResult(args: string[], state: {
   fence: string
   apkSha256?: string
@@ -48,7 +43,7 @@ function installEvidenceResult(args: string[], state: {
   if (logical[1] === 'dumpsys' && logical[2] === 'user' && logical[3] === '--user') {
     return {
       code: 0,
-      stdout: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
+      stdout: ' UserInfo{0:DevHotel:13} serialNo=0 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
       stderr: ''
     }
   }
@@ -341,7 +336,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     adb.execs = []
     adb.execResultFor = (_serial, args) =>
@@ -378,7 +373,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     backend.fencedEmulatorExecCalls = []
     backend.fencedEmulatorExecHandler = (androidArgs) =>
@@ -548,7 +543,7 @@ describe('Android automation targets the attached device without a hand-written 
         packageIncarnation: TEST_PACKAGE_INCARNATION,
         logFence: null,
         installUserId: 0,
-        installUserSerial: 42
+        installUserSerial: 0
       })
     }
     adb.execResultFor = (_serial, args) => args[0] === 'install'
@@ -1301,6 +1296,46 @@ describe('Android automation targets the attached device without a hand-written 
     expect(backend.calls.filter((call) => call.startsWith('copyFromRoom:'))).toEqual([])
     expect(backend.calls.some((call) => call.startsWith('exportAndroidArtifacts:'))).toBe(true)
     expect(backend.calls.some((call) => call.startsWith('installFencedEmulatorApk:'))).toBe(true)
+    expect(backend.fencedEmulatorBootCalls).toEqual([{ opts: { timeoutMs: 5 * 60_000 } }])
+    expect(backend.fencedEmulatorExecCalls.some(({ args }) => {
+      const logical = logicalAdbArgs(args)
+      return logical[1] === 'getprop' && logical[2] === 'sys.boot_completed'
+    })).toBe(false)
+  })
+
+  it('reports bounded emulator boot evidence and does not install after the single witness times out', async () => {
+    const { orch, backend } = setup()
+    backend.emulatorStateValue = 'running'
+    backend.fencedEmulatorBootHandler = () => ({
+      booted: false,
+      adbState: 'unauthorized',
+      bootProperty: 'empty',
+      lastAdbCode: 1,
+      helperCode: 74
+    })
+    backend.execInRoomHandler = (_roomId, cmd) => {
+      const command = cmd.at(-1) ?? ''
+      if (command.includes('find /workspace')) {
+        return { code: 0, stdout: '/workspace/app/build/outputs/apk/debug/output-metadata.json\0', stderr: '' }
+      }
+      if (command.startsWith("cat -- '/workspace/")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ applicationId: 'com.example.app', elements: [{ outputFile: 'app-debug.apk' }] }),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+
+    const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
+
+    expect(entry).toMatchObject({ status: 'failed', verify: { ok: false } })
+    expect(entry.verify?.detail).toContain(
+      'ADB state unauthorized; sys.boot_completed empty; last ADB code 1; helper code 74'
+    )
+    expect(backend.fencedEmulatorBootCalls).toEqual([{ opts: { timeoutMs: 5 * 60_000 } }])
+    expect(backend.calls.some((call) => call.startsWith('installFencedEmulatorApk:'))).toBe(false)
   })
 
   it('never publishes a private Host APK stage when copy or local inspection fails', async () => {
@@ -1344,17 +1379,19 @@ describe('Android automation targets the attached device without a hand-written 
     const { orch, backend, userData } = setup()
     backend.emulatorStateValue = 'running'
     let deleted = false
-    backend.fencedEmulatorExecHandler = (androidArgs) => {
-      const logical = logicalAdbArgs(androidArgs)
-      if (logical[1] === 'getprop' && logical[2] === 'sys.boot_completed') {
-        const artifactRoot = join(userData, 'rooms', 'aaaa1111', 'artifacts')
-        for (const operationId of readdirSync(artifactRoot)) {
-          rmSync(join(artifactRoot, operationId, 'app/build/outputs/apk/debug/app-debug.apk'))
-          deleted = true
-        }
-        return { code: 0, stdout: '1\n', stderr: '' }
+    backend.fencedEmulatorBootHandler = () => {
+      const artifactRoot = join(userData, 'rooms', 'aaaa1111', 'artifacts')
+      for (const operationId of readdirSync(artifactRoot)) {
+        rmSync(join(artifactRoot, operationId, 'app/build/outputs/apk/debug/app-debug.apk'))
+        deleted = true
       }
-      return { code: 0, stdout: '', stderr: '' }
+      return {
+        booted: true,
+        adbState: 'device',
+        bootProperty: '1',
+        lastAdbCode: 0,
+        helperCode: 0
+      }
     }
 
     const entry = await orch.applyChange('aaaa1111', { kind: 'android-run' }, 'user')
@@ -1381,7 +1418,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     backend.fencedEmulatorExecHandler = (androidArgs) => {
       const logical = logicalAdbArgs(androidArgs)
@@ -1395,7 +1432,7 @@ describe('Android automation targets the attached device without a hand-written 
       if (logical[1] === 'dumpsys' && logical[2] === 'user') {
         return {
           code: 0,
-          stdout: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
+          stdout: ' UserInfo{0:DevHotel:13} serialNo=0 isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n',
           stderr: ''
         }
       }
@@ -1530,7 +1567,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     backend.fencedEmulatorExecHandler = (args) => {
       const logical = logicalAdbArgs(args)
@@ -1567,7 +1604,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     backend.fencedEmulatorExecHandler = (args) => {
       const logical = logicalAdbArgs(args)
@@ -1612,7 +1649,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     let replaced = false
     let screenBegin = ''
@@ -1776,7 +1813,7 @@ describe('Android automation targets the attached device without a hand-written 
       packageIncarnation: TEST_PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 0,
-      installUserSerial: 42
+      installUserSerial: 0
     })
     await orch.releaseAndroidDevice('aaaa1111', 'rotate lease')
     const second = await orch.attachAndroidDevice('aaaa1111', { purpose: 'acceptance', workerId: 'worker-b' })

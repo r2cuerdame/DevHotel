@@ -52,6 +52,7 @@ import type {
   ExecOutputChunk,
   ExecResult,
   ExportedArtifact,
+  FencedEmulatorBootResult,
   IsolationBackend,
   ManagedNetwork,
   RoomArtifactExpectation,
@@ -66,6 +67,11 @@ const LONG_TIMEOUT_MS = 600_000
 const ONE_SHOT_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 const ONE_SHOT_MAX_STDERR_BYTES = 4 * 1024 * 1024
 const SCREENSHOT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
+const FENCED_EMULATOR_BOOT_TIMEOUT_MS = 5 * 60_000
+const FENCED_EMULATOR_BOOT_STDOUT_BYTES = 256
+const FENCED_EMULATOR_BOOT_STDERR_BYTES = 1024
+const FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS = 10_000
+const FENCED_EMULATOR_BOOT_RECEIPT = /^devhotel-emulator-boot-v1\t(ready|timeout)\t(device|offline|unauthorized|missing|unknown)\t(1|empty|other)\t(0|[1-9]\d{0,2})$/
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
   '.git',
@@ -437,18 +443,26 @@ state=$1
 stdout_limit=$2
 stderr_limit=$3
 command_timeout=$4
-shift 4
+mode=$5
+shift 5
 socket_path=$state/server.sock
 socket=localfilesystem:$socket_path
-adb=/opt/android-sdk/platform-tools/adb
-rm -rf -- "$state"
-mkdir -m 700 -p "$state/home" "$state/tmp"
+adb=/opt/android/platform-tools/adb
 run_adb() {
   env -i \
     HOME="$state/home" \
     TMPDIR="$state/tmp" \
-    PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
-    ANDROID_SDK_ROOT=/opt/android-sdk \
+    PATH=/opt/android/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android \
+    ADB_SERVER_SOCKET="$socket" \
+    "$adb" -L "$socket" "$@"
+}
+run_adb_bounded() {
+  timeout -k 1 2 env -i \
+    HOME="$state/home" \
+    TMPDIR="$state/tmp" \
+    PATH=/opt/android/platform-tools:/usr/bin:/bin \
+    ANDROID_SDK_ROOT=/opt/android \
     ADB_SERVER_SOCKET="$socket" \
     "$adb" -L "$socket" "$@"
 }
@@ -457,10 +471,90 @@ cleanup() {
   if [ -n "\${stderr_reader:-}" ]; then kill "$stderr_reader" >/dev/null 2>&1 || true; fi
   if [ -n "\${stdout_reader:-}" ]; then wait "$stdout_reader" >/dev/null 2>&1 || true; fi
   if [ -n "\${stderr_reader:-}" ]; then wait "$stderr_reader" >/dev/null 2>&1 || true; fi
-  run_adb kill-server >/dev/null 2>&1 || true
+  if [ -S "$socket_path" ]; then
+    if [ "$mode" = wait-for-boot ]; then
+      run_adb_bounded kill-server >/dev/null 2>&1 || true
+    else
+      run_adb kill-server >/dev/null 2>&1 || true
+    fi
+  fi
   rm -rf -- "$state"
 }
 trap cleanup EXIT HUP INT TERM
+if [ "$mode" = wait-for-boot ]; then
+  last_state=missing
+  last_boot=empty
+  last_code=1
+  boot_timeout() {
+    printf 'devhotel-emulator-boot-v1\\ttimeout\\t%s\\t%s\\t%s\\n' "$last_state" "$last_boot" "$last_code"
+    exit 74
+  }
+  # Boot mode must always finish with one normalized receipt. In particular,
+  # an adb client startup timeout is not evidence that its same-socket server
+  # failed to start, so retry that one private server until the boot deadline.
+  set +e
+  rm -rf -- "$state"
+  state_code=$?
+  if [ "$state_code" -eq 0 ]; then
+    mkdir -m 700 -p "$state/home" "$state/tmp"
+    state_code=$?
+  fi
+  if [ "$state_code" -ne 0 ]; then
+    last_state=unknown
+    boot_timeout
+  fi
+  if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
+    last_state=unknown
+    boot_timeout
+  fi
+  boot_deadline=$(( $(date +%s) + command_timeout ))
+  while [ "$(date +%s)" -lt "$boot_deadline" ] && [ ! -S "$socket_path" ]; do
+    run_adb_bounded start-server >/dev/null 2>&1
+    last_code=$?
+    [ -S "$socket_path" ] && break
+    sleep 0.25
+  done
+  [ -S "$socket_path" ] || boot_timeout
+  socket_owner=$(stat -c %u "$socket_path" 2>/dev/null)
+  socket_owner_code=$?
+  helper_owner=$(id -u 2>/dev/null)
+  helper_owner_code=$?
+  if [ "$socket_owner_code" -ne 0 ] || [ "$helper_owner_code" -ne 0 ] || [ "$socket_owner" != "$helper_owner" ]; then
+    last_state=unknown
+    last_code=1
+    boot_timeout
+  fi
+  while [ "$(date +%s)" -lt "$boot_deadline" ]; do
+    observed_state=$(run_adb_bounded -s emulator-5554 get-state 2>/dev/null)
+    last_code=$?
+    observed_state=$(printf '%s' "$observed_state" | tr -d '\\r\\n')
+    case "$observed_state" in
+      device|offline|unauthorized) last_state=$observed_state ;;
+      '') last_state=missing ;;
+      *) last_state=unknown ;;
+    esac
+    last_boot=empty
+    if [ "$last_state" = device ] && [ "$last_code" -eq 0 ]; then
+      observed_boot=$(run_adb_bounded -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null)
+      last_code=$?
+      observed_boot=$(printf '%s' "$observed_boot" | tr -d '\\r\\n')
+      case "$observed_boot" in
+        1) last_boot=1 ;;
+        '') last_boot=empty ;;
+        *) last_boot=other ;;
+      esac
+      if [ "$last_boot" = 1 ] && [ "$last_code" -eq 0 ]; then
+        printf 'devhotel-emulator-boot-v1\\tready\\tdevice\\t1\\t0\\n'
+        exit 0
+      fi
+    fi
+    sleep 0.25
+  done
+  boot_timeout
+fi
+[ "$mode" = command ] || exit 75
+rm -rf -- "$state"
+mkdir -m 700 -p "$state/home" "$state/tmp"
 [ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || exit 70
 run_adb start-server >/dev/null 2>&1
 [ -S "$socket_path" ] || exit 71
@@ -484,8 +578,8 @@ set +e
 timeout -k 1 "$command_timeout" env -i \
   HOME="$state/home" \
   TMPDIR="$state/tmp" \
-  PATH=/opt/android-sdk/platform-tools:/usr/bin:/bin \
-  ANDROID_SDK_ROOT=/opt/android-sdk \
+  PATH=/opt/android/platform-tools:/usr/bin:/bin \
+  ANDROID_SDK_ROOT=/opt/android \
   ADB_SERVER_SOCKET="$socket" \
   "$adb" -L "$socket" -s emulator-5554 "$@" > "$stdout_pipe" 2> "$stderr_pipe"
 status=$?
@@ -495,6 +589,31 @@ wait "$stderr_reader"
 stderr_reader=
 set -e
 exit "$status"`
+
+function parseFencedEmulatorBootResult(result: ExecResult): FencedEmulatorBootResult {
+  const match = FENCED_EMULATOR_BOOT_RECEIPT.exec(result.stdout.trim())
+  const lastAdbCode = match ? Number(match[4]) : Number.NaN
+  if (!match || !Number.isSafeInteger(lastAdbCode) || lastAdbCode < 0 || lastAdbCode > 255) {
+    throw new Error('fenced emulator boot helper returned invalid bounded evidence')
+  }
+  const booted = match[1] === 'ready'
+  if (
+    (booted && (
+      result.code !== 0 || match[2] !== 'device' || match[3] !== '1' || lastAdbCode !== 0
+    )) ||
+    (!booted && result.code !== 74)
+  ) {
+    throw new Error('fenced emulator boot helper receipt did not match its exit status')
+  }
+  return {
+    booted,
+    adbState: match[2] as FencedEmulatorBootResult['adbState'],
+    bootProperty: match[3] as FencedEmulatorBootResult['bootProperty'],
+    lastAdbCode,
+    helperCode: result.code
+  }
+}
+
 function appendSyncIncludePathsScript(output: string, entries: 'files' | 'all'): string {
   const findFilter = entries === 'files' ? "\\( -type f -o -type l \\) " : ''
   return [
@@ -3253,6 +3372,27 @@ export class OciCliBackend implements IsolationBackend {
     return this.runFencedEmulatorAdb(roomId, args, opts)
   }
 
+  async waitForFencedEmulatorBoot(
+    roomId: string,
+    opts: Pick<ExecOpts, 'timeoutMs' | 'signal'> = {}
+  ): Promise<FencedEmulatorBootResult> {
+    throwIfAborted(opts.signal)
+    const result = await this.runFencedEmulatorAdb(
+      roomId,
+      [],
+      {
+        ...opts,
+        timeoutMs: opts.timeoutMs ?? FENCED_EMULATOR_BOOT_TIMEOUT_MS,
+        maxStdoutBytes: FENCED_EMULATOR_BOOT_STDOUT_BYTES,
+        maxStderrBytes: FENCED_EMULATOR_BOOT_STDERR_BYTES
+      },
+      undefined,
+      false,
+      'wait-for-boot'
+    )
+    return parseFencedEmulatorBootResult(result)
+  }
+
   async execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     return this.runFencedEmulatorAdb(roomId, args, opts, undefined, true)
@@ -3317,19 +3457,31 @@ export class OciCliBackend implements IsolationBackend {
     args: string[],
     opts: ExecOpts,
     hostApkPath?: string,
-    recoveryOnly = false
+    recoveryOnly = false,
+    mode: 'command' | 'wait-for-boot' = 'command'
   ): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     await this.assertPinnedEngineIdentity()
-    if (!args[0] || args[0].startsWith('-')) throw new Error('fenced emulator ADB requires a command without selectors')
-    if (!hostApkPath && ['install', 'install-multiple', 'install-multi-package'].includes(args[0])) {
+    if (mode === 'command' && (!args[0] || args[0].startsWith('-'))) {
+      throw new Error('fenced emulator ADB requires a command without selectors')
+    }
+    if (mode === 'wait-for-boot' && args.length !== 0) {
+      throw new Error('fenced emulator boot helper does not accept ADB arguments')
+    }
+    if (
+      mode === 'command' &&
+      !hostApkPath &&
+      ['install', 'install-multiple', 'install-multi-package'].includes(args[0]!)
+    ) {
       throw new Error('fenced emulator installs require a private staged APK capability')
     }
     let topology: FencedEmulatorTopology | undefined
     let recoveryTopology: FencedEmulatorRecoveryTopology | undefined
     if (recoveryOnly) recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId)
     else topology = await this.assertFencedEmulatorTopology(roomId)
-    const emulatorId = (recoveryTopology ?? topology)!.emulatorId
+    const provedTopology = (recoveryTopology ?? topology)!
+    const emulatorId = provedTopology.emulatorId
+    const emulatorImageId = provedTopology.emulatorImageId
     const reproveTopology = async (): Promise<void> => {
       if (recoveryOnly) {
         recoveryTopology = await this.assertFencedEmulatorRecoveryTopology(roomId, recoveryTopology)
@@ -3337,7 +3489,6 @@ export class OciCliBackend implements IsolationBackend {
         topology = await this.assertFencedEmulatorTopology(roomId, topology)
       }
     }
-    await this.ensureImage(ANDROID_IMAGE)
     const id = randomUUID()
     const name = jobName(roomId, id)
     const abortToken = randomUUID()
@@ -3363,6 +3514,11 @@ export class OciCliBackend implements IsolationBackend {
       '--rm',
       '--name',
       name,
+      // The emulator image defaults to uid 1300, but the Host-private APK
+      // capability is intentionally 0400. Keep the former root helper access
+      // while retaining ALL-cap drop, no-new-privileges and a read-only rootfs.
+      '--user',
+      '0:0',
       '--network',
       `container:${emulatorId}`,
       '--cap-drop',
@@ -3385,7 +3541,7 @@ export class OciCliBackend implements IsolationBackend {
       `ADB_SERVER_SOCKET=localfilesystem:${state}/server.sock`,
       '--entrypoint',
       '/bin/sh',
-      ANDROID_IMAGE,
+      emulatorImageId,
       '-c',
       FENCED_EMULATOR_ADB_SCRIPT,
       'devhotel-fenced-adb',
@@ -3393,6 +3549,7 @@ export class OciCliBackend implements IsolationBackend {
       String(stdoutLimit),
       String(stderrLimit),
       String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      mode,
       ...args
     ]
     let helperId: string | undefined
@@ -3421,6 +3578,12 @@ export class OciCliBackend implements IsolationBackend {
       if (createdHelper.HostConfig?.NetworkMode !== `container:${emulatorId}`) {
         throw new Error('fenced emulator ADB helper is not attached to the exact emulator network namespace')
       }
+      if (createdHelper.Config?.User !== '0:0') {
+        throw new Error('fenced emulator ADB helper did not retain its exact private-stage user')
+      }
+      if (exactDockerImageContentId(createdHelper.Image, 'Fenced emulator ADB helper') !== emulatorImageId) {
+        throw new Error('fenced emulator ADB helper did not retain the proved emulator image content identity')
+      }
       if (createdHelper.State?.Status !== 'created') {
         throw new Error('fenced emulator ADB helper was not inert before its controlled action')
       }
@@ -3440,7 +3603,9 @@ export class OciCliBackend implements IsolationBackend {
     let executionError: unknown
     try {
       result = await runDocker(['start', '-a', helperId], {
-        timeoutMs,
+        timeoutMs: mode === 'wait-for-boot'
+          ? timeoutMs + FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS
+          : timeoutMs,
         signal: opts.signal,
         maxStdoutBytes: stdoutLimit,
         maxStderrBytes: stderrLimit,
@@ -3511,6 +3676,7 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
     const emulatorId = exactFullContainerId(emulator, roomId)
+    const emulatorImageId = exactDockerImageContentId(emulator.Image, 'Android emulator')
     const controlSandboxId = this.exactRunningSandboxId(anchor, 'Android control anchor')
     const runtimeSandboxId = this.exactRunningSandboxId(runtimeAnchor, 'Android runtime anchor')
     const controlStartedAt = exactDockerStartedAt(anchor, 'Android control anchor')
@@ -3567,6 +3733,9 @@ export class OciCliBackend implements IsolationBackend {
     )
     const webStartedAt = exactDockerStartedAt(web, 'Android web')
     const emulatorStartedAt = exactDockerStartedAt(emulator, 'Android emulator')
+    if (expected && emulatorImageId !== expected.emulatorImageId) {
+      throw new Error('Android emulator image content identity changed while the helper was created')
+    }
     if (
       expected &&
       (
@@ -3692,6 +3861,7 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchorId,
       webId,
       emulatorId,
+      emulatorImageId,
       controlSandboxId,
       runtimeSandboxId,
       controlStartedAt,
@@ -3734,6 +3904,7 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeAnchorId = exactFullContainerId(runtimeAnchor, roomId)
     const webId = exactFullContainerId(web, roomId)
     const emulatorId = exactFullContainerId(emulator, roomId)
+    const emulatorImageId = exactDockerImageContentId(emulator.Image, 'Android recovery emulator')
     const runtimeAnchorState = runtimeAnchor.State?.Status ?? ''
     const webState = web.State?.Status ?? ''
     const controlStartedAt = exactDockerStartedAt(anchor, 'Android recovery control anchor')
@@ -3748,6 +3919,9 @@ export class OciCliBackend implements IsolationBackend {
     const runtimeStartedAt = runtimeAnchorState === 'running'
       ? exactDockerStartedAt(runtimeAnchor, 'Android recovery runtime anchor')
       : null
+    if (expected && emulatorImageId !== expected.emulatorImageId) {
+      throw new Error('Android recovery emulator image content identity changed while the helper was created')
+    }
     if (
       expected &&
       (
@@ -3916,6 +4090,7 @@ export class OciCliBackend implements IsolationBackend {
       runtimeAnchorId,
       webId,
       emulatorId,
+      emulatorImageId,
       controlSandboxId,
       controlStartedAt,
       webStartedAt,
@@ -6702,6 +6877,7 @@ interface FencedEmulatorTopology {
   runtimeAnchorId: string
   webId: string
   emulatorId: string
+  emulatorImageId: string
   controlSandboxId: string
   runtimeSandboxId: string
   controlStartedAt: string
@@ -6717,6 +6893,7 @@ interface FencedEmulatorRecoveryTopology {
   runtimeAnchorId: string
   webId: string
   emulatorId: string
+  emulatorImageId: string
   controlSandboxId: string
   controlStartedAt: string
   webStartedAt: string
@@ -6759,6 +6936,14 @@ function exactFullContainerId(container: DockerContainerInspect, roomId: string)
 function exactDockerObjectId(value: string | undefined, what: string): string {
   const id = value?.trim() ?? ''
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error(`${what} did not report a full immutable ID`)
+  return id
+}
+
+function exactDockerImageContentId(value: string | undefined, what: string): string {
+  const id = value?.trim() ?? ''
+  if (!/^sha256:[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`${what} did not report a full immutable image content identity`)
+  }
   return id
 }
 

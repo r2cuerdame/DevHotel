@@ -280,7 +280,7 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('SCREEN_HEIGHT=1140')
     expect(args).toContain('EMULATOR_DEVICE=Samsung Galaxy S10')
     expect(args).toContain('EMULATOR_CONFIG_PATH=/home/androidusr/devhotel-avd-override.ini')
-    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim')
+    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth')
   })
 
   it('rotates the X screen and AVD orientation for landscape emulators', () => {

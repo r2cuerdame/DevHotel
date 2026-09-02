@@ -68,6 +68,18 @@ export interface ExecOpts {
   onStderr?: (chunk: ExecOutputChunk) => void
 }
 
+export type FencedEmulatorAdbState = 'device' | 'offline' | 'unauthorized' | 'missing' | 'unknown'
+export type FencedEmulatorBootProperty = '1' | 'empty' | 'other'
+
+/** Bounded, normalized evidence retained by the single-helper emulator boot witness. */
+export interface FencedEmulatorBootResult {
+  booted: boolean
+  adbState: FencedEmulatorAdbState
+  bootProperty: FencedEmulatorBootProperty
+  lastAdbCode: number
+  helperCode: number
+}
+
 export interface ManagedNetwork {
   roomId: string
   name: string
@@ -296,6 +308,11 @@ export interface IsolationBackend {
   copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void>
   /** Controlled emulator ADB outside the user Room; acceptance callers separately require a pause fence. */
   execFencedEmulatorAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /** Keep one private helper and ADB server alive while witnessing emulator boot. */
+  waitForFencedEmulatorBoot(
+    roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult>
   /** Recovery-only ADB through the retained control anchor; never starts the Room web workload. */
   execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
   /** Install one Host-private staged APK without reopening the Room workspace. */

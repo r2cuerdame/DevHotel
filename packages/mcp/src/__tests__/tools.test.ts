@@ -1,7 +1,13 @@
 import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { ControlClient, DevHotelNotRunningError, loadControlInfo, resilientClient } from '../client'
+import {
+  ControlClient,
+  DevHotelAmbiguousMutationError,
+  DevHotelNotRunningError,
+  loadControlInfo,
+  resilientClient
+} from '../client'
 import { makeTools } from '../tools'
 import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
@@ -18,6 +24,12 @@ const ARTIFACT_PNG = Buffer.concat([
 ])
 const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
 const ACCEPTANCE_REPORT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const APPLIED_CHANGE = {
+  id: '11111111-2222-4333-8444-555555555555',
+  roomId: 'abc12345',
+  kind: 'node-version',
+  status: 'verified'
+}
 const acceptanceResult = {
   report: {
     id: ACCEPTANCE_REPORT_ID,
@@ -55,6 +67,7 @@ const runningOperation = {
 let server: Server
 let port: number
 const seen: { method: string; url: string; body: any }[] = []
+let partialReadRequests = 0
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -69,6 +82,36 @@ beforeAll(async () => {
       if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.4.1' }))
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
+      }
+      if (req.url === '/v1/rooms/abc12345/changes' && req.method === 'POST') {
+        return void res.end(JSON.stringify(APPLIED_CHANGE))
+      }
+      if (req.url === '/v1/rooms/partial-body/changes' && req.method === 'POST') {
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': 128,
+          connection: 'close'
+        })
+        res.write('{"id":"committed-before-response-ended"')
+        setTimeout(() => res.destroy(), 10)
+        return
+      }
+      if (req.url === '/v1/rooms/server-error/changes' && req.method === 'POST') {
+        return void res.writeHead(500).end('change failed')
+      }
+      if (req.url === '/v1/rooms/partial-read' && req.method === 'GET') {
+        partialReadRequests++
+        if (partialReadRequests === 1) {
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': 128,
+            connection: 'close'
+          })
+          res.write('{"id":"partial-read"')
+          setTimeout(() => res.destroy(), 10)
+          return
+        }
+        return void res.end(JSON.stringify({ id: 'partial-read', status: 'ready' }))
       }
       if (req.url?.startsWith('/v1/rooms/abc12345/start')) {
         return void res.end(JSON.stringify({ operation: runningOperation }))
@@ -205,6 +248,14 @@ function client(): ControlClient {
   return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.4.1' })
 }
 
+async function closedLoopbackPort(): Promise<number> {
+  const probe = createServer()
+  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve))
+  const closedPort = (probe.address() as { port: number }).port
+  await new Promise<void>((resolve) => probe.close(() => resolve()))
+  return closedPort
+}
+
 describe('ControlClient', () => {
   it('authenticates and lists rooms', async () => {
     const rooms = await client().listRooms()
@@ -234,13 +285,134 @@ describe('ControlClient', () => {
 })
 
 describe('resilientClient', () => {
-  it('re-reads control info and retries once when DevHotel restarted', async () => {
+  it('re-reads control info and retries a read-only request once when DevHotel restarted', async () => {
     let connects = 0
     const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, version: 'x' })
     const wrapped = resilientClient(async () => (connects++ === 0 ? stale : client()))
     const rooms = await wrapped.listRooms()
     expect(rooms).toHaveLength(1)
     expect(connects).toBe(2)
+  })
+
+  it('retries a mutation only when ECONNREFUSED proves the first request never connected', async () => {
+    let connects = 0
+    const closedPort = await closedLoopbackPort()
+    const unavailable = new ControlClient({ port: closedPort, token: TOKEN, pid: 0, version: 'x' })
+    const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
+    const wrapped = resilientClient(async () => (connects++ === 0 ? unavailable : client()))
+
+    await expect(wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })).resolves.toEqual(
+      APPLIED_CHANGE
+    )
+    expect(connects).toBe(2)
+    expect(seen.filter((request) => request.url === '/v1/rooms/abc12345/changes')).toHaveLength(before + 1)
+  })
+
+  it('does not replay applyChange after a transport timeout with an ambiguous outcome', async () => {
+    let calls = 0
+    let connects = 0
+    const headersTimeout = Object.assign(new Error('Headers Timeout Error'), { code: 'UND_ERR_HEADERS_TIMEOUT' })
+    const stale = {
+      async applyChange() {
+        calls++
+        throw new DevHotelNotRunningError('control API response timed out', {
+          cause: new TypeError('fetch failed', { cause: headersTimeout })
+        })
+      }
+    } as unknown as ControlClient
+    const wrapped = resilientClient(async () => {
+      connects++
+      return stale
+    })
+
+    let caught: unknown
+    try {
+      await wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(DevHotelAmbiguousMutationError)
+    expect(caught).toMatchObject({ transportCode: 'UND_ERR_HEADERS_TIMEOUT' })
+    expect((caught as Error).message).toMatch(/ambiguous outcome.*not retried.*list_changes.*inspect_room.*check_operation/i)
+    expect(calls).toBe(1)
+    expect(connects).toBe(1)
+  })
+
+  it('does not replay a mutation when a 200 response body terminates after the server handled it', async () => {
+    let connects = 0
+    const before = seen.filter((request) => request.url === '/v1/rooms/partial-body/changes').length
+    const wrapped = resilientClient(async () => {
+      connects++
+      return client()
+    })
+
+    await expect(
+      wrapped.applyChange('partial-body', { kind: 'node-version', version: '24' })
+    ).rejects.toBeInstanceOf(DevHotelAmbiguousMutationError)
+    expect(connects).toBe(1)
+    expect(seen.filter((request) => request.url === '/v1/rooms/partial-body/changes')).toHaveLength(before + 1)
+  })
+
+  it('reconnects and retries a read-only GET after a partial 200 response body', async () => {
+    let connects = 0
+    partialReadRequests = 0
+    const before = seen.filter((request) => request.url === '/v1/rooms/partial-read').length
+    const wrapped = resilientClient(async () => {
+      connects++
+      return client()
+    })
+
+    await expect(wrapped.inspectRoom('partial-read')).resolves.toEqual({ id: 'partial-read', status: 'ready' })
+    expect(connects).toBe(2)
+    expect(seen.filter((request) => request.url === '/v1/rooms/partial-read')).toHaveLength(before + 2)
+  })
+
+  it('reconnects and retries a mutation rejected with 401 before routing', async () => {
+    let connects = 0
+    const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const wrapped = resilientClient(async () => (connects++ === 0 ? unauthorized : client()))
+
+    await expect(wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })).resolves.toEqual(
+      APPLIED_CHANGE
+    )
+    expect(connects).toBe(2)
+    expect(seen.filter((request) => request.url === '/v1/rooms/abc12345/changes')).toHaveLength(before + 1)
+  })
+
+  it('reports a transport failure on the safe 401 replay as an ambiguous mutation', async () => {
+    let connects = 0
+    let replayCalls = 0
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const disconnected = {
+      async applyChange() {
+        replayCalls++
+        throw new DevHotelNotRunningError('control API disconnected during the replay')
+      }
+    } as unknown as ControlClient
+    const wrapped = resilientClient(async () => (connects++ === 0 ? unauthorized : disconnected))
+
+    await expect(
+      wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })
+    ).rejects.toBeInstanceOf(DevHotelAmbiguousMutationError)
+    expect(connects).toBe(2)
+    expect(replayCalls).toBe(1)
+  })
+
+  it('does not reconnect or replay a mutation after a 5xx response', async () => {
+    let connects = 0
+    const before = seen.filter((request) => request.url === '/v1/rooms/server-error/changes').length
+    const wrapped = resilientClient(async () => {
+      connects++
+      return client()
+    })
+
+    await expect(
+      wrapped.applyChange('server-error', { kind: 'node-version', version: '24' })
+    ).rejects.toThrow(/control API 500: change failed/)
+    expect(connects).toBe(1)
+    expect(seen.filter((request) => request.url === '/v1/rooms/server-error/changes')).toHaveLength(before + 1)
   })
 
   it('is not thenable, so async plumbing cannot call a non-existent .then', async () => {

@@ -8195,6 +8195,9 @@ export class RoomOrchestrator {
             })
           : this.backend.execFencedEmulatorAdb(roomId, args, opts)
       },
+      waitForFencedEmulatorBoot: physicalDevice
+        ? undefined
+        : (opts) => this.backend.waitForFencedEmulatorBoot(roomId, opts),
       installTrackedAndroidArtifact: async (applicationId, artifact, changeId) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
         await this.installAndRecordAndroidArtifactLocked(

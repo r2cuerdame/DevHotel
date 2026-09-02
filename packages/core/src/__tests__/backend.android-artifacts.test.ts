@@ -21,7 +21,6 @@ import {
   workspaceTransactionalFingerprintScript
 } from '../backend/ociCli'
 import { tempDir } from './fakes'
-import { ANDROID_IMAGE } from '../providers/androidProvider'
 
 vi.mock('../backend/cli', () => ({
   getPinnedDockerRuntime: vi.fn(() => ({ context: 'test-context' })),
@@ -35,6 +34,7 @@ const SNAPSHOT = workspaceSnapshotVolume(ROOM_ID, OPERATION_ID)
 const ok = { code: 0, stdout: '', stderr: '' }
 const SCREENSHOT_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_BASE64_LIMIT = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
+const TEST_EMULATOR_IMAGE_ID = `sha256:${'7'.repeat(64)}`
 
 function volumeInspect(): string {
   return JSON.stringify([{
@@ -582,6 +582,7 @@ describe('OciCliBackend Android artifact export', () => {
       emulator: 'c'.repeat(64),
       sandbox: 'd'.repeat(64),
       helper: 'e'.repeat(64),
+      emulatorImage: `sha256:${'2'.repeat(64)}`,
       runtime: 'f'.repeat(64),
       runtimeSandbox: '1'.repeat(64),
       controlNetwork: '3'.repeat(64),
@@ -596,6 +597,8 @@ describe('OciCliBackend Android artifact export', () => {
     let helper: Record<string, unknown> | null = null
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
+    let helperUser = '0:0'
+    let helperImageId = ids.emulatorImage
     let emulatorSandboxId = ''
     let webSandboxId = ''
     let driftEmulatorSandboxAfterCreate = false
@@ -610,9 +613,15 @@ describe('OciCliBackend Android artifact export', () => {
     let restartEmulatorGenerationAfterStart = false
     let restartWebGenerationAfterStart = false
     let emulatorReplaced = false
+    let emulatorImageId = ids.emulatorImage
+    let driftEmulatorImageAfterStart = false
     let receivedBytes = 0
+    let bootStart = false
+    let bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+    let bootHelperCode = 0
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
+      ...(role === 'svc-emulator' ? { Image: emulatorImageId } : {}),
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
@@ -715,13 +724,17 @@ describe('OciCliBackend Android artifact export', () => {
         const token = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
         helper = {
           Id: ids.helper,
+          Image: helperImageId,
           Name: `/${name}`,
-          Config: { Labels: {
-            'devhotel.room': ROOM_ID,
-            'devhotel.role': 'job',
-            'devhotel.managed': '1',
-            'devhotel.abort-token': token
-          } },
+          Config: {
+            User: helperUser,
+            Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'job',
+              'devhotel.managed': '1',
+              'devhotel.abort-token': token
+            }
+          },
           State: { Status: helperState },
           HostConfig: { NetworkMode: helperNetworkMode }
         }
@@ -737,6 +750,12 @@ describe('OciCliBackend Android artifact export', () => {
           : { code: 0, stdout: `${ids.helper}\n`, stderr: '' }
       }
       if (args[0] === 'start') {
+        if (bootStart) {
+          opts?.onStdout?.(bootReceipt)
+          if (replaceEmulatorAfterStart) emulatorReplaced = true
+          if (driftEmulatorImageAfterStart) emulatorImageId = `sha256:${'8'.repeat(64)}`
+          return { code: bootHelperCode, stdout: '', stderr: '' }
+        }
         if (holdStartUntilAbort) {
           opts?.onStdout?.('begin\n')
           return await new Promise<typeof ok>((_resolve, reject) => {
@@ -754,6 +773,7 @@ describe('OciCliBackend Android artifact export', () => {
         }
         opts?.onStdout?.(Buffer.alloc(SCREENSHOT_BASE64_LIMIT - 1, 0x61))
         if (replaceEmulatorAfterStart) emulatorReplaced = true
+        if (driftEmulatorImageAfterStart) emulatorImageId = `sha256:${'8'.repeat(64)}`
         if (restartEmulatorGenerationAfterStart) {
           emulatorStartedAt = '2026-09-02T00:00:02.300000001Z'
         }
@@ -791,11 +811,12 @@ describe('OciCliBackend Android artifact export', () => {
     const startOpts = startCall[1]
     expect(create).toEqual(expect.arrayContaining([
       '--network', `container:${ids.emulator}`,
+      '--user', '0:0',
       '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges',
       '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=23m',
       '--entrypoint', '/bin/sh',
-      ANDROID_IMAGE
+      ids.emulatorImage
     ]))
     expect(create).not.toContain(`container:${ids.anchor}`)
     expect(create).not.toContain(`container:${anchorName(ROOM_ID)}`)
@@ -803,6 +824,9 @@ describe('OciCliBackend Android artifact export', () => {
     expect(create).not.toContain('--entrypoint=adb')
     const script = create[create.indexOf('-c') + 1]!
     expect(script).toContain('env -i')
+    expect(script).toContain('adb=/opt/android/platform-tools/adb')
+    expect(script).toContain('ANDROID_SDK_ROOT=/opt/android')
+    expect(script).not.toContain('/opt/android-sdk')
     expect(script).toContain('localfilesystem:$socket_path')
     expect(script).toContain('"$adb" -L "$socket" -s emulator-5554')
     expect(script).toContain('[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ]')
@@ -813,7 +837,7 @@ describe('OciCliBackend Android artifact export', () => {
     expect(script).not.toContain('stdout_file=')
     expect(script).not.toContain('stderr_file=')
     expect(script).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
-    expect(create.slice(-3)).toEqual(['shell', 'getprop', 'sys.boot_completed'])
+    expect(create.slice(-4)).toEqual(['command', 'shell', 'getprop', 'sys.boot_completed'])
     expect(create).toEqual(expect.arrayContaining(['shell', 'getprop', 'sys.boot_completed']))
     expect(createCall[1]).toMatchObject({
       timeoutMs: null,
@@ -831,6 +855,86 @@ describe('OciCliBackend Android artifact export', () => {
       maxStderrBytes: 64,
       onAbort: expect.any(Function)
     })
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'image' || args[0] === 'pull')).toBe(false)
+
+    mockedRunDocker.mockClear()
+    bootStart = true
+    const boot = await new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 })
+    bootStart = false
+    expect(boot).toEqual({
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
+    })
+    const bootCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    expect(bootCalls.filter((args) => args[0] === 'create')).toHaveLength(1)
+    expect(bootCalls.filter((args) => args[0] === 'start')).toHaveLength(1)
+    expect(bootCalls.filter((args) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(bootCalls.some((args) => args[0] === 'image' || args[0] === 'pull')).toBe(false)
+    const bootCreate = bootCalls.find((args) => args[0] === 'create')!
+    const bootScript = bootCreate[bootCreate.indexOf('-c') + 1]!
+    expect(bootCreate.slice(-1)).toEqual(['wait-for-boot'])
+    expect(bootScript).toContain('if [ "$mode" = wait-for-boot ]')
+    expect(bootScript).toContain('run_adb_bounded start-server')
+    expect(bootScript).toContain('run_adb_bounded kill-server')
+    expect(bootScript).toContain('state_code=$?')
+    expect(bootScript).toContain('&& [ ! -S "$socket_path" ]')
+    expect(bootScript).toContain('[ -S "$socket_path" ] || boot_timeout')
+    expect(bootScript).toContain('while [ "$(date +%s)" -lt "$boot_deadline" ]')
+    const commandModeAt = bootScript.indexOf('[ "$mode" = command ] || exit 75')
+    expect(commandModeAt).toBeGreaterThan(0)
+    for (const rawBootFailure of ['exit 70', 'exit 71', 'exit 72', 'exit 73']) {
+      expect(bootScript.indexOf(rawBootFailure)).toBeGreaterThan(commandModeAt)
+    }
+    expect(helper).toBeNull()
+    expect(mockedRunDocker.mock.calls.find(([args]) => args[0] === 'start')?.[1])
+      .toMatchObject({ timeoutMs: 30_000 })
+
+    mockedRunDocker.mockClear()
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\tunauthorized\tempty\t1\n'
+    bootHelperCode = 74
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .resolves.toEqual({
+        booted: false,
+        adbState: 'unauthorized',
+        bootProperty: 'empty',
+        lastAdbCode: 1,
+        helperCode: 74
+      })
+    bootStart = false
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'create')).toHaveLength(1)
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'start')).toHaveLength(1)
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(helper).toBeNull()
+
+    mockedRunDocker.mockClear()
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\tmissing\tempty\t124\n'
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .resolves.toEqual({
+        booted: false,
+        adbState: 'missing',
+        bootProperty: 'empty',
+        lastAdbCode: 124,
+        helperCode: 74
+      })
+    bootStart = false
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(helper).toBeNull()
+
+    mockedRunDocker.mockClear()
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\tunauthorized\tempty\t999\n'
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .rejects.toThrow(/invalid bounded evidence/)
+    bootStart = false
+    expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    expect(helper).toBeNull()
+    bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+    bootHelperCode = 0
 
     mockedRunDocker.mockClear()
     webSandboxId = ids.runtimeSandbox
@@ -853,11 +957,13 @@ describe('OciCliBackend Android artifact export', () => {
     mockedRunDocker.mockClear()
     replaceEmulatorAfterStart = true
     let replacementError = ''
+    bootStart = true
     try {
-      await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'])
+      await new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 })
     } catch (error) {
       replacementError = error instanceof Error ? error.message : String(error)
     }
+    bootStart = false
     expect(replacementError).toMatch(/topology participant disappeared/)
     expect(replacementError).not.toContain('a'.repeat(32))
     expect(helper).toBeNull()
@@ -868,6 +974,23 @@ describe('OciCliBackend Android artifact export', () => {
     expect(topologyPostflightAt).toBeGreaterThan(helperCleanupAt)
     replaceEmulatorAfterStart = false
     emulatorReplaced = false
+
+    mockedRunDocker.mockClear()
+    driftEmulatorImageAfterStart = true
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .rejects.toThrow(/image content identity changed/)
+    bootStart = false
+    expect(helper).toBeNull()
+    const imageDriftCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    const imageDriftCleanupAt = imageDriftCalls.findIndex((args) => args[0] === 'rm' && args[2] === ids.helper)
+    const imageDriftPostflightAt = imageDriftCalls.findLastIndex(
+      (args) => args[0] === 'inspect' && args[1] === ids.emulator
+    )
+    expect(imageDriftCleanupAt).toBeGreaterThanOrEqual(0)
+    expect(imageDriftPostflightAt).toBeGreaterThan(imageDriftCleanupAt)
+    driftEmulatorImageAfterStart = false
+    emulatorImageId = ids.emulatorImage
 
     mockedRunDocker.mockClear()
     restartEmulatorGenerationAfterStart = true
@@ -927,6 +1050,22 @@ describe('OciCliBackend Android artifact export', () => {
 
     mockedRunDocker.mockClear()
     helperNetworkMode = `container:${ids.emulator}`
+    helperUser = '1300:1301'
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/exact private-stage user/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toBe(true)
+
+    mockedRunDocker.mockClear()
+    helperUser = '0:0'
+    helperImageId = `sha256:${'6'.repeat(64)}`
+    await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
+      .rejects.toThrow(/proved emulator image content identity/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'start')).toBe(false)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toBe(true)
+
+    mockedRunDocker.mockClear()
+    helperImageId = ids.emulatorImage
     helperState = 'running'
     await expect(new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state']))
       .rejects.toThrow(/not inert/)
@@ -1063,6 +1202,7 @@ describe('OciCliBackend Android artifact export', () => {
           : role === 'android-runtime-anchor'
             ? ids.runtime
             : ids.web,
+      ...(role === 'svc-emulator' ? { Image: TEST_EMULATOR_IMAGE_ID } : {}),
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
@@ -1155,13 +1295,17 @@ describe('OciCliBackend Android artifact export', () => {
         const token = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
         helper = {
           Id: ids.helper,
+          Image: TEST_EMULATOR_IMAGE_ID,
           Name: `/${name}`,
-          Config: { Labels: {
-            'devhotel.room': ROOM_ID,
-            'devhotel.role': 'job',
-            'devhotel.managed': '1',
-            'devhotel.abort-token': token
-          } },
+          Config: {
+            User: '0:0',
+            Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'job',
+              'devhotel.managed': '1',
+              'devhotel.abort-token': token
+            }
+          },
           State: { Status: 'created' },
           HostConfig: { NetworkMode: `container:${ids.emulator}` }
         }
@@ -1213,6 +1357,7 @@ describe('OciCliBackend Android artifact export', () => {
     let emulatorSandbox = ''
     const participant = (name: string, role: string, id: string, sandboxId: string, networkMode: string) => ({
       Id: id,
+      ...(role === 'svc-emulator' ? { Image: TEST_EMULATOR_IMAGE_ID } : {}),
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
@@ -1409,6 +1554,7 @@ describe('OciCliBackend Android artifact export', () => {
     let webStartedAt = '2026-09-02T00:00:00.400000001Z'
     const container = (name: string, role: string, id: string, sandboxId: string, networkMode?: string) => JSON.stringify([{
       Id: id,
+      ...(role === 'svc-emulator' ? { Image: TEST_EMULATOR_IMAGE_ID } : {}),
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
@@ -1774,6 +1920,7 @@ describe('OciCliBackend Android artifact export', () => {
     let helperInspect: Record<string, unknown> | null = null
     const roomContainer = (name: string, role: string, id: string) => ({
       Id: id,
+      ...(role === 'svc-emulator' ? { Image: TEST_EMULATOR_IMAGE_ID } : {}),
       Name: `/${name}`,
       Config: { Labels: {
         'devhotel.room': ROOM_ID,
@@ -1887,12 +2034,16 @@ describe('OciCliBackend Android artifact export', () => {
         const abortToken = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
         helperInspect = {
           ...roomContainer(name, 'job', ownedIds.helper),
-          Config: { Labels: {
-            'devhotel.room': ROOM_ID,
-            'devhotel.role': 'job',
-            'devhotel.managed': '1',
-            'devhotel.abort-token': abortToken
-          } },
+          Image: TEST_EMULATOR_IMAGE_ID,
+          Config: {
+            User: '0:0',
+            Labels: {
+              'devhotel.room': ROOM_ID,
+              'devhotel.role': 'job',
+              'devhotel.managed': '1',
+              'devhotel.abort-token': abortToken
+            }
+          },
           State: { Status: 'created' },
           HostConfig: { NetworkMode: `container:${ownedIds.emulator}` }
         }

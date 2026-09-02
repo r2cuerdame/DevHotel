@@ -9,6 +9,7 @@ import type {
   ExecOpts,
   ExecResult,
   ExportedArtifact,
+  FencedEmulatorBootResult,
   IsolationBackend,
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
@@ -516,6 +517,27 @@ export class FakeBackend implements IsolationBackend {
       ...result,
       stdout: opts?.onStdout ? '' : result.stdout,
       stderr: opts?.onStderr ? '' : result.stderr
+    }
+  }
+  fencedEmulatorBootHandler: ((
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ) => Promise<FencedEmulatorBootResult> | FencedEmulatorBootResult) | null = null
+  fencedEmulatorBootCalls: { opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'> }[] = []
+  async waitForFencedEmulatorBoot(
+    _roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult> {
+    this.calls.push('waitForFencedEmulatorBoot')
+    this.fencedEmulatorBootCalls.push({ opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (this.fencedEmulatorBootHandler) return await this.fencedEmulatorBootHandler(opts)
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    return {
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
     }
   }
   async execFencedEmulatorRecoveryAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {

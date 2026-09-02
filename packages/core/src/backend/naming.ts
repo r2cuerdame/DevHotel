@@ -234,7 +234,10 @@ export function buildEmulatorArgs(
     '-e',
     `EMULATOR_CONFIG_PATH=${EMULATOR_AVD_OVERRIDE_PATH}`,
     '-e',
-    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim',
+    // ADB authentication is disabled only for this managed emulator: its ADB
+    // transport has no Host port or Room-network path, and immutable-ID
+    // helpers can reach it only through the proved private control netns.
+    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth',
     '-e',
     `SCREEN_WIDTH=${screen.width}`,
     '-e',

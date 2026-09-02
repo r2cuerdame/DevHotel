@@ -88,13 +88,64 @@ export function defaultControlFile(): string {
   return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'DevHotel', 'control.json')
 }
 
+function transportErrorCode(error: unknown): string | null {
+  const seen = new Set<unknown>()
+  let current = error
+  while (typeof current === 'object' && current !== null && !seen.has(current)) {
+    seen.add(current)
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)) return code
+    current = (current as { cause?: unknown }).cause
+  }
+  return null
+}
+
+type TransportFailureKind = 'pre-connect' | 'ambiguous'
+
+const DEFINITELY_PRE_CONNECT_CODES = new Set(['ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'])
+
 export class DevHotelNotRunningError extends Error {
-  constructor(detail: string) {
+  readonly transportCode: string | null
+  readonly transportFailureKind: TransportFailureKind
+
+  constructor(detail: string, options: { cause?: unknown; responseStarted?: boolean } = {}) {
     super(
       `DevHotel does not appear to be running (${detail}). ` +
-        'Start the DevHotel desktop app, then try again.'
+        'Start the DevHotel desktop app, then try again.',
+      { cause: options.cause }
     )
     this.name = 'DevHotelNotRunningError'
+    this.transportCode = transportErrorCode(options.cause)
+    this.transportFailureKind =
+      options.responseStarted !== true &&
+      this.transportCode !== null &&
+      DEFINITELY_PRE_CONNECT_CODES.has(this.transportCode)
+        ? 'pre-connect'
+        : 'ambiguous'
+  }
+}
+
+export class DevHotelAmbiguousMutationError extends Error {
+  readonly transportCode: string | null
+
+  constructor(method: string, cause: DevHotelNotRunningError) {
+    const code = cause.transportCode ? ` (${cause.transportCode})` : ''
+    super(
+      `DevHotel lost the control API response while running ${method}${code}. ` +
+        'The mutation has an ambiguous outcome and was not retried. ' +
+        'Inspect list_changes, inspect_room, or check_operation (when an operation ID was returned) ' +
+        'before deciding whether to retry.',
+      { cause }
+    )
+    this.name = 'DevHotelAmbiguousMutationError'
+    this.transportCode = cause.transportCode
+  }
+}
+
+class DevHotelControlApiError extends Error {
+  constructor(readonly status: number, detail: string, options: { cause?: unknown } = {}) {
+    super(`DevHotel control API ${status}: ${detail}`, { cause: options.cause })
+    this.name = 'DevHotelControlApiError'
   }
 }
 
@@ -130,14 +181,28 @@ export class ControlClient {
         body: body !== undefined ? JSON.stringify(body) : undefined
       })
     } catch (err) {
-      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`)
+      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`, {
+        cause: err
+      })
     }
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new Error(`DevHotel control API ${res.status}: ${text || res.statusText}`)
+      let text: string
+      try {
+        text = await res.text()
+      } catch (err) {
+        throw new DevHotelControlApiError(res.status, res.statusText || 'response body unavailable', { cause: err })
+      }
+      throw new DevHotelControlApiError(res.status, text || res.statusText)
     }
     if (res.status === 204) return undefined as T
-    return (await res.json()) as T
+    try {
+      return (await res.json()) as T
+    } catch (err) {
+      throw new DevHotelNotRunningError(
+        `control API response body ended before valid JSON was received on port ${this.info.port}: ${String(err)}`,
+        { cause: err, responseStarted: true }
+      )
+    }
   }
 
   private async reqBytes(path: string): Promise<{ bytes: Buffer; sha256: string }> {
@@ -146,11 +211,18 @@ export class ControlClient {
     try {
       res = await fetch(url, { headers: { authorization: `Bearer ${this.info.token}` } })
     } catch (err) {
-      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`)
+      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`, {
+        cause: err
+      })
     }
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new Error(`DevHotel control API ${res.status}: ${text || res.statusText}`)
+      let text: string
+      try {
+        text = await res.text()
+      } catch (err) {
+        throw new DevHotelControlApiError(res.status, res.statusText || 'response body unavailable', { cause: err })
+      }
+      throw new DevHotelControlApiError(res.status, text || res.statusText)
     }
     if (res.headers.get('content-type')?.split(';', 1)[0] !== 'image/png') {
       throw new Error('DevHotel control API returned a non-PNG artifact')
@@ -168,7 +240,12 @@ export class ControlClient {
     const chunks: Uint8Array[] = []
     let length = 0
     while (true) {
-      const { done, value } = await reader.read()
+      const { done, value } = await reader.read().catch((err: unknown) => {
+        throw new DevHotelNotRunningError(
+          `control API artifact response body ended early on port ${this.info.port}: ${String(err)}`,
+          { cause: err, responseStarted: true }
+        )
+      })
       if (done) break
       length += value.byteLength
       if (length > SCREENSHOT_ARTIFACT_MAX_BYTES) {
@@ -449,11 +526,16 @@ export async function connect(): Promise<ControlClient> {
   return client
 }
 
-function isStaleConnection(err: unknown): boolean {
+type StaleConnectionKind = 'auth-401' | 'pre-connect' | 'ambiguous-transport'
+
+function staleConnectionKind(err: unknown): StaleConnectionKind | null {
   // DevHotel restarts change the control port and token: the old socket
   // refuses (NotRunning) or a lucky port reuse answers 401.
-  if (err instanceof DevHotelNotRunningError) return true
-  return err instanceof Error && /control API 401/.test(err.message)
+  if (err instanceof DevHotelNotRunningError) {
+    return err.transportFailureKind === 'pre-connect' ? 'pre-connect' : 'ambiguous-transport'
+  }
+  if (err instanceof DevHotelControlApiError && err.status === 401) return 'auth-401'
+  return null
 }
 
 /** Real ControlClient methods; anything else must not be forwarded (see below). */
@@ -462,9 +544,41 @@ const CLIENT_METHODS = new Set(
 )
 
 /**
- * A ControlClient that survives DevHotel app restarts: on a stale-connection
- * failure it re-reads control.json (fresh port/token) and retries once, so a
- * long-lived MCP session never needs a manual reconnect.
+ * Public methods in this list issue only read-only GET requests. A transport
+ * failure may therefore be replayed after reconnecting without duplicating a
+ * Room mutation. Mutation methods intentionally fail closed because a missing
+ * response does not prove the first request was never accepted.
+ */
+const TRANSPORT_RETRY_SAFE_METHODS = new Set([
+  'ping',
+  'listRooms',
+  'inspectRoom',
+  'getOperation',
+  'listRoomOperations',
+  'listRuns',
+  'readRunOutput',
+  'listChanges',
+  'components',
+  'logs',
+  'diagnostic',
+  'hotelStatus',
+  'screenshot',
+  'androidAutomationStatus',
+  'listAndroidAcceptanceReports',
+  'getAndroidAcceptanceReport',
+  'listRoomArtifacts',
+  'getRoomArtifact',
+  'readRoomArtifactContent',
+  'pullFile',
+  'androidDevices',
+  'hotelGithubStatus'
+])
+
+/**
+ * A ControlClient that survives DevHotel app restarts: after an authentication
+ * rejection or a provably pre-connect transport failure it re-reads
+ * control.json and retries once. Ambiguous transport failures replay only
+ * explicitly read-only requests; sent mutations fail closed instead.
  *
  * Only real methods are forwarded. A proxy that answers *every* property with a
  * function is thenable, so `return client` from an async function makes the
@@ -483,10 +597,29 @@ export function resilientClient(connector: () => Promise<ControlClient> = connec
         try {
           return await call(inner)
         } catch (err) {
-          if (!isStaleConnection(err)) throw err
+          const stale = staleConnectionKind(err)
+          if (stale === null) throw err
           inner = null
+          if (stale === 'ambiguous-transport' && !TRANSPORT_RETRY_SAFE_METHODS.has(prop)) {
+            throw new DevHotelAmbiguousMutationError(prop, err as DevHotelNotRunningError)
+          }
           inner = await connector()
-          return await call(inner)
+          try {
+            return await call(inner)
+          } catch (retryError) {
+            // A mutation rejected with 401 or blocked before connecting was
+            // safe to replay. If that replay loses its response, its outcome
+            // is now just as ambiguous as any other sent mutation.
+            if (
+              !TRANSPORT_RETRY_SAFE_METHODS.has(prop) &&
+              retryError instanceof DevHotelNotRunningError &&
+              retryError.transportFailureKind === 'ambiguous'
+            ) {
+              inner = null
+              throw new DevHotelAmbiguousMutationError(prop, retryError)
+            }
+            throw retryError
+          }
         }
       }
     },

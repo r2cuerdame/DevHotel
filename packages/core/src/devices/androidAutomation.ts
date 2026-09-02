@@ -89,6 +89,7 @@ const FINAL_LOCALE_PULSE_KEYS = [
   'pids',
   'pgrepStatus'
 ] as const
+const ANDROID_SYSTEM_USER_INCARNATION = 'devhotel-system-user-incarnation-v1 user=0 serial=0'
 const FINAL_LOCALE_PULSE_SCRIPT = [
   'set -eu',
   'app="$1"',
@@ -97,7 +98,7 @@ const FINAL_LOCALE_PULSE_SCRIPT = [
   'emit() { key="$1"; value="$2"; encoded="$(printf %s "$value" | base64 | tr -d "\\r\\n")"; printf "%s=%s\\n" "$key" "$encoded"; }',
   'api="$(getprop ro.build.version.sdk)"',
   'active_user="$(am get-current-user)"',
-  'user_dump="$(dumpsys user --user "$user")"',
+  `user_dump="$(if [ "$user" = "0" ]; then printf %s '${ANDROID_SYSTEM_USER_INCARNATION}'; else dumpsys user --user "$user"; fi)"`,
   'paths="$(pm path --user "$user" "$app")"',
   'base_path="$(printf "%s\\n" "$paths" | sed -n "s/^package://p")"',
   'case "$base_path" in /data/app/*/base.apk) ;; *) exit 41 ;; esac',
@@ -204,7 +205,7 @@ export function isPhysicalAcceptanceProofReadCommand(
       return args.length === 3 && args[0] === 'shell' && args[1] === 'am' && args[2] === 'get-current-user'
     case 'Android user incarnation probe':
       return args.length === 5 && args[0] === 'shell' && args[1] === 'dumpsys' && args[2] === 'user' &&
-        args[3] === '--user' && user(args[4])
+        args[3] === '--user' && user(args[4]) && args[4] !== '0'
     case 'Android package probe':
       return args.length === 6 && args[0] === 'shell' && args[1] === 'pm' && args[2] === 'path' &&
         args[3] === '--user' && user(args[4]) && app(args[5])
@@ -835,6 +836,11 @@ export class AndroidAutomationSession {
     deadline?: AndroidAutomationDeadline,
     signal?: AbortSignal
   ): Promise<number> {
+    // Android reserves user 0 for the non-removable system user and defines
+    // USER_SERIAL_SYSTEM as 0. Avoid a large, name-bearing dumpsys response for
+    // the common managed-emulator case; the surrounding active-user sandwich
+    // still proves that every subsequent operation remains on user 0.
+    if (userId === 0) return 0
     const result = await this.command(
       ['shell', 'dumpsys', 'user', '--user', String(userId)],
       {
@@ -1687,17 +1693,24 @@ export class AndroidAutomationSession {
     const apiLevel = parseAndroidApiLevel(value('api'))
     if (apiLevel !== expectedFence.apiLevel) fail()
     if (value('activeUser') !== String(tracked.installUserId)) fail()
-    const userLines = value('userDump').split(/\r?\n/)
-    const userPattern = /^ UserInfo\{(0|[1-9]\d{0,4}):[^\r\n]*:[0-9a-fA-F]+\} serialNo=(0|[1-9]\d{0,9}) isPrimary=(?:true|false)(?: parentId=(?:0|[1-9]\d{0,4}))?(?: .*?)?$/
-    const users = userLines
-      .map((line, index) => ({ index, match: userPattern.exec(line) }))
-      .filter((entry): entry is { index: number; match: RegExpExecArray } => Boolean(entry.match))
-    if (
-      users.length !== 1 ||
-      users[0]!.index !== 0 ||
-      users[0]!.match[1] !== String(tracked.installUserId) ||
-      users[0]!.match[2] !== String(tracked.installUserSerial)
-    ) fail()
+    if (tracked.installUserId === 0) {
+      if (
+        tracked.installUserSerial !== 0 ||
+        value('userDump') !== ANDROID_SYSTEM_USER_INCARNATION
+      ) fail()
+    } else {
+      const userLines = value('userDump').split(/\r?\n/)
+      const userPattern = /^ UserInfo\{(0|[1-9]\d{0,4}):[^\r\n]*:[0-9a-fA-F]+\} serialNo=(0|[1-9]\d{0,9}) isPrimary=(?:true|false)(?: parentId=(?:0|[1-9]\d{0,4}))?(?: .*?)?$/
+      const users = userLines
+        .map((line, index) => ({ index, match: userPattern.exec(line) }))
+        .filter((entry): entry is { index: number; match: RegExpExecArray } => Boolean(entry.match))
+      if (
+        users.length !== 1 ||
+        users[0]!.index !== 0 ||
+        users[0]!.match[1] !== String(tracked.installUserId) ||
+        users[0]!.match[2] !== String(tracked.installUserSerial)
+      ) fail()
+    }
 
     const pathMatch = /^package:([^\r\n]+)$/.exec(value('paths'))
     const baseApk = pathMatch?.[1]

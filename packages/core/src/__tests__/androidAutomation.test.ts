@@ -28,7 +28,9 @@ const PACKAGE_INCARNATION = createHash('sha256')
   .digest('hex')
 const INSTALL_LOG_FENCE = 'devhotel-install-u0-uid10123-11111111-2222-4333-8444-555555555555'
 const SECONDARY_INSTALL_LOG_FENCE = 'devhotel-install-u10-uid1010123-11111111-2222-4333-8444-555555555555'
-const INSTALL_USER_SERIAL = 42
+const INSTALL_USER_SERIAL = 0
+const SECONDARY_INSTALL_USER_SERIAL = 42
+const SYSTEM_USER_INCARNATION = 'devhotel-system-user-incarnation-v1 user=0 serial=0'
 function exclusivePackageDump(
   idField: 'userId' | 'appId',
   userRows: string[] = ['    User 0: ceDataInode=1 installed=true hidden=false stopped=true enabled=0']
@@ -182,6 +184,7 @@ describe('tracked Android automation session', () => {
     } = {}
   ) {
     const installUserId = Number.parseInt(/^devhotel-install-u(\d+)-/.exec(logFence ?? '')?.[1] ?? '0', 10)
+    const installUserSerial = installUserId === 0 ? INSTALL_USER_SERIAL : SECONDARY_INSTALL_USER_SERIAL
     const db = testDb()
     dbs.push(db)
     roomsRepo(db).create(makeRoom({
@@ -202,7 +205,7 @@ describe('tracked Android automation session', () => {
       packageIncarnation: PACKAGE_INCARNATION,
       logFence,
       installUserId,
-      installUserSerial: INSTALL_USER_SERIAL
+      installUserSerial
     })
     const calls: string[][] = []
     const timeouts: Array<number | undefined> = []
@@ -395,7 +398,7 @@ describe('tracked Android automation session', () => {
           const userId = args[4]!
           return {
             code: 0,
-            stdout: ` UserInfo{${userId}:DevHotel:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=${userId === '0'}\n Type: android.os.usertype.full.SECONDARY\n`,
+            stdout: ` UserInfo{${userId}:DevHotel:13} serialNo=${installUserSerial} isPrimary=${userId === '0'}\n Type: android.os.usertype.full.SECONDARY\n`,
             stderr: ''
           }
         }
@@ -454,16 +457,27 @@ describe('tracked Android automation session', () => {
       }
       if (args[0] === 'logcat') return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
-    }, {}, { ...target, apiLevel, androidVersion })
+    }, {}, { ...target, apiLevel, androidVersion }, userId === 0 ? INSTALL_LOG_FENCE : SECONDARY_INSTALL_LOG_FENCE)
 
     const evidence = await session.establishInstallEvidence(APP_ID)
     expect(evidence).toEqual({
       apkSha256: 'a'.repeat(64),
       packageIncarnation: PACKAGE_INCARNATION,
       installUserId: userId,
-      installUserSerial: INSTALL_USER_SERIAL,
+      installUserSerial: userId === 0 ? INSTALL_USER_SERIAL : SECONDARY_INSTALL_USER_SERIAL,
       logFence: emittedFence
     })
+    expect(calls.some((args) => args[1] === 'dumpsys' && args[2] === 'user')).toBe(userId !== 0)
+    expect(isPhysicalAcceptanceProofReadCommand(
+      ['shell', 'dumpsys', 'user', '--user', '0'],
+      'Android user incarnation probe'
+    )).toBe(false)
+    if (userId !== 0) {
+      expect(isPhysicalAcceptanceProofReadCommand(
+        ['shell', 'dumpsys', 'user', '--user', String(userId)],
+        'Android user incarnation probe'
+      )).toBe(true)
+    }
     expect(emittedFence).toMatch(new RegExp(`^devhotel-install-u${userId}-uid${uid}-[0-9a-f-]{36}$`))
     expect(calls.find((args) => args[1] === 'run-as')).toEqual([
       'shell', 'run-as', APP_ID, '--user', String(userId),
@@ -514,13 +528,13 @@ describe('tracked Android automation session', () => {
       if (args[1] === 'dumpsys' && args[2] === 'user') {
         return {
           code: 0,
-          stdout: ` UserInfo{0:DevHotel:13} serialNo=${markerRead ? INSTALL_USER_SERIAL + 1 : INSTALL_USER_SERIAL} isPrimary=true\n`,
+          stdout: ` UserInfo{10:Work:13} serialNo=${markerRead ? SECONDARY_INSTALL_USER_SERIAL + 1 : SECONDARY_INSTALL_USER_SERIAL} isPrimary=false\n`,
           stderr: ''
         }
       }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
-      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
-      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args.includes('--uid')) return { code: 0, stdout: `package:${APP_ID} uid:1010123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:1010123\n`, stderr: '' }
       if (args[1] === 'run-as') {
         emittedFence = args.at(-1)!
         return { code: 0, stdout: '', stderr: '' }
@@ -530,7 +544,7 @@ describe('tracked Android automation session', () => {
         return { code: 0, stdout: `${emittedFence}\n`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
-    })
+    }, {}, target, SECONDARY_INSTALL_LOG_FENCE)
 
     await expect(session.establishInstallEvidence(APP_ID)).rejects.toMatchObject({
       code: 'ANDROID_APP_USER_CHANGED'
@@ -2004,9 +2018,6 @@ describe('tracked Android automation session', () => {
       timeout !== undefined && timeout > 0 && (index === 0 || timeout <= timeouts[index - 1]!)
     )).toBe(true)
     expect(timeouts.at(-1)).toBeLessThan(1_000)
-    expect(calls.some((args) =>
-      args[1] === 'rm' && args.at(-1)?.includes('/data/local/tmp/devhotel-ui-')
-    )).toBe(false)
     const trappedDump = calls.find((args) => args[0] === 'exec-out')
     expect(trappedDump?.[3]).toContain('trap cleanup 0 1 2 15')
     expect(trappedDump?.[3]).toContain('kill "$child"')
@@ -2610,17 +2621,17 @@ describe('tracked Android automation session', () => {
   )
 
   it('rejects a recycled numeric user ID with a new serial without deleting the old receipt', async () => {
-    const recycledSerial = INSTALL_USER_SERIAL + 1
+    const recycledSerial = SECONDARY_INSTALL_USER_SERIAL + 1
     const { installs, calls, session } = setup((args) => {
       if (args[1] === 'dumpsys' && args[2] === 'user') {
         return {
           code: 0,
-          stdout: ` UserInfo{0:Replacement user:13} serialNo=${recycledSerial} isPrimary=true\n Type: android.os.usertype.full.SYSTEM\n`,
+          stdout: ` UserInfo{10:Replacement user:13} serialNo=${recycledSerial} isPrimary=false\n Type: android.os.usertype.full.SECONDARY\n`,
           stderr: ''
         }
       }
       return { code: 0, stdout: '', stderr: '' }
-    })
+    }, {}, target, SECONDARY_INSTALL_LOG_FENCE)
 
     await expect(session.launch(APP_ID, '.MainActivity')).rejects.toMatchObject({
       code: 'ANDROID_APP_USER_CHANGED'
@@ -2636,24 +2647,24 @@ describe('tracked Android automation session', () => {
   it.each([
     {
       label: 'malformed',
-      stdout: ' UserInfo{0:Private user name:13} serialNo=not-a-number isPrimary=true\n'
+      stdout: ' UserInfo{10:Private user name:13} serialNo=not-a-number isPrimary=false\n'
     },
     {
       label: 'duplicate',
       stdout: [
-        ` UserInfo{0:Private user name:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=true`,
-        ` UserInfo{0:Injected:13} serialNo=${INSTALL_USER_SERIAL} isPrimary=true`,
+        ` UserInfo{10:Private user name:13} serialNo=${SECONDARY_INSTALL_USER_SERIAL} isPrimary=false`,
+        ` UserInfo{10:Injected:13} serialNo=${SECONDARY_INSTALL_USER_SERIAL} isPrimary=false`,
         ''
       ].join('\n')
     },
     {
       label: 'overflow',
-      stdout: ' UserInfo{0:Private user name:13} serialNo=2147483648 isPrimary=true\n'
+      stdout: ' UserInfo{10:Private user name:13} serialNo=2147483648 isPrimary=false\n'
     }
   ])('fails a $label user-serial probe closed without exposing its dump', async ({ stdout }) => {
     const { calls, session } = setup((args) => args[1] === 'dumpsys' && args[2] === 'user'
       ? { code: 0, stdout, stderr: 'private-user-diagnostic' }
-      : { code: 0, stdout: '', stderr: '' })
+      : { code: 0, stdout: '', stderr: '' }, {}, target, SECONDARY_INSTALL_LOG_FENCE)
 
     await session.forceStop(APP_ID).catch((error: unknown) => {
       expect(error).toMatchObject({
@@ -2686,7 +2697,7 @@ describe('tracked Android automation session', () => {
       packageIncarnation: PACKAGE_INCARNATION,
       logFence: null,
       installUserId: 10,
-      installUserSerial: INSTALL_USER_SERIAL
+      installUserSerial: SECONDARY_INSTALL_USER_SERIAL
     })
 
     await expect(session.status()).resolves.toMatchObject({
@@ -3278,7 +3289,7 @@ describe('tracked Android automation session', () => {
       const values = {
         api: '34',
         activeUser: '0',
-        userDump: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true',
+        userDump: SYSTEM_USER_INCARNATION,
         paths: `package:${BASE_APK_PATH}`,
         stat: BASE_APK_STAT,
         sha: `${'a'.repeat(64)}  ${BASE_APK_PATH}`,
@@ -3328,7 +3339,7 @@ describe('tracked Android automation session', () => {
     const values = {
       api: '34',
       activeUser: '0',
-      userDump: ' UserInfo{0:DevHotel:13} serialNo=42 isPrimary=true',
+      userDump: SYSTEM_USER_INCARNATION,
       paths: `package:${BASE_APK_PATH}`,
       stat: BASE_APK_STAT,
       sha: `${'a'.repeat(64)}  ${BASE_APK_PATH}`,

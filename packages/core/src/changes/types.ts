@@ -1,5 +1,5 @@
 import type { ChangeEntry, RoomRecord } from '@devhotel/shared'
-import type { ExecResult, IsolationBackend, WebSpec } from '../backend/types'
+import type { ExecResult, FencedEmulatorBootResult, IsolationBackend, WebSpec } from '../backend/types'
 import type { Gateway } from '../gateway/gateway'
 import type { ChangesRepo } from '../store/changesRepo'
 import type { RoomsRepo } from '../store/roomsRepo'
@@ -38,6 +38,8 @@ export interface ChangeCtx {
   }
   /** Execute one bounded target probe through the physical broker or controlled emulator helper. */
   execFencedAndroidTarget?: (args: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>
+  /** Witness managed-emulator boot through one helper/server for the whole deadline. */
+  waitForFencedEmulatorBoot?: (opts?: { timeoutMs?: number }) => Promise<FencedEmulatorBootResult>
   /** Resolve one sealed Host artifact capability, stage once, install, prove, and atomically persist its receipt. */
   installTrackedAndroidArtifact: (
     applicationId: string,
