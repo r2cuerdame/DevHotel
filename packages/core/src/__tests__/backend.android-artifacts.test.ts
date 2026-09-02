@@ -749,7 +749,15 @@ describe('OciCliBackend Android artifact export', () => {
           ? { code: -1, stdout: `${ids.helper}\n`, stderr: '', outputLimitExceeded: true }
           : { code: 0, stdout: `${ids.helper}\n`, stderr: '' }
       }
+      if (args[0] === 'exec') {
+        // The resident helper answers on the private server it already holds.
+        opts?.onStdout?.(Buffer.alloc(SCREENSHOT_BASE64_LIMIT - 1, 0x61))
+        return ok
+      }
       if (args[0] === 'start') {
+        // A detached start leaves the container running, and the resident proof
+        // depends on the next inspect seeing that. `start -a` is the one-shot path.
+        if (helper && !args.includes('-a')) helper['State'] = { Status: 'running' }
         if (bootStart) {
           opts?.onStdout?.(bootReceipt)
           if (replaceEmulatorAfterStart) emulatorReplaced = true
@@ -809,15 +817,20 @@ describe('OciCliBackend Android artifact export', () => {
     const create = createCall[0]
     const start = startCall[0]
     const startOpts = startCall[1]
+    // The resident helper is created once per Room and commands run through
+    // `docker exec` into it, so the fencing flags are asserted on its create and
+    // the per-command argv on its exec. A shared helper cannot size its scratch
+    // per command, so the tmpfs is the ceiling one command may request.
     expect(create).toEqual(expect.arrayContaining([
       '--network', `container:${ids.emulator}`,
       '--user', '0:0',
       '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges',
-      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=23m',
+      '--read-only',
       '--entrypoint', '/bin/sh',
       ids.emulatorImage
     ]))
+    expect(create.some((arg) => /^\/tmp:rw,nosuid,nodev,noexec,size=\d+m$/.test(arg))).toBe(true)
     expect(create).not.toContain(`container:${ids.anchor}`)
     expect(create).not.toContain(`container:${anchorName(ROOM_ID)}`)
     expect(create).not.toContain('/workspace')
@@ -828,17 +841,23 @@ describe('OciCliBackend Android artifact export', () => {
     expect(script).toContain('ANDROID_SDK_ROOT=/opt/android')
     expect(script).not.toContain('/opt/android-sdk')
     expect(script).toContain('localfilesystem:$socket_path')
-    expect(script).toContain('"$adb" -L "$socket" -s emulator-5554')
+    // The device selector and the caps belong to one command, so they live on the
+    // exec that carries it rather than on the helper that outlives it.
+    const execCall = mockedRunDocker.mock.calls.find(([callArgs]) => callArgs[0] === 'exec')!
+    const execArgs = execCall[0]
+    const execScript = execArgs[execArgs.indexOf('-c') + 1]!
+    expect(execArgs).toEqual(expect.arrayContaining(['exec', '--user', '0:0', ids.helper]))
+    expect(execScript).toContain('-s emulator-5554 "$@"')
+    expect(execScript).toContain('head -c "$((stdout_limit + 1))" < "$stdout_pipe" &')
+    expect(execScript).toContain('head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &')
+    expect(execScript).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
+    expect(execArgs.slice(-3)).toEqual(['shell', 'getprop', 'sys.boot_completed'])
     expect(script).toContain('[ ! -e "$socket_path" ] && [ ! -L "$socket_path" ]')
     expect(script).toContain('[ -S "$socket_path" ]')
     expect(script).toContain('run_adb kill-server')
-    expect(script).toContain('head -c "$((stdout_limit + 1))" < "$stdout_pipe" &')
-    expect(script).toContain('head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &')
     expect(script).not.toContain('stdout_file=')
     expect(script).not.toContain('stderr_file=')
     expect(script).not.toMatch(/localhost|127\.0\.0\.1|5037|tcp:/)
-    expect(create.slice(-4)).toEqual(['command', 'shell', 'getprop', 'sys.boot_completed'])
-    expect(create).toEqual(expect.arrayContaining(['shell', 'getprop', 'sys.boot_completed']))
     expect(createCall[1]).toMatchObject({
       timeoutMs: null,
       maxStdoutBytes: 128,
@@ -847,13 +866,15 @@ describe('OciCliBackend Android artifact export', () => {
     })
     expect(createCall[1]?.signal).toBeUndefined()
     expect(createCall[1]?.onAbort).toBeUndefined()
-    expect(start).toEqual(['start', '-a', ids.helper])
-    expect(startOpts).toMatchObject({
+    // The resident helper is started detached and outlives the command; the
+    // caller's timeout, abort signal and output caps ride on the exec that
+    // carries the command, which is where they can still bound it.
+    expect(start).toEqual(['start', ids.helper])
+    expect(execCall[1]).toMatchObject({
       timeoutMs: 20_000,
       signal: controller.signal,
       maxStdoutBytes: SCREENSHOT_BASE64_LIMIT,
-      maxStderrBytes: 64,
-      onAbort: expect.any(Function)
+      maxStderrBytes: 64
     })
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'image' || args[0] === 'pull')).toBe(false)
 

@@ -92,6 +92,11 @@ const FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS = 10_000
 /** How long a resident helper waits for another command before reaping itself. */
 const FENCED_EMULATOR_RESIDENT_IDLE_SECONDS = 120
 const FENCED_EMULATOR_RESIDENT_STATE = '/tmp/devhotel-fenced-resident'
+
+/** The ceiling one fenced command may request, plus room for the private server. */
+function residentTmpfsSizeMiB(): number {
+  return Math.ceil((SCREENSHOT_MAX_BASE64_BYTES + 64 * 1024 + 1024 * 1024) / (1024 * 1024))
+}
 const FENCED_EMULATOR_BOOT_RECEIPT = /^devhotel-emulator-boot-v1\t(ready|timeout)\t(device|offline|unauthorized|missing|unknown)\t(1|empty|other)\t(0|[1-9]\d{0,2})$/
 const SYNC_INCLUDE_FILE = '.devhotel-sync-include'
 const GENERATED_SYNC_DIRS = [
@@ -514,19 +519,54 @@ while [ -e "$state/lease" ]; do
   sleep 1
 done`
 
-/** One command against the resident helper's already-running private server. */
+/**
+ * One command against the resident helper's already-running private server.
+ *
+ * The output caps are enforced *here*, in the container, exactly as the one-shot
+ * helper enforces them. A host-side cap alone is one layer where the fence had
+ * two, and the guest would be able to produce more than the command was
+ * authorised to return. Each invocation gets its own fifos, so a cap belongs to
+ * the command that asked for it.
+ */
 const FENCED_EMULATOR_RESIDENT_COMMAND = `set -eu
 state=$1
-command_timeout=$2
-shift 2
+stdout_limit=$2
+stderr_limit=$3
+command_timeout=$4
+invocation=$5
+shift 5
 touch "$state/lease"
-exec timeout -k 1 "$command_timeout" env -i \
+stdout_pipe=$state/tmp/stdout-$invocation.pipe
+stderr_pipe=$state/tmp/stderr-$invocation.pipe
+stdout_reader=
+stderr_reader=
+cleanup() {
+  if [ -n "$stdout_reader" ]; then kill "$stdout_reader" >/dev/null 2>&1 || true; wait "$stdout_reader" >/dev/null 2>&1 || true; fi
+  if [ -n "$stderr_reader" ]; then kill "$stderr_reader" >/dev/null 2>&1 || true; wait "$stderr_reader" >/dev/null 2>&1 || true; fi
+  rm -f -- "$stdout_pipe" "$stderr_pipe"
+}
+trap cleanup EXIT HUP INT TERM
+[ ! -e "$stdout_pipe" ] && [ ! -e "$stderr_pipe" ] || exit 70
+mkfifo -m 600 "$stdout_pipe" "$stderr_pipe"
+head -c "$((stdout_limit + 1))" < "$stdout_pipe" &
+stdout_reader=$!
+head -c "$((stderr_limit + 1))" < "$stderr_pipe" >&2 &
+stderr_reader=$!
+set +e
+timeout -k 1 "$command_timeout" env -i \
   HOME="$state/home" \
   TMPDIR="$state/tmp" \
   PATH=/opt/android/platform-tools:/usr/bin:/bin \
   ANDROID_SDK_ROOT=/opt/android \
   ADB_SERVER_SOCKET="localfilesystem:$state/server.sock" \
-  /opt/android/platform-tools/adb -L "localfilesystem:$state/server.sock" -s emulator-5554 "$@"`
+  /opt/android/platform-tools/adb -L "localfilesystem:$state/server.sock" -s emulator-5554 "$@" > "$stdout_pipe" 2> "$stderr_pipe"
+status=$?
+wait "$stdout_reader"
+stdout_reader=
+wait "$stderr_reader"
+stderr_reader=
+set -e
+exit "$status"`
 
 const FENCED_EMULATOR_ADB_SCRIPT = `set -eu
 state=$1
@@ -3609,7 +3649,10 @@ export class OciCliBackend implements IsolationBackend {
           'create', '--name', name, '--user', '0:0',
           '--network', `container:${emulatorId}`,
           '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--read-only',
-          '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
+          // A shared helper cannot size its scratch per command, so it is sized to
+          // the largest a single command may request. The per-command cap is still
+          // enforced in-container by the fifo readers in the command script.
+          '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${residentTmpfsSizeMiB()}m`,
           '-l', `devhotel.room=${roomId}`, '-l', 'devhotel.role=job', '-l', 'devhotel.managed=1',
           '-l', `devhotel.abort-token=${abortToken}`,
           '-e', `ADB_SERVER_SOCKET=localfilesystem:${FENCED_EMULATOR_RESIDENT_STATE}/server.sock`,
@@ -3618,7 +3661,9 @@ export class OciCliBackend implements IsolationBackend {
           '-c', FENCED_EMULATOR_RESIDENT_SCRIPT, 'devhotel-fenced-resident',
           FENCED_EMULATOR_RESIDENT_STATE, String(FENCED_EMULATOR_RESIDENT_IDLE_SECONDS)
         ],
-        { timeoutMs: 60_000, maxStdoutBytes: 128, maxStderrBytes: 8 * 1024, killOnOutputLimit: false }
+        // No timeout, like the one-shot create: killing a create mid-flight is how
+        // a container gets orphaned outside the cleanup path that owns it.
+        { timeoutMs: null, maxStdoutBytes: 128, maxStderrBytes: 8 * 1024, killOnOutputLimit: false }
       )
       const candidate = created.stdout.trim()
       if (!/^[a-f0-9]{64}$/.test(candidate)) throw new Error('resident fenced helper create returned no immutable ID')
@@ -3720,7 +3765,10 @@ export class OciCliBackend implements IsolationBackend {
             'exec', '--user', '0:0', resident, '/bin/sh', '-c',
             FENCED_EMULATOR_RESIDENT_COMMAND, 'devhotel-fenced-resident-command',
             FENCED_EMULATOR_RESIDENT_STATE,
+            String(stdoutLimitEarly),
+            String(stderrLimitEarly),
             String(Math.max(1, Math.ceil(timeoutMsEarly / 1000))),
+            randomUUID(),
             ...args
           ],
           {
