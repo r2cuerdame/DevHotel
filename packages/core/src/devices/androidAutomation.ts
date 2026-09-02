@@ -139,15 +139,27 @@ const SCREEN_WITNESS_CLOSE_SCRIPT = [
 ].join('\n')
 const MAX_TAP_SCREEN_WITNESS_RECORDS = 16
 const SCREEN_WITNESS_BOOTSTRAP_RECORD_BUDGET = 8
-const SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS = 8
-const SCREEN_WITNESS_BOOTSTRAP_RETRY_MS = 250
+export const SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS = 8
+export const SCREEN_WITNESS_BOOTSTRAP_RETRY_MS = 250
+/**
+ * One bootstrap marker is a whole fenced helper container: create, ownership and
+ * topology proofs, start, emit, remove, re-prove. Measured at ~4.5s against a
+ * managed emulator on Docker Desktop, so eight attempts cannot possibly fit in a
+ * flat 20s budget — the witness aborted before its own retries were spent and
+ * every screen-sensitive action failed with ANDROID_SCREEN_WITNESS_FAILED.
+ * The budget is derived from what an attempt actually costs, and the loop still
+ * exits on the first observed marker, so a fast host waits no longer than before.
+ */
+const SCREEN_WITNESS_MARKER_ROUND_TRIP_BUDGET_MS = 6_000
 const PACKAGE_DUMP_SCRIPT = `dumpsys package "$1"; status=$?; printf '\n%s\n' "$2"; exit "$status"`
 const MAX_USER_SWITCH_WITNESS_BYTES = 16 * 1024
 const DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS = 60_000
-const SCREEN_WITNESS_READY_TIMEOUT_MS = 20_000
+export const SCREEN_WITNESS_READY_TIMEOUT_MS =
+  SCREEN_WITNESS_BOOTSTRAP_ATTEMPTS *
+  (SCREEN_WITNESS_MARKER_ROUND_TRIP_BUDGET_MS + SCREEN_WITNESS_BOOTSTRAP_RETRY_MS)
 // Two strict user-incarnation sandwiches, bounded bootstrap retries and close
 // markers surround the caller-declared action window.
-const SCREEN_WITNESS_NON_ACTION_BUDGET_MS = 90_000
+export const SCREEN_WITNESS_NON_ACTION_BUDGET_MS = 90_000
 const GUARDED_TAP_SCRIPT = [
   'expected_user="$1"',
   'x="$2"',
