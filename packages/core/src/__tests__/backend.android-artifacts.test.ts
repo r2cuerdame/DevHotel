@@ -1393,7 +1393,9 @@ describe('OciCliBackend Android artifact export', () => {
     })
     const chunks: Buffer[] = []
 
+    const controller = new AbortController()
     const result = await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], {
+      signal: controller.signal,
       maxStdoutBytes: 4,
       maxStderrBytes: 4,
       onStdout: (chunk) => chunks.push(Buffer.from(chunk))
@@ -2120,7 +2122,8 @@ describe('OciCliBackend Android artifact export', () => {
       }
       return ok
     })
-    await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'])
+    const controller = new AbortController()
+    await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], { signal: controller.signal })
     const helperCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')!
     const startCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'start')!
     const helperArgs = helperCall[0]
