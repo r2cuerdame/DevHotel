@@ -55,6 +55,8 @@ export interface ExecOpts {
   timeoutMs?: number
   /** Cancel the command and complete its mandatory ownership-safe cleanup. */
   signal?: AbortSignal
+  /** Hard disposable helper container lifecycle (e.g. streaming readers or disposable tests). */
+  disposableHelper?: boolean
   /** Optional hard capture caps used by fenced helpers and high-level automation. */
   maxStdoutBytes?: number
   maxStderrBytes?: number

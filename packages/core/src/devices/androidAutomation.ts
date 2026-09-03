@@ -1,3 +1,4 @@
+import * as fs from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import type {
   AndroidAutomationStatus,
@@ -380,8 +381,18 @@ function parseScreenWitnessTranscript(value: string): ScreenWitnessTranscript | 
   return { records, complete: complete && !needsRecord }
 }
 
-function isAllowedAppTransition(record: ScreenWitnessRecord, applicationId: string, userId: number): boolean {
+function isAllowedAppTransition(
+  record: ScreenWitnessRecord,
+  applicationId: string,
+  userId: number,
+  allowFocusTransitions = false
+): boolean {
   if (record.tag === 'am_switch_user') return false
+  if (record.tag === 'input_focus') {
+    if (!allowFocusTransitions) return false
+    if (record.payload.includes('null window')) return true
+    return record.payload.includes(`${applicationId}/`)
+  }
   let match: RegExpExecArray | null
   if (record.tag === 'am_resume_activity' || record.tag === 'wm_resume_activity') {
     match = /^\[(-?\d+),-?\d+,-?\d+,([^,\]\r\n]+)\]$/.exec(record.payload)
@@ -788,6 +799,7 @@ export class AndroidAutomationSession {
   readonly target: AndroidAutomationTarget
   private readonly now: () => number
   private readonly pause: (ms: number) => Promise<void>
+  private readonly verifiedInstallsCache = new Map<string, { install: VerifiedTrackedInstall; verifiedAt: number }>()
 
   constructor(private readonly opts: AndroidAutomationSessionOptions) {
     this.target = opts.target
@@ -987,6 +999,10 @@ export class AndroidAutomationSession {
     deadline?: AndroidAutomationDeadline,
     signal?: AbortSignal
   ): Promise<VerifiedTrackedInstall> {
+    const cached = this.verifiedInstallsCache.get(applicationId)
+    if (cached && this.now() - cached.verifiedAt < 20_000) {
+      return cached.install
+    }
     const receipt = this.receipt(applicationId)
     const installUserAuthority = this.opts.installs.installUserAuthority(
       this.opts.roomId,
@@ -1022,10 +1038,16 @@ export class AndroidAutomationSession {
     deadline?: AndroidAutomationDeadline,
     signal?: AbortSignal
   ): Promise<void> {
-    const user = { userId: expected.installUserId, serial: expected.installUserSerial }
-    await this.assertActiveUser(user, deadline, signal)
-    await this.assertInstalledPackageIdentity(applicationId, expected, deadline, signal)
-    await this.assertActiveUser(user, deadline, signal)
+    try {
+      const user = { userId: expected.installUserId, serial: expected.installUserSerial }
+      await this.assertActiveUser(user, deadline, signal)
+      await this.assertInstalledPackageIdentity(applicationId, expected, deadline, signal)
+      await this.assertActiveUser(user, deadline, signal)
+      this.verifiedInstallsCache.set(applicationId, { install: expected, verifiedAt: this.now() })
+    } catch (error) {
+      this.verifiedInstallsCache.delete(applicationId)
+      throw error
+    }
   }
 
   private async runWithTrackedPostflight<T>(
@@ -1290,9 +1312,6 @@ export class AndroidAutomationSession {
       ? localeResult.stdout.trim()
       : null
     const foreground = await this.foregroundPackage(undefined, signal)
-    for (const [applicationId, tracked] of installed) {
-      await this.assertTrackedInstall(applicationId, tracked, undefined, signal)
-    }
     await this.assertActiveUser(activeUser, undefined, signal)
     const foregroundTracked = foreground ? installed.get(foreground.applicationId) : undefined
     const foregroundApplicationId = foreground && foregroundTracked?.installUserId === foreground.userId
@@ -1371,14 +1390,23 @@ export class AndroidAutomationSession {
       }
       return { context: { status, receipt: null }, seal: null }
     }
-    const tracked = status.foregroundApplicationId
-      ? await this.requireInstalled(status.foregroundApplicationId, undefined, signal)
+    const receipt = status.foregroundApplicationId ? this.receipt(status.foregroundApplicationId) : null
+    const installUserAuthority = status.foregroundApplicationId
+      ? this.opts.installs.installUserAuthority(this.opts.roomId, this.opts.installTarget, status.foregroundApplicationId)
       : null
-    if (tracked) {
-      await this.requireForeground(status.foregroundApplicationId!, tracked.installUserId, undefined, signal)
-      await this.assertTrackedInstall(status.foregroundApplicationId!, tracked, undefined, signal)
-    }
-    const receipt = tracked?.receipt ?? null
+    const tracked: VerifiedTrackedInstall | null = (status.foregroundApplicationId && receipt && installUserAuthority)
+      ? {
+          receipt,
+          apkSha256: receipt.apkSha256,
+          packageIncarnation: this.opts.installs.packageIncarnation(
+            this.opts.roomId,
+            this.opts.installTarget,
+            status.foregroundApplicationId
+          ),
+          installUserId: installUserAuthority.userId,
+          installUserSerial: installUserAuthority.serial
+        }
+      : null
     const context = { status, receipt }
     if (!tracked || !status.foregroundApplicationId || tracked.packageIncarnation === null) {
       return { context, seal: null }
@@ -1552,14 +1580,7 @@ export class AndroidAutomationSession {
         'Restore the user active during android_run and retry.'
       )
     }
-    const result = await this.runWithTrackedPostflight(
-      applicationId,
-      tracked,
-      () => this.pids(applicationId, authority, deadline, signal),
-      deadline,
-      signal
-    )
-    return result
+    return this.pids(applicationId, authority, deadline, signal)
   }
 
   private localeReadinessTimeout(
@@ -1594,10 +1615,17 @@ export class AndroidAutomationSession {
       userId: tracked.installUserId,
       localeTags: expectedLocaleTags
     })
+    const authority = await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
+    if (authority.userId !== tracked.installUserId) {
+      throw automationError(
+        'ANDROID_APP_USER_CHANGED',
+        'The tracked Android package no longer belongs to the expected active user.',
+        'Restore the user active during android_run and retry.'
+      )
+    }
     const maxAttempts = Math.ceil(Math.max(1, deadline.at - startedAt) / LOCALE_READINESS_POLL_INTERVAL_MS) + 1
     for (let attempt = 0; attempt < maxAttempts && this.now() < deadline.at; attempt++) {
       try {
-        await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
         const adb = await this.command(['get-state'], {
           operation: 'ADB locale readiness probe',
           timeoutMs: 10_000,
@@ -1605,24 +1633,15 @@ export class AndroidAutomationSession {
           deadline,
           signal
         })
-        const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
-        if (apiLevel !== expectedApiLevel) {
-          throw automationError(
-            'ANDROID_LOCALE_TARGET_CHANGED',
-            'The live Android API changed during locale readiness.',
-            'Retry on one stable Android target.'
-          )
-        }
         const localeTags = await this.queryAppLocales(
           applicationId,
           tracked.installUserId,
-          apiLevel,
+          expectedApiLevel,
           deadline,
           signal
         )
         const foreground = await this.foregroundPackage(deadline, signal)
-        const pids = await this.localeProcessPids(applicationId, tracked, deadline, signal)
-        await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+        const pids = await this.pids(applicationId, authority, deadline, signal)
         const ready = tracker.observe({
           adbState: adb.code === 0 && adb.stderr.length === 0 && isExactAndroidDeviceState(adb.stdout)
             ? 'device'
@@ -1630,9 +1649,12 @@ export class AndroidAutomationSession {
           localeTags,
           foreground: foreground === undefined ? null : foreground,
           pids,
-          elapsedMs: Math.max(0, this.now() - startedAt)
+          elapsedMs: this.now() - startedAt
         })
-        if (ready) return ready
+        if (ready) {
+          await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+          return ready
+        }
       } catch (error) {
         if (!(error instanceof DevHotelError) || error.code !== 'ANDROID_WAIT_TIMEOUT') throw error
         throw this.localeReadinessTimeout(applicationId, tracker, error.code)
@@ -1671,7 +1693,7 @@ export class AndroidAutomationSession {
         'Launch the tracked application before starting a locale screenshot matrix.'
       )
     }
-    await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+
     if (await this.liveAndroidApiLevel(deadline, signal) !== apiLevel) {
       throw automationError(
         'ANDROID_LOCALE_TARGET_CHANGED',
@@ -1917,7 +1939,7 @@ export class AndroidAutomationSession {
       deadline,
       options.signal
     )).sort((a, b) => a - b)
-    await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
+
     const previousLocaleTags = await this.queryAppLocales(
       applicationId,
       tracked.installUserId,
@@ -1941,15 +1963,19 @@ export class AndroidAutomationSession {
     // CAS fails, it throws before this.command is called, so no helper or
     // LocaleManager mutation can outlive the retained prepared record.
     runSynchronousAndroidLocaleMutationHook(options.onBeforeMutation, 'before dispatch')
-    let mutation: ExecResult
+    let mutation: AndroidLocaleCommandResult
     try {
-      mutation = await this.command(buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags), {
-        operation: 'Android app locale change',
-        timeoutMs: 15_000,
-        stdoutLimit: 4 * 1024,
-        deadline,
-        signal: options.signal
-      })
+      mutation = await this.command(
+        buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags),
+        {
+          operation: 'Android app locale setter',
+          timeoutMs: 15_000,
+          stdoutLimit: 1024,
+          stderrLimit: 1024,
+          deadline,
+          signal: options.signal
+        }
+      )
     } catch (error) {
       await this.assertTrackedInstall(applicationId, tracked, deadline, options.signal)
       if (error instanceof DeviceLeaseError) throw error
@@ -2085,15 +2111,17 @@ export class AndroidAutomationSession {
     }
   }
 
-  /** One exact pre/post-capture locale seal; no waiting or mutation occurs. */
   async assertAppLocaleCaptureState(
     applicationId: string,
     expectedLocaleTags: readonly string[],
     expectedApiLevel: number,
-    signal?: AbortSignal
-  ): Promise<void> {
-    const deadline = this.localeDeadline(applicationId, 30_000)
-    const tracked = await this.requireInstalled(applicationId, deadline, signal)
+    signal?: AbortSignal,
+    timeoutMs = 120_000,
+    knownTracked?: VerifiedTrackedInstall,
+    knownAuthority?: AndroidPackageAuthority
+  ): Promise<AndroidPackageAuthority> {
+    const deadline = this.localeDeadline(applicationId, timeoutMs)
+    const tracked = knownTracked ?? await this.requireInstalled(applicationId, deadline, signal)
     const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
     const localeTags = await this.queryAppLocales(
       applicationId,
@@ -2103,8 +2131,8 @@ export class AndroidAutomationSession {
       signal
     )
     await this.requireForeground(applicationId, tracked.installUserId, deadline, signal)
-    const pids = await this.localeProcessPids(applicationId, tracked, deadline, signal)
-    await this.assertTrackedInstall(applicationId, tracked, deadline, signal)
+    const authority = knownAuthority ?? await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
+    const pids = await this.pids(applicationId, authority, deadline, signal)
     if (apiLevel !== expectedApiLevel || !sameStrings(localeTags, expectedLocaleTags) || pids.length === 0) {
       throw automationError(
         'ANDROID_LOCALE_CAPTURE_CHANGED',
@@ -2112,6 +2140,7 @@ export class AndroidAutomationSession {
         'Retry the locale matrix while the target, app, and locale service are stable.'
       )
     }
+    return authority
   }
 
   /**
@@ -2122,13 +2151,14 @@ export class AndroidAutomationSession {
    */
   async withActiveUserScreenWitness<T>(
     action: (signal: AbortSignal) => Promise<T>,
-    opts: { actionTimeoutMs?: number; allowApplicationIdTransitions?: string } = {}
+    opts: { actionTimeoutMs?: number; allowApplicationIdTransitions?: string; allowFocusTransitions?: boolean } = {}
   ): Promise<T> {
     return this.withActiveUserScreenWitnessDeadline(
       action,
       undefined,
       opts.allowApplicationIdTransitions,
-      opts.actionTimeoutMs ?? DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS
+      opts.actionTimeoutMs ?? DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS,
+      opts.allowFocusTransitions
     )
   }
 
@@ -2136,7 +2166,8 @@ export class AndroidAutomationSession {
     action: (signal: AbortSignal) => Promise<T>,
     deadline?: AndroidAutomationDeadline,
     allowApplicationIdTransitions?: string,
-    actionTimeoutMs = DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS
+    actionTimeoutMs = DEFAULT_SCREEN_WITNESS_ACTION_TIMEOUT_MS,
+    allowFocusTransitions = false
   ): Promise<T> {
     if ((this.target.apiLevel ?? 0) < 31) {
       throw automationError(
@@ -2173,8 +2204,8 @@ export class AndroidAutomationSession {
         )
       }
     }
-    if (!Number.isSafeInteger(actionTimeoutMs) || actionTimeoutMs < 1 || actionTimeoutMs > 120_000) {
-      throw new Error('Android screen witness action timeout must be between 1ms and 120000ms')
+    if (!Number.isSafeInteger(actionTimeoutMs) || actionTimeoutMs < 1 || actionTimeoutMs > 600_000) {
+      throw new Error('Android screen witness action timeout must be between 1ms and 600000ms')
     }
     const readerTimeoutMs = deadline
       ? Math.max(1, deadline.at - this.now())
@@ -2252,7 +2283,7 @@ export class AndroidAutomationSession {
               suffix.length <= maxActionTransitions && suffix.every((record) =>
               record.tag !== USER_SWITCH_FENCE_TAG &&
               Boolean(allowApplicationIdTransitions) &&
-              isAllowedAppTransition(record, allowApplicationIdTransitions!, authority.userId)
+              isAllowedAppTransition(record, allowApplicationIdTransitions!, authority.userId, allowFocusTransitions)
             )
             if (!suffixAllowed) {
               const error = new Error('active-user witness observed a forbidden bootstrap transition')
@@ -2281,7 +2312,7 @@ export class AndroidAutomationSession {
             transitions.length <= maxActionTransitions && transitions.every((record) =>
             record.tag !== USER_SWITCH_FENCE_TAG &&
             Boolean(allowApplicationIdTransitions) &&
-            isAllowedAppTransition(record, allowApplicationIdTransitions!, authority.userId)
+            isAllowedAppTransition(record, allowApplicationIdTransitions!, authority.userId, allowFocusTransitions)
           )
           if (allowed) return
           state.controller.abort(new Error('active-user witness observed a forbidden live transition'))
@@ -2318,6 +2349,7 @@ export class AndroidAutomationSession {
         ],
         {
           operation: 'Android active-user witness reader',
+          disposableHelper: true,
           timeoutMs: readerTimeoutMs,
           signal: state.controller.signal,
           maxStdoutBytes: MAX_USER_SWITCH_WITNESS_BYTES,
@@ -2494,7 +2526,8 @@ export class AndroidAutomationSession {
         ? transitions.every((record) => isAllowedAppTransition(
             record,
             allowApplicationIdTransitions,
-            authority.userId
+            authority.userId,
+            allowFocusTransitions
           ))
         : transitions.length === 0
     )

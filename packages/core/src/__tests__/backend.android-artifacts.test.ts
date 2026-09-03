@@ -830,6 +830,7 @@ describe('OciCliBackend Android artifact export', () => {
       {
         timeoutMs: 20_000,
         signal: controller.signal,
+        disposableHelper: true,
         maxStdoutBytes: SCREENSHOT_BASE64_LIMIT,
         maxStderrBytes: 64,
         onStdout: (chunk) => { receivedBytes += Buffer.from(chunk).byteLength }
@@ -1396,6 +1397,7 @@ describe('OciCliBackend Android artifact export', () => {
     const controller = new AbortController()
     const result = await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], {
       signal: controller.signal,
+      disposableHelper: true,
       maxStdoutBytes: 4,
       maxStderrBytes: 4,
       onStdout: (chunk) => chunks.push(Buffer.from(chunk))
@@ -2123,7 +2125,10 @@ describe('OciCliBackend Android artifact export', () => {
       return ok
     })
     const controller = new AbortController()
-    await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], { signal: controller.signal })
+    await new OciCliBackend().execFencedEmulatorAdb(ROOM_ID, ['get-state'], {
+      signal: controller.signal,
+      disposableHelper: true
+    })
     const helperCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')!
     const startCall = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'start')!
     const helperArgs = helperCall[0]

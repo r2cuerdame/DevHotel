@@ -3748,18 +3748,36 @@ export class OciCliBackend implements IsolationBackend {
         topology = await this.assertFencedEmulatorTopology(roomId, topology)
       }
     }
+    const normalizeAdbArgsForShell = (commandArgs: readonly string[]): string[] => {
+      if (commandArgs.length === 0 || commandArgs[0] !== 'shell') return [...commandArgs]
+      if (commandArgs.length >= 4 && commandArgs[1] === 'sh' && commandArgs[2] === '-c') {
+        return [
+          'shell',
+          'sh',
+          '-c',
+          `'${commandArgs[3]!.replace(/'/g, "'\\''")}'`,
+          ...commandArgs.slice(4).map((param) => `'${param.replace(/'/g, "'\\''")}'`)
+        ]
+      }
+      return [...commandArgs]
+    }
     const stdoutLimitEarly = Math.min(opts.maxStdoutBytes ?? 1024 * 1024, SCREENSHOT_MAX_BASE64_BYTES)
     const stderrLimitEarly = Math.min(opts.maxStderrBytes ?? 64 * 1024, 64 * 1024)
     const timeoutMsEarly = Math.min(opts.timeoutMs ?? 120_000, 10 * 60_000)
     // A plain command against a proved emulator can run in the Room's resident
     // helper. An install cannot: it needs its own read-only bind mount of a
     // Host-private APK, so it keeps building a helper of its own.
-    // A command the caller can abort keeps the one-shot helper: throwing the
-    // container away is what guarantees the command inside it actually stopped,
-    // and killing a `docker exec` client leaves its process running in a shared
-    // helper. The witness reader is exactly that kind of command. Everything
-    // else — the short proofs that dominate an action — reuses the helper.
-    if (mode === 'command' && !hostApkPath && !recoveryOnly && !opts.signal) {
+    // Long-running streaming readers (witness reader) or explicit disposable commands
+    // keep the one-shot helper so throwing the container away guarantees the
+    // background process actually stopped. Everything else — the short proofs that
+    // dominate an action — reuses the resident helper, even when run with an abort signal.
+    const isDisposable = Boolean(
+      opts.disposableHelper ||
+      args.some((arg) => arg.includes('devhotel-screen-witness') && !arg.includes('devhotel-screen-witness-close')) ||
+      args.some((arg) => arg.includes('logcat'))
+    )
+    const normalizedArgs = normalizeAdbArgsForShell(args)
+    if (mode === 'command' && !hostApkPath && !recoveryOnly && !isDisposable) {
       const resident = (await this.liveResidentFencedHelper(roomId, emulatorId, emulatorImageId)) ??
         (await this.startResidentFencedHelper(roomId, emulatorId, emulatorImageId, reproveTopology))
       if (resident) {
@@ -3774,7 +3792,7 @@ export class OciCliBackend implements IsolationBackend {
             String(stderrLimitEarly),
             String(Math.max(1, Math.ceil(timeoutMsEarly / 1000))),
             randomUUID(),
-            ...args
+            ...normalizedArgs
           ],
           {
             timeoutMs: timeoutMsEarly,
@@ -3872,7 +3890,7 @@ export class OciCliBackend implements IsolationBackend {
       String(stderrLimit),
       String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       mode,
-      ...args
+      ...normalizedArgs
     ]
     let helperId: string | undefined
     try {
@@ -4045,7 +4063,7 @@ export class OciCliBackend implements IsolationBackend {
       runtimeSandboxId,
       runtimeStartedAt,
       'Android web',
-      false,
+      true,
       webHasRecoveryAttestation
     )
     const emulatorNeedsRecoveryAttestation = this.joinedContainerNeedsRecoveryAttestation(
@@ -6381,7 +6399,7 @@ export class OciCliBackend implements IsolationBackend {
 
     const expectedMemory = spec.memoryMB ? spec.memoryMB * 1024 * 1024 : 0
     const expectedNanoCpus = spec.cpus ? Math.round(spec.cpus * 1_000_000_000) : 0
-    const capDrop = (container.HostConfig?.CapDrop ?? []).map((cap) => cap.toUpperCase()).sort()
+    const capDrop = (container.HostConfig?.CapDrop ?? []).map((cap) => cap.toUpperCase().replace(/^CAP_/, '')).sort()
     if (
       (container.HostConfig?.Memory ?? 0) !== expectedMemory ||
       (container.HostConfig?.NanoCpus ?? 0) !== expectedNanoCpus ||

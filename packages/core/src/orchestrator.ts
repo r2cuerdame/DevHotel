@@ -228,7 +228,7 @@ const ANDROID_CHANGE_KINDS = new Set([
   'normalize-line-endings'
 ])
 
-const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install', 'android-run'])
+const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install'])
 
 /**
  * The adb readiness probe is deliberately a single bounded question, not a
@@ -3925,12 +3925,15 @@ export class RoomOrchestrator {
             }
           )
         }
+        let authority: AndroidPackageAuthority | undefined
         if (expectedAppLocale) {
-          await session.assertAppLocaleCaptureState(
+          authority = await session.assertAppLocaleCaptureState(
             expectedAppLocale.applicationId,
             expectedAppLocale.appliedLocaleTags,
             expectedAppLocale.apiLevel,
-            signal
+            signal,
+            undefined,
+            before.seal ?? undefined
           )
         }
         const shot = await this.androidScreenshotWithCapturePermit(
@@ -3946,7 +3949,10 @@ export class RoomOrchestrator {
             expectedAppLocale.applicationId,
             expectedAppLocale.appliedLocaleTags,
             expectedAppLocale.apiLevel,
-            signal
+            signal,
+            undefined,
+            before.seal ?? undefined,
+            authority
           )
         }
         const after = await session.foregroundInstallEvidence(signal)
@@ -4363,7 +4369,7 @@ export class RoomOrchestrator {
                   onMutationAccepted: confirmPendingAttemptedLocale
                 }
               ),
-              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+              { actionTimeoutMs: Math.max(timeoutMs, 240_000), allowApplicationIdTransitions: input.applicationId, allowFocusTransitions: true }
             )
             if (
               transition.apiLevel !== original.apiLevel ||
@@ -4460,7 +4466,7 @@ export class RoomOrchestrator {
                 original.localeTags,
                 { timeoutMs, signal }
               ),
-              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+              { actionTimeoutMs: Math.max(timeoutMs, 240_000), allowApplicationIdTransitions: input.applicationId, allowFocusTransitions: true }
             )
             if (
               restored.apiLevel !== original.apiLevel ||
@@ -4498,7 +4504,7 @@ export class RoomOrchestrator {
                   onMutationAccepted: confirmPendingAttemptedLocale
                 }
               ),
-              { actionTimeoutMs: timeoutMs, allowApplicationIdTransitions: input.applicationId }
+              { actionTimeoutMs: Math.max(timeoutMs, 240_000), allowApplicationIdTransitions: input.applicationId, allowFocusTransitions: true }
             )
             if (
               restored.apiLevel !== original.apiLevel ||
@@ -4534,7 +4540,9 @@ export class RoomOrchestrator {
               evidence: {
                 stage: 'restore',
                 primaryFailureCode: primaryFailure instanceof DevHotelError ? primaryFailure.code : null,
-                restoreFailureCode: restoreFailure instanceof DevHotelError ? restoreFailure.code : null
+                primaryEvidence: primaryFailure instanceof DevHotelError ? primaryFailure.evidence : null,
+                restoreFailureCode: restoreFailure instanceof DevHotelError ? restoreFailure.code : null,
+                restoreEvidence: restoreFailure instanceof DevHotelError ? restoreFailure.evidence : null
               }
             }
           )
@@ -5787,7 +5795,8 @@ export class RoomOrchestrator {
           return { transition, evidence }
         }, {
           actionTimeoutMs: timeoutMs,
-          allowApplicationIdTransitions: input.applicationId
+          allowApplicationIdTransitions: input.applicationId,
+          allowFocusTransitions: true
         })
       }
 
@@ -7741,7 +7750,7 @@ export class RoomOrchestrator {
       } catch (error) {
         if (
           change.kind !== 'package-install' &&
-          (change.kind === 'deps-install' || change.kind === 'android-run')
+          change.kind === 'deps-install'
         ) {
           this.advanceStateRevision(roomId)
           await this.refreshSyncStatus(roomId)
@@ -7752,7 +7761,7 @@ export class RoomOrchestrator {
         const applied = entry.status === 'verified' || entry.status === 'applied'
         const possiblyPartialFailure =
           entry.status === 'failed' &&
-          ((change.kind === 'deps-install' && !change.clean) || change.kind === 'android-run')
+          change.kind === 'deps-install' && !change.clean
         if (applied || possiblyPartialFailure) {
           this.advanceStateRevision(roomId)
           await this.refreshSyncStatus(roomId)
