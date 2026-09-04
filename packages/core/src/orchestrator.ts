@@ -3925,15 +3925,12 @@ export class RoomOrchestrator {
             }
           )
         }
-        let authority: AndroidPackageAuthority | undefined
         if (expectedAppLocale) {
-          authority = await session.assertAppLocaleCaptureState(
+          await session.assertAppLocaleCaptureState(
             expectedAppLocale.applicationId,
             expectedAppLocale.appliedLocaleTags,
             expectedAppLocale.apiLevel,
-            signal,
-            undefined,
-            before.seal ?? undefined
+            signal
           )
         }
         const shot = await this.androidScreenshotWithCapturePermit(
@@ -3949,10 +3946,7 @@ export class RoomOrchestrator {
             expectedAppLocale.applicationId,
             expectedAppLocale.appliedLocaleTags,
             expectedAppLocale.apiLevel,
-            signal,
-            undefined,
-            before.seal ?? undefined,
-            authority
+            signal
           )
         }
         const after = await session.foregroundInstallEvidence(signal)

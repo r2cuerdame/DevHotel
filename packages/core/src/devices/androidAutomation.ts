@@ -1,4 +1,3 @@
-import * as fs from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import type {
   AndroidAutomationStatus,
@@ -419,6 +418,7 @@ export interface AndroidAutomationExecOptions {
   maxStderrBytes?: number
   onStdout?: (chunk: ExecOutputChunk) => void
   onStderr?: (chunk: ExecOutputChunk) => void
+  disposableHelper?: boolean
 }
 
 export interface AndroidAutomationSessionOptions {
@@ -846,7 +846,8 @@ export class AndroidAutomationSession {
         maxStdoutBytes: opts.maxStdoutBytes ?? opts.stdoutLimit,
         maxStderrBytes: opts.maxStderrBytes ?? 64 * 1024,
         onStdout: opts.onStdout,
-        onStderr: opts.onStderr
+        onStderr: opts.onStderr,
+        disposableHelper: opts.disposableHelper
       })
     } catch (error) {
       if (error instanceof DeviceLeaseError) throw error
@@ -1963,7 +1964,7 @@ export class AndroidAutomationSession {
     // CAS fails, it throws before this.command is called, so no helper or
     // LocaleManager mutation can outlive the retained prepared record.
     runSynchronousAndroidLocaleMutationHook(options.onBeforeMutation, 'before dispatch')
-    let mutation: AndroidLocaleCommandResult
+    let mutation: ExecResult
     try {
       mutation = await this.command(
         buildAndroidSetAppLocalesArgs(applicationId, tracked.installUserId, localeTags),
@@ -1971,7 +1972,6 @@ export class AndroidAutomationSession {
           operation: 'Android app locale setter',
           timeoutMs: 15_000,
           stdoutLimit: 1024,
-          stderrLimit: 1024,
           deadline,
           signal: options.signal
         }
@@ -2116,12 +2116,10 @@ export class AndroidAutomationSession {
     expectedLocaleTags: readonly string[],
     expectedApiLevel: number,
     signal?: AbortSignal,
-    timeoutMs = 120_000,
-    knownTracked?: VerifiedTrackedInstall,
-    knownAuthority?: AndroidPackageAuthority
-  ): Promise<AndroidPackageAuthority> {
+    timeoutMs = 120_000
+  ): Promise<void> {
     const deadline = this.localeDeadline(applicationId, timeoutMs)
-    const tracked = knownTracked ?? await this.requireInstalled(applicationId, deadline, signal)
+    const tracked = await this.requireInstalled(applicationId, deadline, signal)
     const apiLevel = await this.liveAndroidApiLevel(deadline, signal)
     const localeTags = await this.queryAppLocales(
       applicationId,
@@ -2131,7 +2129,7 @@ export class AndroidAutomationSession {
       signal
     )
     await this.requireForeground(applicationId, tracked.installUserId, deadline, signal)
-    const authority = knownAuthority ?? await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
+    const authority = await this.packageUid(applicationId, tracked.installUserId, deadline, signal)
     const pids = await this.pids(applicationId, authority, deadline, signal)
     if (apiLevel !== expectedApiLevel || !sameStrings(localeTags, expectedLocaleTags) || pids.length === 0) {
       throw automationError(
@@ -2140,7 +2138,6 @@ export class AndroidAutomationSession {
         'Retry the locale matrix while the target, app, and locale service are stable.'
       )
     }
-    return authority
   }
 
   /**

@@ -3683,7 +3683,7 @@ export class OciCliBackend implements IsolationBackend {
       must(await runDocker(['start', helperId], { timeoutMs: 60_000 }), 'start resident fenced emulator ADB helper')
       this.residentFencedHelpers.set(roomId, { id: helperId, name, abortToken, emulatorId })
       return helperId
-    } catch (error) {
+    } catch {
       this.residentFencedHelpers.delete(roomId)
       if (helperId) await this.removeAbortedFencedJob(roomId, name, abortToken, helperId).catch(() => undefined)
       // A Room that cannot host a resident helper still works: the caller falls
