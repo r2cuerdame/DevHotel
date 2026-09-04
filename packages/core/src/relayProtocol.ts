@@ -16,6 +16,7 @@ export function relayPreamble(token: string): string {
 /** Connect to a published relay and queue its authentication preamble first. */
 export function connectRelay(port: number, token?: string): net.Socket {
   const socket = net.connect(port, '127.0.0.1')
+  socket.setNoDelay(true)
   // Queue before returning the socket. HTTP's ClientRequest may write as soon
   // as createConnection returns; a connect-event handler would otherwise race
   // the request bytes and let them become the first line seen by the gate.
@@ -34,6 +35,7 @@ export function createHttpRelayConnection(
   oncreate: (err: Error | null, socket: net.Socket) => void
 ): undefined {
   const socket = net.connect(port, '127.0.0.1')
+  socket.setNoDelay(true)
   let settled = false
   const finish = (err: Error | null): void => {
     if (settled) return

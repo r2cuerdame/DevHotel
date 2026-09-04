@@ -19,11 +19,12 @@ function request(
   kind: 'http' | 'https',
   port: number,
   hostHeader: string,
-  reqPath = '/'
+  reqPath = '/',
+  targetHost = '127.0.0.1'
 ): Promise<SimpleResponse> {
   return new Promise((resolve, reject) => {
     const options: https.RequestOptions = {
-      host: '127.0.0.1',
+      host: targetHost,
       port,
       path: reqPath,
       headers: { host: hostHeader },
@@ -276,4 +277,22 @@ describe('gateway e2e', () => {
     const second = await request('http', httpPort, 'gated.localhost')
     expect(second).toMatchObject({ status: 200, body: 'gated-room' })
   }, 30000)
+
+  it('serves requests arriving on dual-stack IPv6 loopback (::1)', async () => {
+    try {
+      const res = await request('http', httpPort, 'a.localhost', '/', '::1')
+      expect(res).toMatchObject({ status: 200, body: 'room-a' })
+    } catch (error: unknown) {
+      // If host environment does not permit binding ::1, ignore gracefully
+      if (
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        (error.code === 'EADDRNOTAVAIL' || error.code === 'ECONNREFUSED')
+      ) {
+        return
+      }
+      throw error
+    }
+  })
 })

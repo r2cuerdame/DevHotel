@@ -681,6 +681,30 @@ code,
   color: var(--linen);
 }
 
+.domain-pill .copy-btn {
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 3px 5px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  flex: none;
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.domain-pill .copy-btn:hover {
+  color: var(--linen);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.domain-pill .copy-btn.copied {
+  color: var(--ok);
+}
+
 .domain-pill .status-label {
   display: inline-flex;
   align-items: center;

@@ -150,6 +150,8 @@ export const en = {
   'bar.start': 'Start',
   'bar.roomDetails': 'Room Config',
   'bar.more': 'More',
+  'bar.copyUrl': 'Copy URL',
+  'bar.copied': 'URL copied',
   'bar.openExternal': 'Open in default browser',
   'bar.openSourceFolder': 'Open source folder',
   'bar.cloneRoom': 'Clone room…',

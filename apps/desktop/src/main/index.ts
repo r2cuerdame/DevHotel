@@ -31,6 +31,10 @@ const isDev = !!process.env.ELECTRON_RENDERER_URL
 // also makes packaged-app smoke tests deterministic while `pnpm dev` is open.
 if (isDev) app.setPath('userData', `${app.getPath('userData')}-dev`)
 
+// Route *.localhost domains directly to IPv4 loopback so in-app web previews
+// bypass OS DNS timeouts, VPN DNS interception, and IPv6 loopback mismatches.
+app.commandLine.appendSwitch('host-resolver-rules', 'MAP *.localhost 127.0.0.1')
+
 let mainWindow: BrowserWindow | null = null
 let quitting = false
 

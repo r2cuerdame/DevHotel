@@ -142,6 +142,8 @@ export const ja: Translation = {
   'bar.start': '起動',
   'bar.roomDetails': 'ルーム設定',
   'bar.more': 'その他',
+  'bar.copyUrl': 'URLをコピー',
+  'bar.copied': 'URLをコピーしました',
   'bar.openExternal': '既定のブラウザーで開く',
   'bar.openSourceFolder': 'ソースフォルダーを開く',
   'bar.cloneRoom': 'ルームを複製…',

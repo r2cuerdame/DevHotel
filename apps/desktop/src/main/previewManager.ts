@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, promises as fsPromises, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { session, WebContentsView, type BrowserWindow, type WebContents } from 'electron'
+import { session, shell, WebContentsView, type BrowserWindow, type WebContents } from 'electron'
 import forge from 'node-forge'
 import {
   IPC,
@@ -81,6 +81,15 @@ export class PreviewManager {
 
   async attach(roomId: string, bounds: PreviewBounds): Promise<void> {
     if (this.roomId === roomId && this.view) {
+      if (
+        this.lastBounds &&
+        this.lastBounds.x === bounds.x &&
+        this.lastBounds.y === bounds.y &&
+        this.lastBounds.width === bounds.width &&
+        this.lastBounds.height === bounds.height
+      ) {
+        return
+      }
       this.lastBounds = bounds
       this.layout()
       return
@@ -128,7 +137,6 @@ export class PreviewManager {
     this.pendingRoomId = null
     this.pendingBounds = null
     this.pendingVisible = true
-    const room = { ...inspection.room, runtimeStatus: inspection.runtimeStatus }
     if (this.roomId !== roomId) {
       this.detach()
       this.visible = latestVisible
@@ -325,12 +333,23 @@ export class PreviewManager {
     view.setBackgroundColor('#000000')
     const wc = view.webContents
     if (side === 'right') wc.setUserAgent(mobilePreviewUserAgent(process.versions.chrome))
-    wc.setWindowOpenHandler(() => ({ action: 'deny' }))
+    wc.setWindowOpenHandler((details) => {
+      const home = this.safeHomeUrl(roomId)
+      if (home && isAllowedRoomNavigation(details.url, home)) {
+        void wc.loadURL(details.url).catch(() => undefined)
+      } else if (/^https?:\/\//i.test(details.url)) {
+        void shell.openExternal(details.url)
+      }
+      return { action: 'deny' }
+    })
     wc.on('will-attach-webview', (event) => event.preventDefault())
     const denyOutsideRoom = (event: Electron.Event, url: string): void => {
       const home = this.safeHomeUrl(roomId)
       if (!home || !isAllowedRoomNavigation(url, home)) {
         event.preventDefault()
+        if (url && /^https?:\/\//i.test(url)) {
+          void shell.openExternal(url)
+        }
         return
       }
       if (side === 'right') {
@@ -341,6 +360,27 @@ export class PreviewManager {
     }
     wc.on('will-navigate', denyOutsideRoom)
     wc.on('will-redirect', denyOutsideRoom)
+    let loadRetries = 0
+    wc.on('did-fail-load', (_event, errorCode, _errorDescription, failedUrl, isMainFrame) => {
+      if (!isMainFrame) return
+      // Common transient connection errors while the Room web process boots:
+      // -102: ERR_CONNECTION_REFUSED
+      // -101: ERR_CONNECTION_RESET
+      // -105: ERR_NAME_NOT_RESOLVED
+      // -109: ERR_ADDRESS_UNREACHABLE
+      // -324: ERR_EMPTY_RESPONSE
+      if ([-102, -101, -105, -109, -324].includes(errorCode) && loadRetries < 5) {
+        loadRetries++
+        setTimeout(() => {
+          if (!wc.isDestroyed() && this.roomId === roomId) {
+            void wc.loadURL(failedUrl).catch(() => undefined)
+          }
+        }, 1500)
+      }
+    })
+    wc.on('did-finish-load', () => {
+      loadRetries = 0
+    })
     if (this.orch.rooms.get(roomId)?.provider === 'android') {
       wc.on('dom-ready', () => {
         void wc.insertCSS(NOVNC_CHROME_CSS).catch(() => undefined)
@@ -458,15 +498,15 @@ export class PreviewManager {
   }
 
   private async capture(): Promise<void> {
-    if (!this.view || !this.roomId || this.view.webContents.isDestroyed()) return
+    if (!this.view || !this.roomId || !this.visible || this.view.webContents.isDestroyed()) return
     try {
       const image = await this.view.webContents.capturePage()
       if (image.isEmpty()) return
       const resized = image.resize({ width: 640 })
       const dir = join(this.userData, 'rooms', this.roomId)
-      mkdirSync(dir, { recursive: true })
+      await fsPromises.mkdir(dir, { recursive: true })
       const file = join(dir, 'thumb.png')
-      writeFileSync(file, resized.toPNG())
+      await fsPromises.writeFile(file, resized.toPNG())
       this.orch.setThumbnail(this.roomId, file)
     } catch {
       // thumbnails are best-effort
@@ -492,8 +532,8 @@ export class PreviewManager {
     })
     roomSession.setCertificateVerifyProc((request, callback) => {
       const home = this.safeHomeUrl(roomId)
-      const roomHostname = home ? new URL(home).hostname : null
-      if (request.hostname !== roomHostname || !existsSync(caPath)) {
+      const roomHostname = home ? new URL(home).hostname.toLowerCase() : null
+      if (!roomHostname || request.hostname.toLowerCase() !== roomHostname || !existsSync(caPath)) {
         callback(-3) // fall back to Chromium's verdict
         return
       }

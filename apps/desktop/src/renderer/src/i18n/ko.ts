@@ -174,6 +174,8 @@ export const ko: Translation = {
   'bar.start': '시작',
   'bar.roomDetails': 'Room 설정',
   'bar.more': '더 보기',
+  'bar.copyUrl': 'URL 복사',
+  'bar.copied': 'URL 복사됨',
   'bar.openExternal': '기본 브라우저에서 열기',
   'bar.openSourceFolder': '소스 폴더 열기',
   'bar.cloneRoom': 'Room 복제…',

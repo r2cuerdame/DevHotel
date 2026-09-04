@@ -92,13 +92,22 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
         .then(() => api.preview.layout(roomId, previewLayoutRef.current))
         .catch(() => undefined)
     }
+    let rafId: number | null = null
+    const scheduleReport = (): void => {
+      if (rafId !== null) return
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null
+        report()
+      })
+    }
     report()
-    const ro = new ResizeObserver(report)
+    const ro = new ResizeObserver(scheduleReport)
     ro.observe(el)
-    window.addEventListener('resize', report)
+    window.addEventListener('resize', scheduleReport)
     return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId)
       ro.disconnect()
-      window.removeEventListener('resize', report)
+      window.removeEventListener('resize', scheduleReport)
       void api.preview.detach().catch(() => undefined)
     }
   }, [roomId, showSite, android, emulatorLandscape])

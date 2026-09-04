@@ -142,6 +142,8 @@ export const ru: Translation = {
   'bar.start': 'Запустить',
   'bar.roomDetails': 'Настройки номера',
   'bar.more': 'Ещё',
+  'bar.copyUrl': 'Копировать URL',
+  'bar.copied': 'URL скопирован',
   'bar.openExternal': 'Открыть в браузере по умолчанию',
   'bar.openSourceFolder': 'Открыть папку с исходниками',
   'bar.cloneRoom': 'Клонировать номер…',

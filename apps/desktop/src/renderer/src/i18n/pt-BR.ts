@@ -142,6 +142,8 @@ export const ptBR: Translation = {
   'bar.start': 'Iniciar',
   'bar.roomDetails': 'Configuração do quarto',
   'bar.more': 'Mais',
+  'bar.copyUrl': 'Copiar URL',
+  'bar.copied': 'URL copiada',
   'bar.openExternal': 'Abrir no navegador padrão',
   'bar.openSourceFolder': 'Abrir pasta de origem',
   'bar.cloneRoom': 'Clonar quarto…',

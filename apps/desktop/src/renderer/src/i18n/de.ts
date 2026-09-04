@@ -142,6 +142,8 @@ export const de: Translation = {
   'bar.start': 'Starten',
   'bar.roomDetails': 'Zimmerkonfiguration',
   'bar.more': 'Mehr',
+  'bar.copyUrl': 'URL kopieren',
+  'bar.copied': 'URL kopiert',
   'bar.openExternal': 'Im Standardbrowser öffnen',
   'bar.openSourceFolder': 'Quellordner öffnen',
   'bar.cloneRoom': 'Zimmer klonen…',

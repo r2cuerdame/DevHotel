@@ -142,6 +142,8 @@ export const zhCN: Translation = {
   'bar.start': '启动',
   'bar.roomDetails': '房间设置',
   'bar.more': '更多',
+  'bar.copyUrl': '复制 URL',
+  'bar.copied': 'URL 已复制',
   'bar.openExternal': '在默认浏览器中打开',
   'bar.openSourceFolder': '打开源码文件夹',
   'bar.cloneRoom': '克隆房间…',
