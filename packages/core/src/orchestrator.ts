@@ -239,6 +239,10 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install'])
  * the phone is not usable yet, which a `ready` Room status does not say.
  */
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
+// Recovery performs a full target/install/user proof both before and inside a
+// screen witness. Keep the same public ceiling as locale acceptance so those
+// proofs can complete on a cold managed emulator without weakening any fence.
+const ANDROID_LOCALE_RECOVERY_TIMEOUT_MS = 120_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
@@ -1263,7 +1267,7 @@ export class RoomOrchestrator {
             const beforeRestore = await session.proveAppLocaleFinalState(
               pending.applicationId,
               pending.fence,
-              30_000
+              ANDROID_LOCALE_RECOVERY_TIMEOUT_MS
             )
             const isOriginal = sameStringValues(beforeRestore.localeTags, pending.originalLocaleTags)
             const ownsCurrent = pendingAndroidLocaleOwnsCurrent(pending, beforeRestore.localeTags)
@@ -1346,13 +1350,16 @@ export class RoomOrchestrator {
                 recoveryStage.expectedLocaleTags,
                 recoveryStage.attemptedLocaleTags,
                 {
-                  timeoutMs: 30_000,
+                  timeoutMs: ANDROID_LOCALE_RECOVERY_TIMEOUT_MS,
                   signal,
                   onBeforeMutation: markRecoveryMutationDispatched,
                   onMutationAccepted: confirmRecoveryMutationAccepted
                 }
               ),
-              { actionTimeoutMs: 30_000, allowApplicationIdTransitions: recoveryStage.applicationId }
+              {
+                actionTimeoutMs: ANDROID_LOCALE_RECOVERY_TIMEOUT_MS,
+                allowApplicationIdTransitions: recoveryStage.applicationId
+              }
             )
             if (
               result.applicationId !== recoveryStage.applicationId ||
@@ -1369,7 +1376,7 @@ export class RoomOrchestrator {
             const fresh = await session.proveAppLocaleFinalState(
               recoveryStage.applicationId,
               recoveryStage.fence,
-              30_000
+              ANDROID_LOCALE_RECOVERY_TIMEOUT_MS
             )
             if (
               fresh.apiLevel !== recoveryStage.fence.apiLevel ||
