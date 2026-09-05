@@ -893,6 +893,15 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'image' || args[0] === 'pull')).toBe(false)
 
     mockedRunDocker.mockClear()
+    await new OciCliBackend().execFencedEmulatorAdb(
+      ROOM_ID,
+      ['exec-out', 'sh', '-c', 'echo 1', 'arg1'],
+      { disposableHelper: true }
+    )
+    const execOutCreate = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')![0]
+    expect(execOutCreate.slice(-5)).toEqual(['exec-out', 'sh', '-c', "'echo 1'", "'arg1'"])
+
+    mockedRunDocker.mockClear()
     bootStart = true
     const boot = await new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 })
     bootStart = false
