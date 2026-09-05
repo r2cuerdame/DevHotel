@@ -279,7 +279,6 @@ describe('agent control API long operations', () => {
       secondControl.stop()
     }
   })
-
   it('reuses the preferred port across a graceful stop without retaining the live token file', async () => {
     const dir = userDataDir('devhotel-control-port-graceful-reuse-')
     const firstControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
