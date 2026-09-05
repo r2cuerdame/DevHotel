@@ -239,6 +239,10 @@ const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install'])
  * the phone is not usable yet, which a `ready` Room status does not say.
  */
 const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
+// Recovery performs a full target/install/user proof both before and inside a
+// screen witness. Keep the same public ceiling as locale acceptance so those
+// proofs can complete on a cold managed emulator without weakening any fence.
+const ANDROID_LOCALE_RECOVERY_TIMEOUT_MS = 120_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
@@ -1263,7 +1267,7 @@ export class RoomOrchestrator {
             const beforeRestore = await session.proveAppLocaleFinalState(
               pending.applicationId,
               pending.fence,
-              30_000
+              ANDROID_LOCALE_RECOVERY_TIMEOUT_MS
             )
             const isOriginal = sameStringValues(beforeRestore.localeTags, pending.originalLocaleTags)
             const ownsCurrent = pendingAndroidLocaleOwnsCurrent(pending, beforeRestore.localeTags)
@@ -1346,13 +1350,16 @@ export class RoomOrchestrator {
                 recoveryStage.expectedLocaleTags,
                 recoveryStage.attemptedLocaleTags,
                 {
-                  timeoutMs: 30_000,
+                  timeoutMs: ANDROID_LOCALE_RECOVERY_TIMEOUT_MS,
                   signal,
                   onBeforeMutation: markRecoveryMutationDispatched,
                   onMutationAccepted: confirmRecoveryMutationAccepted
                 }
               ),
-              { actionTimeoutMs: 30_000, allowApplicationIdTransitions: recoveryStage.applicationId }
+              {
+                actionTimeoutMs: ANDROID_LOCALE_RECOVERY_TIMEOUT_MS,
+                allowApplicationIdTransitions: recoveryStage.applicationId
+              }
             )
             if (
               result.applicationId !== recoveryStage.applicationId ||
@@ -1369,7 +1376,7 @@ export class RoomOrchestrator {
             const fresh = await session.proveAppLocaleFinalState(
               recoveryStage.applicationId,
               recoveryStage.fence,
-              30_000
+              ANDROID_LOCALE_RECOVERY_TIMEOUT_MS
             )
             if (
               fresh.apiLevel !== recoveryStage.fence.apiLevel ||
@@ -5147,7 +5154,6 @@ export class RoomOrchestrator {
         !receipt || !provenance || !sourceIdentity || !imageSha256 ||
         receipt.roomId !== roomId || receipt.applicationId !== input.applicationId ||
         receipt.target.kind !== installTarget.kind || receipt.target.deviceId !== installTarget.deviceId ||
-        provenance.stateRevision !== room.stateRevision ||
         provenance.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
         provenance.sourceIdentity.domain !== 'source' || provenance.sourceIdentity.value !== sourceIdentity.value ||
         provenance.environmentIdentity.domain !== 'environment' ||
@@ -5409,7 +5415,7 @@ export class RoomOrchestrator {
         const finalReceipt = this.androidInstalls.get(roomId, installTarget, input.applicationId)
         const finalProvenance = this.androidInstalls.acceptanceProvenance(roomId, installTarget, input.applicationId)
         if (
-          finalRoom.stateRevision !== provenance.stateRevision ||
+          finalRoom.stateRevision !== room.stateRevision ||
           finalRoom.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
           !isDeepStrictEqual(finalReceipt, receipt) ||
           !isDeepStrictEqual(finalProvenance, provenance)
@@ -5735,8 +5741,8 @@ export class RoomOrchestrator {
         try {
           return screenshotArtifacts.map((artifact) => {
             if (
-              artifact.metadata.room.stateRevision !== room.stateRevision ||
-              artifact.metadata.room.workspaceVolumeRevision !== room.workspaceVolumeRevision ||
+              artifact.metadata.room.stateRevision !== provenance.stateRevision ||
+              artifact.metadata.room.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
               artifact.metadata.device.kind !== installTarget.kind ||
               artifact.metadata.device.deviceId !== installTarget.deviceId ||
               artifact.metadata.device.model !== artifactMetadataText(session.target.model, 200) ||
@@ -6384,8 +6390,8 @@ export class RoomOrchestrator {
             artifact.sizeBytes !== expected.sizeBytes ||
             artifact.metadata.capture.capturedAt !== expected.capturedAt ||
             !isDeepStrictEqual(artifact.metadata.locale, expected.locale) ||
-            artifact.metadata.room.stateRevision !== report.room.stateRevision ||
-            artifact.metadata.room.workspaceVolumeRevision !== report.room.workspaceVolumeRevision ||
+            artifact.metadata.room.stateRevision !== report.build.stateRevision ||
+            artifact.metadata.room.workspaceVolumeRevision !== report.build.workspaceVolumeRevision ||
             artifact.metadata.device.kind !== report.target.kind ||
             artifact.metadata.device.deviceId !== report.target.deviceId ||
             artifact.metadata.device.model !== report.target.model ||
