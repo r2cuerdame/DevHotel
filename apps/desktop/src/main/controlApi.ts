@@ -67,6 +67,18 @@ const ARTIFACT_BODY_LIMIT_BYTES = 64 * 1024
 const DEFAULT_JSON_BODY_MAX_BYTES = 24 * 1024 * 1024
 const ROOM_FILE_JSON_BODY_MAX_BYTES = 23 * 1024 * 1024
 
+// Fetch blocks these ports even for loopback HTTP. Windows can include some of
+// them in its ephemeral range, so publishing one in control.json would make a
+// healthy control server unreachable to MCP and other Fetch-based clients.
+// Keep this in sync with https://fetch.spec.whatwg.org/#port-blocking.
+const FETCH_BLOCKED_PORTS = new Set([
+  0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104,
+  109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+  526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049,
+  3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080
+])
+const FETCH_SAFE_BIND_ATTEMPTS = 20
+
 interface InputSchema<T> {
   safeParse(input: unknown): { success: true; data: T } | { success: false }
 }
@@ -668,14 +680,29 @@ export async function startControlApi(
       srv.listen(portToTry, '127.0.0.1')
     })
 
-  if (preferredPort) {
+  const closeServer = (srv: Server): Promise<void> =>
+    new Promise((resolve, reject) => {
+      srv.close((error) => (error ? reject(error) : resolve()))
+    })
+
+  const bindFetchSafeEphemeralPort = async (srv: Server): Promise<void> => {
+    for (let attempt = 0; attempt < FETCH_SAFE_BIND_ATTEMPTS; attempt += 1) {
+      await bindServer(srv, 0)
+      const assignedPort = (srv.address() as { port: number }).port
+      if (!FETCH_BLOCKED_PORTS.has(assignedPort)) return
+      await closeServer(srv)
+    }
+    throw new Error(`Unable to allocate a Fetch-safe loopback port after ${FETCH_SAFE_BIND_ATTEMPTS} attempts`)
+  }
+
+  if (preferredPort && !FETCH_BLOCKED_PORTS.has(preferredPort)) {
     try {
       await bindServer(server, preferredPort)
     } catch {
-      await bindServer(server, 0)
+      await bindFetchSafeEphemeralPort(server)
     }
   } else {
-    await bindServer(server, 0)
+    await bindFetchSafeEphemeralPort(server)
   }
 
   const port = (server.address() as { port: number }).port

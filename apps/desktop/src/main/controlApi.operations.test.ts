@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -296,6 +296,22 @@ describe('agent control API long operations', () => {
       expect(secondControl.info.token).not.toBe(firstControl.info.token)
     } finally {
       secondControl.stop()
+    }
+  })
+
+  it('replaces a previous port that Fetch clients are required to block', async () => {
+    const dir = userDataDir('devhotel-control-port-blocked-')
+    writeFileSync(join(dir, 'control-port.json'), JSON.stringify({ port: 6000 }), 'utf8')
+
+    const control = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
+    try {
+      expect(control.info.port).not.toBe(6000)
+      const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/ping`, {
+        headers: { authorization: `Bearer ${control.info.token}` }
+      })
+      expect(response.status).toBe(200)
+    } finally {
+      control.stop()
     }
   })
 })
