@@ -40,6 +40,15 @@ export interface OperationHandle {
   newlyStarted: boolean
 }
 
+export interface OperationRunOptions {
+  /** Client-assigned durable idempotency key. */
+  operationId?: string
+  /** Request identity that must match whenever operationId is reused. */
+  requestKey?: string
+  /** Room starts join by kind/Room; queued Android runs must remain distinct. */
+  joinRunningByRoom?: boolean
+}
+
 interface LiveOperation {
   record: OperationRecord
   settled: Promise<void>
@@ -163,19 +172,45 @@ export class OperationTracker {
     roomId: string,
     actor: Actor,
     task: (report: OperationReporter) => Promise<void>,
-    operationId?: string
+    options: OperationRunOptions = {}
   ): OperationHandle {
-    const key = `${kind}:${roomId}`
+    const { operationId, requestKey, joinRunningByRoom = true } = options
+    if (operationId) {
+      const liveById = this.live.get(operationId)
+      const existingById = liveById?.record ?? this.store.get(operationId)
+      if (existingById) {
+        if (
+          existingById.kind !== kind ||
+          existingById.roomId !== roomId ||
+          existingById.actor !== actor ||
+          existingById.requestKey !== requestKey
+        ) {
+          throw new Error(`Operation ${operationId} already belongs to a different request`)
+        }
+        if (!liveById && existingById.status === 'running') {
+          throw new Error(`Operation ${operationId} is recorded as running but is not owned by this DevHotel process`)
+        }
+        return {
+          record: clone(existingById),
+          completion: liveById?.settled ?? Promise.resolve(),
+          newlyStarted: false
+        }
+      }
+    }
+
+    const id = operationId ?? randomUUID()
+    const key = joinRunningByRoom ? `${kind}:${roomId}` : `${kind}:${roomId}:${id}`
     const existingId = this.runningByKey.get(key)
     const existing = existingId ? this.live.get(existingId) : undefined
     if (existing) return { record: clone(existing.record), completion: existing.settled, newlyStarted: false }
 
     const startedAt = nowIso()
     const record: OperationRecord = {
-      id: operationId ?? randomUUID(),
+      id,
       kind,
       roomId,
       actor,
+      ...(requestKey === undefined ? {} : { requestKey }),
       status: 'running',
       stage: 'preparing',
       stages: [],

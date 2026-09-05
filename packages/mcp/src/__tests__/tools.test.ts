@@ -84,6 +84,17 @@ beforeAll(async () => {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
       }
       if (req.url === '/v1/rooms/abc12345/changes' && req.method === 'POST') {
+        const body = JSON.parse(raw)
+        if (body.change?.kind === 'android-run' && body.waitMs === 0) {
+          return void res.end(JSON.stringify({
+            operation: {
+              ...runningOperation,
+              id: body.operationId,
+              kind: 'android-run',
+              stage: 'preparing'
+            }
+          }))
+        }
         return void res.end(JSON.stringify(APPLIED_CHANGE))
       }
       if (req.url === '/v1/rooms/partial-body/changes' && req.method === 'POST') {
@@ -797,11 +808,15 @@ describe('makeTools', () => {
   })
 
   it('android_run passes operationId upfront to enable recoverable acknowledgement', async () => {
+    const screenshotsBefore = seen.filter((r) => r.url === '/v1/rooms/abc12345/artifacts/screenshots').length
     const res = await byName.android_run!.handler({ roomId: 'abc12345' })
     expect(res.isError).toBeUndefined()
+    expect(firstText(res)).toMatch(/was dispatched.*operation:/)
     const req = seen.findLast((r) => r.url === '/v1/rooms/abc12345/changes')
     expect(req?.body?.change).toEqual({ kind: 'android-run' })
     expect(typeof req?.body?.operationId).toBe('string')
     expect(req?.body?.operationId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(req?.body?.waitMs).toBe(0)
+    expect(seen.filter((r) => r.url === '/v1/rooms/abc12345/artifacts/screenshots')).toHaveLength(screenshotsBefore)
   })
 })

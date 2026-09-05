@@ -7763,6 +7763,9 @@ export class RoomOrchestrator {
     if (room.provider === 'web' && change.kind === 'android-build') {
       throw new Error('Builds are only available in Android rooms')
     }
+    if (change.kind !== 'android-run' && (operationId !== undefined || waitMs !== undefined)) {
+      throw new Error('operationId and waitMs are supported only for android-run changes')
+    }
 
     if (change.kind === 'android-run') {
       if (this.mutationGate !== 'open') throw this.mutationGateError()
@@ -7772,6 +7775,11 @@ export class RoomOrchestrator {
         throw new Error(`Room ${roomId} is still being created and cannot be modified`)
       }
 
+      const androidRunOperationId = operationId ?? randomUUID()
+      const requestKey = createHash('sha256')
+        .update('android-run\0')
+        .update(change.applicationId ?? '')
+        .digest('hex')
       let changeEntry: ChangeEntry | undefined
       const handle = this.operations.run(
         'android-run',
@@ -7788,7 +7796,7 @@ export class RoomOrchestrator {
               change.kind,
               change,
               actor,
-              handle.record.id,
+              androidRunOperationId,
               report
             )
             this.syncStatusFromVerify(roomId, entry)
@@ -7799,7 +7807,14 @@ export class RoomOrchestrator {
             return entry
           })
         },
-        operationId
+        {
+          operationId: androidRunOperationId,
+          requestKey,
+          // Each accepted request keeps its own durable ID. The Room lock
+          // serializes actual mutation work without aliasing one caller's
+          // applicationId to another caller's result.
+          joinRunningByRoom: false
+        }
       )
 
       if (handle.newlyStarted) {
@@ -7810,18 +7825,18 @@ export class RoomOrchestrator {
         return (async () => {
           const record = waitMs > 0 ? await this.operations.wait(handle.record.id, waitMs) : handle.record
           if (record && record.status !== 'running') {
-            return changeEntry ?? this.changes.list(roomId).find((c) => c.kind === 'android-run') ?? { operation: record }
+            return changeEntry ?? this.changes.get(record.id) ?? { operation: record }
           }
           return { operation: record ?? handle.record }
         })()
       }
 
       return handle.completion.then(() => {
-        if (!changeEntry) {
-          const list = this.changes.list(roomId)
-          changeEntry = list.find((c) => c.kind === 'android-run') ?? list[0]
-        }
-        return changeEntry!
+        const exactChange = changeEntry ?? this.changes.get(handle.record.id)
+        if (exactChange) return exactChange
+        const record = this.operations.get(handle.record.id)
+        if (record) return { operation: record }
+        throw new Error(`Android run operation ${handle.record.id} disappeared before completion`)
       })
     }
 

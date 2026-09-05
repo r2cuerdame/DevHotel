@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { applyMigrations, migrations } from '../store/migrations'
 
 describe('database migrations', () => {
-  it('upgrades an async-startup v5 database through physical acceptance fencing v11 without losing operations', () => {
+  it('upgrades an async-startup v5 database through operation request fencing v12 without losing operations', () => {
     const sqlite = new DatabaseSync(':memory:')
     try {
       for (const migration of migrations.filter(({ version }) => version <= 5)) {
@@ -35,11 +35,14 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
       })
+      expect(
+        (sqlite.prepare('PRAGMA table_info(operations)').all() as { name: string }[]).map(({ name }) => name)
+      ).toContain('request_key')
       expect(
         (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
           .map(({ name }) => name)
@@ -212,7 +215,7 @@ describe('database migrations', () => {
       expect(sqlite.prepare(
         "SELECT length(value) AS bytes FROM android_acceptance_secrets WHERE name = 'acceptance-hmac-v1'"
       ).get()).toEqual({ bytes: 32 })
-      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 11 })
+      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 })
     } finally {
       sqlite.close()
     }

@@ -83,6 +83,11 @@ export interface OperationRecord {
   kind: OperationKind
   roomId: string
   actor: 'user' | 'devhotel' | 'agent'
+  /**
+   * Stable, bounded identity of the request that created this operation.
+   * A repeated operation ID is idempotent only when this identity also matches.
+   */
+  requestKey?: string
   status: OperationStatus
   /** Current stage while running; the last stage reached once terminal. */
   stage: OperationStageKey

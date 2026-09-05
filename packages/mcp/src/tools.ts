@@ -564,7 +564,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'android_run',
       description:
-        "One-shot Android dev loop: build the room workspace, install EVERY built module APK, launch the chosen applicationId (default: first module), then return the change result plus a screenshot. Target selection follows the Room attachment: without a physical lease this uses the Room emulator; while the Room holds an attached physical-device lease it installs, launches, and captures that shared phone instead. Release the device before an emulator-only run. The result's `after` carries the facts the next call needs — `adbSerial` for an emulator run (never connect a second serial to the same device, it runs everything twice) or `device` for a leased phone, plus `launchedApplicationId` and `installedApplicationIds`. Long call — the Gradle build alone can take minutes.",
+        "Start a durable Android dev-loop operation: build the room workspace, install EVERY built module APK, and launch the chosen applicationId (default: first module). It returns promptly with an operation ID; poll check_operation until terminal, then inspect list_changes for the exact same ID and capture evidence with android_screenshot. Target selection follows the Room attachment: without a physical lease this uses the Room emulator; while the Room holds an attached physical-device lease it uses that shared phone instead. Release the device before an emulator-only run.",
       schema: {
         roomId: zRoomId,
         applicationId: z.string().optional().describe('which built module to launch, e.g. "com.example.app"; defaults to the first')
@@ -581,7 +581,8 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
                 kind: 'android-run',
                 ...(a.applicationId ? { applicationId: a.applicationId } : {})
               },
-              operationId
+              operationId,
+              0
             )
           } catch (mutationError) {
             let opRecord: OperationRecord | null = null
@@ -599,9 +600,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
                       (c: unknown) =>
                         typeof c === 'object' &&
                         c !== null &&
-                        (c as { kind?: unknown }).kind === 'android-run' &&
-                        ((c as { status?: unknown }).status === 'verified' ||
-                          (c as { status?: unknown }).status === 'applied')
+                        (c as { id?: unknown }).id === operationId
                     )
                   : null
               } else if (opRecord.status === 'failed') {
@@ -643,6 +642,19 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
                     `Poll check_operation with operationId "${op.id}" to await completion.`
                 }
               ]
+            }
+          }
+          if (
+            typeof entry === 'object' &&
+            entry !== null &&
+            'operation' in entry &&
+            (entry as { operation: OperationRecord }).operation
+          ) {
+            const op = (entry as { operation: OperationRecord }).operation
+            const detail = op.error?.message ?? `operation ended with ${op.status}`
+            return {
+              content: [{ type: 'text', text: `android_run ${op.status} (operation ${op.id}): ${detail}` }],
+              isError: op.status === 'failed'
             }
           }
           if (

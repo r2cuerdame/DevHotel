@@ -6,6 +6,7 @@ interface OperationRow {
   kind: string
   room_id: string
   actor: string
+  request_key: string | null
   status: string
   stage: string
   stages_json: string
@@ -21,6 +22,7 @@ function rowToRecord(row: OperationRow): OperationRecord {
     kind: row.kind as OperationKind,
     roomId: row.room_id,
     actor: row.actor as OperationRecord['actor'],
+    ...(row.request_key === null ? {} : { requestKey: row.request_key }),
     status: row.status as OperationStatus,
     stage: row.stage as OperationStageKey,
     stages: JSON.parse(row.stages_json) as OperationStage[],
@@ -53,8 +55,8 @@ export function operationsRepo(db: Db): OperationsRepo {
       sqlite
         .prepare(
           `INSERT INTO operations (
-             id, kind, room_id, actor, status, stage, stages_json, error_json, started_at, updated_at, finished_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             id, kind, room_id, actor, request_key, status, stage, stages_json, error_json, started_at, updated_at, finished_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              stage = excluded.stage,
@@ -68,6 +70,7 @@ export function operationsRepo(db: Db): OperationsRepo {
           record.kind,
           record.roomId,
           record.actor,
+          record.requestKey ?? null,
           record.status,
           record.stage,
           JSON.stringify(record.stages),
