@@ -357,14 +357,19 @@ export class OperationTracker {
         open.status = 'done'
         open.endedAt = finishedAt
       }
-      record.stages.push({
-        key: 'complete',
-        label: 'Complete',
-        status: 'done',
-        detail: null,
-        startedAt: finishedAt,
-        endedAt: finishedAt
-      })
+      // A task may provide a useful terminal label (for example, the exact
+      // application that was verified). Preserve that completed stage instead
+      // of appending a second generic completion marker.
+      if (open?.key !== 'complete' || open.status !== 'done') {
+        record.stages.push({
+          key: 'complete',
+          label: 'Complete',
+          status: 'done',
+          detail: null,
+          startedAt: finishedAt,
+          endedAt: finishedAt
+        })
+      }
       record.stage = 'complete'
       record.status = 'succeeded'
     }

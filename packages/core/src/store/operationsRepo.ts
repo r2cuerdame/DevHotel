@@ -33,7 +33,7 @@ function rowToRecord(row: OperationRow): OperationRecord {
   }
 }
 
-/** Room operations kept per Room; older finished records are pruned on write. */
+/** Display-history operations kept per Room; client idempotency records remain durable. */
 const RETAINED_PER_ROOM = 50
 
 export interface OperationsRepo {
@@ -79,12 +79,14 @@ export function operationsRepo(db: Db): OperationsRepo {
           record.updatedAt,
           record.finishedAt
         )
-      // Keep the newest window per Room. A running operation is never pruned:
-      // its ID is the handle a caller is still polling with.
+      // Keep the newest display window per Room. A running operation is never
+      // pruned because its ID is still being polled. A request_key marks a
+      // client-addressable idempotency record; it must outlive this display
+      // window so a delayed retry cannot repeat a completed mutation.
       sqlite
         .prepare(
           `DELETE FROM operations
-           WHERE room_id = ? AND status != 'running' AND id NOT IN (
+           WHERE room_id = ? AND status != 'running' AND request_key IS NULL AND id NOT IN (
              SELECT id FROM operations WHERE room_id = ? ORDER BY started_at DESC, id DESC LIMIT ?
            )`
         )

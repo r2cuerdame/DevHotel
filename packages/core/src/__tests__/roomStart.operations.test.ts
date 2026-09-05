@@ -315,6 +315,67 @@ describe('Room start as a trackable operation', () => {
     expect(runs).toBe(1)
   })
 
+  it('retains client idempotency records beyond the rolling display-history window', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const options = {
+      operationId,
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    }
+    let runs = 0
+
+    const first = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, options)
+    await first.completion
+
+    for (let index = 0; index < 55; index++) {
+      const timestamp = `2099-01-01T00:00:${String(index).padStart(2, '0')}.000Z`
+      orch.operationRecords.save({
+        id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        kind: 'room-start',
+        roomId: room.id,
+        actor: 'agent',
+        status: 'succeeded',
+        stage: 'complete',
+        stages: [],
+        error: null,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        finishedAt: timestamp
+      })
+    }
+
+    expect(orch.operationRecords.get(operationId)).not.toBeNull()
+    const retry = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, options)
+    await retry.completion
+    expect(retry.newlyStarted).toBe(false)
+    expect(runs).toBe(1)
+  })
+
+  it('preserves a task-provided completion stage without appending a duplicate', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const handle = tracker.run('android-run', room.id, 'agent', async (report) => {
+      report.begin('verify', 'Verify app')
+      report.begin('complete', 'com.example.app running')
+    }, {
+      operationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    })
+
+    await handle.completion
+    const terminal = tracker.get(handle.record.id)
+    expect(terminal?.stages.filter((stage) => stage.key === 'complete')).toEqual([
+      expect.objectContaining({ label: 'com.example.app running', status: 'done' })
+    ])
+  })
+
   it('rejects reuse of an operation id for different Android run parameters', async () => {
     const { orch, room } = await setup()
     const tracker = new OperationTracker(orch.operationRecords)
