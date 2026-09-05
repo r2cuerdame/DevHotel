@@ -274,7 +274,13 @@ export const CONTROL_ROUTES = {
 /** Starting a Room answers with its operation; `waitMs` only chooses how long the call holds. */
 export const zStartRoomBody = z.object({ waitMs: zOperationWaitMs.optional() }).strict()
 export const zRoomOperationsLimit = z.number().int().min(1).max(200)
-export const zApplyChangeBody = z.object({ change: zQuickChange }).strict()
+export const zApplyChangeBody = z
+  .object({
+    change: zQuickChange,
+    operationId: zOperationId.optional(),
+    waitMs: zOperationWaitMs.optional()
+  })
+  .strict()
 export const zUndoChangeBody = z.object({ changeId: zChangeId }).strict()
 /**
  * How much of a command's output the caller wants inline, and which part.

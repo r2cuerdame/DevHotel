@@ -1899,6 +1899,17 @@ export class RoomOrchestrator {
       if (pending.length === 0) continue
       for (const entry of pending) {
         if (entry.kind === 'android-build' || entry.kind === 'android-run') {
+          try {
+            if (await this.backend.webPaused(room.id)) {
+              await this.backend.unpauseWeb(room.id)
+              this.olog(room.id, 'unpaused Room workspace left paused by interrupted Android operation')
+            }
+          } catch (pauseError) {
+            this.olog(
+              room.id,
+              `could not unpause Room workspace: ${pauseError instanceof Error ? pauseError.message : String(pauseError)}`
+            )
+          }
           const cleanupFailures: string[] = []
           try {
             await this.backend.removeWorkspaceSnapshot(room.id, entry.id)
@@ -1913,6 +1924,16 @@ export class RoomOrchestrator {
             this.changes.setStatus(entry.id, 'pending', { verify: { ok: false, detail } })
             this.olog(room.id, detail)
             continue
+          }
+        }
+        if (room.provider !== 'windows') {
+          try {
+            if (await this.backend.webPaused(room.id)) {
+              await this.backend.unpauseWeb(room.id)
+              this.olog(room.id, 'unpaused Room workspace left paused by interrupted change')
+            }
+          } catch {
+            // best effort
           }
         }
         const detail = `interrupted while applying change #${entry.seq}; captured safety data was preserved`
@@ -7722,7 +7743,16 @@ export class RoomOrchestrator {
     return this.changes.list(roomId)
   }
 
-  applyChange(roomId: string, change: QuickChange, actor: Actor): Promise<ChangeEntry> {
+  applyChange(roomId: string, change: QuickChange, actor: Actor, operationId?: string, waitMs?: undefined): Promise<ChangeEntry>
+  applyChange(roomId: string, change: QuickChange, actor: Actor, operationId: string | undefined, waitMs: number): Promise<ChangeEntry | { operation: OperationRecord }>
+  applyChange(roomId: string, change: QuickChange, actor: Actor, operationId?: string, waitMs?: number): Promise<ChangeEntry | { operation: OperationRecord }>
+  applyChange(
+    roomId: string,
+    change: QuickChange,
+    actor: Actor,
+    operationId?: string,
+    waitMs?: number
+  ): Promise<ChangeEntry | { operation: OperationRecord }> {
     const room = this.mustGet(roomId)
     if (room.provider === 'windows') {
       throw new Error(`'${change.kind}' is not available until the Windows guest agent is installed`)
@@ -7733,6 +7763,89 @@ export class RoomOrchestrator {
     if (room.provider === 'web' && change.kind === 'android-build') {
       throw new Error('Builds are only available in Android rooms')
     }
+    if (change.kind !== 'android-run' && (operationId !== undefined || waitMs !== undefined)) {
+      throw new Error('operationId and waitMs are supported only for android-run changes')
+    }
+
+    if (change.kind === 'android-run') {
+      const androidRunOperationId = operationId ?? randomUUID()
+      const requestKey = operationId === undefined
+        ? undefined
+        : createHash('sha256')
+          .update('android-run\0')
+          .update(change.applicationId ?? '')
+          .digest('hex')
+      let changeEntry: ChangeEntry | undefined
+      const handle = this.operations.run(
+        'android-run',
+        roomId,
+        actor,
+        async (report) => {
+          changeEntry = await this.withRoomLock(roomId, async () => {
+            const current = this.mustGet(roomId)
+            if (actor === 'agent' && current.workspaceMode === 'legacy-host-bind') {
+              throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
+            }
+            const entry = await this.engine.execute(
+              this.ctxFor(roomId),
+              change.kind,
+              change,
+              actor,
+              androidRunOperationId,
+              report
+            )
+            this.syncStatusFromVerify(roomId, entry)
+            this.reattachLogs(roomId)
+            await writeManifest(this.userData, this.mustGet(roomId))
+            this.emit(roomId, 'change', entry.title)
+            this.emit(roomId, 'status')
+            return entry
+          })
+        },
+        {
+          operationId: androidRunOperationId,
+          requestKey,
+          // Each accepted request keeps its own ID. Caller-supplied IDs also
+          // carry durable request identity; renderer-generated history remains
+          // subject to the normal display window. The Room lock serializes
+          // actual mutations without aliasing different requested apps.
+          joinRunningByRoom: false,
+          beforeStart: () => {
+            if (this.mutationGate !== 'open') throw this.mutationGateError()
+            if (this.deletingRooms.has(roomId)) {
+              throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
+            }
+            this.assertNoPendingArtifactExport(roomId)
+            if (this.materializingRooms.has(roomId)) {
+              throw new Error(`Room ${roomId} is still being created and cannot be modified`)
+            }
+          }
+        }
+      )
+
+      if (handle.newlyStarted) {
+        this.roomOps.set(roomId, handle.completion.catch(() => undefined))
+      }
+
+      if (waitMs !== undefined) {
+        return (async () => {
+          const record = waitMs > 0 ? await this.operations.wait(handle.record.id, waitMs) : handle.record
+          if (record && record.status !== 'running') {
+            return changeEntry ?? this.changes.get(record.id) ?? { operation: record }
+          }
+          return { operation: record ?? handle.record }
+        })()
+      }
+
+      return handle.completion.then(() => {
+        const exactChange = changeEntry ?? this.changes.get(handle.record.id)
+        if (exactChange) return exactChange
+        const record = this.operations.get(handle.record.id)
+        if (record) return { operation: record }
+        throw new Error(`Android run operation ${handle.record.id} disappeared before completion`)
+      })
+    }
+
     return this.withRoomLock(roomId, async () => {
       const current = this.mustGet(roomId)
       if (actor === 'agent' && current.workspaceMode === 'legacy-host-bind') {
@@ -7740,7 +7853,7 @@ export class RoomOrchestrator {
       }
       let entry: ChangeEntry
       try {
-        entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor)
+        entry = await this.engine.execute(this.ctxFor(roomId), change.kind, change, actor, operationId)
       } catch (error) {
         if (
           change.kind !== 'package-install' &&

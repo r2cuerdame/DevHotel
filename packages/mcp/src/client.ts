@@ -349,8 +349,12 @@ export class ControlClient {
   runChecks(roomId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/checks`)
   }
-  applyChange(roomId: string, change: QuickChange) {
-    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/changes`, { change })
+  applyChange(roomId: string, change: QuickChange, operationId?: string, waitMs?: number) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/changes`, {
+      change,
+      ...(operationId !== undefined ? { operationId } : {}),
+      ...(waitMs !== undefined ? { waitMs } : {})
+    })
   }
   undoChange(roomId: string, changeId: string) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/undo`, { changeId })

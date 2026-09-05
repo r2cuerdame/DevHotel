@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Actor, ChangeEntry } from '@devhotel/shared'
+import type { OperationReporter } from '../operations'
 import type { ChangeCtx, ChangeDefinition } from './types'
 import { verifyWebUp } from './types'
 
@@ -12,11 +13,18 @@ export class ChangeEngine {
     this.defs.set(def.kind, def)
   }
 
-  async execute<P>(ctx: ChangeCtx, kind: string, params: P, actor: Actor): Promise<ChangeEntry> {
+  async execute<P>(
+    ctx: ChangeCtx,
+    kind: string,
+    params: P,
+    actor: Actor,
+    operationId?: string,
+    reporter?: OperationReporter
+  ): Promise<ChangeEntry> {
     const def = this.defs.get(kind)
     if (!def) throw new Error(`Unknown change kind: ${kind}`)
 
-    const operation = { id: randomUUID(), createdAt: new Date().toISOString() }
+    const operation = { id: operationId ?? randomUUID(), createdAt: new Date().toISOString() }
     const planned = def.plan(ctx, params)
     await def.preflight?.(ctx, params)
     const captured = def.capture ? await def.capture(ctx, params, operation) : null
@@ -49,6 +57,19 @@ export class ChangeEngine {
       push: (s: string) => {
         steps.push(s)
         ctx.log(`  · ${s}`)
+        if (reporter) {
+          if (s.includes('Pause Room workspace') || s.includes('snapshot') || s.includes('Run ') || s.includes('Seal ')) {
+            reporter.begin('build', s)
+          } else if (s.includes('Wait for the emulator to finish booting')) {
+            reporter.begin('emulator-boot', s)
+          } else if (s.includes('Install sealed')) {
+            reporter.begin('install', s)
+          } else if (s.includes('launch') || s.includes('Launch')) {
+            reporter.begin('launch', s)
+          } else {
+            reporter.detail(s)
+          }
+        }
         // Persist progress while the entry is still pending. A process crash
         // must not sever an already-created safety backup from its operation.
         ctx.changes.setStatus(entry.id, 'pending', { steps: [...steps] })
@@ -73,6 +94,7 @@ export class ChangeEngine {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
       ctx.log(`  apply failed: ${detail}`)
+      if (reporter) reporter.fail('apply failed', err)
       ctx.changes.setStatus(entry.id, 'failed', { steps, verify: { ok: false, detail: `apply failed: ${detail}` } })
       const failureCapture = capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured
       const canRollback = def.canRollbackApplyFailure?.(ctx, params, failureCapture) ?? true
@@ -92,6 +114,7 @@ export class ChangeEngine {
 
     const effectiveCaptured = capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured
     let verify: { ok: boolean; detail: string }
+    if (reporter) reporter.begin('verify', 'Verify change status')
     try {
       verify = await def.verify(ctx, params, effectiveCaptured, operation)
     } catch {
@@ -101,9 +124,11 @@ export class ChangeEngine {
       verify = { ok: false, detail: VERIFY_EXCEPTION_DETAIL }
     }
     if (verify.ok) {
+      if (reporter) reporter.begin('complete', verify.detail)
       ctx.changes.setStatus(entry.id, 'verified', { verify })
       ctx.log(`  verified: ${verify.detail}`)
     } else if (planned.autoRollback && planned.undoable && def.undo) {
+      if (reporter) reporter.fail(`verify failed (${verify.detail})`)
       ctx.log(`  verify failed (${verify.detail}) — rolling back`)
       try {
         await def.undo(ctx, { ...entry, captured: capturedOverride ? (capturedOverride as { blob: unknown }).blob : captured, steps })
@@ -115,6 +140,7 @@ export class ChangeEngine {
       }
     } else {
       // stays applied with a failed verify — undo remains available to the user
+      if (reporter) reporter.fail(`verify failed: ${verify.detail}`)
       ctx.changes.setStatus(entry.id, 'applied', { verify })
       ctx.log(`  verify failed: ${verify.detail}`)
     }

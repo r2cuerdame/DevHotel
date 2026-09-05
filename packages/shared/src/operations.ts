@@ -5,7 +5,7 @@
  * still running, finished, or failed.
  */
 
-export type OperationKind = 'room-start'
+export type OperationKind = 'room-start' | 'android-run'
 
 /** `running` is not an outcome — poll until `succeeded` or `failed`. */
 export type OperationStatus = 'running' | 'succeeded' | 'failed'
@@ -16,6 +16,22 @@ export type OperationStatus = 'running' | 'succeeded' | 'failed'
  * grace window. Its `detail` says which.
  */
 export type OperationStageStatus = 'running' | 'done' | 'skipped' | 'failed'
+
+/** Stage keys an operation can report. */
+export const OPERATION_STAGES = [
+  'preparing',
+  'container-start',
+  'emulator-boot',
+  'services-start',
+  'web-start',
+  'verify',
+  'adb-ready',
+  'vm-start',
+  'build',
+  'install',
+  'launch',
+  'complete'
+] as const
 
 /** Stage keys a Room start can report, in the order they can occur. */
 export const ROOM_START_STAGES = [
@@ -30,7 +46,18 @@ export const ROOM_START_STAGES = [
   'complete'
 ] as const
 
-export type OperationStageKey = (typeof ROOM_START_STAGES)[number]
+/** Stage keys an Android run can report. */
+export const ANDROID_RUN_STAGES = [
+  'preparing',
+  'build',
+  'emulator-boot',
+  'install',
+  'launch',
+  'verify',
+  'complete'
+] as const
+
+export type OperationStageKey = (typeof OPERATION_STAGES)[number]
 
 export interface OperationStage {
   key: OperationStageKey
@@ -56,6 +83,11 @@ export interface OperationRecord {
   kind: OperationKind
   roomId: string
   actor: 'user' | 'devhotel' | 'agent'
+  /**
+   * Stable, bounded identity of the request that created this operation.
+   * A repeated operation ID is idempotent only when this identity also matches.
+   */
+  requestKey?: string
   status: OperationStatus
   /** Current stage while running; the last stage reached once terminal. */
   stage: OperationStageKey

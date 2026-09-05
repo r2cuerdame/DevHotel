@@ -6,6 +6,7 @@ interface OperationRow {
   kind: string
   room_id: string
   actor: string
+  request_key: string | null
   status: string
   stage: string
   stages_json: string
@@ -21,6 +22,7 @@ function rowToRecord(row: OperationRow): OperationRecord {
     kind: row.kind as OperationKind,
     roomId: row.room_id,
     actor: row.actor as OperationRecord['actor'],
+    ...(row.request_key === null ? {} : { requestKey: row.request_key }),
     status: row.status as OperationStatus,
     stage: row.stage as OperationStageKey,
     stages: JSON.parse(row.stages_json) as OperationStage[],
@@ -31,7 +33,7 @@ function rowToRecord(row: OperationRow): OperationRecord {
   }
 }
 
-/** Room operations kept per Room; older finished records are pruned on write. */
+/** Display-history operations kept per Room; client idempotency records remain durable. */
 const RETAINED_PER_ROOM = 50
 
 export interface OperationsRepo {
@@ -53,8 +55,8 @@ export function operationsRepo(db: Db): OperationsRepo {
       sqlite
         .prepare(
           `INSERT INTO operations (
-             id, kind, room_id, actor, status, stage, stages_json, error_json, started_at, updated_at, finished_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             id, kind, room_id, actor, request_key, status, stage, stages_json, error_json, started_at, updated_at, finished_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              stage = excluded.stage,
@@ -68,6 +70,7 @@ export function operationsRepo(db: Db): OperationsRepo {
           record.kind,
           record.roomId,
           record.actor,
+          record.requestKey ?? null,
           record.status,
           record.stage,
           JSON.stringify(record.stages),
@@ -76,12 +79,14 @@ export function operationsRepo(db: Db): OperationsRepo {
           record.updatedAt,
           record.finishedAt
         )
-      // Keep the newest window per Room. A running operation is never pruned:
-      // its ID is the handle a caller is still polling with.
+      // Keep the newest display window per Room. A running operation is never
+      // pruned because its ID is still being polled. A request_key marks a
+      // client-addressable idempotency record; it must outlive this display
+      // window so a delayed retry cannot repeat a completed mutation.
       sqlite
         .prepare(
           `DELETE FROM operations
-           WHERE room_id = ? AND status != 'running' AND id NOT IN (
+           WHERE room_id = ? AND status != 'running' AND request_key IS NULL AND id NOT IN (
              SELECT id FROM operations WHERE room_id = ? ORDER BY started_at DESC, id DESC LIMIT ?
            )`
         )

@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { writeFileSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import {
@@ -128,6 +128,8 @@ export async function startControlApi(
   const token = randomBytes(24).toString('hex')
 
   const server = createServer((req, res) => {
+    req.on('error', () => {})
+    res.on('error', () => {})
     void handle(req, res).catch((err) => {
       if (err instanceof DeviceLeaseError) {
         sendJson(res, 409, { error: err.message, code: err.code })
@@ -564,7 +566,7 @@ export async function startControlApi(
             return
           case 'changes': {
             const body = zApplyChangeBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.applyChange(safeRoomId, body.change, 'agent'))
+            sendJson(res, 200, await orch.applyChange(safeRoomId, body.change, 'agent', body.operationId, body.waitMs))
             return
           }
           case 'undo': {
@@ -636,10 +638,44 @@ export async function startControlApi(
     sendJson(res, 404, { error: 'not found' })
   }
 
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const controlFile = join(userData, 'control.json')
+  let preferredPort: number | undefined
+  try {
+    const existing = JSON.parse(readFileSync(controlFile, 'utf8')) as { port?: number }
+    if (typeof existing?.port === 'number' && existing.port > 0 && existing.port <= 65535) {
+      preferredPort = existing.port
+    }
+  } catch {
+    // No previous control.json or unreadable
+  }
+
+  const bindServer = (srv: Server, portToTry: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const onError = (err: Error) => {
+        srv.removeListener('listening', onListening)
+        reject(err)
+      }
+      const onListening = () => {
+        srv.removeListener('error', onError)
+        resolve()
+      }
+      srv.once('error', onError)
+      srv.once('listening', onListening)
+      srv.listen(portToTry, '127.0.0.1')
+    })
+
+  if (preferredPort) {
+    try {
+      await bindServer(server, preferredPort)
+    } catch {
+      await bindServer(server, 0)
+    }
+  } else {
+    await bindServer(server, 0)
+  }
+
   const port = (server.address() as { port: number }).port
   const info: ControlInfo = { port, token, pid: process.pid, version }
-  const controlFile = join(userData, 'control.json')
   writeFileSync(controlFile, JSON.stringify(info, null, 2), 'utf8')
 
   return {
@@ -679,9 +715,14 @@ function inspectionForAgent(inspection: RoomInspection): RoomInspection {
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) })
-  res.end(text)
+  if (res.writableEnded || res.destroyed) return
+  try {
+    const text = JSON.stringify(body)
+    res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) })
+    res.end(text)
+  } catch {
+    // Client disconnected or socket closed before response could be sent
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -714,15 +755,20 @@ function sendArtifactExportJson(res: ServerResponse, status: number, result: Art
 }
 
 function sendPng(res: ServerResponse, filename: string, sha256: string, content: Buffer): void {
-  res.writeHead(200, {
-    'content-type': 'image/png',
-    'content-length': content.byteLength,
-    'content-disposition': `inline; filename="${filename}"`,
-    'cache-control': 'private, no-store',
-    'x-content-type-options': 'nosniff',
-    'x-devhotel-sha256': sha256
-  })
-  res.end(content)
+  if (res.writableEnded || res.destroyed) return
+  try {
+    res.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': content.byteLength,
+      'content-disposition': `inline; filename="${filename}"`,
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+      'x-devhotel-sha256': sha256
+    })
+    res.end(content)
+  } catch {
+    // Client disconnected or socket closed before response could be sent
+  }
 }
 
 async function readBody(req: IncomingMessage, maxBytes = DEFAULT_JSON_BODY_MAX_BYTES): Promise<unknown> {

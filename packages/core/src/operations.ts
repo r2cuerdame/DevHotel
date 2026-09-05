@@ -40,6 +40,17 @@ export interface OperationHandle {
   newlyStarted: boolean
 }
 
+export interface OperationRunOptions {
+  /** Client-assigned durable idempotency key. */
+  operationId?: string
+  /** Request identity that must match whenever operationId is reused. */
+  requestKey?: string
+  /** Room starts join by kind/Room; queued Android runs must remain distinct. */
+  joinRunningByRoom?: boolean
+  /** Synchronous fences applied only when this call would start new work. */
+  beforeStart?: () => void
+}
+
 interface LiveOperation {
   record: OperationRecord
   settled: Promise<void>
@@ -162,19 +173,51 @@ export class OperationTracker {
     kind: OperationKind,
     roomId: string,
     actor: Actor,
-    task: (report: OperationReporter) => Promise<void>
+    task: (report: OperationReporter) => Promise<void>,
+    options: OperationRunOptions = {}
   ): OperationHandle {
-    const key = `${kind}:${roomId}`
+    const { operationId, requestKey, joinRunningByRoom = true, beforeStart } = options
+    if (operationId) {
+      const liveById = this.live.get(operationId)
+      const existingById = liveById?.record ?? this.store.get(operationId)
+      if (existingById) {
+        if (
+          existingById.kind !== kind ||
+          existingById.roomId !== roomId ||
+          existingById.actor !== actor ||
+          existingById.requestKey !== requestKey
+        ) {
+          throw new Error(`Operation ${operationId} already belongs to a different request`)
+        }
+        if (!liveById && existingById.status === 'running') {
+          throw new Error(`Operation ${operationId} is recorded as running but is not owned by this DevHotel process`)
+        }
+        return {
+          record: clone(existingById),
+          completion: liveById?.settled ?? Promise.resolve(),
+          newlyStarted: false
+        }
+      }
+    }
+
+    const id = operationId ?? randomUUID()
+    const key = joinRunningByRoom ? `${kind}:${roomId}` : `${kind}:${roomId}:${id}`
     const existingId = this.runningByKey.get(key)
     const existing = existingId ? this.live.get(existingId) : undefined
     if (existing) return { record: clone(existing.record), completion: existing.settled, newlyStarted: false }
 
+    // Replays and joins above are reads of work already accepted. Fences that
+    // protect a new mutation belong after those lookups but before the durable
+    // publication boundary.
+    beforeStart?.()
+
     const startedAt = nowIso()
     const record: OperationRecord = {
-      id: randomUUID(),
+      id,
       kind,
       roomId,
       actor,
+      ...(requestKey === undefined ? {} : { requestKey }),
       status: 'running',
       stage: 'preparing',
       stages: [],
@@ -321,14 +364,19 @@ export class OperationTracker {
         open.status = 'done'
         open.endedAt = finishedAt
       }
-      record.stages.push({
-        key: 'complete',
-        label: 'Complete',
-        status: 'done',
-        detail: null,
-        startedAt: finishedAt,
-        endedAt: finishedAt
-      })
+      // A task may provide a useful terminal label (for example, the exact
+      // application that was verified). Preserve that completed stage instead
+      // of appending a second generic completion marker.
+      if (open?.key !== 'complete' || open.status !== 'done') {
+        record.stages.push({
+          key: 'complete',
+          label: 'Complete',
+          status: 'done',
+          detail: null,
+          startedAt: finishedAt,
+          endedAt: finishedAt
+        })
+      }
       record.stage = 'complete'
       record.status = 'succeeded'
     }

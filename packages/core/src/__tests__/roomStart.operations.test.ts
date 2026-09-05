@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { OperationRecord, OperationStageKey } from '@devhotel/shared'
@@ -286,6 +287,237 @@ describe('Room start as a trackable operation', () => {
     await first.completion
     await joinedCompletion
     expect(joinedSettled).toBe(true)
+  })
+
+  it('replays a completed client-assigned operation id without repeating work', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    let runs = 0
+    const options = {
+      operationId,
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    }
+
+    const first = tracker.run('android-run', room.id, 'agent', async (report) => {
+      runs++
+      report.begin('build', 'Build app')
+    }, options)
+    await first.completion
+
+    const retry = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, options)
+    await retry.completion
+
+    expect(retry.newlyStarted).toBe(false)
+    expect(retry.record).toMatchObject({ id: operationId, status: 'succeeded', requestKey: 'a'.repeat(64) })
+    expect(runs).toBe(1)
+  })
+
+  it('retains client idempotency records beyond the rolling display-history window', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const options = {
+      operationId,
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    }
+    let runs = 0
+
+    const first = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, options)
+    await first.completion
+
+    for (let index = 0; index < 55; index++) {
+      const timestamp = `2099-01-01T00:00:${String(index).padStart(2, '0')}.000Z`
+      orch.operationRecords.save({
+        id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        kind: 'room-start',
+        roomId: room.id,
+        actor: 'agent',
+        status: 'succeeded',
+        stage: 'complete',
+        stages: [],
+        error: null,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        finishedAt: timestamp
+      })
+    }
+
+    expect(orch.operationRecords.get(operationId)).not.toBeNull()
+    const retry = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, options)
+    await retry.completion
+    expect(retry.newlyStarted).toBe(false)
+    expect(runs).toBe(1)
+  })
+
+  it('preserves a task-provided completion stage without appending a duplicate', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const handle = tracker.run('android-run', room.id, 'agent', async (report) => {
+      report.begin('verify', 'Verify app')
+      report.begin('complete', 'com.example.app running')
+    }, {
+      operationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    })
+
+    await handle.completion
+    const terminal = tracker.get(handle.record.id)
+    expect(terminal?.stages.filter((stage) => stage.key === 'complete')).toEqual([
+      expect.objectContaining({ label: 'com.example.app running', status: 'done' })
+    ])
+  })
+
+  it('rejects reuse of an operation id for different Android run parameters', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const operationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const first = tracker.run('android-run', room.id, 'agent', async () => {}, {
+      operationId,
+      requestKey: 'a'.repeat(64),
+      joinRunningByRoom: false
+    })
+    await first.completion
+
+    expect(() => tracker.run('android-run', room.id, 'agent', async () => {}, {
+      operationId,
+      requestKey: 'b'.repeat(64),
+      joinRunningByRoom: false
+    })).toThrow(/different request/)
+  })
+
+  it('keeps distinct Android run operation ids separate instead of coalescing them by Room', async () => {
+    const { orch, room } = await setup()
+    const tracker = new OperationTracker(orch.operationRecords)
+    const finish = gate()
+    let runs = 0
+    const start = (operationId: string, requestKey: string) => tracker.run(
+      'android-run',
+      room.id,
+      'agent',
+      async () => {
+        runs++
+        await finish.promise
+      },
+      { operationId, requestKey, joinRunningByRoom: false }
+    )
+
+    const first = start('11111111-2222-4333-8444-555555555555', 'a'.repeat(64))
+    const second = start('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', 'b'.repeat(64))
+
+    expect(first.record.id).not.toBe(second.record.id)
+    expect(first.newlyStarted).toBe(true)
+    expect(second.newlyStarted).toBe(true)
+    expect(runs).toBe(2)
+    finish.open()
+    await Promise.all([first.completion, second.completion])
+  })
+
+  it('returns the failed operation instead of an older Android change when preflight creates no change', async () => {
+    const { orch, room } = await setup()
+    const oldChangeId = '99999999-8888-4777-8666-555555555555'
+    orch.changes.append({
+      id: oldChangeId,
+      roomId: room.id,
+      kind: 'android-run',
+      title: 'Old Android run',
+      actor: 'agent',
+      component: 'Build',
+      before: null,
+      after: null,
+      captured: null,
+      steps: [],
+      verify: { ok: true, detail: 'historical result' },
+      undoable: false,
+      undoStrategy: 'none',
+      status: 'verified',
+      rawLogPath: null,
+      createdAt: '2026-08-25T00:00:00.000Z',
+      undoneAt: null
+    })
+    const operationId = '11111111-2222-4333-8444-555555555555'
+
+    const result = await orch.applyChange(room.id, { kind: 'android-run' }, 'agent', operationId, 10_000)
+
+    expect(result).toEqual({
+      operation: expect.objectContaining({
+        id: operationId,
+        kind: 'android-run',
+        status: 'failed',
+        error: expect.objectContaining({ message: expect.stringMatching(/Only Android rooms/) })
+      })
+    })
+    expect(result).not.toMatchObject({ id: oldChangeId })
+  })
+
+  it('keeps renderer-generated Android run history inside the normal pruning window', async () => {
+    const { orch, room } = await setup()
+
+    const result = await orch.applyChange(room.id, { kind: 'android-run' }, 'agent', undefined, 10_000)
+
+    expect(result).toEqual({
+      operation: expect.objectContaining({ kind: 'android-run', status: 'failed' })
+    })
+    if (!('operation' in result)) throw new Error('Expected an operation result')
+    expect(result.operation).not.toHaveProperty('requestKey')
+  })
+
+  it('replays a completed Android run before applying unrelated current mutation fences', async () => {
+    const { orch, room } = await setup()
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const applicationId = 'com.example.app'
+    const requestKey = createHash('sha256')
+      .update('android-run\0')
+      .update(applicationId)
+      .digest('hex')
+    const tracker = new OperationTracker(orch.operationRecords)
+    let runs = 0
+    const original = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, { operationId, requestKey, joinRunningByRoom: false })
+    await original.completion
+    orch.settings.set('artifactExportPending:' + room.id, '{}')
+
+    const replay = await orch.applyChange(
+      room.id,
+      { kind: 'android-run', applicationId },
+      'agent',
+      operationId,
+      0
+    )
+
+    expect(replay).toEqual({
+      operation: expect.objectContaining({ id: operationId, status: 'succeeded', requestKey })
+    })
+    expect(runs).toBe(1)
+    expect(() => orch.applyChange(
+      room.id,
+      { kind: 'android-run', applicationId },
+      'agent',
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      0
+    )).toThrow(/fenced while an interrupted artifact export/)
+  })
+
+  it('does not advertise pollable semantics for untracked change kinds', async () => {
+    const { orch, room } = await setup()
+
+    expect(() => orch.applyChange(
+      room.id,
+      { kind: 'node-version', version: '24' },
+      'agent',
+      '11111111-2222-4333-8444-555555555555',
+      0
+    )).toThrow(/supported only for android-run/)
   })
 
   it('reports an unfinished wake as running, never as failed, when the wait runs out', async () => {

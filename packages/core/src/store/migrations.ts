@@ -432,6 +432,15 @@ export const migrations: Migration[] = [
         started_at TEXT NOT NULL
       );
     `
+  },
+  {
+    // Client-assigned operation IDs are idempotency keys only when they remain
+    // bound to the same request. Persist the bounded request identity so a
+    // retry after completion cannot overwrite history or run different work.
+    version: 12,
+    sql: `
+      ALTER TABLE operations ADD COLUMN request_key TEXT;
+    `
   }
 ]
 
