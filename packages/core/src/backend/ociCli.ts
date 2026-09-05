@@ -3786,7 +3786,14 @@ export class OciCliBackend implements IsolationBackend {
       args.some((arg) => arg.includes('logcat'))
     )
     const normalizedArgs = normalizeAdbArgsForShell(args)
-    if (mode === 'command' && !hostApkPath && !recoveryOnly && !isDisposable) {
+    // Recovery sessions use the same exact emulator/image/topology proofs, but
+    // may run while the Room web workload is unavailable. Reuse the resident
+    // helper with the recovery topology re-prover instead of falling back to a
+    // fresh helper for every proof command: a multi-pulse locale recovery has
+    // one shared deadline and cannot safely spend it rebuilding identical
+    // fenced helpers. Streaming readers and explicit disposable commands still
+    // keep their one-shot lifecycle below.
+    if (mode === 'command' && !hostApkPath && !isDisposable) {
       const resident = (await this.liveResidentFencedHelper(roomId, emulatorId, emulatorImageId)) ??
         (await this.startResidentFencedHelper(roomId, emulatorId, emulatorImageId, reproveTopology))
       if (resident) {
