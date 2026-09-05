@@ -1707,8 +1707,9 @@ describe('Android automation targets the attached device without a hand-written 
     expect(replaced).toBe(true)
     expect(readerAborted).toBe(true)
     const execOut = adb.execs.find((call) => call.args[0] === 'exec-out')
-    expect(execOut?.args.slice(0, 3)).toEqual(['exec-out', 'sh', '-c'])
-    expect(execOut?.args.length).toBeGreaterThan(5)
+    expect(execOut?.args).toHaveLength(2)
+    expect(execOut?.args[1]).toMatch(/^'sh' '-c' /)
+    expect(execOut?.args[1]).toContain("'devhotel-ui-dump'")
     expect(adb.execs.some((call) => {
       const logical = logicalAdbArgs(call.args)
       return logical[1] === 'sh' && logical[3]?.includes('input tap "$x" "$y"')
