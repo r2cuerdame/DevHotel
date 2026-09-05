@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -274,6 +275,25 @@ describe('agent control API long operations', () => {
     const secondControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
     try {
       expect(secondControl.info.port).toBe(assignedPort)
+    } finally {
+      secondControl.stop()
+    }
+  })
+  it('reuses the preferred port across a graceful stop without retaining the live token file', async () => {
+    const dir = userDataDir('devhotel-control-port-graceful-reuse-')
+    const firstControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
+    const assignedPort = firstControl.info.port
+    const closed = once(firstControl.server, 'close')
+    firstControl.stop()
+    await closed
+
+    expect(() => readFileSync(join(dir, 'control.json'), 'utf8')).toThrow()
+    expect(JSON.parse(readFileSync(join(dir, 'control-port.json'), 'utf8'))).toEqual({ port: assignedPort })
+
+    const secondControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
+    try {
+      expect(secondControl.info.port).toBe(assignedPort)
+      expect(secondControl.info.token).not.toBe(firstControl.info.token)
     } finally {
       secondControl.stop()
     }

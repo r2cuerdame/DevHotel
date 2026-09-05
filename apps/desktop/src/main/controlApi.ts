@@ -639,14 +639,18 @@ export async function startControlApi(
   }
 
   const controlFile = join(userData, 'control.json')
+  const controlPortFile = join(userData, 'control-port.json')
   let preferredPort: number | undefined
-  try {
-    const existing = JSON.parse(readFileSync(controlFile, 'utf8')) as { port?: number }
-    if (typeof existing?.port === 'number' && existing.port > 0 && existing.port <= 65535) {
-      preferredPort = existing.port
+  for (const candidate of [controlPortFile, controlFile]) {
+    try {
+      const existing = JSON.parse(readFileSync(candidate, 'utf8')) as { port?: number }
+      if (typeof existing?.port === 'number' && existing.port > 0 && existing.port <= 65535) {
+        preferredPort = existing.port
+        break
+      }
+    } catch {
+      // No saved preference or unreadable stale control file
     }
-  } catch {
-    // No previous control.json or unreadable
   }
 
   const bindServer = (srv: Server, portToTry: number): Promise<void> =>
@@ -676,6 +680,10 @@ export async function startControlApi(
 
   const port = (server.address() as { port: number }).port
   const info: ControlInfo = { port, token, pid: process.pid, version }
+  // Keep the non-secret port preference across graceful relaunches while the
+  // token-bearing control file remains a live-process signal and is removed on
+  // shutdown. Falling back to control.json also preserves crash-upgrade reuse.
+  writeFileSync(controlPortFile, JSON.stringify({ port }, null, 2), 'utf8')
   writeFileSync(controlFile, JSON.stringify(info, null, 2), 'utf8')
 
   return {
