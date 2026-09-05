@@ -600,6 +600,7 @@ describe('OciCliBackend Android artifact export', () => {
     // `helper` stays the one-shot slot, so assertions about it keep their meaning.
     const residentHelperId = '7'.repeat(64)
     let residentHelper: Record<string, unknown> | null = null
+    let residentUsesEmulatorImage = false
     let helperNetworkMode = `container:${ids.emulator}`
     let helperState = 'created'
     let helperUser = '0:0'
@@ -733,7 +734,7 @@ describe('OciCliBackend Android artifact export', () => {
           const residentToken = args.find((arg) => arg.startsWith('devhotel.abort-token='))!.split('=')[1]!
           residentHelper = {
             Id: residentHelperId,
-            Image: TEST_EMULATOR_IMAGE_ID,
+            Image: residentUsesEmulatorImage ? emulatorImageId : TEST_EMULATOR_IMAGE_ID,
             Name: `/${residentName}`,
             Config: { User: '0:0', Labels: {
               'devhotel.room': ROOM_ID,
@@ -900,6 +901,18 @@ describe('OciCliBackend Android artifact export', () => {
     )
     const execOutCreate = mockedRunDocker.mock.calls.find(([args]) => args[0] === 'create')![0]
     expect(execOutCreate.slice(-5)).toEqual(['exec-out', 'sh', '-c', "'echo 1'", "'arg1'"])
+
+    mockedRunDocker.mockClear()
+    const recoveryBackend = new OciCliBackend()
+    residentUsesEmulatorImage = true
+    await recoveryBackend.execFencedEmulatorRecoveryAdb(ROOM_ID, ['get-state'])
+    await recoveryBackend.execFencedEmulatorRecoveryAdb(ROOM_ID, ['shell', 'getprop', 'sys.boot_completed'])
+    const recoveryCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    expect(recoveryCalls.filter((args) => args[0] === 'create')).toHaveLength(1)
+    expect(recoveryCalls.filter((args) => args[0] === 'exec')).toHaveLength(2)
+    expect(recoveryCalls.find((args) => args[0] === 'create')).toContain('devhotel-fenced-resident')
+    residentHelper = null
+    residentUsesEmulatorImage = false
 
     mockedRunDocker.mockClear()
     bootStart = true

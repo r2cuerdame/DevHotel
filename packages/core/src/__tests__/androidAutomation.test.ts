@@ -3369,7 +3369,7 @@ describe('tracked Android automation session', () => {
     expect(pulseCalls).toBe(2)
   })
 
-  it('returns the stable PID set from the last complete release pulse', async () => {
+  it('returns the stable PID set when the package filter also returns a prefixed sibling app', async () => {
     let pulseCalls = 0
     const values = {
       api: '34',
@@ -3378,7 +3378,7 @@ describe('tracked Android automation session', () => {
       paths: `package:${BASE_APK_PATH}`,
       stat: BASE_APK_STAT,
       sha: `${'a'.repeat(64)}  ${BASE_APK_PATH}`,
-      uidRecord: `package:${APP_ID} uid:10123`,
+      uidRecord: `package:${APP_ID} uid:10123\npackage:${APP_ID}.crashsample uid:10124`,
       uidOwners: `package:${APP_ID} uid:10123`,
       locale: `Locales for ${APP_ID} for user 0 are [en-US]`,
       focus: `mCurrentFocus=Window{1 u0 ${APP_ID}/.MainActivity}`,
@@ -3395,7 +3395,15 @@ describe('tracked Android automation session', () => {
       }
       if (args[1] === 'pm' && args[2] === 'path') return { code: 0, stdout: `package:${BASE_APK_PATH}\n`, stderr: '' }
       if (args[1] === 'getprop' && args[2] === 'ro.build.version.sdk') return { code: 0, stdout: '34\n', stderr: '' }
-      if (args[1] === 'pm' && args[2] === 'list') return { code: 0, stdout: `package:${APP_ID} uid:10123\n`, stderr: '' }
+      if (args[1] === 'pm' && args[2] === 'list') {
+        return {
+          code: 0,
+          stdout: args.includes('--uid')
+            ? `package:${APP_ID} uid:10123\n`
+            : `package:${APP_ID} uid:10123\npackage:${APP_ID}.crashsample uid:10124\n`,
+          stderr: ''
+        }
+      }
       if (args[1] === 'cmd' && args[2] === 'locale' && args[3] === 'get-app-locales') {
         return { code: 0, stdout: `Locales for ${APP_ID} for user 0 are [en-US]\n`, stderr: '' }
       }

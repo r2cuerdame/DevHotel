@@ -1762,37 +1762,38 @@ export class AndroidAutomationSession {
         signal
       }
     )
-    const fail = (): never => {
+    const fail = (stage: string): never => {
       throw automationError(
         'ANDROID_LOCALE_TARGET_CHANGED',
         'The final Android locale, foreground process or exact tracked install could not be sealed.',
         'Keep the exact target and tracked app stable, then retry retained locale recovery.',
-        409
+        409,
+        { stage }
       )
     }
-    if (result.code !== 0 || result.stderr.length > 0 || commandHitOutputLimit(result)) fail()
+    if (result.code !== 0 || result.stderr.length > 0 || commandHitOutputLimit(result)) fail('command-result')
     const lines = result.stdout.replace(/\r/g, '').split('\n').filter((line) => line.length > 0)
-    if (lines.length !== FINAL_LOCALE_PULSE_KEYS.length) fail()
+    if (lines.length !== FINAL_LOCALE_PULSE_KEYS.length) fail('record-count')
     const values = new Map<string, string>()
     for (const [index, key] of FINAL_LOCALE_PULSE_KEYS.entries()) {
       const match = new RegExp(`^${key}=([A-Za-z0-9+/]*={0,2})$`).exec(lines[index] ?? '')
-      if (!match) fail()
-      if (values.has(key)) fail()
+      if (!match) fail(`record-${key}`)
+      if (values.has(key)) fail(`duplicate-${key}`)
       const encoded = match![1]!
       const decoded = Buffer.from(encoded, 'base64')
-      if (decoded.toString('base64') !== encoded) fail()
+      if (decoded.toString('base64') !== encoded) fail(`base64-${key}`)
       values.set(key, decoded.toString('utf8'))
     }
-    const value = (key: typeof FINAL_LOCALE_PULSE_KEYS[number]): string => values.get(key) ?? fail()
+    const value = (key: typeof FINAL_LOCALE_PULSE_KEYS[number]): string => values.get(key) ?? fail(`missing-${key}`)
 
     const apiLevel = parseAndroidApiLevel(value('api'))
-    if (apiLevel !== expectedFence.apiLevel) fail()
-    if (value('activeUser') !== String(tracked.installUserId)) fail()
+    if (apiLevel !== expectedFence.apiLevel) fail('api')
+    if (value('activeUser') !== String(tracked.installUserId)) fail('active-user')
     if (tracked.installUserId === 0) {
       if (
         tracked.installUserSerial !== 0 ||
         value('userDump') !== ANDROID_SYSTEM_USER_INCARNATION
-      ) fail()
+      ) fail('system-user')
     } else {
       const userLines = value('userDump').split(/\r?\n/)
       const userPattern = /^ UserInfo\{(0|[1-9]\d{0,4}):[^\r\n]*:[0-9a-fA-F]+\} serialNo=(0|[1-9]\d{0,9}) isPrimary=(?:true|false)(?: parentId=(?:0|[1-9]\d{0,4}))?(?: .*?)?$/
@@ -1804,7 +1805,7 @@ export class AndroidAutomationSession {
         users[0]!.index !== 0 ||
         users[0]!.match[1] !== String(tracked.installUserId) ||
         users[0]!.match[2] !== String(tracked.installUserSerial)
-      ) fail()
+      ) fail('user-incarnation')
     }
 
     const pathMatch = /^package:([^\r\n]+)$/.exec(value('paths'))
@@ -1816,24 +1817,30 @@ export class AndroidAutomationSession {
       Buffer.byteLength(baseApk, 'utf8') > 4096 ||
       /[\p{C}\p{Zl}\p{Zp}]/u.test(baseApk) ||
       baseApk.split('/').some((segment) => segment === '.' || segment === '..')
-    ) fail()
+    ) fail('package-path')
     const stat = value('stat')
-    if (!/^\d+:\d+:\d+:-?\d+:-?\d+$/.test(stat)) fail()
+    if (!/^\d+:\d+:\d+:-?\d+:-?\d+$/.test(stat)) fail('package-stat')
     const shaMatch = /^([a-fA-F0-9]{64})\s+([^\r\n]+)$/.exec(value('sha'))
     if (
       !shaMatch ||
       shaMatch[1]!.toLowerCase() !== tracked.apkSha256 ||
       shaMatch[2] !== baseApk ||
       packageIncarnation(baseApk!, stat) !== tracked.packageIncarnation
-    ) fail()
+    ) fail('package-sha')
 
     const escaped = applicationId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const uidLine = new RegExp(`^package:${escaped}\\s+uid[:=](${authority.uid})$`)
-    if (!uidLine.test(value('uidRecord'))) fail()
+    const uidRecordLines = value('uidRecord').split(/\r?\n/).filter(Boolean)
+    const uidRecordPattern = /^package:([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\s+uid[:=](\d+)$/
+    const uidRecords = uidRecordLines.map((line) => uidRecordPattern.exec(line))
+    if (
+      uidRecords.some((record) => record === null) ||
+      uidRecordLines.filter((line) => uidLine.test(line)).length !== 1
+    ) fail('uid-record')
     const ownerLines = value('uidOwners').split(/\r?\n/).filter(Boolean)
-    if (ownerLines.length !== 1 || !uidLine.test(ownerLines[0]!)) fail()
+    if (ownerLines.length !== 1 || !uidLine.test(ownerLines[0]!)) fail('uid-owners')
     const localeTags = parseAndroidAppLocales(applicationId, tracked.installUserId, value('locale'))
-    if (localeTags === null) fail()
+    if (localeTags === null) fail('locale')
 
     const focusLines = value('focus').split(/\r?\n/).filter((line) => /^\s*mCurrentFocus=/.test(line))
     const focus = focusLines.length === 1
@@ -1844,10 +1851,10 @@ export class AndroidAutomationSession {
       focus[1] !== String(tracked.installUserId) ||
       focus[2] !== applicationId ||
       value('pgrepStatus') !== '0'
-    ) fail()
+    ) fail('foreground-process')
     const pids = parsePids(value('pids')).sort((left, right) => left - right)
     const pidTokens = value('pids').trim().split(/\s+/).filter(Boolean)
-    if (pids.length === 0 || pids.length !== pidTokens.length || pids.length > MAX_PACKAGE_PROCESSES) fail()
+    if (pids.length === 0 || pids.length !== pidTokens.length || pids.length > MAX_PACKAGE_PROCESSES) fail('process-list')
 
     return { apiLevel: apiLevel!, localeTags: localeTags!, pids, restoreFence: expectedFence }
   }
@@ -3134,11 +3141,16 @@ export class AndroidAutomationSession {
         deadline, signal
       }
     )
-    const match = new RegExp(`^package:${escaped}\\s+uid[:=](\\d+)$`, 'm').exec(uidResult.stdout)
-    const uid = match ? Number.parseInt(match[1]!, 10) : Number.NaN
+    const uidRecordPattern = /^package:([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)\s+uid[:=](\d+)$/
+    const uidRecordLines = uidResult.stdout.split(/\r?\n/).filter(Boolean)
+    const uidRecords = uidRecordLines.map((line) => uidRecordPattern.exec(line))
+    const matchingUidRecords = uidRecords.filter((record) => record?.[1] === applicationId)
+    const match = matchingUidRecords.length === 1 ? matchingUidRecords[0] : null
+    const uid = match ? Number.parseInt(match[2]!, 10) : Number.NaN
     const appId = Number.isSafeInteger(uid) && uid >= 0 ? uid % ANDROID_PER_USER_RANGE : Number.NaN
     if (
       uidResult.code !== 0 ||
+      uidRecords.some((record) => record === null) ||
       !match ||
       !Number.isSafeInteger(uid) ||
       appId < ANDROID_FIRST_APPLICATION_ID ||
