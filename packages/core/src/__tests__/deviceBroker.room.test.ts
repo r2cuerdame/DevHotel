@@ -19,9 +19,9 @@ const TEST_PACKAGE_INCARNATION = createHash('sha256')
   .digest('hex')
 
 function logicalAdbArgs(args: string[]): string[] {
-  if (args[0] !== 'shell' || args.length !== 2 || !args[1]?.startsWith("'") || !args[1].endsWith("'")) return args
+  if ((args[0] !== 'shell' && args[0] !== 'exec-out') || args.length !== 2 || !args[1]?.startsWith("'") || !args[1].endsWith("'")) return args
   return [
-    'shell',
+    args[0],
     ...args[1]
       .slice(1, -1)
       .split("' '")
@@ -1710,6 +1710,7 @@ describe('Android automation targets the attached device without a hand-written 
     expect(execOut?.args).toHaveLength(2)
     expect(execOut?.args[1]).toMatch(/^'sh' '-c' /)
     expect(execOut?.args[1]).toContain("'devhotel-ui-dump'")
+    expect(logicalAdbArgs(execOut?.args ?? []).slice(0, 3)).toEqual(['exec-out', 'sh', '-c'])
     expect(adb.execs.some((call) => {
       const logical = logicalAdbArgs(call.args)
       return logical[1] === 'sh' && logical[3]?.includes('input tap "$x" "$y"')
