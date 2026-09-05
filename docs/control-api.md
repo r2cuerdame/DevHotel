@@ -10,7 +10,7 @@ changes bump the path version (`/v1/`).
 While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.4.2" }
+{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.0" }
 ```
 
 - Base URL: `http://127.0.0.1:<port>` — loopback only, never remote.
