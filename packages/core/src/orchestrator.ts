@@ -1236,6 +1236,7 @@ export class RoomOrchestrator {
 
     for (const { room, key, raw, pending } of pendingRooms) {
       let restored = false
+      let safeFailureStage: string | null = null
       if (
         pending !== null &&
         room.provider === 'android' &&
@@ -1390,7 +1391,12 @@ export class RoomOrchestrator {
             restored = true
             unresolved.delete(room.id)
           }, { allowPendingAndroidLocaleRestoration: true })
-        } catch {
+        } catch (error) {
+          const evidence = error instanceof DevHotelError && error.evidence && typeof error.evidence === 'object'
+            ? error.evidence as Record<string, unknown>
+            : null
+          const stage = typeof evidence?.['stage'] === 'string' ? evidence['stage'] : null
+          safeFailureStage = stage && /^[a-z0-9-]{1,64}$/.test(stage) ? stage : null
           // The retained value remains a hard mutation gate. Recovery can be
           // retried only with the exact target/install/user/lease authority.
         }
@@ -1405,7 +1411,7 @@ export class RoomOrchestrator {
         room.id,
         restored
           ? 'interrupted Android locale matrix was restored under its exact retained fence'
-          : 'interrupted Android locale matrix still needs exact target recovery; private details were withheld'
+          : `interrupted Android locale matrix still needs exact target recovery${safeFailureStage ? ` at ${safeFailureStage}` : ''}; private details were withheld`
       )
     }
     return unresolved
