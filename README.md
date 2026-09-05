@@ -107,10 +107,10 @@ The bundled MCP server exposes 52 tools across the complete development lifecycl
 
 ### Control API (without MCP)
 
-External agents can drive DevHotel directly over the loopback REST API without MCP. On startup, DevHotel writes `%APPDATA%\DevHotel\control.json` containing the ephemeral port and bearer token:
+External agents can drive DevHotel directly over the loopback REST API without MCP. On startup, DevHotel writes `%APPDATA%\DevHotel\control.json` containing the current port and bearer token:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.0" }
+{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.1" }
 ```
 
 See [Control API (v1)](./docs/control-api.md) for endpoint details and agent security boundaries.

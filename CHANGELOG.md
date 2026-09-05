@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.1 — 2026-09-05
+
+### Android runs survive lost responses and control restarts
+
+- `android_run` now acknowledges a durable caller-assigned operation ID
+  immediately and exposes build, install, launch, and verification progress via
+  `check_operation`. Replaying the same ID returns the original in-flight or
+  terminal result; a mismatched app request fails closed.
+- Distinct Android requests retain their own identity while the existing Room
+  mutation lock, emulator ownership checks, leases, and artifact fences remain
+  authoritative. No Android timeout was increased.
+- Completed caller-assigned IDs remain durable beyond the rolling display
+  history. Renderer-generated history still follows the bounded window.
+- Control sockets contain request/response errors, restarts prefer the previous
+  Fetch-safe port, and MCP clients rediscover current credentials after a
+  restart. Startup reconciliation and Room shutdown recover a workspace
+  container interrupted while paused.
+
 ## 0.5.0 — 2026-09-03
 
 ### Windows Rooms, on VMware Workstation

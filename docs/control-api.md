@@ -10,13 +10,15 @@ changes bump the path version (`/v1/`).
 While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.0" }
+{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.1" }
 ```
 
 - Base URL: `http://127.0.0.1:<port>` — loopback only, never remote.
 - Every request needs `Authorization: Bearer <token>`.
-- The port and token change on every app start: re-read the file on
-  connection errors, and treat a missing file as "DevHotel is not running".
+- The bearer token changes on every app start. DevHotel prefers the prior port
+  when it can reclaim it and otherwise falls back to a new loopback port, so
+  re-read the file on connection or authorization errors; treat a missing file
+  as "DevHotel is not running".
 - Errors are JSON `{ "error": "…" }` with 4xx/5xx status. Stable DevHotel
   contract failures also include `code` and `recoveryHint`; engine-specific
   diagnostics are not exposed as the public error contract.
