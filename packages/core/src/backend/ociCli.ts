@@ -1482,6 +1482,15 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const containers = await this.listRoomContainers(roomId)
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
+    for (const container of active) {
+      if (container.state === 'paused') {
+        try {
+          await runDocker(['unpause', container.id])
+        } catch {
+          // best-effort unpause before stop
+        }
+      }
+    }
     const web = active.filter((container) => container.role === 'web').map((container) => container.id)
     const leaves = active
       .filter((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role))

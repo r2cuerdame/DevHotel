@@ -162,7 +162,8 @@ export class OperationTracker {
     kind: OperationKind,
     roomId: string,
     actor: Actor,
-    task: (report: OperationReporter) => Promise<void>
+    task: (report: OperationReporter) => Promise<void>,
+    operationId?: string
   ): OperationHandle {
     const key = `${kind}:${roomId}`
     const existingId = this.runningByKey.get(key)
@@ -171,7 +172,7 @@ export class OperationTracker {
 
     const startedAt = nowIso()
     const record: OperationRecord = {
-      id: randomUUID(),
+      id: operationId ?? randomUUID(),
       kind,
       roomId,
       actor,

@@ -795,4 +795,13 @@ describe('makeTools', () => {
     expect(requests.at(-2)?.body).toEqual({})
     expect(requests.at(-1)?.body).toEqual({ confirmationToken: RESYNC_TOKEN })
   })
+
+  it('android_run passes operationId upfront to enable recoverable acknowledgement', async () => {
+    const res = await byName.android_run!.handler({ roomId: 'abc12345' })
+    expect(res.isError).toBeUndefined()
+    const req = seen.findLast((r) => r.url === '/v1/rooms/abc12345/changes')
+    expect(req?.body?.change).toEqual({ kind: 'android-run' })
+    expect(typeof req?.body?.operationId).toBe('string')
+    expect(req?.body?.operationId).toMatch(/^[0-9a-f-]{36}$/)
+  })
 })

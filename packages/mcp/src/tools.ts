@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
+  type OperationRecord,
   zAndroidActivityName,
   zAndroidAcceptanceReportId,
   zAndroidAcceptanceReportListLimit,
@@ -218,11 +220,11 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'check_operation',
       description:
-        'Check a long DevHotel operation (today: waking a Room) by id, or list a Room’s recent operations. Checking ' +
+        'Check a long DevHotel operation (e.g. waking a Room or running an Android dev loop) by id, or list a Room’s recent operations. Checking ' +
         'never starts or repeats work. A "running" status means the operation is still in progress — your own earlier ' +
         'timeout did not fail it.',
       schema: {
-        operationId: z.string().uuid().optional().describe('operation id returned by start_room'),
+        operationId: z.string().uuid().optional().describe('operation id returned by start_room or android_run'),
         roomId: zRoomId.optional().describe('list this Room’s recent operations instead'),
         waitMs: z
           .number()
@@ -570,10 +572,88 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: async (a: { roomId: string; applicationId?: string }): Promise<ToolResult> => {
         try {
           const client = await getClient()
-          const entry = await client.applyChange(a.roomId, {
-            kind: 'android-run',
-            ...(a.applicationId ? { applicationId: a.applicationId } : {})
-          })
+          const operationId = randomUUID()
+          let entry: unknown
+          try {
+            entry = await client.applyChange(
+              a.roomId,
+              {
+                kind: 'android-run',
+                ...(a.applicationId ? { applicationId: a.applicationId } : {})
+              },
+              operationId
+            )
+          } catch (mutationError) {
+            let opRecord: OperationRecord | null = null
+            try {
+              const res = await client.getOperation(operationId, 30_000)
+              opRecord = res?.operation ?? null
+            } catch {
+              // control API probe failed
+            }
+            if (opRecord) {
+              if (opRecord.status === 'succeeded') {
+                const changes = await client.listChanges(a.roomId)
+                entry = Array.isArray(changes)
+                  ? changes.find(
+                      (c: unknown) =>
+                        typeof c === 'object' &&
+                        c !== null &&
+                        (c as { kind?: unknown }).kind === 'android-run' &&
+                        ((c as { status?: unknown }).status === 'verified' ||
+                          (c as { status?: unknown }).status === 'applied')
+                    )
+                  : null
+              } else if (opRecord.status === 'failed') {
+                const detail = opRecord.error?.message ?? 'Operation recorded failure'
+                return {
+                  content: [{ type: 'text', text: `android_run failed (operation ${operationId}): ${detail}` }],
+                  isError: true
+                }
+              } else if (opRecord.status === 'running') {
+                return {
+                  content: [
+                    {
+                      type: 'text',
+                      text:
+                        `android_run was dispatched and is running in DevHotel (operation: ${operationId}, stage: ${opRecord.stage}). ` +
+                        `The initial connection timed out, but the build and install are continuing. ` +
+                        `Poll check_operation with operationId "${operationId}" to await completion.`
+                    }
+                  ]
+                }
+              }
+            }
+            if (!entry) throw mutationError
+          }
+
+          if (
+            typeof entry === 'object' &&
+            entry !== null &&
+            'operation' in entry &&
+            (entry as { operation: { status?: unknown } }).operation?.status === 'running'
+          ) {
+            const op = (entry as { operation: OperationRecord }).operation
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    `android_run was dispatched and is running in DevHotel (operation: ${op.id}, stage: ${op.stage}). ` +
+                    `Poll check_operation with operationId "${op.id}" to await completion.`
+                }
+              ]
+            }
+          }
+          if (
+            typeof entry === 'object' &&
+            entry !== null &&
+            'change' in entry &&
+            (entry as { change?: unknown }).change
+          ) {
+            entry = (entry as { change: unknown }).change
+          }
+
           let status: unknown = null
           try {
             status = await client.androidAutomationStatus(a.roomId)

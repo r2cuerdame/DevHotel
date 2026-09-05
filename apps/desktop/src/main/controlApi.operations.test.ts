@@ -236,4 +236,46 @@ describe('agent control API long operations', () => {
       control.stop()
     }
   })
+
+  it('forwards operationId and waitMs to applyChange when provided', async () => {
+    const applyChange = vi.fn(async () => ({ operation: operation({ kind: 'android-run' }) }))
+    const control = await startControlApi(
+      { applyChange } as unknown as RoomOrchestrator,
+      userDataDir('devhotel-control-apply-op-'),
+      'test'
+    )
+    try {
+      const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc/changes`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${control.info.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          change: { kind: 'android-run' },
+          operationId: OPERATION_ID,
+          waitMs: 500
+        })
+      })
+      const body = (await response.json()) as { operation: OperationRecord }
+
+      expect(response.status).toBe(200)
+      expect(applyChange).toHaveBeenCalledWith('room1abc', { kind: 'android-run' }, 'agent', OPERATION_ID, 500)
+      expect(body.operation.kind).toBe('android-run')
+    } finally {
+      control.stop()
+    }
+  })
+
+  it('reuses previous port from control.json across restarts when available', async () => {
+    const dir = userDataDir('devhotel-control-port-reuse-')
+    const firstControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
+    const assignedPort = firstControl.info.port
+    expect(assignedPort).toBeGreaterThan(0)
+    firstControl.server.close() // Close server while leaving control.json in place
+
+    const secondControl = await startControlApi({} as unknown as RoomOrchestrator, dir, 'test')
+    try {
+      expect(secondControl.info.port).toBe(assignedPort)
+    } finally {
+      secondControl.stop()
+    }
+  })
 })
