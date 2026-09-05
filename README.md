@@ -12,147 +12,159 @@
 >
 > **One Room. One Writer. No Accidental Conflicts.**
 
-DevHotel is being built as a local Agent Runtime that gives AI a strongly isolated, persistent development server — a **Room** — instead of access to your computer. Humans supervise permissions, state, jobs, and results through a browser-like Windows client.
+DevHotel is a local Agent Runtime that gives AI a strongly isolated, persistent development server — a **Room** — instead of access to your computer. Humans supervise permissions, state, jobs, and results through a browser-like Windows client.
 
 > DevHotel protects the computer, not by limiting the agent, but by limiting its world.
 
-Easy Setup · Easy Change · Easy Check · Easy Undo
+## Key capabilities
 
-Quick Start · Quick Change
+- **Isolation First:** Room-owned files, processes, network, dependencies, and service data cannot affect another Room or the Host. The Room executes in its own network namespace and working state.
+- **Port-Free Routing:** Rooms are accessed by stable local domains like `https://my-project-dev.localhost`, never by raw port numbers. Two rooms can run internal services on identical ports (e.g. 3000, 5432, 6379) simultaneously without conflict.
+- **Your Desktop Stays Yours:** UI input is injected strictly inside the Room (in-Room `adb`, the Room's browser view, or the emulator's virtual display). Tests never move the Host cursor, press Host keys, or steal the foreground window. The one path that interacts with the Host desktop (opening a Windows Room in the VMware console) is a named, user-only, journaled capability. See [Host input isolation](./docs/host-input-isolation.md).
+- **Sleep & Persistence:** Sleeping a Room stops every process it owns and frees CPU/RAM; workspace files, dependencies, database state, and browser sessions survive app restarts and Host reboots.
+- **Room Services:** PostgreSQL and Redis run as Room-scoped services with dedicated health monitoring, persistent storage, version selection, and isolated connection environments.
+- **Clone & Branching:** A working Web Room can be cloned into `stage` or `node24-test`, optionally copying dependencies and service data; the clone receives a fresh isolated browser profile.
+- **Quick Changes with Undo:** Environment modifications run as verified transactions with action-level Undo: `↶ Undo: Node 22 → 24`.
+- **15-Step Check Pipeline & Diagnostics:** When something breaks, a 15-step check pipeline (including CRLF `line-endings` detection) identifies which layer failed. **Copy Diagnostic** generates a secret-redacted bundle ready for issues or LLMs.
+- **Guarded Host Sync:** Inbound sync from Host folders uses `safe_resync_from_host`: drift is inspected first, common generated build outputs are ignored, and meaningful drift returns an opaque single-use confirmation token before anything is imported.
+- **Bounded Command Execution & Run Retention:** `run_in_room` returns a bounded stream view (default 64KB per stream) with server-side substring filtering (`include`/`exclude`). When output exceeds the inline window, the full raw stream is durably retained under the Room and paged with `read_run_output`.
+- **Durable Long Operations:** Long-running lifecycle actions like `start_room` return a durable operation ID with observable progress stages (`check_operation`), surviving client timeouts and disconnects.
+- **One USB Phone, Many Projects (Device Broker):** A physical Android phone is a shared Hotel Service lent to one Room at a time under an exclusive lease. Waiters see the queue and current owner. Crucially, verified builds stay installed on release or reclaim without destructive uninstalls. See [Android Device Broker](./docs/android-device-broker.md).
 
-- **Isolation First:** Room-owned files, processes, network, dependencies, and service data must not affect another Room or the Host. In the target architecture, a selected Host folder is a scoped source/sync endpoint; the Room imports it into Room-owned working state and writes back only through explicit Apply, Export, or Commit actions.
-- Two rooms can use the same internal web, PostgreSQL, and Redis ports at the same time — each room has its own network namespace.
-- **Your desktop stays yours while tests run.** A Room's UI input is injected inside the Room — in-Room `adb`, the Room's own browser, the emulator's own display — so nothing moves the real cursor, presses real keys, or steals the foreground window. The one path that does take the Host desktop (opening a Windows Room in the VMware console) is a named, user-only, journaled capability. See [Host input isolation](./docs/host-input-isolation.md).
-- Rooms are reached by stable domains like `https://my-project-dev.localhost`, never by port numbers.
-- Sleeping a room stops every process it owns and frees CPU/RAM; its dependencies, data, and browser session survive app restarts and reboots.
-- PostgreSQL and Redis are Room-scoped **Services**, with their own health, storage, version, and connection environment.
-- A working Web Room can be cloned into `stage` or `node24-test`, optionally including dependencies and service data; the clone receives a fresh isolated browser profile.
-- Quick Changes run as verified transactions with **action-level Undo**: `↶ Undo: Node 22 → 24`.
-- When something breaks, a 14-step check pipeline tells you *which* layer failed, and **Copy Diagnostic** produces a secret-redacted bundle you can paste into an issue or an LLM.
-- **One USB phone, many projects.** A physical Android device is a Hotel Service, not a Room resource: DevHotel gives it to one Room at a time under an exclusive lease, queues everyone else with the owner and their position visible, and reclaims it automatically when a worker dies — without ever uninstalling or clearing what the last project verified. Development stays on each Room's own emulator; the phone is for the final acceptance run. See [Android Device Broker](./docs/android-device-broker.md).
-- **Reset Room** hands a Room back clean without checking out: it keeps the room number, nickname, domain, plan, source code and history, and rebuilds only what it can — dependencies, caches, Room App data, browser profile. Room App data is dumped to a safety backup first.
-- Three Room kinds today. **Web** is the primary served-site provider. **Android** builds APKs with no Host SDK or `adb` and shows a Room-owned KVM-backed emulator screen — portrait or landscape, with Back/Home/Recents/Rotate — as its site. **Windows (VMware)** clones a Workstation template snapshot into a Room-owned VM; guest exec and file ingress are deliberately later capabilities.
+## Room providers
 
-See [goal.md](./goal.md) for the full product definition (Korean).
+DevHotel supports three Room providers:
 
-## Agent-first architecture
+| Provider | What it does | Current status & limitations |
+|---|---|---|
+| **Web** | Serves web applications with Node.js, package managers (pnpm/npm/yarn), Room-scoped PostgreSQL/Redis, and local HTTPS. | Fully supported. Agents create via `provider: 'web'` (default). |
+| **Android** | Builds APKs without Host SDK or `adb`. Includes a private KVM-backed AOSP emulator sidecar with routed noVNC screen preview, phone strip controls (Back/Home/Recents/Rotate), resident fenced ADB helper, app-scoped locale matrices ([docs](./docs/android-locale-matrix.md)), and cryptographic acceptance reports ([docs](./docs/android-acceptance-reports.md)). | Fully supported. Requires KVM via Docker. Agents create via `provider: 'android'`. |
+| **Windows (VMware)** | Clones a VMware Workstation template snapshot into a headless Room-owned VM for isolated Windows testing. | Preview. Setup is guided via the desktop app; console access is a user-only capability. Guest exec and file ingress are planned for the forthcoming guest agent. Not creatable via agent API (`provider: 'windows'` is reserved for desktop setup). |
 
-The target product core is a stable local DevHotel daemon, a versioned REST API, and a context-aware Agent Gateway. GUI, CLI, the DevHotel MCP adapter, and future SDKs are clients of the same state and permission model. Long-running builds and tests are durable Jobs, independent of client connections.
+## Installation & prerequisites
 
-Every Room owns the working state it executes. Build and test Jobs consume an immutable `StateRevision`, allowing the Room to keep changing without changing a Job's inputs. Host source is ingress/sync, not a live execution bind; Clone, Undo, and Suite share the same revision primitive. See the [Working State / Sync / Build design](./docs/superpowers/specs/2026-08-10-devhotel-working-state-design.md).
+DevHotel is currently in developer preview. While the long-term goal is a zero-prerequisite runtime (see [Managed Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-managed-runtime-design.md)), the current release utilizes external container and virtualization engines:
 
-An Agent checks into a Room with an exclusive writer lease. Heartbeats and fencing tokens prevent stale writers after takeover. Parallel Agents get independent Room clones by default. Host folders, devices, secrets, public URLs, and other outside resources require explicit scoped permission grants.
+- **OS:** Windows 11 x64.
+- **Container Engine:** Docker Engine via Docker Desktop with the WSL2 backend, or any local engine exposing the standard `docker` CLI.
+- **For Android Rooms:** KVM hardware acceleration enabled and exposed through the engine (`/dev/kvm`).
+- **For Windows Rooms:** VMware Workstation Pro installed on the Host.
+- **For building from source:** Node.js ≥ 22 and pnpm ≥ 10.
 
-DevHotel distinguishes two service layers. A **Room Service** belongs to one Room's environment: PostgreSQL, Redis, its web process, build/test execution, local HTTPS, and backups. It may consume shared infrastructure, but its configuration, state, and lifecycle remain Room-scoped. A **Hotel Service** is shared infrastructure owned once by DevHotel: GitHub integration, credentials and permissions, device pools, queues/scheduling, registry/update infrastructure, and later MCP or Skills catalogs. The shared Android device pool is the first of these to ship its lease and queue model. Hotel Services are bound to a Room or Agent through permission; they are not installed into each Room.
-
-The first concrete Hotel Service is **GitHub Service**. This preview provisions a checksum-verified, pinned `gh` build in Hotel-owned storage and can keep an explicitly supplied GitHub token in Electron's encrypted credential vault; it does not resolve or authenticate through Host `gh`. Provisioning makes the service available but does not enable it for an Agent. The current vertical slice covers owned installation, version/health checks, credential Connect/Disconnect, and cleanup with Hotel data. Agent assignment, scoped permission enforcement, native-interface connection, and revoke are still target control-plane work. Project-versioned Node, pnpm, Vite, Prisma, and compilers remain Room-owned because they affect reproducibility. MCP and Skills are later Hotel Service categories, not Room package installs. The DevHotel MCP adapter remains a replaceable client of the stable REST API, not the foundation or lifecycle owner. See the [Agent Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-agent-runtime-design.md) and [sandbox/backend research ADR](./docs/superpowers/specs/2026-08-10-devhotel-sandbox-research.md).
-
-> **Target architecture:** the current developer preview still keeps orchestration in the Electron main process and does not yet provide the independent daemon, Room Key, lease, fencing, or capability-grant model described above. Waking a Room is the one long operation that already survives a client's disconnect — it has a durable ID, stages and a terminal outcome ([Long operations](./docs/control-api.md#long-operations)); builds and tests are not Jobs yet.
-
-## One Installer. Zero Prerequisites.
-
-This is a hard product and release goal, not a convenience item. The shipping product must install and manage its own isolation runtime, keep runtimes/images/caches/rooms in a DevHotel-owned data area, show storage use, clean unused resources, and offer a complete `Remove DevHotel + Delete Rooms/Data` uninstall path.
-
-Users must not have to install or manage Docker Desktop, Node.js, PostgreSQL, Redis, or another container runtime to use the released product.
-
-## Current developer preview
-
-> **Important:** the current developer preview has not reached the zero-prerequisite goal. It still uses an external Docker Engine through the `docker` CLI. The DevHotel-owned managed runtime, dedicated lifecycle, and complete cleanup/uninstall flow are not finished yet.
-
-The compatibility backend separates direct Room-to-Room traffic, but it does not yet enforce the Full Agent Room policy that also blocks Host gateway/private-LAN egress. Do not use it as the final security boundary for an untrusted autonomous Agent.
-
-Room-local changes made only in a container's writable root filesystem are not yet a durable, cloneable component contract, and compatibility images are still selected by floating major-version tags rather than recorded immutable digests. Managed workspace, dependency and service volumes persist, but the final Agent Room must also preserve or declaratively reproduce installed system tools and clone the exact resolved component builds.
-
-New Local Folder Rooms import Host source through a short-lived read-only mount into a Room-owned source volume. **Sync from Host** is one guarded inspect/refuse-or-confirm/reset/resync operation: meaningful Room drift is named before anything changes, an opaque single-use token binds confirmation to the inspected snapshot, and a later edit or file push produces a fresh preview instead of discarding unseen work. Existing Local Folder Rooms stay in visible `legacy-host-bind` compatibility mode with Agent mutation/Clone blocked until the user selects **Move into Hotel**. Import is currently a full staged copy rather than incremental/COW sync. Android Clean Build snapshots the complete Room-owned source, uses the pinned image with disposable SDK/Gradle state, and exports APKs plus verified provenance under the Room; Web Build/Test and durable per-Job recovery still lack the shared immutable `StateRevision` implementation.
-
-Drift checks ignore common generated outputs (`build`, `.gradle`, `.kotlin`,
-`.cxx`, `dist`, `target`, `node_modules`, APK/AAB files, and similar caches) so
-a normal build does not hide real source edits. Projects that intentionally
-track a generated input can list its exact Room-relative file or directory
-prefix in `.devhotel-sync-include`; those paths are imported and checked again.
-
-Current preview requirements:
-
-- Windows 11 (first supported OS)
-- Docker Engine — Docker Desktop with the WSL2 backend, or any engine exposing the `docker` CLI
-- Android Rooms additionally need KVM through that engine; Windows Rooms need VMware Workstation Pro on the host
-
-## Download
+### Download
 
 **[⬇ Download the latest installer](https://github.com/r2cuerdame/DevHotel/releases/latest)** — `DevHotel-Setup-<version>.exe`, Windows 11 x64.
 
-Run the installer and DevHotel starts in the tray. It keeps itself up to date from Releases; app updates never silently change a Room's Node, PostgreSQL, Redis, or package-manager selection — Room stacks change only when you change them.
+Run the installer and DevHotel starts in the system tray. Auto-updates verify checksums against `latest.yml` before downloading. Releases are cut locally — see [Releasing](./docs/releasing.md).
 
-This is a developer preview: it still expects the external Docker requirement above, so it is not yet the zero-prerequisite install described in the previous section. Windows Rooms additionally need VMware Workstation Pro on the host.
+## Hotel Services
 
-Every release ships `DevHotel-Setup-<version>.exe`, its `.blockmap`, and `latest.yml`; the `latest.yml` checksum must match the installer or auto-update refuses the download. Releases are cut locally rather than by CI — see [Releasing](./docs/releasing.md).
+A **Hotel Service** is shared infrastructure owned once by DevHotel and lent or bound to Rooms with explicit permissions, rather than being re-installed in every Room:
 
-## Hotel Services — shared infrastructure, scoped access
+- **Android Device Broker:** Manages physical USB Android devices as an exclusive leased queue across projects. Features include dead-worker reclaim, PID tracking, and non-destructive release. Secure wireless pairing is restricted to the trusted desktop UI and never exposed to agents or raw ADB. See [Android Device Broker](./docs/android-device-broker.md).
+- **GitHub Service:** Provisions and maintains a pinned, checksum-verified `gh` binary in Hotel-owned storage. Stores user-provided tokens in Electron's encrypted credential vault without touching Host global PATH or git config.
 
-In the target control plane, Hotel Services are installed and updated once in DevHotel-owned storage, then connected through the Agent Gateway. Selecting a Hotel Service for a Room creates an access binding; it does not create another physical installation. This layer must not be confused with Room Services such as PostgreSQL or Redis, whose state and lifecycle belong to an individual Room. The current preview has the persistence and manifest foundation, but does not yet expose these generic assignment or connection operations.
+## For agents & AI tools
 
-Hotel Infra and Rooms are independent. A Host Agent may use an assigned Hotel Service without creating or waking a Room, but **No Room does not mean unrestricted Host access**: selected projects, folders, credentials, devices, and networks still require explicit grants. Availability never implies enablement. DevHotel prepares and maintains; the guest decides and uses.
+DevHotel is built from the ground up for autonomous coding agents.
 
-Availability is not authority. In the target Gateway, every call carries an Agent identity and a Host or Room context. Room Agents receive only that Room's filesystem, browser, database, network, lease, and permission scope. Host Agents use the same services but still need explicit Host or shared-resource grants; “Host Agent” never means unrestricted Host shell access. Runtime placement — Host helper, managed runtime process, or sidecar — remains an internal implementation choice rather than a user-visible topology.
+### Setup
 
-GitHub is the first implemented Hotel Service foundation. Its pinned Hotel-managed `gh` and encrypted private credential stay outside Host global PATH and outside Room images. The current preview automatically maintains the built-in binary as available infrastructure, keeps Agent enablement false by default, and provides install/repair/health and credential Connect/Disconnect. Connecting a credential does not assign the service or authorize an Agent. Agent-native assignment/injection and a complete permission broker are still milestones. MCP and Skills may later use the same Hotel-owned lifecycle and binding model, but they are not part of a Room's installed app list.
+In the desktop app, go to **Settings → MCP** for ready-to-copy registration configurations.
 
-The target common control plane is intentionally small: discover, describe, install, update, enable, disable, assign, request permission, inspect health, and obtain a scoped connection. The actual GitHub, Serena, or Playwright tools remain owned by that service's native interface. These generic operations and native connections are not implemented by the current preview. **DevHotel MCP is the concierge, not every service worker.**
+**Claude Code:**
+```bash
+claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "<path-to-DevHotel.exe>" "<path-to-resources\mcp\index.js>"
+```
 
-The **DevHotel MCP adapter** translates MCP tools to the stable, versioned local REST API. This repository currently includes an experimental stdio MCP package that calls an ephemeral loopback control API owned by the Electron process. It does not yet implement the independent stable daemon/API, Hotel service registry, Gateway context propagation, durable Jobs, leases, fencing, permission grants, or managed isolation described above.
+**Claude Desktop / Cursor (`mcpServers`):**
+```json
+{
+  "mcpServers": {
+    "devhotel": {
+      "command": "<path-to-DevHotel.exe>",
+      "args": ["<path-to-resources\\mcp\\index.js>"],
+      "env": { "ELECTRON_RUN_AS_NODE": "1" }
+    }
+  }
+}
+```
+*Always register using absolute paths so agents started outside DevHotel's environment can resolve the executable.*
 
-## Development
+### MCP tool surface (52 tools)
 
-Requirements: Node ≥ 22, pnpm ≥ 10, Docker.
+The bundled MCP server exposes 52 tools across the complete development lifecycle:
+
+- **Room Lifecycle & Health (12):** `list_rooms`, `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
+- **Working State, Changes & Sync (10):** `apply_quick_change`, `undo_change`, `list_changes`, `room_components`, `restart_web`, `clone_room`, `reset_room`, `safe_resync_from_host`, `sync_from_host`, `reset_sync_baseline`.
+- **Execution & Output Retention (3):** `run_in_room` (bounded output with server-side substring filter), `read_run_output` (paging retained output by byte offset with optional base64), `list_room_runs`.
+- **Room Files (2):** `room_pull_file`, `room_push_file` (workspace-scoped file transfer).
+- **Room Artifacts (3):** `list_room_artifacts`, `read_room_artifact`, `export_room_artifact`.
+- **Android Automation & Verification (11):** `android_run`, `android_launch_app`, `android_force_stop`, `android_wait_for_text`, `android_tap_text`, `android_dump_ui`, `android_logcat`, `android_run_crash_scenario`, `android_screenshot`, `android_locale_screenshot_matrix`, `abandon_android_locale_matrix_recovery`.
+- **Android Acceptance Reports (3):** `android_create_acceptance_report`, `list_android_acceptance_reports`, `get_android_acceptance_report` (cryptographically sealed HMAC receipts for emulator development or final physical proof).
+- **Shared Device Broker (6):** `android_devices`, `attach_android_device`, `release_android_device`, `heartbeat_android_device`, `cancel_android_device_request`, `android_device_adb`.
+- **Hotel Services (2):** `hotel_github_status`, `hotel_github_install`.
+
+### Control API (without MCP)
+
+External agents can drive DevHotel directly over the loopback REST API without MCP. On startup, DevHotel writes `%APPDATA%\DevHotel\control.json` containing the ephemeral port and bearer token:
+
+```json
+{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.0" }
+```
+
+See [Control API (v1)](./docs/control-api.md) for endpoint details and agent security boundaries.
+
+### Agent boundaries & guarantees
+
+- **Audited mutations:** All agent mutations are recorded as `actor: agent` in the Room's change journal with action-level undo where possible.
+- **Host protection:** Agents cannot create linked-folder Rooms (user approval in UI required), cannot read arbitrary Host paths, and cannot hijack Host mouse, keyboard, or foreground windows.
+- **Pairing isolation:** Wireless pairing is restricted to the trusted desktop UI and cannot be initiated by agents or raw ADB.
+
+## Local development
 
 ```bash
 pnpm install
 pnpm dev              # run the desktop app in dev mode
-pnpm test             # automated tests (live Docker smoke is opt-in below)
-pnpm typecheck
-pnpm build:installer  # NSIS installer into apps/desktop/release
+pnpm test             # automated test suite
+pnpm typecheck        # TypeScript check across all packages
+pnpm lint             # ESLint check
+pnpm build:installer  # build NSIS installer into apps/desktop/release
 ```
 
 Live backend smoke test (talks to your local Docker):
-
 ```powershell
 $env:DEVHOTEL_SMOKE='1'; pnpm --filter @devhotel/core exec vitest run src/__tests__/backend.smoke.test.ts --testTimeout=180000
 ```
 
-### Current preview architecture
-
-```text
-apps/desktop      Electron app — UI (React), embedded per-room browser views,
-                  tray, auto-update, loopback control API
-packages/core     Orchestrator — OCI room-pod backend (docker CLI), local
-                  gateway (*.localhost + SNI TLS + local CA), SQLite store,
-                  change-transaction engine with undo, check pipeline,
-                  diagnostics with secret redaction
-packages/mcp      devhotel-mcp — stdio MCP server over the control API
-packages/shared   Types and contracts
+Live host input probe check (verifies desktop isolation on an idle machine):
+```powershell
+$env:DEVHOTEL_HOST_INPUT_PROBE='1'; pnpm --filter devhotel test
 ```
 
-Each served Room uses an **anchor** relay on its owned network. The gateway routes `<project>-<nickname>.localhost` domains to Rooms, so port numbers stay invisible. Web Rooms serve their site; Android Rooms run the build runtime plus a KVM-backed emulator sidecar in the same netns, and the emulator's noVNC screen is the Room's routed site. Dependency volumes are keyed by Node major (`…-deps-node22`, `…-deps-node24`), which is why a Node version change undoes instantly.
+### Architecture layout
 
-This describes the current external-Docker developer preview. The target release architecture adds a DevHotel-owned runtime bootstrap, dedicated data root, storage cleanup, and uninstall manifest around the room backend.
+```text
+apps/desktop      Electron app — UI (React 19), embedded per-room browser views,
+                  tray, auto-update, loopback REST control API
+packages/core     Orchestrator — OCI room backend (docker CLI), VMware backend,
+                  local gateway (*.localhost + SNI TLS + local CA), SQLite store,
+                  change transaction engine with undo, 15-step check pipeline,
+                  secret-redacted diagnostics, device broker
+packages/mcp      devhotel-mcp — stdio MCP server (52 tools over the control API)
+packages/shared   Shared schemas, contracts, and host input boundary definitions
+```
 
-See [Managed Runtime design](./docs/superpowers/specs/2026-08-10-devhotel-managed-runtime-design.md) for the zero-prerequisite installation, ownership, update, recovery, and cleanup boundary.
+## Documentation
 
-Releases are cut locally, not by CI — see [Releasing](./docs/releasing.md).
-
-## For agents
-
-Settings → **MCP** gives you a one-line registration command for Claude Code and an `mcpServers` snippet for any other client. Register it by absolute path; the bundled server reconnects by itself when the DevHotel app restarts.
-
-The MCP server exposes Room lifecycle, command, change, diagnostics, file-transfer, guarded Host-resync, Android and device-lease tools over the same contract the app uses. Android tools build and install APKs, launch or stop tracked apps, wait for or tap app-scoped text, inspect a sanitized UI tree, read package-UID-scoped logs, and run bounded crash scenarios. On API 31+ an exact tracked foreground app can be saved under an explicit filename as an immutable Room artifact: pixels and secret-safe device/app/build metadata share one active-screen witness, agents receive a directly reviewable image, and the artifact remains retrievable by its Room-scoped ID. It may be exported to a new repo-relative PNG path whose parent already exists as a regular Room directory; the returned Markdown is for a repository-root document, so nested documents must rebase the path and issues/PRs need a repository/ref URL. Launcher, OS-dialog and untracked-app captures remain available only through the compatibility screenshot endpoint. No Host path is accepted and exports never overwrite project files.
-
-Long commands do not lose their output. `run_in_room` returns a **bounded** view — by default the last 64KB of each stream, with optional server-side `include`/`exclude` filtering instead of wrapping every command in `grep`/`sed` — and reports raw bytes and lines against what it returned. Whenever the response could not carry everything, the complete raw output is retained under the Room and read back with `read_run_output`, which pages by byte offset, can return arbitrary bytes as base64, and works while the command is still running. `list_room_runs` shows what a Room is running now and what it still holds.
-
-Waking a Room outlasts most tool timeouts, so `start_room` answers with the wake as an **operation** — a durable ID, a `running`/`succeeded`/`failed` status, the stage it reached, and the terminal error if there was one. `check_operation` follows that ID to the end. Your own timeout no longer reads as a failure, and asking again joins the wake in progress instead of starting a second one. The same thing over REST: [Long operations](./docs/control-api.md#long-operations).
-
-Agents (or any local tool) can drive DevHotel **without MCP** through the same stable loopback REST API — see [Control API](./docs/control-api.md) for discovery (`%APPDATA%\DevHotel\control.json`), bearer auth, agent semantics, and every endpoint.
-
-Everything an agent changes lands in the Room's Changes list, attributed to `agent` and undoable where an inverse honestly exists. Host resources stay outside that boundary: agents cannot create Host-linked Rooms, choose Host paths, or transfer files in a legacy Host-bound Room. The Host's mouse, keyboard and foreground window are outside it too — drive a Room's UI from inside the Room, never with host automation aimed at the preview window ([Host input isolation](./docs/host-input-isolation.md)).
+- [Control API (v1)](./docs/control-api.md) — REST API endpoints, discovery, and agent semantics.
+- [Android Device Broker](./docs/android-device-broker.md) — Shared USB phone queue and exclusive lease model.
+- [Android Acceptance Reports](./docs/android-acceptance-reports.md) — Cryptographically sealed verification receipts.
+- [Android Locale Matrix](./docs/android-locale-matrix.md) — App-scoped locale testing and recovery contract.
+- [Host Input Isolation](./docs/host-input-isolation.md) — Desktop cursor and window protection contract.
+- [Releasing](./docs/releasing.md) — Release packaging, checksum verification, and update process.
+- [Changelog](./CHANGELOG.md) — Detailed version history and release notes.
+- [Product Definition (`goal.md`)](./goal.md) — Original product specification (Korean).
 
 ## License
 

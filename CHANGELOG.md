@@ -264,7 +264,7 @@ Reported by agents whose `start_room` timed out while the Room went on starting 
 - **Stages instead of a spinner.** A Web Room reports `preparing → container-start → services-start → web-start → verify → complete`; an Android Room reports `preparing → container-start → emulator-boot → web-start → verify → adb-ready → complete`; a Windows Room reports `preparing → vm-start → complete`. Each stage carries its own detail, and a stage that did not complete but deliberately did not stop the wake (an already-awake Room, an emulator without KVM) is marked `skipped` with the reason.
 - **A wake that did not bring the Room up is now reported as failed**, with the failing stage and the error text — previously the call returned successfully while the Room quietly went to `attention` or `broken`. The Room's own status behaviour is unchanged.
 - **Android Rooms stop claiming a phone that is still booting.** The wake asks adb once whether the device finished booting and records the answer; the Room is `ready` for builds either way, and `android-run` still waits for the device itself. The probe is a single bounded question, never a wait, so no Android wake got slower.
-- MCP: `start_room` returns the operation, and the new **`check_operation`** tool follows it by ID (or lists a Room's recent operations). Thirty tools now.
+- MCP: `start_room` returns the operation, and the new **`check_operation`** tool follows it by ID (or lists a Room's recent operations). Fifty-two MCP tools are now available across room lifecycle, Android automation, acceptance receipts, and device broker operations.
 
 ## 0.4.3 — 2026-08-16
 
