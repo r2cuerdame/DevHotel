@@ -784,10 +784,10 @@ function posixRemoteArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
 
-/** adb shell concatenates its remaining argv into one remote shell command. */
+/** adb shell and exec-out concatenate their remaining argv into one remote shell command. */
 function protectAndroidRemoteCommand(args: string[]): string[] {
   const verb = args[0]
-  if (verb !== 'shell' || args.length < 2) return args
+  if ((verb !== 'shell' && verb !== 'exec-out') || args.length < 2) return args
   return [verb, args.slice(1).map(posixRemoteArg).join(' ')]
 }
 
@@ -6716,7 +6716,8 @@ export class RoomOrchestrator {
             maxStdoutBytes: opts?.maxStdoutBytes,
             maxStderrBytes: opts?.maxStderrBytes,
             onStdout: opts?.onStdout,
-            onStderr: opts?.onStderr
+            onStderr: opts?.onStderr,
+            disposableHelper: opts?.disposableHelper
           }
         )
         return {

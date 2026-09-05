@@ -17,10 +17,10 @@ const CHANGE_ID = '11111111-2222-4333-8444-555555555555'
 const INSTALLED_AT = '2026-08-30T00:00:00.000Z'
 
 function lockedSessionTestTarget(orch: RoomOrchestrator): {
-  openAndroidAutomationSessionLocked: (...args: never[]) => Promise<AndroidAutomationSession>
+  openAndroidAutomationSessionLocked: (...args: unknown[]) => Promise<AndroidAutomationSession>
 } {
   return orch as unknown as {
-    openAndroidAutomationSessionLocked: (...args: never[]) => Promise<AndroidAutomationSession>
+    openAndroidAutomationSessionLocked: (...args: unknown[]) => Promise<AndroidAutomationSession>
   }
 }
 const emulatorTarget: AndroidAutomationTarget = {
@@ -487,4 +487,22 @@ describe('Android screenshot artifact capture', () => {
     })
     expect(adb.execs).toEqual([])
   })
+
+  it('passes disposableHelper and protects exec-out commands in emulator automation session', async () => {
+    const { backend, orch } = setup()
+    backend.execResult = { code: 0, stdout: '', stderr: '' }
+
+    await orch['withRoomLock'](ROOM_ID, async () => {
+      const session = await lockedSessionTestTarget(orch).openAndroidAutomationSessionLocked(ROOM_ID, { kind: 'emulator' })
+      const execMethod = (session as unknown as { opts: { exec: (args: string[], opts?: unknown) => Promise<unknown> } }).opts.exec
+
+      await execMethod(['exec-out', 'sh', '-c', 'echo 123', 'arg1'], { disposableHelper: true, timeoutMs: 5_000 })
+    })
+
+    expect(backend.fencedEmulatorExecCalls.length).toBe(1)
+    const call = backend.fencedEmulatorExecCalls[0]!
+    expect(call.args).toEqual(['exec-out', "'sh' '-c' 'echo 123' 'arg1'"])
+    expect(call.opts?.disposableHelper).toBe(true)
+  })
 })
+

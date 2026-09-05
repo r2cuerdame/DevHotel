@@ -3758,10 +3758,10 @@ export class OciCliBackend implements IsolationBackend {
       }
     }
     const normalizeAdbArgsForShell = (commandArgs: readonly string[]): string[] => {
-      if (commandArgs.length === 0 || commandArgs[0] !== 'shell') return [...commandArgs]
+      if (commandArgs.length === 0 || (commandArgs[0] !== 'shell' && commandArgs[0] !== 'exec-out')) return [...commandArgs]
       if (commandArgs.length >= 4 && commandArgs[1] === 'sh' && commandArgs[2] === '-c') {
         return [
-          'shell',
+          commandArgs[0],
           'sh',
           '-c',
           `'${commandArgs[3]!.replace(/'/g, "'\\''")}'`,
