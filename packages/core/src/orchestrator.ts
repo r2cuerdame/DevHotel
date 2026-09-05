@@ -7768,18 +7768,13 @@ export class RoomOrchestrator {
     }
 
     if (change.kind === 'android-run') {
-      if (this.mutationGate !== 'open') throw this.mutationGateError()
-      if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
-      this.assertNoPendingArtifactExport(roomId)
-      if (this.materializingRooms.has(roomId)) {
-        throw new Error(`Room ${roomId} is still being created and cannot be modified`)
-      }
-
       const androidRunOperationId = operationId ?? randomUUID()
-      const requestKey = createHash('sha256')
-        .update('android-run\0')
-        .update(change.applicationId ?? '')
-        .digest('hex')
+      const requestKey = operationId === undefined
+        ? undefined
+        : createHash('sha256')
+          .update('android-run\0')
+          .update(change.applicationId ?? '')
+          .digest('hex')
       let changeEntry: ChangeEntry | undefined
       const handle = this.operations.run(
         'android-run',
@@ -7810,10 +7805,21 @@ export class RoomOrchestrator {
         {
           operationId: androidRunOperationId,
           requestKey,
-          // Each accepted request keeps its own durable ID. The Room lock
-          // serializes actual mutation work without aliasing one caller's
-          // applicationId to another caller's result.
-          joinRunningByRoom: false
+          // Each accepted request keeps its own ID. Caller-supplied IDs also
+          // carry durable request identity; renderer-generated history remains
+          // subject to the normal display window. The Room lock serializes
+          // actual mutations without aliasing different requested apps.
+          joinRunningByRoom: false,
+          beforeStart: () => {
+            if (this.mutationGate !== 'open') throw this.mutationGateError()
+            if (this.deletingRooms.has(roomId)) {
+              throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
+            }
+            this.assertNoPendingArtifactExport(roomId)
+            if (this.materializingRooms.has(roomId)) {
+              throw new Error(`Room ${roomId} is still being created and cannot be modified`)
+            }
+          }
         }
       )
 

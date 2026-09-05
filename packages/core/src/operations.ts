@@ -47,6 +47,8 @@ export interface OperationRunOptions {
   requestKey?: string
   /** Room starts join by kind/Room; queued Android runs must remain distinct. */
   joinRunningByRoom?: boolean
+  /** Synchronous fences applied only when this call would start new work. */
+  beforeStart?: () => void
 }
 
 interface LiveOperation {
@@ -174,7 +176,7 @@ export class OperationTracker {
     task: (report: OperationReporter) => Promise<void>,
     options: OperationRunOptions = {}
   ): OperationHandle {
-    const { operationId, requestKey, joinRunningByRoom = true } = options
+    const { operationId, requestKey, joinRunningByRoom = true, beforeStart } = options
     if (operationId) {
       const liveById = this.live.get(operationId)
       const existingById = liveById?.record ?? this.store.get(operationId)
@@ -203,6 +205,11 @@ export class OperationTracker {
     const existingId = this.runningByKey.get(key)
     const existing = existingId ? this.live.get(existingId) : undefined
     if (existing) return { record: clone(existing.record), completion: existing.settled, newlyStarted: false }
+
+    // Replays and joins above are reads of work already accepted. Fences that
+    // protect a new mutation belong after those lookups but before the durable
+    // publication boundary.
+    beforeStart?.()
 
     const startedAt = nowIso()
     const record: OperationRecord = {

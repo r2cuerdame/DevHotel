@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { OperationRecord, OperationStageKey } from '@devhotel/shared'
@@ -456,6 +457,55 @@ describe('Room start as a trackable operation', () => {
       })
     })
     expect(result).not.toMatchObject({ id: oldChangeId })
+  })
+
+  it('keeps renderer-generated Android run history inside the normal pruning window', async () => {
+    const { orch, room } = await setup()
+
+    const result = await orch.applyChange(room.id, { kind: 'android-run' }, 'agent', undefined, 10_000)
+
+    expect(result).toEqual({
+      operation: expect.objectContaining({ kind: 'android-run', status: 'failed' })
+    })
+    if (!('operation' in result)) throw new Error('Expected an operation result')
+    expect(result.operation).not.toHaveProperty('requestKey')
+  })
+
+  it('replays a completed Android run before applying unrelated current mutation fences', async () => {
+    const { orch, room } = await setup()
+    const operationId = '11111111-2222-4333-8444-555555555555'
+    const applicationId = 'com.example.app'
+    const requestKey = createHash('sha256')
+      .update('android-run\0')
+      .update(applicationId)
+      .digest('hex')
+    const tracker = new OperationTracker(orch.operationRecords)
+    let runs = 0
+    const original = tracker.run('android-run', room.id, 'agent', async () => {
+      runs++
+    }, { operationId, requestKey, joinRunningByRoom: false })
+    await original.completion
+    orch.settings.set('artifactExportPending:' + room.id, '{}')
+
+    const replay = await orch.applyChange(
+      room.id,
+      { kind: 'android-run', applicationId },
+      'agent',
+      operationId,
+      0
+    )
+
+    expect(replay).toEqual({
+      operation: expect.objectContaining({ id: operationId, status: 'succeeded', requestKey })
+    })
+    expect(runs).toBe(1)
+    expect(() => orch.applyChange(
+      room.id,
+      { kind: 'android-run', applicationId },
+      'agent',
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      0
+    )).toThrow(/fenced while an interrupted artifact export/)
   })
 
   it('does not advertise pollable semantics for untracked change kinds', async () => {
