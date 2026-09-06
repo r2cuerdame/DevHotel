@@ -488,6 +488,58 @@ describe('Android acceptance orchestration', () => {
       .toThrowError(expect.objectContaining({ code: 'ANDROID_ACCEPTANCE_EVIDENCE_CORRUPT' }))
   })
 
+  it('accepts a retained evidence run created after android_run without treating its revision as source drift', async () => {
+    const test = setup()
+    const provenance = test.orch.androidInstalls.acceptanceProvenance(
+      ROOM_ID,
+      { kind: 'emulator', targetId: ROOM_ID, deviceId: null },
+      APP_ID
+    )!
+    test.backend.execChunks = { stdout: ['evidence\n', 'x'.repeat(2_000)] }
+
+    const executed = await test.orch.execInRoom(
+      ROOM_ID,
+      ['sh', '-lc', 'verified evidence command'],
+      { output: { maxBytes: 256 } }
+    )
+    expect(executed.output.retained).toBe(true)
+    expect(test.orch.rooms.get(ROOM_ID)?.stateRevision).toBe(provenance.stateRevision + 1)
+    test.backend.fencedEmulatorExecHandler = (args) => {
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: screenshotPng(3, 2, { text: 'post retained run' }).toString('base64'),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const screenshot = await test.orch.captureAndroidScreenshotArtifact(
+      ROOM_ID,
+      { filename: 'post-retained-run.png' },
+      'agent'
+    )
+    expect(screenshot.metadata.room.stateRevision).toBe(provenance.stateRevision + 1)
+
+    const result = await test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      steps: [{
+        id: 'post-install-run',
+        status: 'pass',
+        screenshotArtifactIds: [screenshot.id],
+        logRunIds: [executed.output.runId]
+      }]
+    }, 'agent')
+
+    expect(result.report.status).toBe('pass')
+    expect(result.report.room.stateRevision).toBe(provenance.stateRevision + 1)
+    expect(result.report.build.stateRevision).toBe(provenance.stateRevision)
+    expect(result.report.logs).toEqual([
+      expect.objectContaining({ runId: executed.output.runId, code: 0 })
+    ])
+    expect(test.orch.getAndroidAcceptanceReport(ROOM_ID, result.report.id)).toEqual(result)
+  })
+
   it('publishes no report when the Room source changes across the final source fence', async () => {
     const test = setup()
     vi.spyOn(test.backend, 'fingerprintWorkspace')
@@ -1053,6 +1105,84 @@ describe('Android acceptance orchestration', () => {
     expect(test.orch.settings.get(`androidAcceptanceRestorePending:${ROOM_ID}`)).toBeNull()
     expect(test.orch.androidAcceptanceReports.isRunPinned(ROOM_ID, test.runId)).toBe(true)
     expect(verificationTransactions).toEqual([false, true])
+  })
+
+  it('records the current Room revision in final physical reports after a retained evidence run', async () => {
+    const test = setupPhysical()
+    const provenance = test.orch.androidInstalls.acceptanceProvenance(
+      ROOM_ID,
+      test.target,
+      APP_ID
+    )!
+    test.backend.execChunks = { stdout: ['physical evidence\n', 'x'.repeat(2_000)] }
+
+    const executed = await test.orch.execInRoom(
+      ROOM_ID,
+      ['sh', '-lc', 'verified physical evidence command'],
+      { output: { maxBytes: 256 } }
+    )
+    expect(executed.output.retained).toBe(true)
+    expect(test.orch.rooms.get(ROOM_ID)?.stateRevision).toBe(provenance.stateRevision + 1)
+    const capturedAt = new Date().toISOString()
+    const screenshot = test.orch.artifacts.publishScreenshot({
+      roomId: ROOM_ID,
+      filename: 'post-retained-physical-run.png',
+      png: screenshotPng(3, 2),
+      actor: 'agent',
+      createdAt: capturedAt,
+      metadata: {
+        schema: 1,
+        room: {
+          id: ROOM_ID,
+          stateRevision: provenance.stateRevision + 1,
+          workspaceVolumeRevision: provenance.workspaceVolumeRevision
+        },
+        capture: { source: 'adb', capturedAt, width: 3, height: 2, orientation: 'landscape' },
+        device: {
+          kind: 'physical',
+          deviceId: test.deviceId,
+          model: 'Pixel 8',
+          androidVersion: '15',
+          apiLevel: 35
+        },
+        app: { status: 'tracked-active', packageName: APP_ID },
+        locale: { tag: 'en-US', scope: 'app' },
+        build: { exact: true, changeId: CHANGE_ID, apkSha256: APK_SHA256, installedAt: INSTALLED_AT },
+        association: { changeId: null, runId: null }
+      }
+    })
+
+    const result = await test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      stage: 'final-physical',
+      target: { kind: 'physical', deviceId: test.deviceId },
+      steps: [{
+        id: 'post-install-run',
+        status: 'pass',
+        screenshotArtifactIds: [screenshot.id],
+        logRunIds: [executed.output.runId]
+      }]
+    }, 'agent')
+
+    expect(result.report.room.stateRevision).toBe(provenance.stateRevision + 1)
+    expect(result.report.build.stateRevision).toBe(provenance.stateRevision)
+    expect(result.report.logs).toEqual([
+      expect.objectContaining({ runId: executed.output.runId, code: 0 })
+    ])
+    expect(result.report.screenshots).toEqual([
+      expect.objectContaining({ artifactId: screenshot.id })
+    ])
+    expect(test.orch.getAndroidAcceptanceReport(ROOM_ID, result.report.id)).toEqual(result)
+    expect(test.calls.physical).toMatchObject({
+      snapshot: 1,
+      prove: 2,
+      screenWitness: 0,
+      foregroundEvidence: 0,
+      launch: 0,
+      crash: 0,
+      applyLocales: 0,
+      restoreLocales: 0
+    })
   })
 
   it('rejects a physical writer after the final proof gate is acquired and never invokes its Host callback', async () => {

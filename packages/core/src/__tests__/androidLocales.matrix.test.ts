@@ -881,6 +881,10 @@ describe('Android locale screenshot matrix', () => {
     await fixture.orch.init()
 
     expect(fixture.applied.at(-1)).toEqual(['en-US'])
+    expect(fixture.witnessOptions.at(-1)).toEqual({
+      actionTimeoutMs: 120_000,
+      allowApplicationIdTransitions: APP_ID
+    })
     expect(fixture.currentLocaleTags()).toEqual(['en-US'])
     expect(settings.get(pendingKey)).toBeNull()
   })

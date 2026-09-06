@@ -380,7 +380,6 @@ function refineAndroidAcceptanceReport(
   if (
     value.build.imageReference !== value.image.reference ||
     value.build.imageSha256 !== value.image.sha256 ||
-    value.build.stateRevision !== value.room.stateRevision ||
     value.build.workspaceVolumeRevision !== value.room.workspaceVolumeRevision ||
     value.build.sourceIdentity.value !== value.room.sourceIdentity.value
   ) {
