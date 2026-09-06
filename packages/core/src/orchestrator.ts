@@ -5458,7 +5458,7 @@ export class RoomOrchestrator {
           createdAt: new Date().toISOString(),
           actor,
           room: {
-            stateRevision: provenance.stateRevision,
+            stateRevision: room.stateRevision,
             workspaceVolumeRevision: provenance.workspaceVolumeRevision,
             sourceType: room.sourceType,
             sourceIdentity

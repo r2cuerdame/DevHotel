@@ -1107,6 +1107,48 @@ describe('Android acceptance orchestration', () => {
     expect(verificationTransactions).toEqual([false, true])
   })
 
+  it('records the current Room revision in final physical reports after a retained evidence run', async () => {
+    const test = setupPhysical()
+    const provenance = test.orch.androidInstalls.acceptanceProvenance(
+      ROOM_ID,
+      test.target,
+      APP_ID
+    )!
+    test.backend.execChunks = { stdout: ['physical evidence\n', 'x'.repeat(2_000)] }
+
+    const executed = await test.orch.execInRoom(
+      ROOM_ID,
+      ['sh', '-lc', 'verified physical evidence command'],
+      { output: { maxBytes: 256 } }
+    )
+    expect(executed.output.retained).toBe(true)
+    expect(test.orch.rooms.get(ROOM_ID)?.stateRevision).toBe(provenance.stateRevision + 1)
+
+    const result = await test.orch.createAndroidAcceptanceReport(ROOM_ID, {
+      applicationId: APP_ID,
+      stage: 'final-physical',
+      target: { kind: 'physical', deviceId: test.deviceId },
+      steps: [{ id: 'post-install-run', status: 'pass', logRunIds: [executed.output.runId] }]
+    }, 'agent')
+
+    expect(result.report.room.stateRevision).toBe(provenance.stateRevision + 1)
+    expect(result.report.build.stateRevision).toBe(provenance.stateRevision)
+    expect(result.report.logs).toEqual([
+      expect.objectContaining({ runId: executed.output.runId, code: 0 })
+    ])
+    expect(test.orch.getAndroidAcceptanceReport(ROOM_ID, result.report.id)).toEqual(result)
+    expect(test.calls.physical).toMatchObject({
+      snapshot: 1,
+      prove: 2,
+      screenWitness: 0,
+      foregroundEvidence: 0,
+      launch: 0,
+      crash: 0,
+      applyLocales: 0,
+      restoreLocales: 0
+    })
+  })
+
   it('rejects a physical writer after the final proof gate is acquired and never invokes its Host callback', async () => {
     const test = setupPhysical()
     const originalProof = test.physicalSession.proveAppLocaleFinalState
