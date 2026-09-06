@@ -5741,7 +5741,8 @@ export class RoomOrchestrator {
         try {
           return screenshotArtifacts.map((artifact) => {
             if (
-              artifact.metadata.room.stateRevision !== provenance.stateRevision ||
+              artifact.metadata.room.stateRevision < provenance.stateRevision ||
+              artifact.metadata.room.stateRevision > room.stateRevision ||
               artifact.metadata.room.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
               artifact.metadata.device.kind !== installTarget.kind ||
               artifact.metadata.device.deviceId !== installTarget.deviceId ||
@@ -6390,7 +6391,8 @@ export class RoomOrchestrator {
             artifact.sizeBytes !== expected.sizeBytes ||
             artifact.metadata.capture.capturedAt !== expected.capturedAt ||
             !isDeepStrictEqual(artifact.metadata.locale, expected.locale) ||
-            artifact.metadata.room.stateRevision !== report.build.stateRevision ||
+            artifact.metadata.room.stateRevision < report.build.stateRevision ||
+            artifact.metadata.room.stateRevision > report.room.stateRevision ||
             artifact.metadata.room.workspaceVolumeRevision !== report.build.workspaceVolumeRevision ||
             artifact.metadata.device.kind !== report.target.kind ||
             artifact.metadata.device.deviceId !== report.target.deviceId ||

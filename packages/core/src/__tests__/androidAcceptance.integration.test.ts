@@ -495,34 +495,6 @@ describe('Android acceptance orchestration', () => {
       { kind: 'emulator', targetId: ROOM_ID, deviceId: null },
       APP_ID
     )!
-    const capturedAt = new Date().toISOString()
-    const screenshot = test.orch.artifacts.publishScreenshot({
-      roomId: ROOM_ID,
-      filename: 'installed-build.png',
-      png: screenshotPng(3, 2),
-      actor: 'agent',
-      createdAt: capturedAt,
-      metadata: {
-        schema: 1,
-        room: {
-          id: ROOM_ID,
-          stateRevision: provenance.stateRevision,
-          workspaceVolumeRevision: provenance.workspaceVolumeRevision
-        },
-        capture: { source: 'adb', capturedAt, width: 3, height: 2, orientation: 'landscape' },
-        device: {
-          kind: 'emulator',
-          deviceId: null,
-          model: 'Pixel 8',
-          androidVersion: '15',
-          apiLevel: 35
-        },
-        app: { status: 'tracked-active', packageName: APP_ID },
-        locale: { tag: 'en-US', scope: 'app' },
-        build: { exact: true, changeId: CHANGE_ID, apkSha256: APK_SHA256, installedAt: INSTALLED_AT },
-        association: { changeId: null, runId: null }
-      }
-    })
     test.backend.execChunks = { stdout: ['evidence\n', 'x'.repeat(2_000)] }
 
     const executed = await test.orch.execInRoom(
@@ -532,6 +504,22 @@ describe('Android acceptance orchestration', () => {
     )
     expect(executed.output.retained).toBe(true)
     expect(test.orch.rooms.get(ROOM_ID)?.stateRevision).toBe(provenance.stateRevision + 1)
+    test.backend.fencedEmulatorExecHandler = (args) => {
+      if (args[0] === 'exec-out') {
+        return {
+          code: 0,
+          stdout: screenshotPng(3, 2, { text: 'post retained run' }).toString('base64'),
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const screenshot = await test.orch.captureAndroidScreenshotArtifact(
+      ROOM_ID,
+      { filename: 'post-retained-run.png' },
+      'agent'
+    )
+    expect(screenshot.metadata.room.stateRevision).toBe(provenance.stateRevision + 1)
 
     const result = await test.orch.createAndroidAcceptanceReport(ROOM_ID, {
       applicationId: APP_ID,
