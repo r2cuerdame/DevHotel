@@ -114,6 +114,10 @@ describe('Android locale screenshot matrix', () => {
     dispatchPendingDuringFinalProof?: boolean
     driftAfterRestore?: string[]
     finalPidsAfterRestore?: number[]
+    failLaunch?: boolean
+    failInstallSeal?: boolean
+    failUserChanged?: boolean
+    simulateProcessMissingBeforeLaunch?: boolean
   } = {}) {
     const controls = { ...options }
     const userData = tempDir()
@@ -158,6 +162,8 @@ describe('Android locale screenshot matrix', () => {
     let currentLocaleTags = ['en-US']
     let restoredOnce = false
     let nextPid = 101
+    const launchedApps: string[] = []
+    let hasLaunched = false
     const restoreFence = localeRestoreFence()
     const transition = (localeTags: readonly string[], previousLocaleTags: readonly string[]) => {
       const afterPids = [nextPid++]
@@ -183,16 +189,19 @@ describe('Android locale screenshot matrix', () => {
       }
     }
     const session = {
-      target,
+      target: { ...target },
       async appLocaleSnapshot() {
         if (restoredOnce && controls.driftAfterRestore) {
           currentLocaleTags = [...controls.driftAfterRestore]
           controls.driftAfterRestore = undefined
         }
+        const hasProcess = !controls.simulateProcessMissingBeforeLaunch || hasLaunched
         return {
           apiLevel: 34,
           localeTags: [...currentLocaleTags],
-          pids: restoredOnce && controls.finalPidsAfterRestore
+          pids: !hasProcess
+            ? []
+            : restoredOnce && controls.finalPidsAfterRestore
             ? [...controls.finalPidsAfterRestore]
             : [100],
           restoreFence
@@ -321,9 +330,31 @@ describe('Android locale screenshot matrix', () => {
         captureSealCalls += 1
         if (controls.failCapture && captureSealCalls === 1) throw new Error('capture locale drift')
       },
-      async launchApp() {
-        events.push('launch')
-        throw new Error('unexpected launch')
+      async launch(applicationId: string) {
+        launchedApps.push(applicationId)
+        if (controls.failLaunch) {
+          throw new DevHotelError('ANDROID_LAUNCH_FAILED', 'simulated launch failure')
+        }
+        hasLaunched = true
+        return {
+          target,
+          applicationId,
+          component: `${applicationId}/.MainActivity`,
+          evidence: {}
+        }
+      },
+      async trackedInstallSeal(_applicationId: string) {
+        if (controls.failUserChanged) {
+          throw new DevHotelError(
+            'ANDROID_APP_USER_CHANGED',
+            'The active Android user no longer matches this tracked install.'
+          )
+        }
+        if (controls.failInstallSeal) {
+          const broken = installEvidence().seal!
+          return { ...broken, apkSha256: 'f'.repeat(64) }
+        }
+        return installEvidence().seal!
       },
       async forceStop() {
         events.push('force-stop')
@@ -358,6 +389,7 @@ describe('Android locale screenshot matrix', () => {
       },
       expectedPrevious,
       events,
+      launchedApps,
       localeSeals,
       open,
       orch,
@@ -1468,5 +1500,222 @@ describe('Android locale screenshot matrix', () => {
     expect(fixture.open).not.toHaveBeenCalled()
     expect(settings.get(pendingKey)).not.toBeNull()
     expect(fixture.backend.calls).not.toContain(`stopRoomPod:${ROOM_ID}`)
+  })
+
+  it('recovers an interrupted restoration record with attemptedLocaleOwned=true and null ownership tag (issue #61)', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'retained-recovery-real-host'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    const settings = (fixture.orch as unknown as {
+      settings: { get(key: string): string | null; set(key: string, value: string): void }
+    }).settings
+    const pending = JSON.parse(settings.get(pendingKey)!) as Record<string, unknown>
+    const retained = JSON.stringify({
+      ...pending,
+      attemptedLocaleDispatchStarted: true,
+      attemptedLocaleOwned: true,
+      attemptedLocaleOwnershipTag: null
+    })
+    settings.set(pendingKey, retained)
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(settings.get(pendingKey)).toBeNull()
+    expect(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)).toBeNull()
+    expect(fixture.currentLocaleTags()).toEqual(['en-US'])
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('sleeping')
+  })
+
+  it('launches the tracked application when process is absent on restart recovery', async () => {
+    const fixture = setup({
+      failRestore: true,
+      simulateProcessMissingBeforeLaunch: true
+    })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'process-absent-recovery'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    const settings = (fixture.orch as unknown as {
+      settings: { get(key: string): string | null }
+    }).settings
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(fixture.launchedApps).toContain(APP_ID)
+    expect(settings.get(pendingKey)).toBeNull()
+    expect(fixture.currentLocaleTags()).toEqual(['en-US'])
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('sleeping')
+  })
+
+  it('retains fence and records outside-locale structured diagnostic when external actor changed locale', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-outside'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+    fixture.setCurrentLocaleTags(['ja-JP'])
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diagRaw = settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)
+    expect(diagRaw).not.toBeNull()
+    const diag = JSON.parse(diagRaw!) as { invariantClass: string; reason: string; operatorAction: string }
+    expect(diag.invariantClass).toBe('outside-locale')
+    expect(diag.reason).toContain('outside the retained matrix stage')
+    expect(diag.operatorAction).toContain('abandon_android_locale_matrix_recovery')
+
+    const runtime = await fixture.orch.inspectRoomRuntime(ROOM_ID)
+    expect(runtime.runtimeStatus.detail).toContain(diag.reason)
+    expect(runtime.runtimeStatus.recoveryHint).toBe(diag.operatorAction)
+
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['fr-FR'],
+      filenamePrefix: 'blocked'
+    }, 'agent')).rejects.toMatchObject({
+      code: 'ANDROID_LOCALE_RECOVERY_REQUIRED',
+      recoveryHint: diag.operatorAction
+    })
+  })
+
+  it('retains fence and records install-mismatch structured diagnostic when app package is replaced', async () => {
+    const fixture = setup({ failRestore: true, failInstallSeal: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-install'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('install-mismatch')
+    expect(diag.operatorAction).toContain('Restore the exact retained target and install state')
+  })
+
+  it('retains fence and records user-mismatch structured diagnostic when active Android user changed', async () => {
+    const fixture = setup({ failRestore: true, failUserChanged: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-user'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('user-mismatch')
+    expect(diag.reason).toContain('Tracked Android install user does not match the retained recovery fence')
+    expect(diag.operatorAction).toContain('Restore the original Android user identity for this Room')
+  })
+
+  it('retains fence and records api-mismatch structured diagnostic when target API level changed', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-api'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+    fixture.session.target.apiLevel = 35
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('api-mismatch')
+    expect(diag.operatorAction).toContain('configured with the expected API level')
+  })
+
+  it('retains fence and records launch-failed structured diagnostic when app launch fails', async () => {
+    const fixture = setup({ failRestore: true, failLaunch: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-launch'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('launch-failed')
+    expect(diag.operatorAction).toContain('has a launchable activity')
+  })
+
+  it('clears recovery diagnostic when an outside recovery intent is abandoned', async () => {
+    const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'abandon-clears-diag'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RECOVERY_REQUIRED' })
+
+    const settings = (fixture.orch as unknown as {
+      settings: { get(key: string): string | null; set(key: string, value: string): void }
+    }).settings
+    const diagKey = `androidLocaleRecoveryDiagnostic:${ROOM_ID}`
+    settings.set(diagKey, JSON.stringify({
+      invariantClass: 'outside-locale',
+      reason: 'test reason',
+      operatorAction: 'test action',
+      recordedAt: new Date().toISOString()
+    }))
+
+    const result = await fixture.orch.abandonAndroidLocaleMatrixRecovery(ROOM_ID, {
+      applicationId: APP_ID,
+      acknowledgeOutsideLocale: true
+    })
+    expect(result.abandoned).toBe(true)
+    expect(settings.get(pendingKey)).toBeNull()
+    expect(settings.get(diagKey)).toBeNull()
   })
 })
