@@ -116,6 +116,7 @@ describe('Android locale screenshot matrix', () => {
     finalPidsAfterRestore?: number[]
     failLaunch?: boolean
     failInstallSeal?: boolean
+    failUserChanged?: boolean
     simulateProcessMissingBeforeLaunch?: boolean
   } = {}) {
     const controls = { ...options }
@@ -343,6 +344,12 @@ describe('Android locale screenshot matrix', () => {
         }
       },
       async trackedInstallSeal(_applicationId: string) {
+        if (controls.failUserChanged) {
+          throw new DevHotelError(
+            'ANDROID_APP_USER_CHANGED',
+            'The active Android user no longer matches this tracked install.'
+          )
+        }
         if (controls.failInstallSeal) {
           const broken = installEvidence().seal!
           return { ...broken, apkSha256: 'f'.repeat(64) }
@@ -1606,7 +1613,32 @@ describe('Android locale screenshot matrix', () => {
       operatorAction: string
     }
     expect(diag.invariantClass).toBe('install-mismatch')
-    expect(diag.operatorAction).toContain('Reinstall the original matching build')
+    expect(diag.operatorAction).toContain('Restore the exact retained target and install state')
+  })
+
+  it('retains fence and records user-mismatch structured diagnostic when active Android user changed', async () => {
+    const fixture = setup({ failRestore: true, failUserChanged: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-user'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).not.toBeNull()
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('user-mismatch')
+    expect(diag.reason).toContain('Tracked Android install user does not match the retained recovery fence')
+    expect(diag.operatorAction).toContain('Restore the original Android user identity for this Room')
   })
 
   it('retains fence and records api-mismatch structured diagnostic when target API level changed', async () => {

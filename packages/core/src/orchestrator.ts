@@ -519,13 +519,16 @@ function classifyAndroidLocaleRecoveryFailure(
       case 'ANDROID_LOCALE_INSTALL_MISMATCH':
       case 'ANDROID_APP_NOT_INSTALLED':
       case 'ANDROID_APP_REPLACED':
+      case 'ANDROID_APP_IDENTITY_UNVERIFIED':
         return {
           invariantClass: 'install-mismatch',
           reason: 'Tracked package install does not match the retained recovery fence',
-          operatorAction: 'Reinstall the original matching build into this Room, then restart DevHotel.'
+          operatorAction: 'Restore the exact retained target and install state, or reset or re-provision the Room.'
         }
       case 'ANDROID_LOCALE_USER_MISMATCH':
       case 'ANDROID_USER_CHANGED':
+      case 'ANDROID_APP_USER_CHANGED':
+      case 'ANDROID_APP_USER_UNVERIFIED':
         return {
           invariantClass: 'user-mismatch',
           reason: 'Tracked Android install user does not match the retained recovery fence',
@@ -1479,12 +1482,16 @@ export class RoomOrchestrator {
             )
             const isOriginal = sameStringValues(beforeRestore.localeTags, pending.originalLocaleTags)
             const ownsCurrent = pendingAndroidLocaleOwnsCurrent(pending, beforeRestore.localeTags)
-            if (
-              beforeRestore.apiLevel !== pending.fence.apiLevel ||
-              !sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, pending.fence) ||
-              beforeRestore.pids.length === 0 ||
-              (!isOriginal && !ownsCurrent)
-            ) {
+            if (beforeRestore.apiLevel !== pending.fence.apiLevel) {
+              throw new DevHotelError('ANDROID_LOCALE_API_MISMATCH', 'Target API level does not match retained recovery fence')
+            }
+            if (!sameAndroidLocaleRestoreFence(beforeRestore.restoreFence, pending.fence)) {
+              throw new DevHotelError('ANDROID_LOCALE_TARGET_CHANGED', 'Final locale, process state, or fence proof changed during restoration')
+            }
+            if (beforeRestore.pids.length === 0) {
+              throw new DevHotelError('ANDROID_APP_NOT_FOREGROUND', 'Application could not be confirmed in the foreground')
+            }
+            if (!isOriginal && !ownsCurrent) {
               throw new DevHotelError('ANDROID_LOCALE_OUTSIDE_LOCALE', 'Interrupted Android locale stage no longer owns the exact current target')
             }
             if (isOriginal) {
