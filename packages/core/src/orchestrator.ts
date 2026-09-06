@@ -5331,7 +5331,8 @@ export class RoomOrchestrator {
 
         const screenshots = screenshotArtifacts.map((artifact) => {
           if (
-            artifact.metadata.room.stateRevision !== provenance.stateRevision ||
+            artifact.metadata.room.stateRevision < provenance.stateRevision ||
+            artifact.metadata.room.stateRevision > room.stateRevision ||
             artifact.metadata.room.workspaceVolumeRevision !== provenance.workspaceVolumeRevision ||
             artifact.metadata.device.kind !== 'physical' ||
             artifact.metadata.device.deviceId !== installTarget.deviceId ||
