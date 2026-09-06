@@ -415,17 +415,191 @@ function pendingAndroidLocaleOwnsCurrent(
   pending: PendingAndroidLocaleRestore,
   currentLocaleTags: readonly string[]
 ): boolean {
-  if (pending.attemptedLocaleOwned) {
-    return hasExactAndroidLocaleOwnershipMarker(pending) &&
-      sameStringValues(currentLocaleTags, pending.attemptedLocaleTags)
-  }
-  return (
+  const matchesExpectedWithMarker =
     pending.expectedLocaleTags.some(isAndroidLocaleOwnershipMarkerTag) &&
     sameStringValues(currentLocaleTags, pending.expectedLocaleTags)
-  ) ||
-    (pending.attemptedLocaleDispatchStarted &&
-      hasExactAndroidLocaleOwnershipMarker(pending) &&
-      sameStringValues(currentLocaleTags, pending.attemptedLocaleTags))
+
+  const matchesAttemptedWithMarker =
+    (pending.attemptedLocaleOwned || pending.attemptedLocaleDispatchStarted) &&
+    hasExactAndroidLocaleOwnershipMarker(pending) &&
+    sameStringValues(currentLocaleTags, pending.attemptedLocaleTags)
+
+  return matchesExpectedWithMarker || matchesAttemptedWithMarker
+}
+
+type AndroidLocaleRecoveryInvariantClass =
+  | 'target-unavailable'
+  | 'install-mismatch'
+  | 'user-mismatch'
+  | 'api-mismatch'
+  | 'launch-failed'
+  | 'outside-locale'
+  | 'proof-mismatch'
+  | 'mutation-rejected'
+  | 'readiness-timeout'
+  | 'ownership-changed'
+  | 'stale-jobs-present'
+  | 'malformed-intent'
+  | 'unknown'
+
+interface AndroidLocaleRecoveryDiagnostic {
+  readonly invariantClass: AndroidLocaleRecoveryInvariantClass
+  readonly reason: string
+  readonly operatorAction: string
+  readonly recordedAt: string
+}
+
+function pendingAndroidLocaleRecoveryDiagnosticKey(roomId: string): string {
+  return `androidLocaleRecoveryDiagnostic:${roomId}`
+}
+
+function parsePendingAndroidLocaleRecoveryDiagnostic(raw: string | null): AndroidLocaleRecoveryDiagnostic | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      typeof parsed['invariantClass'] === 'string' &&
+      typeof parsed['reason'] === 'string' &&
+      typeof parsed['operatorAction'] === 'string' &&
+      typeof parsed['recordedAt'] === 'string'
+    ) {
+      return parsed as unknown as AndroidLocaleRecoveryDiagnostic
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function classifyAndroidLocaleRecoveryFailure(
+  error: unknown,
+  context: {
+    pending: PendingAndroidLocaleRestore | null
+    staleJobsAbsent: boolean
+    targetKind?: string
+  }
+): { invariantClass: AndroidLocaleRecoveryInvariantClass; reason: string; operatorAction: string } {
+  if (!context.staleJobsAbsent) {
+    return {
+      invariantClass: 'stale-jobs-present',
+      reason: 'Stale job containers could not be proven absent before recovery',
+      operatorAction: 'Wait for background container cleanup or remove stale job containers, then restart DevHotel.'
+    }
+  }
+  if (!context.pending) {
+    return {
+      invariantClass: 'malformed-intent',
+      reason: 'Retained recovery intent is malformed or invalid for this Room',
+      operatorAction: 'Inspect the database settings table entry for this Room or re-provision the Room.'
+    }
+  }
+  if (context.targetKind && context.targetKind !== 'emulator') {
+    return {
+      invariantClass: 'target-unavailable',
+      reason: 'Physical Android target requires manual reconnection and lease recovery',
+      operatorAction: 'Reattach the physical device and restart DevHotel.'
+    }
+  }
+  if (error instanceof DevHotelError) {
+    switch (error.code) {
+      case 'ANDROID_LOCALE_OUTSIDE_LOCALE':
+        return {
+          invariantClass: 'outside-locale',
+          reason: 'Current app locale was changed outside the retained matrix stage',
+          operatorAction: 'Inspect current app locale; run abandon_android_locale_matrix_recovery if intentional, or restore expected test locale and restart DevHotel.'
+        }
+      case 'ANDROID_LOCALE_API_MISMATCH':
+        return {
+          invariantClass: 'api-mismatch',
+          reason: 'Target Android API level does not match the retained recovery fence',
+          operatorAction: 'Ensure the Room emulator is configured with the expected API level, then restart DevHotel.'
+        }
+      case 'ANDROID_LOCALE_INSTALL_MISMATCH':
+      case 'ANDROID_APP_NOT_INSTALLED':
+      case 'ANDROID_APP_REPLACED':
+        return {
+          invariantClass: 'install-mismatch',
+          reason: 'Tracked package install does not match the retained recovery fence',
+          operatorAction: 'Reinstall the original matching build into this Room, then restart DevHotel.'
+        }
+      case 'ANDROID_LOCALE_USER_MISMATCH':
+      case 'ANDROID_USER_CHANGED':
+        return {
+          invariantClass: 'user-mismatch',
+          reason: 'Tracked Android install user does not match the retained recovery fence',
+          operatorAction: 'Restore the original Android user identity for this Room, then restart DevHotel.'
+        }
+      case 'ANDROID_LAUNCH_FAILED':
+      case 'ANDROID_LAUNCHER_NOT_FOUND':
+      case 'ANDROID_APP_NOT_FOREGROUND':
+        return {
+          invariantClass: 'launch-failed',
+          reason: 'Application could not be launched into the foreground',
+          operatorAction: 'Verify that the application package is installed and has a launchable activity, then restart DevHotel.'
+        }
+      case 'ANDROID_LOCALE_MUTATION_REJECTED':
+        return {
+          invariantClass: 'mutation-rejected',
+          reason: 'Target device rejected the locale restoration command',
+          operatorAction: 'Keep the target unchanged and restart DevHotel to retry locale restoration.'
+        }
+      case 'ANDROID_LOCALE_READINESS_TIMEOUT':
+        return {
+          invariantClass: 'readiness-timeout',
+          reason: 'App readiness check timed out after locale mutation',
+          operatorAction: 'Keep the target running and restart DevHotel to retry recovery.'
+        }
+      case 'ANDROID_LOCALE_TARGET_CHANGED':
+        return {
+          invariantClass: 'proof-mismatch',
+          reason: 'Final locale, process state, or fence proof changed during restoration',
+          operatorAction: 'Keep the exact target stable and restart DevHotel to retry recovery.'
+        }
+      case 'ANDROID_LOCALE_TARGET_MISMATCH':
+        return {
+          invariantClass: 'target-unavailable',
+          reason: 'Managed emulator target is unavailable or could not be started',
+          operatorAction: 'Verify emulator container health and isolation backend status, then restart DevHotel.'
+        }
+    }
+  }
+  if (error instanceof Error) {
+    if (/ownership changed/i.test(error.message)) {
+      return {
+        invariantClass: 'ownership-changed',
+        reason: 'Retained recovery intent ownership changed concurrently',
+        operatorAction: 'Restart DevHotel to synchronize recovery state.'
+      }
+    }
+    if (/no longer owns the exact current target|outside the exact/i.test(error.message)) {
+      return {
+        invariantClass: 'outside-locale',
+        reason: 'Current app locale was changed outside the retained matrix stage',
+        operatorAction: 'Inspect current app locale; run abandon_android_locale_matrix_recovery if intentional, or restore expected test locale and restart DevHotel.'
+      }
+    }
+    if (/proof changed|result changed/i.test(error.message)) {
+      return {
+        invariantClass: 'proof-mismatch',
+        reason: 'Final locale, process state, or fence proof changed during restoration',
+        operatorAction: 'Keep the exact target stable and restart DevHotel to retry recovery.'
+      }
+    }
+    if (/emulator|connect|session|backend|docker|pod/i.test(error.message)) {
+      return {
+        invariantClass: 'target-unavailable',
+        reason: 'Managed emulator target is unavailable or could not be started',
+        operatorAction: 'Verify emulator container health and isolation backend status, then restart DevHotel.'
+      }
+    }
+  }
+  return {
+    invariantClass: 'unknown',
+    reason: 'Interrupted locale restoration could not be proven',
+    operatorAction: 'Keep the target unchanged and inspect Room logs, then restart DevHotel.'
+  }
 }
 
 function sameAndroidLocaleRestoreFence(
@@ -1240,7 +1414,7 @@ export class RoomOrchestrator {
 
     for (const { room, key, raw, pending } of pendingRooms) {
       let restored = false
-      let safeFailureStage: string | null = null
+      let failureError: unknown = null
       if (
         pending !== null &&
         room.provider === 'android' &&
@@ -1264,6 +1438,40 @@ export class RoomOrchestrator {
               selector,
               { allowPendingRecovery: true }
             )
+            if (
+              session.target.kind !== pending.fence.targetKind ||
+              session.target.deviceId !== pending.fence.deviceId
+            ) {
+              throw new DevHotelError('ANDROID_LOCALE_TARGET_MISMATCH', 'Target device does not match retained recovery fence')
+            }
+            if (session.target.apiLevel !== pending.fence.apiLevel) {
+              throw new DevHotelError('ANDROID_LOCALE_API_MISMATCH', 'Target API level does not match retained recovery fence')
+            }
+            if (typeof session.trackedInstallSeal === 'function') {
+              const seal = await session.trackedInstallSeal(pending.applicationId)
+              if (
+                seal.targetKind !== pending.fence.targetKind ||
+                seal.targetId !== pending.fence.targetId ||
+                seal.deviceId !== pending.fence.deviceId ||
+                seal.roomId !== pending.fence.roomId ||
+                seal.applicationId !== pending.fence.applicationId ||
+                seal.changeId !== pending.fence.changeId ||
+                seal.apkSha256 !== pending.fence.apkSha256 ||
+                seal.installedAt !== pending.fence.installedAt ||
+                seal.packageIncarnation !== pending.fence.packageIncarnation
+              ) {
+                throw new DevHotelError('ANDROID_LOCALE_INSTALL_MISMATCH', 'Tracked install does not match retained recovery fence')
+              }
+              if (
+                seal.installUserId !== pending.fence.installUserId ||
+                seal.installUserSerial !== pending.fence.installUserSerial
+              ) {
+                throw new DevHotelError('ANDROID_LOCALE_USER_MISMATCH', 'Tracked install user does not match retained recovery fence')
+              }
+            }
+            if (typeof session.launch === 'function') {
+              await session.launch(pending.applicationId)
+            }
             const beforeRestore = await session.proveAppLocaleFinalState(
               pending.applicationId,
               pending.fence,
@@ -1277,7 +1485,7 @@ export class RoomOrchestrator {
               beforeRestore.pids.length === 0 ||
               (!isOriginal && !ownsCurrent)
             ) {
-              throw new Error('Interrupted Android locale stage no longer owns the exact current target')
+              throw new DevHotelError('ANDROID_LOCALE_OUTSIDE_LOCALE', 'Interrupted Android locale stage no longer owns the exact current target')
             }
             if (isOriginal) {
               // The desired state is already present under a fresh composite
@@ -1286,6 +1494,7 @@ export class RoomOrchestrator {
               if (!this.deletePendingAndroidLocaleRestorationIfOwned(key, raw, pending)) {
                 throw new Error('Interrupted Android locale original-state ownership changed')
               }
+              this.settings.delete(pendingAndroidLocaleRecoveryDiagnosticKey(room.id))
               restored = true
               unresolved.delete(room.id)
               return
@@ -1395,15 +1604,12 @@ export class RoomOrchestrator {
             )) {
               throw new Error('Interrupted Android locale restoration ownership changed')
             }
+            this.settings.delete(pendingAndroidLocaleRecoveryDiagnosticKey(room.id))
             restored = true
             unresolved.delete(room.id)
           }, { allowPendingAndroidLocaleRestoration: true })
         } catch (error) {
-          const evidence = error instanceof DevHotelError && error.evidence && typeof error.evidence === 'object'
-            ? error.evidence as Record<string, unknown>
-            : null
-          const stage = typeof evidence?.['stage'] === 'string' ? evidence['stage'] : null
-          safeFailureStage = stage && /^[a-z0-9-]{1,64}$/.test(stage) ? stage : null
+          failureError = error
           // The retained value remains a hard mutation gate. Recovery can be
           // retried only with the exact target/install/user/lease authority.
         }
@@ -1413,13 +1619,30 @@ export class RoomOrchestrator {
         if (current && current.provider === 'android') {
           this.rooms.update(room.id, { status: 'attention' })
         }
+        const diagnostic = classifyAndroidLocaleRecoveryFailure(failureError, {
+          pending,
+          staleJobsAbsent,
+          targetKind: pending?.fence?.targetKind
+        })
+        this.settings.set(
+          pendingAndroidLocaleRecoveryDiagnosticKey(room.id),
+          JSON.stringify({
+            invariantClass: diagnostic.invariantClass,
+            reason: diagnostic.reason,
+            operatorAction: diagnostic.operatorAction,
+            recordedAt: new Date().toISOString()
+          })
+        )
+        this.olog(
+          room.id,
+          `interrupted Android locale matrix still needs exact target recovery [${diagnostic.invariantClass}]: ${diagnostic.reason}; operator action: ${diagnostic.operatorAction}; private details were withheld`
+        )
+      } else {
+        this.olog(
+          room.id,
+          'interrupted Android locale matrix was restored under its exact retained fence'
+        )
       }
-      this.olog(
-        room.id,
-        restored
-          ? 'interrupted Android locale matrix was restored under its exact retained fence'
-          : `interrupted Android locale matrix still needs exact target recovery${safeFailureStage ? ` at ${safeFailureStage}` : ''}; private details were withheld`
-      )
     }
     return unresolved
   }
@@ -2087,13 +2310,18 @@ export class RoomOrchestrator {
   }
 
   private assertNoPendingAndroidLocaleRestoration(roomId: string): void {
-    if (this.settings.get(pendingAndroidLocaleRestoreKey(roomId)) === null) return
+    const raw = this.settings.get(pendingAndroidLocaleRestoreKey(roomId))
+    if (raw === null) return
+    const diag = parsePendingAndroidLocaleRecoveryDiagnostic(
+      this.settings.get(pendingAndroidLocaleRecoveryDiagnosticKey(roomId))
+    )
     throw new DevHotelError(
       'ANDROID_LOCALE_RECOVERY_REQUIRED',
-      'This Room is fenced while an interrupted Android locale matrix is being restored.',
+      `This Room is fenced while an interrupted Android locale matrix is being restored${diag?.reason ? `: ${diag.reason}` : '.'}`,
       {
-        recoveryHint: 'Restore the exact target, install, Android user and lease, then restart DevHotel.',
-        httpStatus: 409
+        recoveryHint: diag?.operatorAction ?? 'Restore the exact target, install, Android user and lease, then restart DevHotel.',
+        httpStatus: 409,
+        evidence: diag ? { invariantClass: diag.invariantClass, reason: diag.reason, operatorAction: diag.operatorAction } : undefined
       }
     )
   }
@@ -2825,6 +3053,26 @@ export class RoomOrchestrator {
     const eitherRunning = main === 'running' || emulator === 'running'
     const eitherUnknown = main === 'unknown' || emulator === 'unknown'
     const state = bothRunning ? 'running' : eitherRunning ? 'degraded' : eitherUnknown ? 'unknown' : 'dead'
+
+    const pendingLocale = this.settings.get(pendingAndroidLocaleRestoreKey(room.id))
+    if (pendingLocale !== null) {
+      const diag = parsePendingAndroidLocaleRecoveryDiagnostic(
+        this.settings.get(pendingAndroidLocaleRecoveryDiagnosticKey(room.id))
+      )
+      if (diag?.operatorAction) {
+        return {
+          state: state === 'running' ? 'degraded' : state,
+          expected,
+          recordedStatus: room.status,
+          main,
+          emulator,
+          observedAt,
+          detail: `Interrupted Android locale matrix recovery pending: ${diag.reason}`,
+          recoveryHint: diag.operatorAction
+        }
+      }
+    }
+
     return {
       state,
       expected,
@@ -4192,6 +4440,7 @@ export class RoomOrchestrator {
           }
         )
       }
+      this.settings.delete(pendingAndroidLocaleRecoveryDiagnosticKey(roomId))
       this.olog(roomId, 'an explicitly acknowledged outside Android locale released one undispatched recovery fence')
       return { abandoned: true, applicationId: pending.applicationId, target: session.target }
     }, { allowPendingAndroidLocaleRestoration: true })
