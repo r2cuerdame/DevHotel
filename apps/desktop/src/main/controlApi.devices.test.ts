@@ -441,6 +441,45 @@ describe('agent Android automation routes', () => {
     })
   })
 
+  it('returns a non-secret structured locale recovery reason without serializing the underlying cause', async () => {
+    const secret = 'SECRET target/install/user/lease details'
+    const reason = 'Tracked package install does not match the retained recovery fence'
+    const operatorAction = 'Restore the exact retained target and install state, or reset or re-provision the Room.'
+    const androidLocaleScreenshotMatrix = vi.fn(async () => {
+      throw new DevHotelError(
+        'ANDROID_LOCALE_RECOVERY_REQUIRED',
+        `This Room is fenced while an interrupted Android locale matrix is being restored: ${reason}`,
+        {
+          httpStatus: 409,
+          recoveryHint: operatorAction,
+          evidence: { invariantClass: 'install-mismatch', reason, operatorAction },
+          cause: new Error(secret)
+        }
+      )
+    })
+
+    await withApi({ androidLocaleScreenshotMatrix } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/android/locale-matrix', {
+        method: 'POST',
+        body: JSON.stringify({
+          applicationId: 'com.example.app',
+          locales: ['ko-KR'],
+          filenamePrefix: 'retained-recovery'
+        })
+      })
+
+      expect(result).toMatchObject({
+        status: 409,
+        body: {
+          code: 'ANDROID_LOCALE_RECOVERY_REQUIRED',
+          recoveryHint: operatorAction,
+          evidence: { invariantClass: 'install-mismatch', reason, operatorAction }
+        }
+      })
+      expect(JSON.stringify(result.body)).not.toContain(secret)
+    })
+  })
+
   it('forwards only an explicit literal locale-recovery acknowledgement to Core', async () => {
     const abandonAndroidLocaleMatrixRecovery = vi.fn(async (
       _roomId: string,
