@@ -73,7 +73,9 @@ import type {
   CreateAndroidAcceptanceReportInput,
   RuntimeRoomRecord,
   SafeHostResyncOutcome,
-  SourceType
+  SourceType,
+  VolumeGcResult,
+  VolumeReconciliationReport
 } from '@devhotel/shared'
 import {
   canonicalAndroidLocaleTag,
@@ -185,6 +187,12 @@ import { writeManifest } from './manifest'
 import { OperationTracker, type OperationReporter } from './operations'
 import { operationsRepo, type OperationsRepo } from './store/operationsRepo'
 import { reconcile, type ReconcileResult } from './reconcile'
+import {
+  reconcileVolumesState,
+  executeVolumeGc,
+  type VolumeGcOptions,
+  type VolumeReconciliationContext
+} from './volumeGc'
 import type { Db } from './store/db'
 import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
@@ -4033,6 +4041,47 @@ export class RoomOrchestrator {
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
     return { reclaimedBytes }
+  }
+
+  /**
+   * Reconciles all Docker volumes on the host against canonical DevHotel state,
+   * classifying each volume (retained, sleeping, fenced, orphaned, unowned)
+   * without deleting anything.
+   */
+  async reconcileVolumes(): Promise<VolumeReconciliationReport> {
+    const volumes = await this.backend.listVolumesWithUsage()
+    const allRooms = this.rooms.list()
+    const activeOps = this.operations.listLive()
+    const context: VolumeReconciliationContext = {
+      volumes,
+      rooms: allRooms,
+      settings: this.settings,
+      activeOperations: activeOps,
+      changes: this.changes,
+      roomDirExists: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId)),
+      isLegacyAdopted: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId))
+    }
+    return reconcileVolumesState(context)
+  }
+
+  /**
+   * Performs bounded garbage collection of provably orphaned DevHotel volumes.
+   * By default, runs in dry-run mode. Never touches fenced rooms (#61) or sleeping rooms.
+   */
+  async gcVolumes(opts?: VolumeGcOptions): Promise<VolumeGcResult> {
+    const volumes = await this.backend.listVolumesWithUsage()
+    const allRooms = this.rooms.list()
+    const activeOps = this.operations.listLive()
+    const context: VolumeReconciliationContext = {
+      volumes,
+      rooms: allRooms,
+      settings: this.settings,
+      activeOperations: activeOps,
+      changes: this.changes,
+      roomDirExists: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId)),
+      isLegacyAdopted: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId))
+    }
+    return await executeVolumeGc(this.backend, context, opts)
   }
 
   private static readonly ROOM_FILE_CAP = 16 * 1024 * 1024

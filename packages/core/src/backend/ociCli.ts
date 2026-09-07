@@ -52,6 +52,7 @@ import type {
   ExecOpts,
   ExecOutputChunk,
   ExecResult,
+  DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
   FencedEmulatorBootResult,
@@ -62,6 +63,7 @@ import type {
   RoomArtifactWebRuntimeFence,
   WebSpec
 } from './types'
+import { parseDockerUnitSize } from '../volumeGc'
 
 const DU_IMAGE = 'alpine'
 /**
@@ -7176,6 +7178,87 @@ export class OciCliBackend implements IsolationBackend {
       }
     }
     return [...new Set(names)]
+  }
+
+  async listVolumesWithUsage(): Promise<DockerVolumeUsage[]> {
+    await this.assertPinnedEngineIdentity()
+    try {
+      const result = await runDocker(['system', 'df', '-v', '--format', '{{json .Volumes}}'], { timeoutMs: 60_000 })
+      if (result.code === 0 && result.stdout.trim().length > 0) {
+        const parsed = JSON.parse(result.stdout) as Array<{
+          Name?: string
+          Driver?: string
+          Scope?: string
+          Mountpoint?: string
+          Size?: string
+          Links?: string | number
+          Labels?: string
+        }>
+        if (Array.isArray(parsed)) {
+          return parsed
+            .map((item) => {
+              const labelsMap = parseDockerLabels(item.Labels ?? '')
+              const labelsObj: Record<string, string> = {}
+              for (const [k, v] of labelsMap.entries()) labelsObj[k] = v
+              return {
+                name: item.Name ?? '',
+                driver: item.Driver ?? 'local',
+                scope: item.Scope ?? 'local',
+                mountpoint: item.Mountpoint ?? '',
+                sizeBytes: parseDockerUnitSize(item.Size ?? '0B'),
+                links: typeof item.Links === 'number' ? item.Links : Number.parseInt(item.Links ?? '0', 10) || 0,
+                labels: labelsObj
+              }
+            })
+            .filter((v) => v.name.length > 0)
+        }
+      }
+    } catch {
+      // Fallback to volume enumeration
+    }
+
+    const listResult = await runDocker(['volume', 'ls', '--format', '{{json .}}'], { timeoutMs: 60_000 })
+    if (listResult.code !== 0) return []
+    const usages: DockerVolumeUsage[] = []
+    const lines = listResult.stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+    for (const line of lines) {
+      try {
+        const row = JSON.parse(line) as { Name?: string; Driver?: string; Scope?: string; Mountpoint?: string; Labels?: string; Links?: string }
+        if (!row.Name) continue
+        const labelsMap = parseDockerLabels(row.Labels ?? '')
+        const labelsObj: Record<string, string> = {}
+        for (const [k, v] of labelsMap.entries()) labelsObj[k] = v
+        usages.push({
+          name: row.Name,
+          driver: row.Driver ?? 'local',
+          scope: row.Scope ?? 'local',
+          mountpoint: row.Mountpoint ?? '',
+          sizeBytes: 0,
+          links: Number.parseInt(row.Links ?? '0', 10) || 0,
+          labels: labelsObj
+        })
+      } catch {
+        continue
+      }
+    }
+    return usages
+  }
+
+  async removeManagedVolume(name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    const existing = await this.inspectVolume(name)
+    if (!existing) return
+    const roomId = existing.Labels?.['devhotel.room']
+    if (roomId) {
+      assertExpectedRoomVolumeName(roomId, name)
+      await this.assertRoomVolumeOwnership(existing, roomId, name)
+    } else {
+      throw new Error(`cannot remove volume without room ownership metadata: ${name}`)
+    }
+    must(await runDocker(['volume', 'rm', '-f', name]), `remove volume ${name}`)
+    if (await this.inspectVolume(name)) {
+      throw new Error(`volume cleanup incomplete: ${name}`)
+    }
   }
 }
 

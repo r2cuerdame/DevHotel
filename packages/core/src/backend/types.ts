@@ -134,6 +134,17 @@ export type RoomArtifactPublicationFailureReason =
   | 'publication-ambiguous'
   | 'helper-failed'
 
+export interface DockerVolumeUsage {
+  name: string
+  driver: string
+  scope: string
+  mountpoint: string
+  sizeBytes: number
+  links: number
+  labels: Record<string, string>
+  createdAt?: string
+}
+
 export type RoomArtifactRecoveryOutcome =
   | 'committed'
   | 'absent'
@@ -290,6 +301,8 @@ export interface IsolationBackend {
     log?: (line: string) => void
   ): Promise<void>
   volumeSizes(roomId: string): Promise<Record<string, number>>
+  listVolumesWithUsage(): Promise<DockerVolumeUsage[]>
+  removeManagedVolume(name: string): Promise<void>
   imageExists(image: string): Promise<boolean>
   pullImage(image: string, log?: (line: string) => void): Promise<void>
   /** force-remove and recreate a volume, guaranteeing it is empty */
