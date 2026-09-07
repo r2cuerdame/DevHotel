@@ -38,6 +38,13 @@ export function parseDockerUnitSize(s: string): number {
   }
 }
 
+export function isDockerUnitSizeKnown(s: string): boolean {
+  const value = s.trim()
+  if (value === '0B') return true
+  const match = /^([\d.]+)\s*(B|kB|MB|GB|TB|KiB|MiB|GiB|TiB)$/i.exec(value)
+  return Boolean(match && Number.isFinite(Number.parseFloat(match[1]!)))
+}
+
 export interface ParsedVolumeIdentity {
   roomId: string | null
   purpose: VolumePurpose
@@ -186,10 +193,14 @@ export interface VolumeReconciliationContext {
   rooms: RoomRecord[]
   settings: { get(key: string): string | null }
   activeOperations?: Array<{ id: string; roomId: string; status: string; extra?: unknown }>
-  changes?: { list(roomId: string): Array<{ undoable?: boolean; captured?: unknown }> }
+  changes?: { list(roomId: string): Array<{ undoable?: boolean; status?: string; captured?: unknown }> }
   fencedRoomIds?: ReadonlySet<string>
   roomDirExists?: (roomId: string) => boolean
-  isLegacyAdopted?: (roomId: string, name: string) => boolean
+}
+
+function isApplicableUndoableChange(change: { undoable?: boolean; status?: string }): boolean {
+  return change.undoable === true &&
+    (change.status === undefined || change.status === 'applied' || change.status === 'verified')
 }
 
 export function isRoomFencedForRecovery(
@@ -229,7 +240,13 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
 
   for (const vol of context.volumes) {
     const parsed = parseVolumeNameAndLabels(vol.name, vol.labels)
-    const isAttached = vol.links > 0
+    const isAttached = vol.linksKnown && vol.links > 0
+    const hasExactManagedLabels =
+      vol.ownership === 'managed-labels' &&
+      vol.labels['devhotel.managed'] === '1' &&
+      vol.labels['devhotel.role'] === 'volume' &&
+      vol.labels['devhotel.room'] === parsed.roomId
+    const hasExplicitOwnership = hasExactManagedLabels || vol.ownership === 'legacy-adoption'
 
     let livenessClass: VolumeLivenessClass = 'unowned'
     let safeToDelete = false
@@ -242,28 +259,42 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
     } else {
       const room = roomsMap.get(parsed.roomId)
       const fenced = isRoomFencedForRecovery(parsed.roomId, context.settings, context.fencedRoomIds, room?.status)
+      const runningOperation = context.activeOperations?.find(
+        (operation) => operation.roomId === parsed.roomId && operation.status === 'running'
+      )
 
       if (fenced) {
         livenessClass = 'fenced'
         safeToDelete = false
         reason = `Room ${parsed.roomId} is protected by an active recovery or acceptance fence (#61); all volumes must remain undisturbed.`
+      } else if (!context.activeOperations) {
+        livenessClass = 'retained-recovery'
+        safeToDelete = false
+        reason = `Room ${parsed.roomId} operation state is unavailable; preserving all volumes fail-closed.`
+      } else if (runningOperation) {
+        livenessClass = 'retained-active'
+        safeToDelete = false
+        reason = `Room ${parsed.roomId} has active operation ${runningOperation.id}; all volumes remain protected.`
       } else if (!room) {
         // Room does not exist in canonical database
-        const hasDiskDir = context.roomDirExists ? context.roomDirExists(parsed.roomId) : false
-        if (hasDiskDir) {
+        const hasDiskDir = context.roomDirExists?.(parsed.roomId)
+        if (hasDiskDir !== false) {
           livenessClass = 'unowned'
           safeToDelete = false
-          reason = `Room ${parsed.roomId} has on-disk directory but is missing from DB; fail-closed preservation required.`
+          reason = hasDiskDir
+            ? `Room ${parsed.roomId} has on-disk directory but is missing from DB; fail-closed preservation required.`
+            : `Room ${parsed.roomId} directory state is unknown; fail-closed preservation required.`
         } else {
           // Both DB and disk say room does not exist
-          const hasManagedLabel = vol.labels['devhotel.managed'] === '1' && vol.labels['devhotel.room'] === parsed.roomId
-          const isAdopted = context.isLegacyAdopted ? context.isLegacyAdopted(parsed.roomId, vol.name) : false
-
-          if (hasManagedLabel || parsed.isDevHotelNamed || isAdopted) {
+          if (hasExplicitOwnership) {
             livenessClass = 'orphaned-deleted-room'
-            safeToDelete = !isAttached
-            reason = isAttached
+            safeToDelete = vol.linksKnown && !isAttached && vol.sizeKnown
+            reason = !vol.linksKnown
+              ? `Room ${parsed.roomId} was deleted but container attachment state is unknown; GC must fail closed.`
+              : isAttached
               ? `Room ${parsed.roomId} was deleted but volume still has active container attachments.`
+              : !vol.sizeKnown
+                ? `Room ${parsed.roomId} was deleted but volume size is unknown; bounded GC must fail closed.`
               : `Room ${parsed.roomId} was deleted from DevHotel; volume is provably orphaned.`
           } else {
             livenessClass = 'unowned'
@@ -310,21 +341,41 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
               reason = `Retained recovery workspace generation r${rev} for room ${parsed.roomId}.`
             } else if (rev < currentRev) {
               // Older historical generation
+              const roomChanges = context.changes?.list(parsed.roomId)
+              const neededForUndo = roomChanges?.some((change) => {
+                if (!isApplicableUndoableChange(change)) return false
+                const captured = change.captured as Record<string, unknown> | null
+                return captured?.previousWorkspaceGeneration === rev
+              }) ?? false
               const activeOpUsing = context.activeOperations?.find(
                 (op) =>
                   op.roomId === parsed.roomId &&
                   op.status === 'running' &&
                   (op.extra as Record<string, unknown> | undefined)?.workspaceVolumeRevision === rev
               )
-              if (activeOpUsing) {
+              if (!roomChanges) {
+                livenessClass = 'retained-recovery'
+                safeToDelete = false
+                reason = `Workspace change history is unavailable; preserving generation r${rev} fail-closed.`
+              } else if (neededForUndo) {
+                livenessClass = 'retained-recovery'
+                safeToDelete = false
+                reason = `Retained workspace generation r${rev} required for change undo.`
+              } else if (activeOpUsing) {
                 livenessClass = 'retained-active'
                 safeToDelete = false
                 reason = `Workspace generation r${rev} in use by active operation ${activeOpUsing.id}.`
               } else {
                 livenessClass = 'orphaned-stale-generation'
-                safeToDelete = !isAttached
-                reason = isAttached
+                safeToDelete = hasExplicitOwnership && vol.linksKnown && !isAttached && vol.sizeKnown
+                reason = !vol.linksKnown
+                  ? `Stale workspace generation r${rev} has unknown container attachment state.`
+                  : isAttached
                   ? `Stale historical workspace generation r${rev} is still attached to a container.`
+                  : !hasExplicitOwnership
+                    ? `Stale workspace generation r${rev} lacks explicit managed ownership proof.`
+                    : !vol.sizeKnown
+                      ? `Stale workspace generation r${rev} has unknown size; bounded GC must fail closed.`
                   : `Stale historical workspace generation r${rev} superseded by r${currentRev} (retained recovery is r${retainedGen ?? 'none'}).`
               }
             } else {
@@ -340,15 +391,25 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
             const op = context.activeOperations?.find(
               (o) => o.roomId === parsed.roomId && o.id.replaceAll('-', '').toLowerCase() === opId
             )
-            if (op && op.status === 'running') {
+            if (!context.activeOperations) {
+              livenessClass = 'retained-recovery'
+              safeToDelete = false
+              reason = `Operation state is unavailable; preserving workspace snapshot fail-closed.`
+            } else if (op && op.status === 'running') {
               livenessClass = 'retained-active'
               safeToDelete = false
               reason = `Build workspace snapshot in use by active operation ${op.id}.`
             } else {
               livenessClass = 'orphaned-stale-snapshot'
-              safeToDelete = !isAttached
-              reason = isAttached
+              safeToDelete = hasExplicitOwnership && vol.linksKnown && !isAttached && vol.sizeKnown
+              reason = !vol.linksKnown
+                ? `Stale workspace snapshot has unknown container attachment state.`
+                : isAttached
                 ? `Stale workspace snapshot volume is still attached to a container.`
+                : !hasExplicitOwnership
+                  ? `Stale workspace snapshot lacks explicit managed ownership proof.`
+                  : !vol.sizeKnown
+                    ? `Stale workspace snapshot has unknown size; bounded GC must fail closed.`
                 : `Stale workspace snapshot volume from inactive or completed build operation.`
             }
             break
@@ -366,8 +427,15 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
               safeToDelete = false
               reason = `Active dependency volume for Node ${major} generation ${gen} for room ${parsed.roomId}.`
             } else {
-              const roomChanges = context.changes?.list(parsed.roomId) ?? []
+              const roomChanges = context.changes?.list(parsed.roomId)
+              if (!roomChanges) {
+                livenessClass = 'retained-recovery'
+                safeToDelete = false
+                reason = `Dependency change history is unavailable; preserving generation ${gen} fail-closed.`
+                break
+              }
               const neededForUndo = roomChanges.some((c) => {
+                if (!isApplicableUndoableChange(c)) return false
                 const rawCap = c.captured as Record<string, unknown> | null
                 const cap = (rawCap?.deps as Record<string, unknown> | undefined) ?? rawCap
                 const prevGen = cap?.prevGen ?? cap?.gen
@@ -380,9 +448,15 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
                 reason = `Retained dependency generation ${gen} for Node ${major} required for change undo.`
               } else {
                 livenessClass = 'orphaned-stale-deps'
-                safeToDelete = !isAttached
-                reason = isAttached
+                safeToDelete = hasExplicitOwnership && vol.linksKnown && !isAttached && vol.sizeKnown
+                reason = !vol.linksKnown
+                  ? `Stale dependency volume has unknown container attachment state.`
+                  : isAttached
                   ? `Stale dependency volume is still attached to a container.`
+                  : !hasExplicitOwnership
+                    ? `Stale dependency volume lacks explicit managed ownership proof.`
+                    : !vol.sizeKnown
+                      ? `Stale dependency volume has unknown size; bounded GC must fail closed.`
                   : `Stale dependency generation ${gen} for Node ${major} superseded by generation ${currentGen}.`
               }
             }
@@ -408,7 +482,10 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
       serviceKind: parsed.serviceKind,
       snapshotOperationId: parsed.snapshotOperationId,
       sizeBytes: vol.sizeBytes,
+      sizeKnown: vol.sizeKnown,
+      ownership: vol.ownership,
       links: vol.links,
+      linksKnown: vol.linksKnown,
       labels: vol.labels,
       class: livenessClass,
       safeToDelete,
@@ -422,7 +499,7 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
     const summary = byClass[livenessClass]
     summary.count += 1
     summary.totalBytes += vol.sizeBytes
-    if (vol.links === 0) {
+    if (vol.linksKnown && vol.links === 0) {
       summary.reclaimableBytes += vol.sizeBytes
     }
   }
@@ -443,14 +520,14 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
 
   for (const rec of volumeRecords) {
     totalDockerBytes += rec.sizeBytes
-    if (rec.links === 0) {
+    if (rec.linksKnown && rec.links === 0) {
       totalDockerReclaimableBytes += rec.sizeBytes
     }
 
     if (rec.purpose !== 'external') {
       devHotelVolumeCount += 1
       devHotelTotalBytes += rec.sizeBytes
-      if (rec.links === 0) {
+      if (rec.linksKnown && rec.links === 0) {
         devHotelReclaimableBytes += rec.sizeBytes
       }
     }
@@ -465,6 +542,7 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
       fencedVolumeBytes += rec.sizeBytes
     } else if (
       rec.class === 'retained-current' ||
+      rec.class === 'retained-active' ||
       rec.class === 'retained-sleeping' ||
       rec.class === 'retained-recovery'
     ) {
@@ -502,10 +580,15 @@ export interface VolumeGcOptions {
   maxBytes?: number
 }
 
+export interface VolumeGcRemovalGuard {
+  removeCandidateIfStillSafe(candidate: VolumeRecord, remainingBytes: number): Promise<number>
+}
+
 export async function executeVolumeGc(
-  backend: IsolationBackend,
+  _backend: IsolationBackend,
   context: VolumeReconciliationContext,
-  opts: VolumeGcOptions = {}
+  opts: VolumeGcOptions = {},
+  guard?: VolumeGcRemovalGuard
 ): Promise<VolumeGcResult> {
   const report = reconcileVolumesState(context)
   const isDryRun = opts.dryRun !== false
@@ -521,8 +604,14 @@ export async function executeVolumeGc(
     }
   }
 
-  const maxVolumes = opts.maxVolumes ?? 50
-  const maxBytes = opts.maxBytes ?? Number.POSITIVE_INFINITY
+  const { maxVolumes, maxBytes } = opts
+  if (typeof maxVolumes !== 'number' || !Number.isSafeInteger(maxVolumes) || maxVolumes <= 0 || maxVolumes > 500) {
+    throw new Error('Real volume GC requires an explicit bounded maxVolumes')
+  }
+  if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error('Real volume GC requires an explicit bounded maxBytes')
+  }
+  if (!guard) throw new Error('Real volume GC requires a concurrent-state removal guard')
 
   const candidates = report.volumes.filter((v) => v.safeToDelete)
   const deletedVolumes: string[] = []
@@ -531,14 +620,16 @@ export async function executeVolumeGc(
 
   for (const candidate of candidates) {
     if (deletedVolumes.length >= maxVolumes) break
-    if (reclaimedBytes + candidate.sizeBytes > maxBytes && deletedVolumes.length > 0) break
+    if (!candidate.sizeKnown || reclaimedBytes + candidate.sizeBytes > maxBytes) continue
 
     // Double-check fail-closed invariants
     if (
       !candidate.safeToDelete ||
+      !candidate.linksKnown ||
       candidate.links > 0 ||
       candidate.class === 'fenced' ||
       candidate.class === 'retained-current' ||
+      candidate.class === 'retained-active' ||
       candidate.class === 'retained-sleeping' ||
       candidate.class === 'retained-recovery' ||
       candidate.class === 'unowned'
@@ -548,9 +639,9 @@ export async function executeVolumeGc(
     }
 
     try {
-      await backend.removeManagedVolume(candidate.name)
+      const removedBytes = await guard.removeCandidateIfStillSafe(candidate, maxBytes - reclaimedBytes)
       deletedVolumes.push(candidate.name)
-      reclaimedBytes += candidate.sizeBytes
+      reclaimedBytes += removedBytes
     } catch (err) {
       errors.push(
         `Failed to remove volume ${candidate.name}: ${err instanceof Error ? err.message : String(err)}`

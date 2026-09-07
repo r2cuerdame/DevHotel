@@ -46,6 +46,10 @@ export const zVolumeLivenessClass = z.enum([
   'unowned'
 ])
 
+export type VolumeOwnership = 'managed-labels' | 'legacy-adoption' | 'unowned'
+
+export const zVolumeOwnership = z.enum(['managed-labels', 'legacy-adoption', 'unowned'])
+
 export interface VolumeRecord {
   name: string
   roomId: string | null
@@ -56,7 +60,10 @@ export interface VolumeRecord {
   serviceKind: string | null
   snapshotOperationId: string | null
   sizeBytes: number
+  sizeKnown: boolean
+  ownership: VolumeOwnership
   links: number
+  linksKnown: boolean
   labels: Record<string, string>
   class: VolumeLivenessClass
   safeToDelete: boolean
@@ -75,7 +82,10 @@ export const zVolumeRecord = z.object({
   serviceKind: z.string().nullable(),
   snapshotOperationId: z.string().nullable(),
   sizeBytes: z.number().int().nonnegative(),
+  sizeKnown: z.boolean(),
+  ownership: zVolumeOwnership,
   links: z.number().int().nonnegative(),
+  linksKnown: z.boolean(),
   labels: z.record(z.string()),
   class: zVolumeLivenessClass,
   safeToDelete: z.boolean(),
@@ -153,7 +163,19 @@ export const zVolumeGcResult = z.object({
 })
 
 export const zVolumeGcBody = z.object({
-  dryRun: z.boolean().optional().default(true),
-  maxVolumes: z.number().int().positive().max(500).optional().default(50),
-  maxBytes: z.number().int().positive().optional()
-})
+  dryRun: z.boolean().optional(),
+  maxVolumes: z.number().int().positive().max(500).optional(),
+  maxBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()
+}).superRefine((value, ctx) => {
+  if (value.dryRun !== false) return
+  if (value.maxVolumes === undefined) {
+    ctx.addIssue({ code: 'custom', path: ['maxVolumes'], message: 'Real volume GC requires an explicit maxVolumes bound' })
+  }
+  if (value.maxBytes === undefined) {
+    ctx.addIssue({ code: 'custom', path: ['maxBytes'], message: 'Real volume GC requires an explicit maxBytes bound' })
+  }
+}).transform((value) => ({
+  dryRun: value.dryRun ?? true,
+  maxVolumes: value.maxVolumes ?? 50,
+  maxBytes: value.maxBytes
+}))

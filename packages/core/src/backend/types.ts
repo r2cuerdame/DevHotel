@@ -1,5 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import type { SourceType, WorkspaceMode } from '@devhotel/shared'
+import type { SourceType, VolumeOwnership, WorkspaceMode } from '@devhotel/shared'
 import type { WorkspaceSnapshot } from '../workspaceDrift'
 
 export interface WebSpec {
@@ -140,7 +140,10 @@ export interface DockerVolumeUsage {
   scope: string
   mountpoint: string
   sizeBytes: number
+  sizeKnown: boolean
+  ownership: VolumeOwnership
   links: number
+  linksKnown: boolean
   labels: Record<string, string>
   createdAt?: string
 }

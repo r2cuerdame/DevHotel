@@ -1,6 +1,7 @@
 import { rmSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { DockerVolumeUsage } from '../backend/types'
+import type { VolumeOwnership } from '@devhotel/shared'
 import { RoomOrchestrator } from '../orchestrator'
 import { retainedWorkspaceGenKey } from '../workingState'
 import { depsGenKey } from '../changes/definitions/deps'
@@ -120,15 +121,32 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
   })
 
   describe('reconcileVolumesState', () => {
-    const fakeVol = (name: string, sizeBytes: number, links = 0, labels: Record<string, string> = {}): DockerVolumeUsage => ({
-      name,
-      driver: 'local',
-      scope: 'local',
-      mountpoint: `/var/lib/docker/volumes/${name}/_data`,
-      sizeBytes,
-      links,
-      labels
-    })
+    const fakeVol = (
+      name: string,
+      sizeBytes: number,
+      links = 0,
+      labels?: Record<string, string>,
+      ownership?: VolumeOwnership,
+      sizeKnown = true,
+      linksKnown = true
+    ): DockerVolumeUsage => {
+      const roomId = /^dh-([a-z0-9]{8})-/.exec(name)?.[1]
+      const exactLabels = labels ?? (roomId
+        ? { 'devhotel.managed': '1', 'devhotel.room': roomId, 'devhotel.role': 'volume' }
+        : {})
+      return {
+        name,
+        driver: 'local',
+        scope: 'local',
+        mountpoint: `/var/lib/docker/volumes/${name}/_data`,
+        sizeBytes,
+        sizeKnown,
+        ownership: ownership ?? (exactLabels['devhotel.managed'] === '1' ? 'managed-labels' : 'unowned'),
+        links,
+        linksKnown,
+        labels: exactLabels
+      }
+    }
 
     it('strictly fences all volumes for issue #61 recovery rooms (njfstb4z, 29c5e8ys)', () => {
       const roomNj = makeRoom({ id: 'njfstb4z', status: 'ready', workspaceVolumeRevision: 10 })
@@ -187,7 +205,9 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       const report = reconcileVolumesState({
         volumes,
         rooms: [room],
-        settings: { get: (k) => settings.get(k) ?? null }
+        settings: { get: (k) => settings.get(k) ?? null },
+        activeOperations: [],
+        changes: { list: () => [] }
       })
 
       const cache = report.volumes.find((v) => v.name === 'dh-cgwwdje7-cache')!
@@ -226,6 +246,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [], // Room does not exist in DB
         settings: { get: () => null },
+        activeOperations: [],
         roomDirExists: () => false // Room has no on-disk folder
       })
 
@@ -237,6 +258,21 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       }
     })
 
+    it('requires exact managed labels or a recorded legacy adoption before classifying a deletion candidate', () => {
+      const unowned = fakeVol('dh-a17wkjn5-cache', 1000, 0, {}, 'unowned')
+      const adopted = fakeVol('dh-a17wkjn5-sdk', 2000, 0, {}, 'legacy-adoption')
+      const report = reconcileVolumesState({
+        volumes: [unowned, adopted],
+        rooms: [],
+        settings: { get: () => null },
+        activeOperations: [],
+        roomDirExists: () => false
+      })
+
+      expect(report.volumes[0]).toMatchObject({ class: 'unowned', safeToDelete: false })
+      expect(report.volumes[1]).toMatchObject({ class: 'orphaned-deleted-room', safeToDelete: true })
+    })
+
     it('fails-closed on deleted room volumes if on-disk folder still exists', () => {
       const volumes: DockerVolumeUsage[] = [
         fakeVol('dh-a17wkjn5-cache', 192700)
@@ -246,6 +282,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [],
         settings: { get: () => null },
+        activeOperations: [],
         roomDirExists: (id) => id === 'a17wkjn5' // Disk folder still exists!
       })
 
@@ -277,7 +314,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       }
     })
 
-    it('preserves build snapshots if operation is actively running', () => {
+    it('preserves every Room volume if any operation is actively running', () => {
       const room = makeRoom({ id: 'ea9p0aqh', status: 'ready' })
       const opId = '1234567890abcdef1234567890abcdef'
       const volumes: DockerVolumeUsage[] = [
@@ -299,8 +336,35 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       expect(activeSnap.safeToDelete).toBe(false)
 
       const staleSnap = report.volumes.find((v) => v.name.includes('fedcba'))!
-      expect(staleSnap.class).toBe('orphaned-stale-snapshot')
-      expect(staleSnap.safeToDelete).toBe(true)
+      expect(staleSnap.class).toBe('retained-active')
+      expect(staleSnap.safeToDelete).toBe(false)
+    })
+
+    it('preserves deleted-Room volumes while an operation record is still running', () => {
+      const report = reconcileVolumesState({
+        volumes: [fakeVol('dh-a17wkjn5-cache', 1000)],
+        rooms: [],
+        settings: { get: () => null },
+        activeOperations: [{ id: 'op-running', roomId: 'a17wkjn5', status: 'running' }],
+        roomDirExists: () => false
+      })
+      expect(report.volumes[0]).toMatchObject({ class: 'retained-active', safeToDelete: false })
+    })
+
+    it('fails closed when operation, change-history, or room-directory state is unavailable', () => {
+      const room = makeRoom({ id: 'cgwwdje7', status: 'ready', workspaceVolumeRevision: 3 })
+      const report = reconcileVolumesState({
+        volumes: [
+          fakeVol('dh-cgwwdje7-src-r1', 1000),
+          fakeVol('dh-cgwwdje7-src-build-fedcba0987654321fedcba0987654321', 2000),
+          fakeVol('dh-cgwwdje7-deps-node22-g1', 3000),
+          fakeVol('dh-a17wkjn5-cache', 4000)
+        ],
+        rooms: [room],
+        settings: { get: () => null }
+      })
+      expect(report.safeGcCandidateCount).toBe(0)
+      expect(report.volumes.every((volume) => volume.safeToDelete === false)).toBe(true)
     })
 
     it('preserves dependency generations referenced by undoable changes', () => {
@@ -318,6 +382,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [room],
         settings: { get: (k) => settings.get(k) ?? null },
+        activeOperations: [],
         changes: {
           list: (roomId) =>
             roomId === '1pdmdbbb'
@@ -347,6 +412,72 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       expect(g0.safeToDelete).toBe(true)
     })
 
+    it('preserves workspace generations referenced by applicable undoable changes', () => {
+      const room = makeRoom({ id: '1pdmdbbb', status: 'sleeping', workspaceVolumeRevision: 3 })
+      const report = reconcileVolumesState({
+        volumes: [
+          fakeVol('dh-1pdmdbbb-src-r3', 3000),
+          fakeVol('dh-1pdmdbbb-src-r2', 2000),
+          fakeVol('dh-1pdmdbbb-src-r1', 1000)
+        ],
+        rooms: [room],
+        settings: { get: () => null },
+        activeOperations: [],
+        changes: {
+          list: () => [
+            { undoable: true, status: 'verified', captured: { previousWorkspaceGeneration: 2 } },
+            { undoable: true, status: 'undone', captured: { previousWorkspaceGeneration: 1 } }
+          ]
+        }
+      })
+
+      expect(report.volumes.find((v) => v.revision === 2)).toMatchObject({
+        class: 'retained-recovery',
+        safeToDelete: false
+      })
+      expect(report.volumes.find((v) => v.revision === 1)).toMatchObject({
+        class: 'orphaned-stale-generation',
+        safeToDelete: true
+      })
+    })
+
+    it('counts retained-active volumes in retained totals', () => {
+      const room = makeRoom({ id: 'cgwwdje7', status: 'ready' })
+      const report = reconcileVolumesState({
+        volumes: [fakeVol('dh-cgwwdje7-cache', 1234)],
+        rooms: [room],
+        settings: { get: () => null },
+        activeOperations: []
+      })
+      expect(report.byClass['retained-active'].count).toBe(1)
+      expect(report.retainedVolumeCount).toBe(1)
+      expect(report.retainedVolumeBytes).toBe(1234)
+    })
+
+    it('fails closed when a deletion candidate size is unknown', () => {
+      const report = reconcileVolumesState({
+        volumes: [fakeVol('dh-a17wkjn5-cache', 0, 0, undefined, undefined, false)],
+        rooms: [],
+        settings: { get: () => null },
+        activeOperations: [],
+        roomDirExists: () => false
+      })
+      expect(report.volumes[0]).toMatchObject({ safeToDelete: false, sizeKnown: false })
+      expect(report.volumes[0]!.reason).toContain('size is unknown')
+    })
+
+    it('fails closed when container attachment state is unknown', () => {
+      const report = reconcileVolumesState({
+        volumes: [fakeVol('dh-a17wkjn5-cache', 1000, 0, undefined, undefined, true, false)],
+        rooms: [],
+        settings: { get: () => null },
+        activeOperations: [],
+        roomDirExists: () => false
+      })
+      expect(report.volumes[0]).toMatchObject({ safeToDelete: false, linksKnown: false })
+      expect(report.volumes[0]!.reason).toContain('attachment state is unknown')
+    })
+
     it('refuses safeToDelete if any stale or deleted-room volume has active container links', () => {
       const volumes: DockerVolumeUsage[] = [
         fakeVol('dh-a17wkjn5-cache', 192700, 1), // deleted room, but attached (links = 1)
@@ -361,6 +492,8 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [roomCg, roomEa],
         settings: { get: () => null },
+        activeOperations: [],
+        changes: { list: () => [] },
         roomDirExists: () => false
       })
 
@@ -372,14 +505,30 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
   })
 
   describe('executeVolumeGc', () => {
-    const fakeVol = (name: string, sizeBytes: number, links = 0): DockerVolumeUsage => ({
-      name,
-      driver: 'local',
-      scope: 'local',
-      mountpoint: `/var/lib/docker/volumes/${name}/_data`,
-      sizeBytes,
-      links,
-      labels: {}
+    const fakeVol = (name: string, sizeBytes: number, links = 0): DockerVolumeUsage => {
+      const roomId = /^dh-([a-z0-9]{8})-/.exec(name)?.[1]
+      const labels: Record<string, string> = roomId
+        ? { 'devhotel.managed': '1', 'devhotel.room': roomId, 'devhotel.role': 'volume' }
+        : {}
+      return {
+        name,
+        driver: 'local',
+        scope: 'local',
+        mountpoint: `/var/lib/docker/volumes/${name}/_data`,
+        sizeBytes,
+        sizeKnown: true,
+        ownership: roomId ? 'managed-labels' : 'unowned',
+        links,
+        linksKnown: true,
+        labels
+      }
+    }
+
+    const removalGuard = (backend: FakeBackend) => ({
+      removeCandidateIfStillSafe: async (candidate: { name: string; sizeBytes: number }) => {
+        await backend.removeManagedVolume(candidate.name)
+        return candidate.sizeBytes
+      }
     })
 
     it('dryRun does not delete any volumes', async () => {
@@ -393,6 +542,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [],
         settings: { get: () => null },
+        activeOperations: [],
         roomDirExists: () => false
       }
 
@@ -417,10 +567,16 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [],
         settings: { get: () => null },
+        activeOperations: [],
         roomDirExists: () => false
       }
 
-      const result = await executeVolumeGc(backend, context, { dryRun: false, maxVolumes: 2 })
+      const result = await executeVolumeGc(
+        backend,
+        context,
+        { dryRun: false, maxVolumes: 2, maxBytes: 10_000 },
+        removalGuard(backend)
+      )
       expect(result.dryRun).toBe(false)
       expect(result.deletedCount).toBe(2)
       expect(result.reclaimedBytes).toBe(3000)
@@ -440,14 +596,38 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         volumes,
         rooms: [],
         settings: { get: () => null },
+        activeOperations: [],
         roomDirExists: () => false
       }
 
-      const result = await executeVolumeGc(backend, context, { dryRun: false, maxBytes: 4000 })
+      const result = await executeVolumeGc(
+        backend,
+        context,
+        { dryRun: false, maxVolumes: 10, maxBytes: 4000 },
+        removalGuard(backend)
+      )
       expect(result.dryRun).toBe(false)
-      expect(result.deletedCount).toBe(1)
-      expect(result.reclaimedBytes).toBe(1000)
-      expect(result.deletedVolumes).toEqual(['dh-a17wkjn5-cache'])
+      expect(result.deletedCount).toBe(2)
+      expect(result.reclaimedBytes).toBe(2000)
+      expect(result.deletedVolumes).toEqual(['dh-a17wkjn5-cache', 'dh-a17wkjn5-src'])
+    })
+
+    it('refuses real execution unless both bounds and the concurrent-state guard are explicit', async () => {
+      const backend = new FakeBackend()
+      const context: VolumeReconciliationContext = {
+        volumes: [fakeVol('dh-a17wkjn5-cache', 1000)],
+        rooms: [],
+        settings: { get: () => null },
+        activeOperations: [],
+        roomDirExists: () => false
+      }
+      await expect(executeVolumeGc(backend, context, { dryRun: false, maxVolumes: 1 })).rejects.toThrow(/maxBytes/)
+      await expect(executeVolumeGc(
+        backend,
+        context,
+        { dryRun: false, maxVolumes: 1, maxBytes: 1000 }
+      )).rejects.toThrow(/concurrent-state/)
+      expect(backend.removedManagedVolumes).toEqual([])
     })
   })
 
@@ -486,8 +666,11 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
           scope: 'local',
           mountpoint: '/path',
           sizeBytes: 50000,
+          sizeKnown: true,
+          ownership: 'managed-labels',
           links: 0,
-          labels: {}
+          linksKnown: true,
+          labels: { 'devhotel.managed': '1', 'devhotel.room': 'room1abc', 'devhotel.role': 'volume' }
         },
         {
           name: 'dh-delroom1-cache',
@@ -495,8 +678,11 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
           scope: 'local',
           mountpoint: '/path',
           sizeBytes: 80000,
+          sizeKnown: true,
+          ownership: 'managed-labels',
           links: 0,
-          labels: {}
+          linksKnown: true,
+          labels: { 'devhotel.managed': '1', 'devhotel.room': 'delroom1', 'devhotel.role': 'volume' }
         },
         {
           name: 'unowned-anon-vol',
@@ -504,7 +690,10 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
           scope: 'local',
           mountpoint: '/path',
           sizeBytes: 120000,
+          sizeKnown: true,
+          ownership: 'unowned',
           links: 0,
+          linksKnown: true,
           labels: {}
         }
       ]
@@ -521,11 +710,38 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       expect(dryRun.deletedCount).toBe(0)
       expect(backend.removedManagedVolumes).toHaveLength(0)
 
-      const executed = await orch.gcVolumes({ dryRun: false })
+      const executed = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000 })
       expect(executed.dryRun).toBe(false)
       expect(executed.deletedCount).toBe(1)
       expect(executed.reclaimedBytes).toBe(80000)
       expect(backend.removedManagedVolumes).toEqual(['dh-delroom1-cache'])
+    })
+
+    it('fails closed when Room state changes between planning and guarded removal', async () => {
+      backend.managedVolumes = [{
+        name: 'dh-delroom1-cache',
+        driver: 'local',
+        scope: 'local',
+        mountpoint: '/path',
+        sizeBytes: 80_000,
+        sizeKnown: true,
+        ownership: 'managed-labels',
+        links: 0,
+        linksKnown: true,
+        labels: { 'devhotel.managed': '1', 'devhotel.room': 'delroom1', 'devhotel.role': 'volume' }
+      }]
+      let lists = 0
+      const originalList = backend.listVolumesWithUsage.bind(backend)
+      backend.listVolumesWithUsage = async () => {
+        lists += 1
+        if (lists === 2) orch.rooms.create(makeRoom({ id: 'delroom1', status: 'sleeping' }))
+        return await originalList()
+      }
+
+      const result = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000 })
+      expect(result.deletedCount).toBe(0)
+      expect(result.errors).toEqual([expect.stringContaining('changed state before guarded removal')])
+      expect(backend.removedManagedVolumes).toEqual([])
     })
   })
 })

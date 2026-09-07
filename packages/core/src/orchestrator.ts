@@ -4048,20 +4048,22 @@ export class RoomOrchestrator {
    * classifying each volume (retained, sleeping, fenced, orphaned, unowned)
    * without deleting anything.
    */
-  async reconcileVolumes(): Promise<VolumeReconciliationReport> {
+  private async volumeReconciliationContext(): Promise<VolumeReconciliationContext> {
     const volumes = await this.backend.listVolumesWithUsage()
     const allRooms = this.rooms.list()
     const activeOps = this.operations.listLive()
-    const context: VolumeReconciliationContext = {
+    return {
       volumes,
       rooms: allRooms,
       settings: this.settings,
       activeOperations: activeOps,
       changes: this.changes,
-      roomDirExists: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId)),
-      isLegacyAdopted: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId))
+      roomDirExists: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId))
     }
-    return reconcileVolumesState(context)
+  }
+
+  async reconcileVolumes(): Promise<VolumeReconciliationReport> {
+    return reconcileVolumesState(await this.volumeReconciliationContext())
   }
 
   /**
@@ -4069,19 +4071,29 @@ export class RoomOrchestrator {
    * By default, runs in dry-run mode. Never touches fenced rooms (#61) or sleeping rooms.
    */
   async gcVolumes(opts?: VolumeGcOptions): Promise<VolumeGcResult> {
-    const volumes = await this.backend.listVolumesWithUsage()
-    const allRooms = this.rooms.list()
-    const activeOps = this.operations.listLive()
-    const context: VolumeReconciliationContext = {
-      volumes,
-      rooms: allRooms,
-      settings: this.settings,
-      activeOperations: activeOps,
-      changes: this.changes,
-      roomDirExists: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId)),
-      isLegacyAdopted: (roomId: string) => existsSync(join(this.userData, 'rooms', roomId))
-    }
-    return await executeVolumeGc(this.backend, context, opts)
+    const context = await this.volumeReconciliationContext()
+    return await executeVolumeGc(this.backend, context, opts, {
+      removeCandidateIfStillSafe: async (candidate, remainingBytes) => {
+        if (!candidate.roomId) throw new Error(`Volume ${candidate.name} has no Room ownership identity`)
+        return await this.withRoomLock(candidate.roomId, async () => {
+          const refreshed = reconcileVolumesState(await this.volumeReconciliationContext())
+          const current = refreshed.volumes.find((volume) => volume.name === candidate.name)
+          if (!current) throw new Error(`Volume ${candidate.name} disappeared before guarded removal`)
+          if (
+            !current.safeToDelete ||
+            !current.sizeKnown ||
+            current.ownership === 'unowned' ||
+            !current.linksKnown ||
+            current.links > 0 ||
+            current.sizeBytes > remainingBytes
+          ) {
+            throw new Error(`Volume ${candidate.name} changed state before guarded removal`)
+          }
+          await this.backend.removeManagedVolume(current.name)
+          return current.sizeBytes
+        })
+      }
+    })
   }
 
   private static readonly ROOM_FILE_CAP = 16 * 1024 * 1024

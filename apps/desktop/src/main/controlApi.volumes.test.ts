@@ -89,4 +89,26 @@ describe('agent control API storage volume endpoints (issue #63)', () => {
       expect(gcVolumes).toHaveBeenCalledWith({ dryRun: true, maxVolumes: 50 })
     })
   })
+
+  it('POST /v1/storage/volumes/gc requires both explicit bounds for real execution', async () => {
+    const gcVolumes = vi.fn(async () => ({ dryRun: false }) as VolumeGcResult)
+
+    await withApi({ gcVolumes } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {
+      const rejected = await fetch(`${base}/v1/storage/volumes/gc`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ dryRun: false, maxVolumes: 1 })
+      })
+      expect(rejected.status).toBe(500)
+      expect(gcVolumes).not.toHaveBeenCalled()
+
+      const accepted = await fetch(`${base}/v1/storage/volumes/gc`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ dryRun: false, maxVolumes: 1, maxBytes: 4096 })
+      })
+      expect(accepted.status).toBe(200)
+      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: false, maxVolumes: 1, maxBytes: 4096 })
+    })
+  })
 })

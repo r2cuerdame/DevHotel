@@ -2,7 +2,7 @@ import { appendFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkd
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { SCREENSHOT_ARTIFACT_MAX_BYTES } from '@devhotel/shared'
+import { SCREENSHOT_ARTIFACT_MAX_BYTES, type VolumeOwnership } from '@devhotel/shared'
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
@@ -63,7 +63,7 @@ import type {
   RoomArtifactWebRuntimeFence,
   WebSpec
 } from './types'
-import { parseDockerUnitSize } from '../volumeGc'
+import { isDockerUnitSizeKnown, parseDockerUnitSize } from '../volumeGc'
 
 const DU_IMAGE = 'alpine'
 /**
@@ -7180,6 +7180,33 @@ export class OciCliBackend implements IsolationBackend {
     return [...new Set(names)]
   }
 
+  private async completeVolumeUsage(
+    usage: Omit<DockerVolumeUsage, 'ownership'>
+  ): Promise<DockerVolumeUsage> {
+    let ownership: VolumeOwnership = 'unowned'
+    const roomId = /^dh-([a-z0-9]{8})-/.exec(usage.name)?.[1]
+    if (roomId) {
+      try {
+        assertExpectedRoomVolumeName(roomId, usage.name)
+        if (
+          usage.labels['devhotel.room'] === roomId &&
+          usage.labels['devhotel.role'] === 'volume' &&
+          usage.labels['devhotel.managed'] === '1'
+        ) {
+          ownership = 'managed-labels'
+        } else if (this.legacyVolumeAdoptionFile) {
+          const inspected = await this.inspectVolume(usage.name)
+          if (inspected && await this.isRecordedLegacyVolume(roomId, usage.name, inspected)) {
+            ownership = 'legacy-adoption'
+          }
+        }
+      } catch {
+        ownership = 'unowned'
+      }
+    }
+    return { ...usage, ownership }
+  }
+
   async listVolumesWithUsage(): Promise<DockerVolumeUsage[]> {
     await this.assertPinnedEngineIdentity()
     try {
@@ -7195,22 +7222,29 @@ export class OciCliBackend implements IsolationBackend {
           Labels?: string
         }>
         if (Array.isArray(parsed)) {
-          return parsed
-            .map((item) => {
+          return await Promise.all(parsed
+            .filter((item) => (item.Name ?? '').length > 0)
+            .map(async (item) => {
               const labelsMap = parseDockerLabels(item.Labels ?? '')
               const labelsObj: Record<string, string> = {}
               for (const [k, v] of labelsMap.entries()) labelsObj[k] = v
-              return {
+              const rawSize = item.Size ?? ''
+              const rawLinks = item.Links
+              const linksKnown = typeof rawLinks === 'number'
+                ? Number.isSafeInteger(rawLinks) && rawLinks >= 0
+                : typeof rawLinks === 'string' && /^\d+$/.test(rawLinks)
+              return await this.completeVolumeUsage({
                 name: item.Name ?? '',
                 driver: item.Driver ?? 'local',
                 scope: item.Scope ?? 'local',
                 mountpoint: item.Mountpoint ?? '',
-                sizeBytes: parseDockerUnitSize(item.Size ?? '0B'),
-                links: typeof item.Links === 'number' ? item.Links : Number.parseInt(item.Links ?? '0', 10) || 0,
+                sizeBytes: parseDockerUnitSize(rawSize),
+                sizeKnown: isDockerUnitSizeKnown(rawSize),
+                links: linksKnown ? Number(rawLinks) : 0,
+                linksKnown,
                 labels: labelsObj
-              }
-            })
-            .filter((v) => v.name.length > 0)
+              })
+            }))
         }
       }
     } catch {
@@ -7228,15 +7262,18 @@ export class OciCliBackend implements IsolationBackend {
         const labelsMap = parseDockerLabels(row.Labels ?? '')
         const labelsObj: Record<string, string> = {}
         for (const [k, v] of labelsMap.entries()) labelsObj[k] = v
-        usages.push({
+        const linksKnown = typeof row.Links === 'string' && /^\d+$/.test(row.Links)
+        usages.push(await this.completeVolumeUsage({
           name: row.Name,
           driver: row.Driver ?? 'local',
           scope: row.Scope ?? 'local',
           mountpoint: row.Mountpoint ?? '',
           sizeBytes: 0,
-          links: Number.parseInt(row.Links ?? '0', 10) || 0,
+          sizeKnown: false,
+          links: linksKnown ? Number(row.Links) : 0,
+          linksKnown,
           labels: labelsObj
-        })
+        }))
       } catch {
         continue
       }
@@ -7248,14 +7285,23 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const existing = await this.inspectVolume(name)
     if (!existing) return
-    const roomId = existing.Labels?.['devhotel.room']
-    if (roomId) {
-      assertExpectedRoomVolumeName(roomId, name)
-      await this.assertRoomVolumeOwnership(existing, roomId, name)
-    } else {
+    const labelRoomId = existing.Labels?.['devhotel.room']
+    const namedRoomId = /^dh-([a-z0-9]{8})-/.exec(name)?.[1]
+    const roomId = labelRoomId ?? namedRoomId
+    if (!roomId) {
       throw new Error(`cannot remove volume without room ownership metadata: ${name}`)
     }
-    must(await runDocker(['volume', 'rm', '-f', name]), `remove volume ${name}`)
+    assertExpectedRoomVolumeName(roomId, name)
+    await this.assertRoomVolumeOwnership(existing, roomId, name)
+    if (!hasRoomVolumeLabels(existing, roomId, name)) {
+      const registry = await this.loadLegacyVolumeRegistry()
+      if (!registry.volumes[name]) throw new Error(`legacy volume ownership disappeared before removal: ${name}`)
+      delete registry.volumes[name]
+      this.writeLegacyVolumeRegistry(registry)
+    }
+    // Deliberately omit --force: Docker must refuse a newly attached volume at
+    // the final host boundary, even if state changed after reconciliation.
+    must(await runDocker(['volume', 'rm', name]), `remove volume ${name}`)
     if (await this.inspectVolume(name)) {
       throw new Error(`volume cleanup incomplete: ${name}`)
     }
