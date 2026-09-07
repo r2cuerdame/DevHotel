@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -13,16 +13,19 @@ vi.mock('../backend/cli', async (importOriginal) => {
 const mockedRunDocker = vi.mocked(runDocker)
 const ROOM_ID = 'room1abc'
 const VOLUME = `dh-${ROOM_ID}-cache`
+const CREATED_AT = '2026-09-07T01:23:45.123456789Z'
 
-function legacyInspect(driver = 'local'): string {
+function legacyInspect(driver = 'local', overrides: Record<string, unknown> = {}): string {
   return JSON.stringify([
     {
       Name: VOLUME,
+      CreatedAt: CREATED_AT,
       Driver: driver,
       Scope: 'local',
       Mountpoint: `/var/lib/docker/volumes/${VOLUME}/_data`,
       Labels: null,
-      Options: null
+      Options: null,
+      ...overrides
     }
   ])
 }
@@ -55,8 +58,14 @@ describe('legacy Room volume adoption', () => {
 
     await expect(backend.adoptLegacyRoomVolumes(ROOM_ID)).resolves.toEqual([VOLUME])
     await expect(backend.volumeSizes(ROOM_ID)).resolves.toEqual({})
-    const registry = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { volumes: Record<string, unknown> }
-    expect(registry.volumes[VOLUME]).toMatchObject({ roomId: ROOM_ID, driver: 'local', scope: 'local' })
+    const registry = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { schema: number; volumes: Record<string, unknown> }
+    expect(registry.schema).toBe(2)
+    expect(registry.volumes[VOLUME]).toMatchObject({
+      roomId: ROOM_ID,
+      driver: 'local',
+      scope: 'local',
+      createdAt: CREATED_AT
+    })
     expect(
       mockedRunDocker.mock.calls.some(
         ([args]) => args[0] === 'volume' && (args[1] === 'rm' || args[1] === 'create')
@@ -84,11 +93,24 @@ describe('legacy Room volume adoption', () => {
     await expect(
       new OciCliBackend({ ...base, canAdoptLegacyVolume: () => true }).adoptLegacyRoomVolumes(ROOM_ID)
     ).rejects.toThrow(/unsafe or ambiguous/)
+
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'ls') return { code: 0, stdout: `${VOLUME}\n`, stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return { code: 0, stdout: legacyInspect('local', { CreatedAt: undefined }), stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    await expect(
+      new OciCliBackend({ ...base, canAdoptLegacyVolume: () => true }).adoptLegacyRoomVolumes(ROOM_ID)
+    ).rejects.toThrow(/unsafe or ambiguous/)
   })
 
-  it('removes an exactly recorded legacy volume without force and retires its ownership record first', async () => {
+  it('removes an exactly recorded legacy volume without force and retires ownership only after success', async () => {
     const adoptionFile = join(dir, 'legacy-volumes.json')
     let exists = true
+    let removalAllowed = false
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
       if (args[0] === 'volume' && args[1] === 'ls') return { code: 0, stdout: `${VOLUME}\n`, stderr: '' }
@@ -98,6 +120,7 @@ describe('legacy Room volume adoption', () => {
           : { code: 1, stdout: '', stderr: 'no such volume' }
       }
       if (args[0] === 'volume' && args[1] === 'rm') {
+        if (!removalAllowed) return { code: 1, stdout: '', stderr: 'volume is in use' }
         exists = false
         return { code: 0, stdout: `${VOLUME}\n`, stderr: '' }
       }
@@ -110,6 +133,11 @@ describe('legacy Room volume adoption', () => {
     })
 
     await backend.adoptLegacyRoomVolumes(ROOM_ID)
+    await expect(backend.removeManagedVolume(VOLUME)).rejects.toThrow(/volume is in use/)
+    const retained = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { volumes: Record<string, unknown> }
+    expect(retained.volumes[VOLUME]).toBeDefined()
+
+    removalAllowed = true
     await backend.removeManagedVolume(VOLUME)
 
     expect(mockedRunDocker.mock.calls.some(([args]) =>
@@ -118,6 +146,61 @@ describe('legacy Room volume adoption', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args.includes('-f'))).toBe(false)
     const registry = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { volumes: Record<string, unknown> }
     expect(registry.volumes[VOLUME]).toBeUndefined()
+  })
+
+  it('rejects a recreated or metadata-changed volume that inherited a stale adoption record', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    let currentInspect = legacyInspect()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'ls') return { code: 0, stdout: `${VOLUME}\n`, stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return { code: 0, stdout: currentInspect, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const backend = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => true
+    })
+
+    await backend.adoptLegacyRoomVolumes(ROOM_ID)
+    currentInspect = legacyInspect('local', { CreatedAt: '2026-09-07T02:23:45.123456789Z' })
+    await expect(backend.removeManagedVolume(VOLUME)).rejects.toThrow(/ownership metadata/)
+
+    currentInspect = legacyInspect('local', { Labels: { external: '1' } })
+    await expect(backend.removeManagedVolume(VOLUME)).rejects.toThrow(/ownership metadata/)
+
+    currentInspect = legacyInspect('local', { Options: { type: 'none' } })
+    await expect(backend.removeManagedVolume(VOLUME)).rejects.toThrow(/ownership metadata/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'volume' && args[1] === 'rm')).toBe(false)
+  })
+
+  it('fails closed on a legacy registry without the creation identity schema', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    const backend = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => true
+    })
+    await backend.adoptLegacyRoomVolumes(ROOM_ID)
+
+    const oldRegistry = JSON.parse(readFileSync(adoptionFile, 'utf8')) as {
+      schema: number
+      volumes: Record<string, Record<string, unknown>>
+    }
+    oldRegistry.schema = 1
+    delete oldRegistry.volumes[VOLUME]!['createdAt']
+    writeFileSync(adoptionFile, JSON.stringify(oldRegistry, null, 2) + '\n', 'utf8')
+
+    const restarted = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => true
+    })
+    await expect(restarted.removeManagedVolume(VOLUME)).rejects.toThrow(/stale, invalid/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'volume' && args[1] === 'rm')).toBe(false)
   })
 
   it('marks fallback volume sizes unknown so bounded GC cannot delete them', async () => {

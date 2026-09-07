@@ -4969,6 +4969,7 @@ export class OciCliBackend implements IsolationBackend {
         volume.Driver !== 'local' ||
         volume.Scope !== 'local' ||
         !volume.Mountpoint ||
+        !isCanonicalDockerStartedAt(volume.CreatedAt) ||
         Object.keys(volume.Labels ?? {}).length > 0 ||
         Object.keys(volume.Options ?? {}).length > 0
       ) {
@@ -4980,6 +4981,7 @@ export class OciCliBackend implements IsolationBackend {
         driver: volume.Driver,
         scope: volume.Scope,
         mountpoint: volume.Mountpoint,
+        createdAt: volume.CreatedAt,
         adoptedAt: new Date().toISOString()
       }
       this.writeLegacyVolumeRegistry(registry)
@@ -5048,7 +5050,7 @@ export class OciCliBackend implements IsolationBackend {
     if (this.legacyVolumeAdoptions) return this.legacyVolumeAdoptions
     const engine = await this.readEngineIdentity()
     if (!this.legacyVolumeAdoptionFile || !existsSync(this.legacyVolumeAdoptionFile)) {
-      this.legacyVolumeAdoptions = { schema: 1, engine, volumes: {} }
+      this.legacyVolumeAdoptions = { schema: 2, engine, volumes: {} }
       return this.legacyVolumeAdoptions
     }
     let parsed: LegacyVolumeAdoptionRegistry
@@ -5058,14 +5060,31 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`legacy volume adoption file is unreadable: ${this.legacyVolumeAdoptionFile}`)
     }
     if (
-      parsed.schema !== 1 ||
+      parsed.schema !== 2 ||
       !parsed.engine ||
       parsed.engine.context !== engine.context ||
       parsed.engine.engineId !== engine.engineId ||
       !parsed.volumes ||
-      typeof parsed.volumes !== 'object'
+      typeof parsed.volumes !== 'object' ||
+      Array.isArray(parsed.volumes) ||
+      !Object.entries(parsed.volumes).every(([name, record]) => {
+        try {
+          assertExpectedRoomVolumeName(record.roomId, name)
+        } catch {
+          return false
+        }
+        return (
+          /^[a-z0-9]{8}$/.test(record.roomId) &&
+          record.driver === 'local' &&
+          record.scope === 'local' &&
+          typeof record.mountpoint === 'string' &&
+          record.mountpoint.length > 0 &&
+          isCanonicalDockerStartedAt(record.createdAt) &&
+          isCanonicalDockerStartedAt(record.adoptedAt)
+        )
+      })
     ) {
-      throw new Error('legacy volume adoption file does not match the pinned Docker engine')
+      throw new Error('legacy volume adoption file is stale, invalid, or does not match the pinned Docker engine')
     }
     this.legacyVolumeAdoptions = parsed
     return parsed
@@ -5077,6 +5096,7 @@ export class OciCliBackend implements IsolationBackend {
     const temp = `${this.legacyVolumeAdoptionFile}.${process.pid}.tmp`
     writeFileSync(temp, JSON.stringify(registry, null, 2) + '\n', 'utf8')
     renameSync(temp, this.legacyVolumeAdoptionFile)
+    this.legacyVolumeAdoptions = registry
   }
 
   private networkRecoveryAttestationPath(roomId: string, joinerId: string): string | undefined {
@@ -5236,7 +5256,10 @@ export class OciCliBackend implements IsolationBackend {
         recorded.roomId === roomId &&
         recorded.driver === volume.Driver &&
         recorded.scope === volume.Scope &&
-        recorded.mountpoint === volume.Mountpoint
+        recorded.mountpoint === volume.Mountpoint &&
+        recorded.createdAt === volume.CreatedAt &&
+        Object.keys(volume.Labels ?? {}).length === 0 &&
+        Object.keys(volume.Options ?? {}).length === 0
     )
   }
 
@@ -7293,17 +7316,25 @@ export class OciCliBackend implements IsolationBackend {
     }
     assertExpectedRoomVolumeName(roomId, name)
     await this.assertRoomVolumeOwnership(existing, roomId, name)
-    if (!hasRoomVolumeLabels(existing, roomId, name)) {
-      const registry = await this.loadLegacyVolumeRegistry()
-      if (!registry.volumes[name]) throw new Error(`legacy volume ownership disappeared before removal: ${name}`)
-      delete registry.volumes[name]
-      this.writeLegacyVolumeRegistry(registry)
+    const legacyRegistry = !hasRoomVolumeLabels(existing, roomId, name)
+      ? await this.loadLegacyVolumeRegistry()
+      : null
+    if (legacyRegistry && !legacyRegistry.volumes[name]) {
+      throw new Error(`legacy volume ownership disappeared before removal: ${name}`)
     }
     // Deliberately omit --force: Docker must refuse a newly attached volume at
     // the final host boundary, even if state changed after reconciliation.
     must(await runDocker(['volume', 'rm', name]), `remove volume ${name}`)
     if (await this.inspectVolume(name)) {
       throw new Error(`volume cleanup incomplete: ${name}`)
+    }
+    if (legacyRegistry) {
+      const retired: LegacyVolumeAdoptionRegistry = {
+        ...legacyRegistry,
+        volumes: { ...legacyRegistry.volumes }
+      }
+      delete retired.volumes[name]
+      this.writeLegacyVolumeRegistry(retired)
     }
   }
 }
@@ -7592,11 +7623,11 @@ function isNetworkRecoveryAttestation(value: unknown): value is NetworkRecoveryA
 }
 
 interface LegacyVolumeAdoptionRegistry {
-  schema: 1
+  schema: 2
   engine: EngineIdentity
   volumes: Record<
     string,
-    { roomId: string; driver: string; scope: string; mountpoint: string; adoptedAt: string }
+    { roomId: string; driver: string; scope: string; mountpoint: string; createdAt: string; adoptedAt: string }
   >
 }
 
