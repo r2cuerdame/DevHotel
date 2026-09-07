@@ -1,5 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import type { SourceType, WorkspaceMode } from '@devhotel/shared'
+import type { SourceType, VolumeOwnership, WorkspaceMode } from '@devhotel/shared'
 import type { WorkspaceSnapshot } from '../workspaceDrift'
 
 export interface WebSpec {
@@ -133,6 +133,20 @@ export type RoomArtifactPublicationFailureReason =
   | 'fence-changed'
   | 'publication-ambiguous'
   | 'helper-failed'
+
+export interface DockerVolumeUsage {
+  name: string
+  driver: string
+  scope: string
+  mountpoint: string
+  sizeBytes: number
+  sizeKnown: boolean
+  ownership: VolumeOwnership
+  links: number
+  linksKnown: boolean
+  labels: Record<string, string>
+  createdAt?: string
+}
 
 export type RoomArtifactRecoveryOutcome =
   | 'committed'
@@ -290,6 +304,8 @@ export interface IsolationBackend {
     log?: (line: string) => void
   ): Promise<void>
   volumeSizes(roomId: string): Promise<Record<string, number>>
+  listVolumesWithUsage(): Promise<DockerVolumeUsage[]>
+  removeManagedVolume(name: string): Promise<void>
   imageExists(image: string): Promise<boolean>
   pullImage(image: string, log?: (line: string) => void): Promise<void>
   /** force-remove and recreate a volume, guaranteeing it is empty */

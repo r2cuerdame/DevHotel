@@ -41,6 +41,7 @@ import {
   zStartRoomBody,
   zSafeHostResyncBody,
   zUndoChangeBody,
+  zVolumeGcBody,
   DeviceLeaseError,
   type ArtifactExportResult,
   type ControlInfo,
@@ -231,6 +232,18 @@ export async function startControlApi(
       }
       if (parts[3] === 'install' && req.method === 'POST') {
         sendJson(res, 200, await hotel.github.install())
+        return
+      }
+    }
+
+    if (parts[1] === 'storage' && parts[2] === 'volumes') {
+      if (!parts[3] && req.method === 'GET') {
+        sendJson(res, 200, await orch.reconcileVolumes())
+        return
+      }
+      if (parts[3] === 'gc' && req.method === 'POST') {
+        const body = zVolumeGcBody.parse(await readBody(req))
+        sendJson(res, 200, await orch.gcVolumes(body))
         return
       }
     }

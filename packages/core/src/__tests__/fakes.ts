@@ -8,6 +8,7 @@ import type {
   AnchorSpec,
   ExecOpts,
   ExecResult,
+  DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
   FencedEmulatorBootResult,
@@ -435,6 +436,17 @@ export class FakeBackend implements IsolationBackend {
   }
   async volumeSizes() {
     return {}
+  }
+  managedVolumes: DockerVolumeUsage[] = []
+  removedManagedVolumes: string[] = []
+  async listVolumesWithUsage(): Promise<DockerVolumeUsage[]> {
+    this.calls.push('listVolumesWithUsage')
+    return this.managedVolumes
+  }
+  async removeManagedVolume(name: string): Promise<void> {
+    this.calls.push(`removeManagedVolume:${name}`)
+    this.removedManagedVolumes.push(name)
+    this.managedVolumes = this.managedVolumes.filter((v) => v.name !== name)
   }
   async imageExists() {
     return true

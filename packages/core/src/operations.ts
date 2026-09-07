@@ -134,6 +134,11 @@ export class OperationTracker {
     return live ? clone(live.record) : null
   }
 
+  /** Snapshots of all operations currently running in memory. */
+  listLive(): OperationRecord[] {
+    return Array.from(this.live.values(), (live) => clone(live.record))
+  }
+
   /**
    * Wait for an operation to reach a terminal status, bounded by `timeoutMs`.
    * A timeout is not an error: the current snapshot comes back with

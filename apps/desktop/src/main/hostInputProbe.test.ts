@@ -130,7 +130,11 @@ describe.runIf(HOST_INPUT_PROBE_SUPPORTED)('Host input monitor helper (Windows)'
     try {
       monitor = await startHostInputMonitor()
     } catch (err) {
-      if (err instanceof Error && err.message.includes('Host input probe lost access to the interactive desktop')) {
+      if (
+        err instanceof Error &&
+        (err.message.includes('Host input probe lost access to the interactive desktop') ||
+          err.message.includes('Host input probe cannot open the interactive desktop'))
+      ) {
         return
       }
       throw err
