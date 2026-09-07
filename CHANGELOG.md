@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.2 — 2026-09-07
+
+### Interrupted Android locale runs recover after a restart
+
+- Startup recovery now recognizes the exact DevHotel-owned locale marker while
+  restoring the original app locale, even after the final attempted marker has
+  already been cleared.
+- Recovery reattaches only to the retained emulator and tracked install, then
+  launches the application before proving its locale, process, and foreground
+  state. Changed targets, installs, users, leases, or outside locales still fail
+  closed without clearing the retained recovery fence.
+- Room status and logs expose privacy-safe recovery classifications and concrete
+  operator actions, while successful recovery clears its diagnostic and lets the
+  Room finish sleeping normally.
+
+### Room-owned volume cleanup proves identity before deletion
+
+- Reconciliation is Room-aware and refuses ambiguous or cross-Room volume
+  ownership instead of adopting or deleting by name alone.
+- Legacy volume adoption is bound to immutable volume identity, and garbage
+  collection re-proves both ownership and identity at the deletion boundary.
+
 ## 0.5.1 — 2026-09-05
 
 ### Android runs survive lost responses and control restarts

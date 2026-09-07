@@ -519,7 +519,7 @@ describe('makeTools', () => {
   })
 
   it('reports the package release metadata', () => {
-    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.1' })
+    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.2' })
   })
 
   function firstText(res: { content: ({ type: string } & Record<string, unknown>)[] }): string {
