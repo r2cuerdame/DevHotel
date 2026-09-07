@@ -379,6 +379,29 @@ describe('Android locale screenshot matrix', () => {
       events.push('open')
       return session
     })
+    const restartOrchestrator = () => {
+      const restarted = new RoomOrchestrator({
+        userData,
+        db,
+        backend,
+        gateway: new FakeGateway().asGateway(),
+        adb: new FakeAdbHost(),
+        appVersion: 'test'
+      })
+      const restartedSessionHost = restarted as unknown as {
+        openAndroidAutomationSessionLocked(
+          roomId: string,
+          selector: AndroidTargetSelector,
+          options?: { allowPendingRecovery?: boolean }
+        ): Promise<AndroidAutomationSession>
+      }
+      const restartedOpen = vi.spyOn(restartedSessionHost, 'openAndroidAutomationSessionLocked')
+        .mockImplementation(async () => {
+          events.push('open')
+          return session
+        })
+      return { open: restartedOpen, orch: restarted }
+    }
     return {
       applied,
       backend,
@@ -396,6 +419,7 @@ describe('Android locale screenshot matrix', () => {
       pendingAtMutation,
       pendingAtRestore,
       restoreFence,
+      restartOrchestrator,
       session,
       witnessOptions
     }
@@ -1488,7 +1512,8 @@ describe('Android locale screenshot matrix', () => {
       deviceId,
       leaseId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
     }
-    settings.set(pendingKey, JSON.stringify(pending))
+    const retained = JSON.stringify(pending)
+    settings.set(pendingKey, retained)
     const refreshInventory = vi.spyOn(fixture.orch.devices, 'refreshInventory')
     const renewRecoveryLease = vi.spyOn(fixture.orch.devices, 'renewRecoveryLease')
     fixture.open.mockClear()
@@ -1498,11 +1523,11 @@ describe('Android locale screenshot matrix', () => {
     expect(refreshInventory).not.toHaveBeenCalled()
     expect(renewRecoveryLease).not.toHaveBeenCalled()
     expect(fixture.open).not.toHaveBeenCalled()
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
     expect(fixture.backend.calls).not.toContain(`stopRoomPod:${ROOM_ID}`)
   })
 
-  it('recovers an interrupted restoration record with attemptedLocaleOwned=true and null ownership tag (issue #61)', async () => {
+  it('recovers retained state in a reconstructed orchestrator when attemptedLocaleOwned=true and ownership tag is null (issue #61)', async () => {
     const fixture = setup({ failRestore: true })
     const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
     await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
@@ -1522,13 +1547,19 @@ describe('Android locale screenshot matrix', () => {
     })
     settings.set(pendingKey, retained)
     fixture.controls.failRestore = false
+    const restarted = fixture.restartOrchestrator()
 
-    await fixture.orch.init()
+    await restarted.orch.init()
 
+    expect(restarted.open).toHaveBeenCalledWith(
+      ROOM_ID,
+      { kind: 'emulator' },
+      { allowPendingRecovery: true }
+    )
     expect(settings.get(pendingKey)).toBeNull()
     expect(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)).toBeNull()
     expect(fixture.currentLocaleTags()).toEqual(['en-US'])
-    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('sleeping')
+    expect(restarted.orch.rooms.get(ROOM_ID)?.status).toBe('sleeping')
   })
 
   it('launches the tracked application when process is absent on restart recovery', async () => {
@@ -1565,12 +1596,15 @@ describe('Android locale screenshot matrix', () => {
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
     fixture.controls.failRestore = false
     fixture.setCurrentLocaleTags(['ja-JP'])
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
 
     await fixture.orch.init()
 
     expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
-    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
     const diagRaw = settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)
     expect(diagRaw).not.toBeNull()
     const diag = JSON.parse(diagRaw!) as { invariantClass: string; reason: string; operatorAction: string }
@@ -1601,12 +1635,15 @@ describe('Android locale screenshot matrix', () => {
       filenamePrefix: 'unrecoverable-install'
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
     fixture.controls.failRestore = false
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
 
     await fixture.orch.init()
 
     expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
-    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
     const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
       invariantClass: string
       reason: string
@@ -1625,12 +1662,15 @@ describe('Android locale screenshot matrix', () => {
       filenamePrefix: 'unrecoverable-user'
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
     fixture.controls.failRestore = false
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
 
     await fixture.orch.init()
 
     expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
-    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
     const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
       invariantClass: string
       reason: string
@@ -1639,6 +1679,35 @@ describe('Android locale screenshot matrix', () => {
     expect(diag.invariantClass).toBe('user-mismatch')
     expect(diag.reason).toContain('Tracked Android install user does not match the retained recovery fence')
     expect(diag.operatorAction).toContain('Restore the original Android user identity for this Room')
+  })
+
+  it('retains fence without mutation when the recovered emulator identity differs from the target fence', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-target'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+    fixture.session.target.deviceId = `d${'b'.repeat(32)}`
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('target-unavailable')
+    expect(diag.reason).toContain('target is unavailable')
+    expect(diag.operatorAction).toContain('emulator container health')
   })
 
   it('retains fence and records api-mismatch structured diagnostic when target API level changed', async () => {
@@ -1651,12 +1720,15 @@ describe('Android locale screenshot matrix', () => {
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
     fixture.controls.failRestore = false
     fixture.session.target.apiLevel = 35
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
 
     await fixture.orch.init()
 
     expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
-    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
     const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
       invariantClass: string
       reason: string
@@ -1675,12 +1747,15 @@ describe('Android locale screenshot matrix', () => {
       filenamePrefix: 'unrecoverable-launch'
     }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
     fixture.controls.failRestore = false
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
 
     await fixture.orch.init()
 
     expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
-    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
-    expect(settings.get(pendingKey)).not.toBeNull()
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
     const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
       invariantClass: string
       reason: string
