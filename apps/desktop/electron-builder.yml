@@ -2,6 +2,8 @@ appId: io.devhotel.app
 productName: DevHotel
 directories:
   output: release
+beforePack: scripts/verify-package-source.mjs
+afterPack: scripts/write-packaged-build-identity.mjs
 files:
   - out/**
   - package.json

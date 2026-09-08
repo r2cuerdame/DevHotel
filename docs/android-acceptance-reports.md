@@ -97,6 +97,11 @@ Detailed reads recheck the report seal, every screenshot byte/receipt, and
 every pinned retained-log byte. A changed or missing object invalidates the
 read instead of returning a partial report.
 
+New reports also seal the exact DevHotel Host build identity (`version`, full
+Git `commit`, and `buildTime`) that performed acceptance. Legacy schema-1
+receipts without this field remain byte-for-byte readable; they are not
+silently rewritten or credited with an identity they never recorded.
+
 ## API and MCP
 
 | Surface | Operation |

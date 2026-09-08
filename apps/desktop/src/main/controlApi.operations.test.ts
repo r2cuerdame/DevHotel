@@ -3,9 +3,9 @@ import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { OperationRecord } from '@devhotel/shared'
+import type { BuildIdentity, OperationRecord } from '@devhotel/shared'
 import type { RoomOrchestrator } from '@devhotel/core'
-import { startControlApi } from './controlApi'
+import { publicUpdateStatus, startControlApi } from './controlApi'
 
 const roots: string[] = []
 
@@ -14,6 +14,11 @@ afterEach(() => {
 })
 
 const OPERATION_ID = '9d2a2c30-9c9a-4a2e-9b8b-0f6a2f1d5f01'
+const BUILD: BuildIdentity = {
+  version: '0.5.2',
+  commit: 'a'.repeat(40),
+  buildTime: '2026-09-08T12:34:56.789Z'
+}
 
 function operation(overrides: Partial<OperationRecord> = {}): OperationRecord {
   return {
@@ -48,6 +53,47 @@ function userDataDir(name: string): string {
 }
 
 describe('agent control API long operations', () => {
+  it('publishes only valid pending target versions', () => {
+    expect(publicUpdateStatus({ state: 'downloading', version: '0.6.0', detail: 'C:\\private\\download.exe' }))
+      .toEqual({ state: 'downloading', targetVersion: '0.6.0' })
+    expect(publicUpdateStatus({ state: 'error', version: '0.6.0', detail: 'secret' }))
+      .toEqual({ state: 'error', targetVersion: null })
+    expect(publicUpdateStatus({ state: 'ready', version: 'C:\\private\\update.exe' }))
+      .toEqual({ state: 'ready', targetVersion: null })
+  })
+
+  it('publishes one exact build identity and a secret-safe update target', async () => {
+    const hotelStatus = vi.fn(async () => ({
+      backend: { ok: true, detail: 'ready' },
+      gateway: { running: true, httpPort: 80, httpsPort: 443, routes: [] },
+      rooms: [],
+      devices: { devices: [], leases: [], queue: [] }
+    }))
+    const dir = userDataDir('devhotel-control-build-identity-')
+    const control = await startControlApi(
+      { hotelStatus } as unknown as RoomOrchestrator,
+      dir,
+      BUILD,
+      {
+        github: null,
+        updateStatus: () => ({ state: 'ready', version: '0.6.0', detail: 'C:\\private\\update.exe?token=secret' })
+      }
+    )
+    const headers = { authorization: `Bearer ${control.info.token}` }
+    try {
+      const ping = await (await fetch(`http://127.0.0.1:${control.info.port}/v1/ping`, { headers })).json()
+      const status = await (await fetch(`http://127.0.0.1:${control.info.port}/v1/status`, { headers })).json()
+      const discovery = JSON.parse(readFileSync(join(dir, 'control.json'), 'utf8'))
+      expect(ping).toEqual(BUILD)
+      expect(status).toMatchObject({ ...BUILD, update: { state: 'ready', targetVersion: '0.6.0' } })
+      expect(discovery).toMatchObject(BUILD)
+      expect(JSON.stringify(status)).not.toContain('private')
+      expect(JSON.stringify(status)).not.toContain('secret')
+    } finally {
+      control.stop()
+    }
+  })
+
   it('answers a start with the wake operation, and never with a bare success', async () => {
     const startRoomOperation = vi.fn(() => operation())
     const waitForOperation = vi.fn(async () => operation())

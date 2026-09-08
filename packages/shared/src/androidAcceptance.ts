@@ -3,6 +3,7 @@ import { zAndroidApplicationId, zAndroidTargetSelector } from './androidAutomati
 import { zArtifactFilename, zArtifactId } from './artifacts'
 import { ANDROID_LOCALE_MATRIX_MAX_ENTRIES, canonicalAndroidLocaleTag } from './androidLocales'
 import { zRoomId } from './control'
+import { zBuildIdentity } from './buildIdentity'
 
 export const ANDROID_ACCEPTANCE_REPORT_MAX_BYTES = 64 * 1024
 export const ANDROID_ACCEPTANCE_REPORT_MAX_PER_ROOM = 100
@@ -257,9 +258,8 @@ export const zAndroidAcceptanceLogRef = z
   })
 export type AndroidAcceptanceLogRef = z.infer<typeof zAndroidAcceptanceLogRef>
 
-const zAndroidAcceptanceReportBase = z
+const zAndroidAcceptanceReportCommon = z
   .object({
-    schema: z.literal(1),
     id: zAndroidAcceptanceReportId,
     roomId: zRoomId,
     stage: zAndroidAcceptanceStage,
@@ -346,6 +346,18 @@ const zAndroidAcceptanceReportBase = z
     logs: z.array(zAndroidAcceptanceLogRef).max(32)
   })
   .strict()
+
+const zAndroidAcceptanceReportLegacyBase = zAndroidAcceptanceReportCommon.extend({
+  schema: z.literal(1)
+})
+const zAndroidAcceptanceReportCurrentBase = zAndroidAcceptanceReportCommon.extend({
+  schema: z.literal(2),
+  devhotelBuild: zBuildIdentity
+})
+const zAndroidAcceptanceReportBase = z.discriminatedUnion('schema', [
+  zAndroidAcceptanceReportLegacyBase,
+  zAndroidAcceptanceReportCurrentBase
+])
 
 function refineAndroidAcceptanceReport(
   value: z.infer<typeof zAndroidAcceptanceReportBase>,
@@ -515,8 +527,10 @@ function refineAndroidAcceptanceReport(
 export const zAndroidAcceptanceReportUnsigned = zAndroidAcceptanceReportBase.superRefine(refineAndroidAcceptanceReport)
 export type AndroidAcceptanceReportUnsigned = z.infer<typeof zAndroidAcceptanceReportUnsigned>
 
-export const zAndroidAcceptanceReport = zAndroidAcceptanceReportBase
-  .extend({ seal: zMacIdentityFor('report') })
+export const zAndroidAcceptanceReport = z.discriminatedUnion('schema', [
+  zAndroidAcceptanceReportLegacyBase.extend({ seal: zMacIdentityFor('report') }),
+  zAndroidAcceptanceReportCurrentBase.extend({ seal: zMacIdentityFor('report') })
+])
   .superRefine(refineAndroidAcceptanceReport)
 export type AndroidAcceptanceReport = z.infer<typeof zAndroidAcceptanceReport>
 
@@ -527,6 +541,7 @@ export interface AndroidAcceptanceReportSummary {
   status: 'pass' | 'fail'
   applicationId: string
   createdAt: string
+  devhotelBuild: z.infer<typeof zBuildIdentity> | null
   targetKind: 'emulator' | 'physical'
   screenshotCount: number
   logCount: number

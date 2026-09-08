@@ -76,6 +76,7 @@ export function acceptanceReportSummary(report: AndroidAcceptanceReport): Androi
     status: report.status,
     applicationId: report.applicationId,
     createdAt: report.createdAt,
+    devhotelBuild: report.schema === 2 ? report.devhotelBuild : null,
     targetKind: report.target.kind,
     screenshotCount: report.screenshots.length,
     logCount: report.logs.length,
@@ -96,6 +97,9 @@ export function androidAcceptanceReportMarkdown(report: AndroidAcceptanceReport)
     '',
     `- Status: **${report.status.toUpperCase()}** · stage \`${report.stage}\``,
     `- Report seal: \`${report.seal.value}\``,
+    ...(report.schema === 2
+      ? [`- DevHotel build: \`${report.devhotelBuild.version}\` · \`${report.devhotelBuild.commit}\` · \`${report.devhotelBuild.buildTime}\``]
+      : []),
     `- Room: \`${report.roomId}\` · state r${report.room.stateRevision} · workspace r${report.room.workspaceVolumeRevision}`,
     `- Source identity: \`${report.room.sourceIdentity.value}\``,
     `- Image: \`${cell(report.image.reference)}\` · \`${report.image.sha256}\``,

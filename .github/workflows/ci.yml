@@ -26,5 +26,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: devhotel-installer
-          path: apps/desktop/release/*.exe
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/build-identity.json
           if-no-files-found: error

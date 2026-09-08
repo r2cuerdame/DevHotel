@@ -25,6 +25,13 @@ passes. This is deliberate — see "Why not CI" below.
      --config.directories.output="$LOCALAPPDATA/Temp/dh-release-X-Y-Z"
    ```
 
+   The desktop build embeds one identity and emits the same
+   `out/main/build-identity.json`; packaging refuses any non-ignored tracked or
+   untracked source change or a manifest whose version/commit differs from
+   exact `HEAD`. After packaging, `build-identity.json` is emitted beside the
+   installer with the packaged `app.asar` SHA-256 and is also carried as
+   `resources/build-identity.json` for acceptance.
+
 6. **Rename to the hyphenated names** electron-builder writes into
    `latest.yml` (`DevHotel-Setup-X.Y.Z.exe`, `…exe.blockmap`), then confirm the
    trio agrees before uploading anything:
@@ -41,13 +48,28 @@ passes. This is deliberate — see "Why not CI" below.
 
    ```
    gh release create vX.Y.Z --title "X.Y.Z" --notes-file notes.md \
-     "DevHotel-Setup-X.Y.Z.exe" "DevHotel-Setup-X.Y.Z.exe.blockmap" latest.yml
+     "DevHotel-Setup-X.Y.Z.exe" "DevHotel-Setup-X.Y.Z.exe.blockmap" \
+     latest.yml build-identity.json
    ```
 
    Never mix CI-built and locally built artifacts in one release.
 8. **Check the result**: `gh release list` should show your version as `Latest`
    and **no drafts**. `gh api repos/<owner>/<repo>/releases/latest` is what
    auto-update reads.
+
+After an explicitly approved installation, compare the expected release
+manifest with discovery and both live identity endpoints. The checker consumes
+the bearer token but prints only the public identity and exits non-zero on any
+mismatch:
+
+```
+pnpm --filter devhotel verify:installed-build -- \
+  --expected <downloaded-release-build-identity.json> \
+  --control <control.json> --app-asar <installed-resources/app.asar>
+```
+
+This is verification only. It never installs an update, approves a prompt, or
+bypasses Room shutdown gates.
 
 ## Publishing an older release afterwards
 

@@ -396,7 +396,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'hotel_status',
       description:
-        'One read-only call answering "is DevHotel ready and what is actually running": app version, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
+        'One read-only call answering "is DevHotel ready and what is actually running": exact app build identity, pending/ready update target version, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
       schema: {},
       handler: wrap(async () => (await getClient()).hotelStatus())
     },

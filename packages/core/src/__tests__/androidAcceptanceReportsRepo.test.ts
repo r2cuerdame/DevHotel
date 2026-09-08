@@ -70,7 +70,7 @@ function unsignedReport(
     stderr: { bytes: 0, lines: 0, retained: false }
   }
   return {
-    schema: 1,
+    schema: 2,
     id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
     roomId: ROOM_ID,
     stage: 'development',
@@ -78,6 +78,11 @@ function unsignedReport(
     applicationId: 'com.example.app',
     createdAt: '2026-08-31T12:00:00.000Z',
     actor: 'agent',
+    devhotelBuild: {
+      version: '0.5.2',
+      commit: 'd'.repeat(40),
+      buildTime: '2026-09-08T01:02:03.004Z'
+    },
     room: {
       stateRevision: 3,
       workspaceVolumeRevision: 2,
@@ -183,10 +188,26 @@ describe('Android acceptance integrity', () => {
     tampered.applicationId = 'com.attacker.app'
     expect(() => verifyAndroidAcceptanceReport(tampered, integrity)).toThrow(/keyed seal/)
 
+    const buildTampered = structuredClone(report)
+    if (buildTampered.schema !== 2) throw new Error('expected current report')
+    buildTampered.devhotelBuild.commit = 'e'.repeat(40)
+    expect(() => verifyAndroidAcceptanceReport(buildTampered, integrity)).toThrow(/keyed seal/)
+
     const repo = androidAcceptanceReportsRepo(db, integrity)
     repo.insert(report)
     db.sqlite.prepare('UPDATE android_acceptance_reports SET status = ? WHERE id = ?').run('fail', report.id)
     expect(() => repo.getForRoom(ROOM_ID, report.id)).toThrow(/durable row/)
+  })
+
+  it('keeps legacy schema-1 receipts without invented build identity readable', () => {
+    const integrity = new AndroidAcceptanceIntegrity(db)
+    const current = unsignedReport(integrity)
+    if (current.schema !== 2) throw new Error('expected current report')
+    const { devhotelBuild: _build, ...currentWithoutBuild } = current
+    const legacy = { ...currentWithoutBuild, schema: 1 as const }
+    const report = sealAndroidAcceptanceReport(legacy, integrity)
+    expect(verifyAndroidAcceptanceReport(report, integrity)).toEqual(report)
+    expect('devhotelBuild' in report).toBe(false)
   })
 })
 
