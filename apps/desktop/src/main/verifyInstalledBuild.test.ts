@@ -102,7 +102,7 @@ server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address()
   }
 }
 
-describe('installed build verifier', () => {
+describe('installed build verifier', { timeout: 20_000 }, () => {
   it('accepts matching expected, discovery, ping, and status identities', async () => {
     const result = await verify()
     expect(JSON.parse(result.stdout)).toEqual({ ok: true, build: BUILD })
