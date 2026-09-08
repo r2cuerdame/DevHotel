@@ -314,16 +314,16 @@ function labelArgs(roomId: string, role: 'anchor' | 'web' | 'job'): string[] {
   return ['-l', `devhotel.room=${roomId}`, '-l', `devhotel.role=${role}`, '-l', 'devhotel.managed=1']
 }
 
-export function buildRoomNetworkCreateArgs(roomId: string): string[] {
-  return buildOwnedBridgeNetworkCreateArgs(roomId, roomNetworkName(roomId))
+export function buildRoomNetworkCreateArgs(roomId: string, subnet?: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, roomNetworkName(roomId), subnet)
 }
 
-export function buildAndroidControlNetworkCreateArgs(roomId: string): string[] {
-  return buildOwnedBridgeNetworkCreateArgs(roomId, androidControlNetworkName(roomId))
+export function buildAndroidControlNetworkCreateArgs(roomId: string, subnet?: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, androidControlNetworkName(roomId), subnet)
 }
 
-function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string): string[] {
-  return [
+function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string, subnet?: string): string[] {
+  const args = [
     'network',
     'create',
     '--driver',
@@ -336,8 +336,12 @@ function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string): string
     'devhotel.role=network',
     '--label',
     'devhotel.managed=1',
-    name,
   ]
+  if (subnet) {
+    args.push('--subnet', subnet)
+  }
+  args.push(name)
+  return args
 }
 
 export function buildAnchorArgs(

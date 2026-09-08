@@ -6,6 +6,7 @@ import { SCREENSHOT_ARTIFACT_MAX_BYTES, type VolumeOwnership } from '@devhotel/s
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
+import { DevHotelError } from '../errors'
 import { RoomArtifactPublicationError } from './types'
 import {
   ANCHOR_IMAGE,
@@ -46,6 +47,7 @@ import {
   workspaceSnapshotVolume,
   type NetworkNamespaceAuthority,
 } from './naming'
+import { SubnetAllocator, classifyNetworkCreateError } from './ipam'
 import { CLONE_IMAGE, gitCloneRun } from './gitClone'
 import type {
   AnchorSpec,
@@ -1272,6 +1274,10 @@ export interface OciCliBackendOptions {
   canAdoptLegacyVolume?: (roomId: string, name: string) => boolean
   /** Test seam; production uses a fresh 256-bit random token per anchor. */
   relayTokenFactory?: () => string
+  /** Bounded network allocator for Room IPAM. */
+  subnetAllocator?: SubnetAllocator
+  /** Liveness predicate to safely distinguish live rooms from stale unattached networks. */
+  isRoomActive?: (roomId: string) => boolean
 }
 
 export class OciCliBackend implements IsolationBackend {
@@ -1279,6 +1285,8 @@ export class OciCliBackend implements IsolationBackend {
   private readonly legacyVolumeAdoptionFile: string | undefined
   private readonly networkRecoveryAttestationDir: string | undefined
   private readonly canAdoptLegacyVolume: ((roomId: string, name: string) => boolean) | undefined
+  private readonly isRoomActive: ((roomId: string) => boolean) | undefined
+  private readonly ipam: SubnetAllocator
   private expectedEngineIdentity: EngineIdentity | null | undefined
   private legacyVolumeAdoptions: LegacyVolumeAdoptionRegistry | undefined
   private readonly relayTokenFactory: () => string
@@ -1294,6 +1302,8 @@ export class OciCliBackend implements IsolationBackend {
       ? resolve(opts.networkRecoveryAttestationDir)
       : undefined
     this.canAdoptLegacyVolume = opts.canAdoptLegacyVolume
+    this.isRoomActive = opts.isRoomActive
+    this.ipam = opts.subnetAllocator ?? new SubnetAllocator()
     this.relayTokenFactory = opts.relayTokenFactory ?? (() => randomBytes(32).toString('hex'))
   }
 
@@ -1372,11 +1382,10 @@ export class OciCliBackend implements IsolationBackend {
       return { hostPort }
     } catch (error) {
       this.relayTokens.delete(spec.roomId)
-      if (!spec.androidRuntimeIsolation) throw error
       try {
-        await this.rollbackPartialAndroidTopology(spec.roomId)
+        await this.rollbackPartialRoomTopology(spec)
       } catch (cleanupError) {
-        throw new AggregateError([error, cleanupError], 'Android Room creation and topology rollback both failed')
+        throw new AggregateError([error, cleanupError], 'Room creation and topology rollback both failed')
       }
       throw error
     }
@@ -2776,6 +2785,7 @@ export class OciCliBackend implements IsolationBackend {
     if (await this.inspectNetwork(name)) {
       throw new Error(`network cleanup incomplete: ${name}`)
     }
+    this.ipam.release(name)
   }
 
   async cloneIntoVolume(
@@ -5334,9 +5344,18 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.inspectNetwork(name)
     if (existing) {
       assertRoomNetwork(existing, roomId, name)
+      const existingSubnet = existing.IPAM?.Config?.[0]?.Subnet
+      if (existingSubnet) this.ipam.adopt(name, existingSubnet)
       return
     }
-    must(await runDocker(buildRoomNetworkCreateArgs(roomId)), `create room network ${name}`)
+    const usedSubnets = await this.collectDockerSubnets()
+    const subnet = await this.allocateSubnetWithStaleReclaim(roomId, name, usedSubnets)
+    try {
+      must(await runDocker(buildRoomNetworkCreateArgs(roomId, subnet)), `create room network ${name}`)
+    } catch (error) {
+      this.ipam.release(name)
+      throw classifyNetworkCreateError(error, roomId, name, subnet)
+    }
   }
 
   private async ensureAndroidControlNetwork(roomId: string): Promise<void> {
@@ -5344,9 +5363,87 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.inspectNetwork(name)
     if (existing) {
       assertRoomNetwork(existing, roomId, name)
+      const existingSubnet = existing.IPAM?.Config?.[0]?.Subnet
+      if (existingSubnet) this.ipam.adopt(name, existingSubnet)
       return
     }
-    must(await runDocker(buildAndroidControlNetworkCreateArgs(roomId)), `create Android control network ${name}`)
+    const usedSubnets = await this.collectDockerSubnets()
+    const subnet = await this.allocateSubnetWithStaleReclaim(roomId, name, usedSubnets)
+    try {
+      must(await runDocker(buildAndroidControlNetworkCreateArgs(roomId, subnet)), `create Android control network ${name}`)
+    } catch (error) {
+      this.ipam.release(name)
+      throw classifyNetworkCreateError(error, roomId, name, subnet)
+    }
+  }
+
+  private async collectDockerSubnets(): Promise<Set<string>> {
+    const used = new Set<string>()
+    try {
+      const result = await runDocker(['network', 'ls', '--format', '{{.Name}}'])
+      if (result.code === 0 && result.stdout.trim()) {
+        const names = result.stdout.trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+        if (names.length > 0) {
+          const inspectResult = await runDocker(['network', 'inspect', ...names])
+          if (inspectResult.code === 0 && inspectResult.stdout.trim()) {
+            const parsed = JSON.parse(inspectResult.stdout) as DockerNetworkInspect[]
+            for (const net of parsed) {
+              for (const cfg of net.IPAM?.Config ?? []) {
+                if (cfg.Subnet) used.add(cfg.Subnet)
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Best-effort inspection: test mocks or docker CLI failures fall back to in-memory allocator tracking
+    }
+    return used
+  }
+
+  private async allocateSubnetWithStaleReclaim(
+    roomId: string,
+    networkName: string,
+    usedSubnets: Set<string>
+  ): Promise<string> {
+    try {
+      return this.ipam.allocate(networkName, usedSubnets)
+    } catch (allocError) {
+      if (!(allocError instanceof DevHotelError) || allocError.code !== 'NETWORK_POOL_EXHAUSTED') {
+        throw allocError
+      }
+      if (this.isRoomActive) {
+        let reclaimedAny = false
+        try {
+          const managed = await this.listManagedNetworks()
+          for (const net of managed) {
+            if (!net.roomId || !this.isRoomActive(net.roomId)) {
+              const inspected = await this.inspectNetwork(net.name)
+              if (inspected && (!inspected.Containers || Object.keys(inspected.Containers).length === 0)) {
+                try {
+                  await this.removeManagedNetwork(net.name)
+                  reclaimedAny = true
+                  const freedSubnet = inspected.IPAM?.Config?.[0]?.Subnet
+                  if (freedSubnet) usedSubnets.delete(freedSubnet)
+                } catch {
+                  // crash-tolerant cleanup: ignore single failure and continue
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore listing failures
+        }
+        if (reclaimedAny) {
+          try {
+            return this.ipam.allocate(networkName, usedSubnets)
+          } catch {
+            // Still exhausted, fall through to rethrow original error
+          }
+        }
+      }
+      throw allocError
+    }
   }
 
   private async ensureAndroidRuntimeAnchor(roomId: string): Promise<void> {
@@ -5378,26 +5475,33 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  private async rollbackPartialAndroidTopology(roomId: string): Promise<void> {
+  private async rollbackPartialRoomTopology(spec: WebSpec): Promise<void> {
     const failures: unknown[] = []
     for (const [name, role] of [
-      [webName(roomId), 'web'],
-      [androidRuntimeAnchorName(roomId), 'android-runtime-anchor'],
-      [anchorName(roomId), 'anchor']
+      [webName(spec.roomId), 'web'],
+      [androidRuntimeAnchorName(spec.roomId), 'android-runtime-anchor'],
+      [anchorName(spec.roomId), 'anchor']
     ] as const) {
       try {
-        await this.removeRoomContainer(roomId, name, role)
+        await this.removeRoomContainer(spec.roomId, name, role)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (spec.androidRuntimeIsolation) {
+      try {
+        await this.removeAndroidControlNetwork(spec.roomId)
       } catch (error) {
         failures.push(error)
       }
     }
     try {
-      await this.removeAndroidControlNetwork(roomId)
+      await this.removeRoomNetwork(spec.roomId)
     } catch (error) {
       failures.push(error)
     }
     if (failures.length > 0) {
-      throw new AggregateError(failures, 'partial Android topology cleanup was incomplete')
+      throw new AggregateError(failures, 'partial Room topology cleanup was incomplete')
     }
   }
 
@@ -6025,23 +6129,31 @@ export class OciCliBackend implements IsolationBackend {
   private async removeRoomNetwork(roomId: string): Promise<void> {
     const name = roomNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
-    if (!existing) return
+    if (!existing) {
+      this.ipam.release(name)
+      return
+    }
     assertRoomNetwork(existing, roomId, name)
     must(await runDocker(['network', 'rm', name]), `remove room network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`Room ${roomId} network cleanup incomplete: ${name}`)
     }
+    this.ipam.release(name)
   }
 
   private async removeAndroidControlNetwork(roomId: string): Promise<void> {
     const name = androidControlNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
-    if (!existing) return
+    if (!existing) {
+      this.ipam.release(name)
+      return
+    }
     assertRoomNetwork(existing, roomId, name)
     must(await runDocker(['network', 'rm', name]), `remove Android control network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`Room ${roomId} Android control network cleanup incomplete: ${name}`)
     }
+    this.ipam.release(name)
   }
 
   private async inspectNetwork(name: string): Promise<DockerNetworkInspect | null> {
@@ -7362,6 +7474,10 @@ interface DockerNetworkInspect {
   Driver?: string
   Labels?: Record<string, string> | null
   Containers?: Record<string, { Name?: string } | null> | null
+  IPAM?: {
+    Driver?: string
+    Config?: Array<{ Subnet?: string; Gateway?: string }> | null
+  } | null
 }
 
 interface DockerContainerInspect {
