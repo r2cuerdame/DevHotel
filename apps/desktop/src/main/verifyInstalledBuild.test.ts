@@ -1,7 +1,6 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createServer } from 'node:http'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -24,35 +23,68 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP, unpackedMain = false) {
+async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP, unpackedMain = false, foreignResources = false) {
   const root = mkdtempSync(join(tmpdir(), 'devhotel-installed-build-private-'))
   roots.push(root)
   const expectedFile = join(root, 'expected.json')
   const controlFile = join(root, 'control.json')
-  const appAsarFile = join(root, 'app.asar')
-  const mcpFile = join(root, 'mcp-index.js')
+  const installDir = join(root, 'install')
+  const resourcesDir = join(installDir, 'resources')
+  const suppliedResources = foreignResources ? join(root, 'other-install', 'resources') : resourcesDir
+  const appAsarFile = join(suppliedResources, 'app.asar')
+  const mcpFile = join(suppliedResources, 'mcp', 'index.js')
+  const executable = join(installDir, process.platform === 'win32' ? 'DevHotel.exe' : 'devhotel')
+  const serverFile = join(root, 'server.cjs')
+  mkdirSync(join(resourcesDir, 'mcp'), { recursive: true })
+  mkdirSync(join(suppliedResources, 'mcp'), { recursive: true })
+  try {
+    linkSync(process.execPath, executable)
+  } catch {
+    copyFileSync(process.execPath, executable)
+  }
+  chmodSync(executable, 0o755)
   writeFileSync(expectedFile, JSON.stringify({ ...BUILD, appAsarSha256: APP_ASAR_SHA256, mcpSha256: MCP_SHA256 }))
+  writeFileSync(join(resourcesDir, 'app.asar'), APP_ASAR)
+  writeFileSync(join(resourcesDir, 'mcp', 'index.js'), MCP)
   writeFileSync(appAsarFile, appAsar)
   writeFileSync(mcpFile, mcp)
   if (unpackedMain) {
-    const chunks = join(root, 'app.asar.unpacked', 'out', 'main', 'chunks')
+    const chunks = join(suppliedResources, 'app.asar.unpacked', 'out', 'main', 'chunks')
     mkdirSync(chunks, { recursive: true })
     writeFileSync(join(chunks, 'executable.js'), 'modified executable payload\n')
   }
 
   const token = 'sensitive-control-token'
-  const server = createServer((req, res) => {
-    if (req.headers.authorization !== `Bearer ${token}`) {
-      res.writeHead(401).end()
-      return
-    }
-    if (hang) return
-    res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify(req.url === '/v1/status' ? { ...liveBuild, update: { state: 'idle', targetVersion: null } } : liveBuild))
+  writeFileSync(serverFile, `
+const { createServer } = require('node:http')
+const build = JSON.parse(Buffer.from(process.argv[2], 'base64url').toString('utf8'))
+const hang = process.argv[3] === 'hang'
+const token = ${JSON.stringify(token)}
+const server = createServer((req, res) => {
+  if (req.headers.authorization !== \`Bearer \${token}\`) return res.writeHead(401).end()
+  if (hang) return
+  res.setHeader('content-type', 'application/json')
+  res.end(JSON.stringify(req.url === '/v1/status' ? { ...build, update: { state: 'idle', targetVersion: null } } : build))
+})
+server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port) + '\\n'))
+`)
+  const server = spawn(executable, [serverFile, Buffer.from(JSON.stringify(liveBuild)).toString('base64url'), hang ? 'hang' : 'reply'], {
+    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true
   })
-  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
-  const port = (server.address() as { port: number }).port
-  writeFileSync(controlFile, JSON.stringify({ ...BUILD, port, token, pid: process.pid }))
+  const port = await new Promise<number>((resolvePort, rejectPort) => {
+    let stdout = ''
+    const timer = setTimeout(() => rejectPort(new Error('test server startup timeout')), 10_000)
+    server.once('error', rejectPort)
+    server.stdout.on('data', (chunk) => {
+      stdout += String(chunk)
+      const value = Number(stdout.trim())
+      if (Number.isInteger(value) && value > 0) {
+        clearTimeout(timer)
+        resolvePort(value)
+      }
+    })
+  })
+  writeFileSync(controlFile, JSON.stringify({ ...BUILD, port, token, pid: server.pid }))
   try {
     return await execFileAsync(process.execPath, [
       resolve(import.meta.dirname, '../../scripts/verify-installed-build.mjs'),
@@ -63,7 +95,10 @@ async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp =
       '--timeout-ms', hang ? '100' : '10000'
     ])
   } finally {
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    if (server.exitCode === null) {
+      server.kill()
+      await new Promise<void>((resolveExit) => server.once('exit', () => resolveExit()))
+    }
   }
 }
 
@@ -109,6 +144,12 @@ describe('installed build verifier', () => {
   it('rejects an unpacked main-process executable payload', async () => {
     await expect(verify(BUILD, APP_ASAR, false, MCP, true)).rejects.toMatchObject({
       stderr: expect.stringContaining('unexpected unpacked main-process payload')
+    })
+  })
+
+  it('rejects matching resources from a different installation than the live process', async () => {
+    await expect(verify(BUILD, APP_ASAR, false, MCP, false, true)).rejects.toMatchObject({
+      stderr: expect.stringContaining('live process installation mismatch')
     })
   })
 

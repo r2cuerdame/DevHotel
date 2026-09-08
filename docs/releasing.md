@@ -66,7 +66,9 @@ passes. This is deliberate — see "Why not CI" below.
 After an explicitly approved installation, compare the expected release
 manifest with discovery and both live identity endpoints. The checker consumes
 the bearer token but prints only the public identity and exits non-zero on any
-mismatch:
+mismatch. It also resolves the discovery PID through the operating system and
+requires the supplied `app.asar` and MCP entry to belong to that live process's
+installation, so artifacts from a second installation cannot satisfy the check:
 
 ```
 pnpm --filter devhotel verify:installed-build -- \
