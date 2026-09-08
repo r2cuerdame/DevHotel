@@ -7,6 +7,20 @@ export interface BuildIdentityLiteral {
   sourceVerified: boolean
 }
 
+function sourceTreeClean(repoRoot: string): boolean {
+  const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+    cwd: repoRoot,
+    encoding: 'utf8'
+  }).trim()
+  if (!status) return true
+  // Vite briefly writes this config bundle before evaluating the config. It is
+  // tooling state, not a build input; the package hook separately requires the
+  // full unfiltered tree to be clean before and after the build.
+  return status.split(/\r?\n/).every((line) =>
+    /^\?\? apps\/desktop\/electron\.vite\.config\.\d+\.mjs$/.test(line)
+  )
+}
+
 export function resolveBuildIdentity(
   repoRoot: string,
   packageVersion: string,
@@ -18,10 +32,7 @@ export function resolveBuildIdentity(
     encoding: 'utf8'
   }).trim().toLowerCase()
   const commit = (env.DEVHOTEL_BUILD_COMMIT || gitCommit).trim().toLowerCase()
-  const sourceVerified = commit === gitCommit && execFileSync('git', ['status', '--porcelain'], {
-    cwd: repoRoot,
-    encoding: 'utf8'
-  }).trim() === ''
+  const sourceVerified = commit === gitCommit && sourceTreeClean(repoRoot)
   const buildTime = env.DEVHOTEL_BUILD_TIME || (env.SOURCE_DATE_EPOCH
     ? new Date(Number(env.SOURCE_DATE_EPOCH) * 1000).toISOString()
     : now().toISOString())

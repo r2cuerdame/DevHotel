@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -54,5 +54,14 @@ describe('desktop build identity source verification', () => {
       ...stableEnv,
       DEVHOTEL_BUILD_COMMIT: 'a'.repeat(40)
     }).sourceVerified).toBe(false)
+  })
+
+  it('ignores only Vite temporary config bundles', () => {
+    const { root } = repository()
+    mkdirSync(join(root, 'apps/desktop'), { recursive: true })
+    writeFileSync(join(root, 'apps/desktop/electron.vite.config.1234567890.mjs'), 'temporary config\n')
+    expect(resolveBuildIdentity(root, '0.5.2', stableEnv).sourceVerified).toBe(true)
+    writeFileSync(join(root, 'apps/desktop/other.mjs'), 'untracked source\n')
+    expect(resolveBuildIdentity(root, '0.5.2', stableEnv).sourceVerified).toBe(false)
   })
 })
