@@ -27,10 +27,13 @@ passes. This is deliberate — see "Why not CI" below.
 
    The desktop build embeds one identity and emits the same
    `out/main/build-identity.json`; packaging refuses any non-ignored tracked or
-   untracked source change or a manifest whose version/commit differs from
-   exact `HEAD`. After packaging, `build-identity.json` is emitted beside the
-   installer with the packaged `app.asar` SHA-256 and is also carried as
-   `resources/build-identity.json` for acceptance.
+   untracked source change, then deletes and rebuilds the ignored `out/` package
+   input from that clean source. It also refuses any identity not marked
+   `sourceVerified: true` or whose version/commit differs from exact `HEAD`.
+   Dirty development builds advertise `sourceVerified: false`. After packaging,
+   `build-identity.json` is emitted beside the
+   installer with SHA-256 digests for the packaged `app.asar` and MCP entry,
+   and is also carried as `resources/build-identity.json` for acceptance.
 
 6. **Rename to the hyphenated names** electron-builder writes into
    `latest.yml` (`DevHotel-Setup-X.Y.Z.exe`, `…exe.blockmap`), then confirm the

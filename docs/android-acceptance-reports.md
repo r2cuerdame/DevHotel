@@ -98,7 +98,10 @@ every pinned retained-log byte. A changed or missing object invalidates the
 read instead of returning a partial report.
 
 New reports also seal the exact DevHotel Host build identity (`version`, full
-Git `commit`, and `buildTime`) that performed acceptance. Legacy schema-1
+Git `commit`, `buildTime`, and `sourceVerified`) that performed acceptance.
+Dirty development builds are explicitly marked `sourceVerified: false` instead
+of being attributed to a clean commit. Schema 2 remains readable with its
+original three-field build identity; new reports use schema 3. Legacy schema-1
 receipts without this field remain byte-for-byte readable; they are not
 silently rewritten or credited with an identity they never recorded.
 

@@ -139,7 +139,8 @@ function buildIdentityFrom(input: BuildIdentity | string): BuildIdentity {
     ? {
         version: zSemanticVersion.safeParse(input).success ? input : '0.0.0-dev',
         commit: '0'.repeat(40),
-        buildTime: '1970-01-01T00:00:00.000Z'
+        buildTime: '1970-01-01T00:00:00.000Z',
+        sourceVerified: false
       }
     : input)
 }

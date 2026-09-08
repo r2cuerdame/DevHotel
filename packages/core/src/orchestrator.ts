@@ -1288,7 +1288,8 @@ export class RoomOrchestrator {
     this.appBuild = opts.appBuild ?? {
       version: /^\d+\.\d+\.\d+/.test(opts.appVersion) ? opts.appVersion : '0.0.0-dev',
       commit: '0'.repeat(40),
-      buildTime: '1970-01-01T00:00:00.000Z'
+      buildTime: '1970-01-01T00:00:00.000Z',
+      sourceVerified: false
     }
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
@@ -5776,7 +5777,7 @@ export class RoomOrchestrator {
           pids: [...finalProof.pids]
         }
         const report = sealAndroidAcceptanceReport({
-          schema: 2,
+          schema: 3,
           id: randomUUID(),
           roomId,
           stage: 'final-physical',
@@ -6464,7 +6465,7 @@ export class RoomOrchestrator {
       const createdAt = new Date().toISOString()
       const systemLocaleTag = artifactLocale(finalProof.evidence.context.status.locale)
       reportCandidate = sealAndroidAcceptanceReport({
-        schema: 2,
+        schema: 3,
         id: randomUUID(),
         roomId,
         stage: input.stage,

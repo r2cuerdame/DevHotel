@@ -12,23 +12,28 @@ const roots: string[] = []
 const BUILD = {
   version: '0.5.2',
   commit: 'b'.repeat(40),
-  buildTime: '2026-09-08T01:02:03.004Z'
+  buildTime: '2026-09-08T01:02:03.004Z',
+  sourceVerified: true
 }
 const APP_ASAR = Buffer.from('packaged-app-asar')
 const APP_ASAR_SHA256 = createHash('sha256').update(APP_ASAR).digest('hex')
+const MCP = Buffer.from('packaged-mcp-entry')
+const MCP_SHA256 = createHash('sha256').update(MCP).digest('hex')
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false) {
+async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP) {
   const root = mkdtempSync(join(tmpdir(), 'devhotel-installed-build-private-'))
   roots.push(root)
   const expectedFile = join(root, 'expected.json')
   const controlFile = join(root, 'control.json')
   const appAsarFile = join(root, 'app.asar')
-  writeFileSync(expectedFile, JSON.stringify({ ...BUILD, appAsarSha256: APP_ASAR_SHA256 }))
+  const mcpFile = join(root, 'mcp-index.js')
+  writeFileSync(expectedFile, JSON.stringify({ ...BUILD, appAsarSha256: APP_ASAR_SHA256, mcpSha256: MCP_SHA256 }))
   writeFileSync(appAsarFile, appAsar)
+  writeFileSync(mcpFile, mcp)
 
   const token = 'sensitive-control-token'
   const server = createServer((req, res) => {
@@ -49,6 +54,7 @@ async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false) {
       '--expected', expectedFile,
       '--control', controlFile,
       '--app-asar', appAsarFile,
+      '--mcp', mcpFile,
       '--timeout-ms', hang ? '100' : '10000'
     ])
   } finally {
@@ -81,6 +87,18 @@ describe('installed build verifier', () => {
     } catch (error) {
       expect(String((error as { stderr?: string }).stderr ?? '')).toContain('installed app.asar digest mismatch')
     }
+  })
+
+  it('rejects identity emitted from an unverifiable source tree', async () => {
+    await expect(verify({ ...BUILD, sourceVerified: false })).rejects.toMatchObject({
+      stderr: expect.stringContaining('invalid build identity')
+    })
+  })
+
+  it('rejects a patched installed MCP entry', async () => {
+    await expect(verify(BUILD, APP_ASAR, false, Buffer.from('patched-mcp-entry'))).rejects.toMatchObject({
+      stderr: expect.stringContaining('installed MCP digest mismatch')
+    })
   })
 
   it('bounds live identity requests', async () => {

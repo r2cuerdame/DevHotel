@@ -3,7 +3,7 @@ import { zAndroidApplicationId, zAndroidTargetSelector } from './androidAutomati
 import { zArtifactFilename, zArtifactId } from './artifacts'
 import { ANDROID_LOCALE_MATRIX_MAX_ENTRIES, canonicalAndroidLocaleTag } from './androidLocales'
 import { zRoomId } from './control'
-import { zBuildIdentity } from './buildIdentity'
+import { zBuildIdentity, zSemanticVersion } from './buildIdentity'
 
 export const ANDROID_ACCEPTANCE_REPORT_MAX_BYTES = 64 * 1024
 export const ANDROID_ACCEPTANCE_REPORT_MAX_PER_ROOM = 100
@@ -350,12 +350,24 @@ const zAndroidAcceptanceReportCommon = z
 const zAndroidAcceptanceReportLegacyBase = zAndroidAcceptanceReportCommon.extend({
   schema: z.literal(1)
 })
-const zAndroidAcceptanceReportCurrentBase = zAndroidAcceptanceReportCommon.extend({
+const zAndroidAcceptanceBuildIdentityV2 = z
+  .object({
+    version: zSemanticVersion,
+    commit: z.string().regex(/^[a-f0-9]{40}$/, 'full lowercase Git commit SHA'),
+    buildTime: z.string().datetime({ offset: true })
+  })
+  .strict()
+const zAndroidAcceptanceReportV2Base = zAndroidAcceptanceReportCommon.extend({
   schema: z.literal(2),
+  devhotelBuild: zAndroidAcceptanceBuildIdentityV2
+})
+const zAndroidAcceptanceReportCurrentBase = zAndroidAcceptanceReportCommon.extend({
+  schema: z.literal(3),
   devhotelBuild: zBuildIdentity
 })
 const zAndroidAcceptanceReportBase = z.discriminatedUnion('schema', [
   zAndroidAcceptanceReportLegacyBase,
+  zAndroidAcceptanceReportV2Base,
   zAndroidAcceptanceReportCurrentBase
 ])
 
@@ -529,6 +541,7 @@ export type AndroidAcceptanceReportUnsigned = z.infer<typeof zAndroidAcceptanceR
 
 export const zAndroidAcceptanceReport = z.discriminatedUnion('schema', [
   zAndroidAcceptanceReportLegacyBase.extend({ seal: zMacIdentityFor('report') }),
+  zAndroidAcceptanceReportV2Base.extend({ seal: zMacIdentityFor('report') }),
   zAndroidAcceptanceReportCurrentBase.extend({ seal: zMacIdentityFor('report') })
 ])
   .superRefine(refineAndroidAcceptanceReport)
@@ -541,7 +554,7 @@ export interface AndroidAcceptanceReportSummary {
   status: 'pass' | 'fail'
   applicationId: string
   createdAt: string
-  devhotelBuild: z.infer<typeof zBuildIdentity> | null
+  devhotelBuild: z.infer<typeof zAndroidAcceptanceBuildIdentityV2> | z.infer<typeof zBuildIdentity> | null
   targetKind: 'emulator' | 'physical'
   screenshotCount: number
   logCount: number

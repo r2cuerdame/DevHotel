@@ -9,7 +9,8 @@ export const zBuildIdentity = z
   .object({
     version: zSemanticVersion,
     commit: z.string().regex(/^[a-f0-9]{40}$/, 'full lowercase Git commit SHA'),
-    buildTime: z.string().datetime({ offset: true })
+    buildTime: z.string().datetime({ offset: true }),
+    sourceVerified: z.boolean()
   })
   .strict()
 

@@ -19,7 +19,12 @@ function sha256(file) {
 export default async function writePackagedBuildIdentity(context) {
   const identity = JSON.parse(readFileSync(resolve(desktopDir, 'out/main/build-identity.json'), 'utf8'))
   const appAsar = resolve(context.appOutDir, 'resources', 'app.asar')
-  const manifest = { ...identity, appAsarSha256: await sha256(appAsar) }
+  const mcp = resolve(context.appOutDir, 'resources', 'mcp', 'index.js')
+  const manifest = {
+    ...identity,
+    appAsarSha256: await sha256(appAsar),
+    mcpSha256: await sha256(mcp)
+  }
   const json = `${JSON.stringify(manifest, null, 2)}\n`
   writeFileSync(resolve(context.appOutDir, 'resources', 'build-identity.json'), json, 'utf8')
   writeFileSync(resolve(context.outDir, 'build-identity.json'), json, 'utf8')

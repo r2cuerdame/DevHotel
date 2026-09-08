@@ -17,7 +17,8 @@ const OPERATION_ID = '9d2a2c30-9c9a-4a2e-9b8b-0f6a2f1d5f01'
 const BUILD: BuildIdentity = {
   version: '0.5.2',
   commit: 'a'.repeat(40),
-  buildTime: '2026-09-08T12:34:56.789Z'
+  buildTime: '2026-09-08T12:34:56.789Z',
+  sourceVerified: true
 }
 
 function operation(overrides: Partial<OperationRecord> = {}): OperationRecord {

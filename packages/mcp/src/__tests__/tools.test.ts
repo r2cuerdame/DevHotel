@@ -13,7 +13,7 @@ import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
-const CONTROL_BUILD = { version: '0.4.1', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z' }
+const CONTROL_BUILD = { version: '0.4.1', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z', sourceVerified: true }
 const RUN_ID = '11111111-2222-3333-4444-555555555555'
 const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
 const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'

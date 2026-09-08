@@ -4,7 +4,7 @@ import { ControlClient } from '../client'
 import { makeTools } from '../tools'
 
 const TOKEN = 'device-token'
-const CONTROL_BUILD = { version: '0.5.2', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z' }
+const CONTROL_BUILD = { version: '0.5.2', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z', sourceVerified: true }
 let server: Server
 let port: number
 const seen: { method: string; url: string; body: any }[] = []

@@ -26,7 +26,8 @@ const APK_SHA256 = 'a'.repeat(64)
 const DEVHOTEL_BUILD = {
   version: '0.5.2',
   commit: 'd'.repeat(40),
-  buildTime: '2026-09-08T01:02:03.004Z'
+  buildTime: '2026-09-08T01:02:03.004Z',
+  sourceVerified: true
 }
 
 describe('Android acceptance orchestration', () => {
@@ -459,7 +460,7 @@ describe('Android acceptance orchestration', () => {
     }, 'agent')
 
     expect(result.report).toMatchObject({
-      schema: 2,
+      schema: 3,
       roomId: ROOM_ID,
       stage: 'development',
       status: 'pass',

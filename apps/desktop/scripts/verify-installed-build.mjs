@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import process from 'node:process'
 
 const SHA = /^[a-f0-9]{40}$/
@@ -12,11 +12,13 @@ function identity(value) {
   const result = {
     version: value?.version,
     commit: value?.commit,
-    buildTime: value?.buildTime
+    buildTime: value?.buildTime,
+    sourceVerified: value?.sourceVerified
   }
   if (
     !SEMVER.test(result.version) ||
     !SHA.test(result.commit) ||
+    result.sourceVerified !== true ||
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(result.buildTime) ||
     new Date(result.buildTime).toISOString() !== result.buildTime
   ) {
@@ -26,7 +28,7 @@ function identity(value) {
 }
 
 function same(left, right) {
-  return left.version === right.version && left.commit === right.commit && left.buildTime === right.buildTime
+  return left.version === right.version && left.commit === right.commit && left.buildTime === right.buildTime && left.sourceVerified === right.sourceVerified
 }
 
 function arg(name) {
@@ -48,8 +50,9 @@ async function main() {
   const expectedFile = arg('--expected')
   const appAsar = arg('--app-asar')
   if (!expectedFile || !appAsar) {
-    throw new Error('usage: verify-installed-build --expected <build-identity.json> --app-asar <installed app.asar> [--control <control.json>]')
+    throw new Error('usage: verify-installed-build --expected <build-identity.json> --app-asar <installed app.asar> [--mcp <installed mcp/index.js>] [--control <control.json>]')
   }
+  const mcpFile = arg('--mcp') || join(dirname(appAsar), 'mcp', 'index.js')
   const controlFile = arg('--control') || join(process.env.APPDATA || '', 'DevHotel', 'control.json')
   const timeoutMs = Number(arg('--timeout-ms') || '10000')
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) throw new Error('invalid timeout')
@@ -57,7 +60,9 @@ async function main() {
   const expectedRaw = JSON.parse(await readFile(expectedFile, 'utf8'))
   const expected = identity(expectedRaw)
   if (!/^[a-f0-9]{64}$/.test(expectedRaw.appAsarSha256)) throw new Error('invalid packaged artifact digest')
+  if (!/^[a-f0-9]{64}$/.test(expectedRaw.mcpSha256)) throw new Error('invalid packaged artifact digest')
   if (await sha256(appAsar) !== expectedRaw.appAsarSha256) throw new Error('installed app.asar digest mismatch')
+  if (await sha256(mcpFile) !== expectedRaw.mcpSha256) throw new Error('installed MCP digest mismatch')
   const discoveryRaw = JSON.parse(await readFile(controlFile, 'utf8'))
   const discovery = identity(discoveryRaw)
   if (!Number.isInteger(discoveryRaw.port) || discoveryRaw.port < 1 || typeof discoveryRaw.token !== 'string') {
@@ -84,7 +89,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|installed app\.asar digest mismatch|installed build identity mismatch)$/.test(error.message)
+  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|installed app\.asar digest mismatch|installed MCP digest mismatch|installed build identity mismatch)$/.test(error.message)
     ? error.message
     : 'verification failed'
   process.stderr.write(`verify-installed-build: ${message}\n`)
