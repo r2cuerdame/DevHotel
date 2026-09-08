@@ -4,6 +4,7 @@ directories:
   output: release
 beforePack: scripts/verify-package-source.mjs
 afterPack: scripts/write-packaged-build-identity.mjs
+afterAllArtifactBuild: scripts/finalize-packaged-build-identity.mjs
 files:
   - out/**
   - package.json

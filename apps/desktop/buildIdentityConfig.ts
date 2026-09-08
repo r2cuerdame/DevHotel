@@ -7,6 +7,10 @@ export interface BuildIdentityLiteral {
   sourceVerified: boolean
 }
 
+export function buildIdentityForViteCommand(identity: BuildIdentityLiteral, command: 'build' | 'serve'): BuildIdentityLiteral {
+  return command === 'serve' ? { ...identity, sourceVerified: false } : identity
+}
+
 function sourceTreeClean(repoRoot: string): boolean {
   const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
     cwd: repoRoot,

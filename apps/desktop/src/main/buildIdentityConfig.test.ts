@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { resolveBuildIdentity } from '../../buildIdentityConfig'
+import { buildIdentityForViteCommand, resolveBuildIdentity } from '../../buildIdentityConfig'
 
 const roots: string[] = []
 const stableEnv = { DEVHOTEL_BUILD_TIME: '2026-09-08T12:34:56.789Z' }
@@ -28,6 +28,17 @@ function repository(): { root: string; commit: string } {
 }
 
 describe('desktop build identity source verification', () => {
+  it('never marks a live development server as source verified', () => {
+    const identity = {
+      version: '0.5.2',
+      commit: 'a'.repeat(40),
+      buildTime: stableEnv.DEVHOTEL_BUILD_TIME,
+      sourceVerified: true
+    }
+    expect(buildIdentityForViteCommand(identity, 'serve').sourceVerified).toBe(false)
+    expect(buildIdentityForViteCommand(identity, 'build')).toBe(identity)
+  })
+
   it('verifies only the clean exact HEAD', () => {
     const { root, commit } = repository()
     expect(resolveBuildIdentity(root, '0.5.2', stableEnv)).toEqual({

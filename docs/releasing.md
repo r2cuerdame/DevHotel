@@ -30,9 +30,13 @@ passes. This is deliberate — see "Why not CI" below.
    untracked source change, then deletes and rebuilds the ignored `out/` package
    input from that clean source. It also refuses any identity not marked
    `sourceVerified: true` or whose version/commit differs from exact `HEAD`.
-   Dirty development builds advertise `sourceVerified: false`. After packaging,
-   `build-identity.json` is emitted beside the
-   installer with SHA-256 digests for the packaged `app.asar` and MCP entry.
+   Development-server builds always advertise `sourceVerified: false`, because
+   they can rebuild after the config is evaluated. After packaging,
+   `build-identity.json` is emitted beside the installer with SHA-256 digests
+   for the packaged `app.asar` and MCP entry. Once signing and all targets
+   finish, that detached release manifest also receives a sorted
+   `runtimePayloads` list covering the signed app executable and every shipped
+   runtime file (excluding licenses and the self-referential installed manifest).
    Main-process chunks stay inside `app.asar`; packaging and installed-artifact
    verification fail if an executable `app.asar.unpacked/out/main/chunks`
    payload appears. The manifest is also carried as
@@ -66,9 +70,11 @@ passes. This is deliberate — see "Why not CI" below.
 After an explicitly approved installation, compare the expected release
 manifest with discovery and both live identity endpoints. The checker consumes
 the bearer token but prints only the public identity and exits non-zero on any
-mismatch. It also resolves the discovery PID through the operating system and
+mismatch. It also resolves the discovery PID through the operating system,
 requires the supplied `app.asar` and MCP entry to belong to that live process's
-installation, so artifacts from a second installation cannot satisfy the check:
+installation, and matches the complete runtime payload file set and hashes.
+Artifacts from a second installation, a replaced executable, or an injected
+native payload therefore cannot satisfy the check:
 
 ```
 pnpm --filter devhotel verify:installed-build -- \

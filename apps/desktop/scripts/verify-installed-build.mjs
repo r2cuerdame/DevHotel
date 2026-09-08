@@ -5,6 +5,7 @@ import { createReadStream, existsSync } from 'node:fs'
 import { readFile, realpath } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
+import { hashRuntimePayloads, validateRuntimePayloads } from './runtime-payloads.mjs'
 
 const SHA = /^[a-f0-9]{40}$/
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
@@ -98,6 +99,7 @@ async function main() {
 
   const expectedRaw = JSON.parse(await readFile(expectedFile, 'utf8'))
   const expected = identity(expectedRaw)
+  const expectedRuntime = validateRuntimePayloads(expectedRaw.runtimePayloads)
   const discoveryRaw = JSON.parse(await readFile(controlFile, 'utf8'))
   const discovery = identity(discoveryRaw)
   if (!Number.isInteger(discoveryRaw.port) || discoveryRaw.port < 1 || typeof discoveryRaw.token !== 'string' ||
@@ -112,6 +114,10 @@ async function main() {
   if (!/^[a-f0-9]{64}$/.test(expectedRaw.mcpSha256)) throw new Error('invalid packaged artifact digest')
   if (await sha256(live.appAsar) !== expectedRaw.appAsarSha256) throw new Error('installed app.asar digest mismatch')
   if (await sha256(live.mcpFile) !== expectedRaw.mcpSha256) throw new Error('installed MCP digest mismatch')
+  const installedRuntime = await hashRuntimePayloads(dirname(live.executable))
+  if (JSON.stringify(installedRuntime) !== JSON.stringify(expectedRuntime)) {
+    throw new Error('installed runtime payload mismatch')
+  }
 
   const headers = { authorization: `Bearer ${discoveryRaw.token}` }
   const request = async (path) => {
@@ -136,7 +142,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|unexpected unpacked main-process payload|installed app\.asar digest mismatch|installed MCP digest mismatch|installed build identity mismatch|live process installation mismatch)$/.test(error.message)
+  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid runtime payload manifest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|unexpected unpacked main-process payload|installed app\.asar digest mismatch|installed MCP digest mismatch|installed runtime payload mismatch|installed build identity mismatch|live process installation mismatch)$/.test(error.message)
     ? error.message
     : 'verification failed'
   process.stderr.write(`verify-installed-build: ${message}\n`)

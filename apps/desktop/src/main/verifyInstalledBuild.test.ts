@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -18,12 +18,19 @@ const APP_ASAR = Buffer.from('packaged-app-asar')
 const APP_ASAR_SHA256 = createHash('sha256').update(APP_ASAR).digest('hex')
 const MCP = Buffer.from('packaged-mcp-entry')
 const MCP_SHA256 = createHash('sha256').update(MCP).digest('hex')
+const EXECUTABLE_NAME = process.platform === 'win32' ? 'DevHotel.exe' : 'devhotel'
+const EXECUTABLE_SHA256 = createHash('sha256').update(readFileSync(process.execPath)).digest('hex')
+const RUNTIME_PAYLOADS = [
+  { path: EXECUTABLE_NAME, sha256: EXECUTABLE_SHA256 },
+  { path: 'resources/app.asar', sha256: APP_ASAR_SHA256 },
+  { path: 'resources/mcp/index.js', sha256: MCP_SHA256 }
+]
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP, unpackedMain = false, foreignResources = false) {
+async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP, unpackedMain = false, foreignResources = false, extraRuntime = false, runtimePayloads = RUNTIME_PAYLOADS) {
   const root = mkdtempSync(join(tmpdir(), 'devhotel-installed-build-private-'))
   roots.push(root)
   const expectedFile = join(root, 'expected.json')
@@ -33,7 +40,7 @@ async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp =
   const suppliedResources = foreignResources ? join(root, 'other-install', 'resources') : resourcesDir
   const appAsarFile = join(suppliedResources, 'app.asar')
   const mcpFile = join(suppliedResources, 'mcp', 'index.js')
-  const executable = join(installDir, process.platform === 'win32' ? 'DevHotel.exe' : 'devhotel')
+  const executable = join(installDir, EXECUTABLE_NAME)
   const serverFile = join(root, 'server.cjs')
   mkdirSync(join(resourcesDir, 'mcp'), { recursive: true })
   mkdirSync(join(suppliedResources, 'mcp'), { recursive: true })
@@ -43,11 +50,17 @@ async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp =
     copyFileSync(process.execPath, executable)
   }
   chmodSync(executable, 0o755)
-  writeFileSync(expectedFile, JSON.stringify({ ...BUILD, appAsarSha256: APP_ASAR_SHA256, mcpSha256: MCP_SHA256 }))
+  writeFileSync(expectedFile, JSON.stringify({
+    ...BUILD,
+    appAsarSha256: APP_ASAR_SHA256,
+    mcpSha256: MCP_SHA256,
+    runtimePayloads
+  }))
   writeFileSync(join(resourcesDir, 'app.asar'), APP_ASAR)
   writeFileSync(join(resourcesDir, 'mcp', 'index.js'), MCP)
   writeFileSync(appAsarFile, appAsar)
   writeFileSync(mcpFile, mcp)
+  if (extraRuntime) writeFileSync(join(installDir, 'injected.dll'), 'unexpected native payload')
   if (unpackedMain) {
     const chunks = join(suppliedResources, 'app.asar.unpacked', 'out', 'main', 'chunks')
     mkdirSync(chunks, { recursive: true })
@@ -150,6 +163,19 @@ describe('installed build verifier', { timeout: 20_000 }, () => {
   it('rejects matching resources from a different installation than the live process', async () => {
     await expect(verify(BUILD, APP_ASAR, false, MCP, false, true)).rejects.toMatchObject({
       stderr: expect.stringContaining('live process installation mismatch')
+    })
+  })
+
+  it('rejects an unmanifested native runtime payload', async () => {
+    await expect(verify(BUILD, APP_ASAR, false, MCP, false, false, true)).rejects.toMatchObject({
+      stderr: expect.stringContaining('installed runtime payload mismatch')
+    })
+  })
+
+  it('rejects a live executable digest that does not match the release manifest', async () => {
+    const mismatched = RUNTIME_PAYLOADS.map((entry, index) => index === 0 ? { ...entry, sha256: '0'.repeat(64) } : entry)
+    await expect(verify(BUILD, APP_ASAR, false, MCP, false, false, false, mismatched)).rejects.toMatchObject({
+      stderr: expect.stringContaining('installed runtime payload mismatch')
     })
   })
 
