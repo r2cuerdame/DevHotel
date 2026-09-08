@@ -32,8 +32,11 @@ passes. This is deliberate — see "Why not CI" below.
    `sourceVerified: true` or whose version/commit differs from exact `HEAD`.
    Dirty development builds advertise `sourceVerified: false`. After packaging,
    `build-identity.json` is emitted beside the
-   installer with SHA-256 digests for the packaged `app.asar` and MCP entry,
-   and is also carried as `resources/build-identity.json` for acceptance.
+   installer with SHA-256 digests for the packaged `app.asar` and MCP entry.
+   Main-process chunks stay inside `app.asar`; packaging and installed-artifact
+   verification fail if an executable `app.asar.unpacked/out/main/chunks`
+   payload appears. The manifest is also carried as
+   `resources/build-identity.json` for acceptance.
 
 6. **Rename to the hyphenated names** electron-builder writes into
    `latest.yml` (`DevHotel-Setup-X.Y.Z.exe`, `…exe.blockmap`), then confirm the

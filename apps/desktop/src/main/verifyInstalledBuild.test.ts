@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -24,7 +24,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP) {
+async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp = MCP, unpackedMain = false) {
   const root = mkdtempSync(join(tmpdir(), 'devhotel-installed-build-private-'))
   roots.push(root)
   const expectedFile = join(root, 'expected.json')
@@ -34,6 +34,11 @@ async function verify(liveBuild = BUILD, appAsar = APP_ASAR, hang = false, mcp =
   writeFileSync(expectedFile, JSON.stringify({ ...BUILD, appAsarSha256: APP_ASAR_SHA256, mcpSha256: MCP_SHA256 }))
   writeFileSync(appAsarFile, appAsar)
   writeFileSync(mcpFile, mcp)
+  if (unpackedMain) {
+    const chunks = join(root, 'app.asar.unpacked', 'out', 'main', 'chunks')
+    mkdirSync(chunks, { recursive: true })
+    writeFileSync(join(chunks, 'executable.js'), 'modified executable payload\n')
+  }
 
   const token = 'sensitive-control-token'
   const server = createServer((req, res) => {
@@ -98,6 +103,12 @@ describe('installed build verifier', () => {
   it('rejects a patched installed MCP entry', async () => {
     await expect(verify(BUILD, APP_ASAR, false, Buffer.from('patched-mcp-entry'))).rejects.toMatchObject({
       stderr: expect.stringContaining('installed MCP digest mismatch')
+    })
+  })
+
+  it('rejects an unpacked main-process executable payload', async () => {
+    await expect(verify(BUILD, APP_ASAR, false, MCP, true)).rejects.toMatchObject({
+      stderr: expect.stringContaining('unexpected unpacked main-process payload')
     })
   })
 

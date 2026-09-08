@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -59,6 +59,9 @@ async function main() {
 
   const expectedRaw = JSON.parse(await readFile(expectedFile, 'utf8'))
   const expected = identity(expectedRaw)
+  if (existsSync(join(dirname(appAsar), 'app.asar.unpacked', 'out', 'main', 'chunks'))) {
+    throw new Error('unexpected unpacked main-process payload')
+  }
   if (!/^[a-f0-9]{64}$/.test(expectedRaw.appAsarSha256)) throw new Error('invalid packaged artifact digest')
   if (!/^[a-f0-9]{64}$/.test(expectedRaw.mcpSha256)) throw new Error('invalid packaged artifact digest')
   if (await sha256(appAsar) !== expectedRaw.appAsarSha256) throw new Error('installed app.asar digest mismatch')
@@ -89,7 +92,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|installed app\.asar digest mismatch|installed MCP digest mismatch|installed build identity mismatch)$/.test(error.message)
+  const message = error instanceof Error && /^(?:usage:.*|invalid build identity|invalid packaged artifact digest|invalid control discovery|invalid timeout|control API \/v1\/(?:ping|status) returned \d{3}|unexpected unpacked main-process payload|installed app\.asar digest mismatch|installed MCP digest mismatch|installed build identity mismatch)$/.test(error.message)
     ? error.message
     : 'verification failed'
   process.stderr.write(`verify-installed-build: ${message}\n`)

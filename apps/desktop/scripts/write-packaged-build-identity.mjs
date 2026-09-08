@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { createReadStream, readFileSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -19,6 +19,8 @@ function sha256(file) {
 export default async function writePackagedBuildIdentity(context) {
   const identity = JSON.parse(readFileSync(resolve(desktopDir, 'out/main/build-identity.json'), 'utf8'))
   const appAsar = resolve(context.appOutDir, 'resources', 'app.asar')
+  const unpackedMainChunks = resolve(context.appOutDir, 'resources', 'app.asar.unpacked', 'out', 'main', 'chunks')
+  if (existsSync(unpackedMainChunks)) throw new Error('Refusing an unpacked main-process executable payload')
   const mcp = resolve(context.appOutDir, 'resources', 'mcp', 'index.js')
   const manifest = {
     ...identity,

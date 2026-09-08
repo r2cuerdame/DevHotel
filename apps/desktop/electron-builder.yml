@@ -7,8 +7,6 @@ afterPack: scripts/write-packaged-build-identity.mjs
 files:
   - out/**
   - package.json
-asarUnpack:
-  - out/main/chunks/**
 extraResources:
   - from: ../../packages/mcp/dist/index.js
     to: mcp/index.js
