@@ -41,8 +41,12 @@ export async function reconcile(
   for (const network of await backend.listManagedNetworks()) {
     if (!network.roomId || !knownOciRooms.has(network.roomId)) {
       log(`reconcile: removing stray network ${network.name} (room ${network.roomId || 'unknown'})`)
-      await backend.removeManagedNetwork(network.name)
-      networksRemoved.push(network.name)
+      try {
+        await backend.removeManagedNetwork(network.name)
+        networksRemoved.push(network.name)
+      } catch (err) {
+        log(`reconcile: could not remove stray network ${network.name}: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
 

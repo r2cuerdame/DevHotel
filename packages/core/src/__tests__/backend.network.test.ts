@@ -146,7 +146,7 @@ describe('OciCliBackend Room networks', () => {
     const calls = mockedRunDocker.mock.calls.map(([args]) => args)
     const createNetworkAt = calls.findIndex((args) => args[0] === 'network' && args[1] === 'create')
     const runAnchorAt = calls.findIndex((args) => args[0] === 'run')
-    expect(calls[createNetworkAt]).toEqual(buildRoomNetworkCreateArgs('r1'))
+    expect(calls[createNetworkAt]).toEqual(buildRoomNetworkCreateArgs('r1', '10.214.0.0/24'))
     expect(calls[runAnchorAt]).toEqual(buildAnchorArgs({ roomId: 'r1', internalPort: 3000 }, VERIFIER))
     expect(createNetworkAt).toBeGreaterThanOrEqual(0)
     expect(runAnchorAt).toBeGreaterThan(createNetworkAt)

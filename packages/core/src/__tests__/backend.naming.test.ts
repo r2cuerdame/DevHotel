@@ -87,6 +87,26 @@ describe('buildRoomNetworkCreateArgs', () => {
     ])
   })
 
+  it('creates a labeled user-defined bridge with explicit managed subnet', () => {
+    expect(buildRoomNetworkCreateArgs('r1', '10.214.0.0/24')).toEqual([
+      'network',
+      'create',
+      '--driver',
+      'bridge',
+      '--opt',
+      'com.docker.network.bridge.enable_icc=false',
+      '--label',
+      'devhotel.room=r1',
+      '--label',
+      'devhotel.role=network',
+      '--label',
+      'devhotel.managed=1',
+      '--subnet',
+      '10.214.0.0/24',
+      'dh-r1-net',
+    ])
+  })
+
   it('creates a separately owned Android control bridge', () => {
     expect(buildAndroidControlNetworkCreateArgs('r1')).toEqual([
       'network',
@@ -101,6 +121,26 @@ describe('buildRoomNetworkCreateArgs', () => {
       'devhotel.role=network',
       '--label',
       'devhotel.managed=1',
+      'dh-r1-android-control-net'
+    ])
+  })
+
+  it('creates a separately owned Android control bridge with explicit managed subnet', () => {
+    expect(buildAndroidControlNetworkCreateArgs('r1', '10.214.1.0/24')).toEqual([
+      'network',
+      'create',
+      '--driver',
+      'bridge',
+      '--opt',
+      'com.docker.network.bridge.enable_icc=false',
+      '--label',
+      'devhotel.room=r1',
+      '--label',
+      'devhotel.role=network',
+      '--label',
+      'devhotel.managed=1',
+      '--subnet',
+      '10.214.1.0/24',
       'dh-r1-android-control-net'
     ])
   })

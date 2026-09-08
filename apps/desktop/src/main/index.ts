@@ -116,7 +116,8 @@ async function bootstrap(): Promise<void> {
     legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
     networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
     canAdoptLegacyVolume: (roomId) =>
-      ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml'))
+      ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
+    isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
   })
   const windowsVm = new WindowsVmBackend({
     userData,
