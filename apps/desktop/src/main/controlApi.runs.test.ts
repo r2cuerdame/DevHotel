@@ -43,7 +43,13 @@ describe('agent control API bounded command output', () => {
       expect(execInRoom).toHaveBeenCalledWith(
         'room1abc',
         ['sh', '-lc', 'adb logcat -d'],
-        { timeoutMs: 30_000, output: { maxBytes: 4096, mode: 'head', include: 'FATAL', ignoreCase: true } },
+        {
+          timeoutMs: 30_000,
+          output: { maxBytes: 4096, mode: 'head', include: 'FATAL', ignoreCase: true },
+          // The route also hands over the question "was this answer delivered?",
+          // which decides whether the full output is kept.
+          responseLost: expect.any(Function)
+        },
         'agent'
       )
     })
@@ -65,7 +71,7 @@ describe('agent control API bounded command output', () => {
       expect(execInRoom).toHaveBeenCalledWith(
         'room1abc',
         cmd,
-        { timeoutMs: undefined, output: undefined },
+        { timeoutMs: undefined, output: undefined, responseLost: expect.any(Function) },
         'agent'
       )
     })

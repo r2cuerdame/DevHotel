@@ -238,7 +238,12 @@ export interface RoomsRepo {
     expectedWorkspaceVolumeRevision: number
     expectedStateRevision: number
   }): boolean
-  delete(id: string): void
+  /**
+   * `keepOperationId` survives the cascade. Exactly one operation ever needs
+   * that: the tracked deletion doing the cascading, whose record is the only
+   * answer a caller who lost the response can still read.
+   */
+  delete(id: string, keepOperationId?: string): void
   nextRoomNumber(): number
 }
 
@@ -382,12 +387,17 @@ export function roomsRepo(db: Db): RoomsRepo {
       )
       return updated.changes === 1
     },
-    delete(id) {
+    delete(id, keepOperationId) {
       sqlite.exec('BEGIN IMMEDIATE')
       try {
         sqlite.prepare('DELETE FROM changes WHERE room_id = ?').run(id)
         sqlite.prepare('DELETE FROM checks WHERE room_id = ?').run(id)
-        sqlite.prepare('DELETE FROM operations WHERE room_id = ?').run(id)
+        // The deletion itself runs as a tracked operation, and its record is
+        // the only way a caller who lost the response learns that the Room is
+        // gone. Cascading that one row away would delete the receipt for the
+        // very mutation performing the cascade; every other operation of this
+        // Room still goes with it.
+        sqlite.prepare('DELETE FROM operations WHERE room_id = ? AND id IS NOT ?').run(id, keepOperationId ?? null)
         sqlite
           .prepare(
             `DELETE FROM settings

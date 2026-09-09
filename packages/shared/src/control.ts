@@ -15,7 +15,25 @@ export const zOperationId = z.string().uuid()
  * Bounded so a client's own timeout is always the shorter one — the caller
  * gets an answer (`status: 'running'`) rather than a dropped connection.
  */
-export const zOperationWaitMs = z.number().int().min(0).max(600_000)
+export const MAX_OPERATION_WAIT_MS = 600_000
+export const zOperationWaitMs = z.number().int().min(0).max(MAX_OPERATION_WAIT_MS)
+/**
+ * The two fields every long mutation accepts. `operationId` is the caller's
+ * idempotency key: repeating a request with the same ID joins or replays the
+ * one operation instead of mutating twice. `waitMs` only decides how long this
+ * call holds before answering with the operation record either way.
+ */
+export const zOperationRequestFields = {
+  operationId: zOperationId.optional(),
+  waitMs: zOperationWaitMs.optional()
+}
+/** Same two fields arriving as query text, for mutations that carry no body. */
+export const zOperationRequestQuery = z
+  .object({
+    operationId: zOperationId.optional(),
+    waitMs: z.coerce.number().int().min(0).max(MAX_OPERATION_WAIT_MS).optional()
+  })
+  .strict()
 export const zTermId = z.string().uuid()
 export const zNickname = z.string().trim().min(1).max(60)
 export const zLocalDomain = z.string().regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$/)
@@ -165,6 +183,8 @@ const zPublicCreateRoomInput = zCreateRoomInput
 
 /** Agent calls cannot create a host bind mount until a future explicit grant API exists. */
 export const zAgentCreateRoomInput = zPublicCreateRoomInput
+  .extend(zOperationRequestFields)
+  .strict()
   .refine((input) => input.sourceType !== 'linked-folder', {
     message: 'Agents cannot create linked-folder Rooms without a user-approved host-folder grant',
     path: ['sourceType']
@@ -175,11 +195,13 @@ export type AgentCreateRoomInput = z.infer<typeof zAgentCreateRoomInput>
 export const zAgentCloneBody = z.object({
   nickname: zNickname,
   copyDependencies: z.boolean(),
-  services: z.enum(['copy', 'empty', 'exclude'])
+  services: z.enum(['copy', 'empty', 'exclude']),
+  ...zOperationRequestFields
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 export const zSafeHostResyncBody = z.object({
-  confirmationToken: z.string().uuid().optional()
+  confirmationToken: z.string().uuid().optional(),
+  ...zOperationRequestFields
 }).strict()
 
 /** Phone controls the Android preview strip can drive on the emulator. */
@@ -277,11 +299,13 @@ export const zRoomOperationsLimit = z.number().int().min(1).max(200)
 export const zApplyChangeBody = z
   .object({
     change: zQuickChange,
-    operationId: zOperationId.optional(),
-    waitMs: zOperationWaitMs.optional()
+    ...zOperationRequestFields
   })
   .strict()
-export const zUndoChangeBody = z.object({ changeId: zChangeId }).strict()
+export const zUndoChangeBody = z.object({ changeId: zChangeId, ...zOperationRequestFields }).strict()
+
+/** Bodies whose only fields are the operation identity and the bounded wait. */
+export const zOperationOnlyBody = z.object(zOperationRequestFields).strict()
 /**
  * How much of a command's output the caller wants inline, and which part.
  * Limits mirror packages/core `runOutput.ts`; anything the response cannot
@@ -298,9 +322,11 @@ export const zOutputSelection = z
   })
   .strict()
 
+/** The longest command timeout the control API accepts, mirrored by clients. */
+export const MAX_EXEC_TIMEOUT_MS = 600_000
 export const zExecBody = z.object({
   cmd: z.array(z.string().max(16_384)).min(1).max(256),
-  timeoutMs: z.number().int().positive().max(600_000).optional(),
+  timeoutMs: z.number().int().positive().max(MAX_EXEC_TIMEOUT_MS).optional(),
   output: zOutputSelection.optional()
 }).strict()
 

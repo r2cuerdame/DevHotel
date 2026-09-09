@@ -508,16 +508,18 @@ describe('Room start as a trackable operation', () => {
     )).toThrow(/fenced while an interrupted artifact export/)
   })
 
-  it('does not advertise pollable semantics for untracked change kinds', async () => {
+  it('gives every other change kind the same pollable semantics', async () => {
     const { orch, room } = await setup()
+    const operationId = '11111111-2222-4333-8444-555555555555'
 
-    expect(() => orch.applyChange(
-      room.id,
-      { kind: 'node-version', version: '24' },
-      'agent',
-      '11111111-2222-4333-8444-555555555555',
-      0
-    )).toThrow(/supported only for android-run/)
+    const applied = await orch.applyChange(room.id, { kind: 'node-version', version: '24' }, 'agent', operationId)
+
+    // A dependency install or a runtime swap outlives a client deadline just
+    // as a wake does, so it carries the same durable ID and the same answer.
+    expect(applied).toMatchObject({ id: operationId, kind: 'node-version' })
+    const record = orch.getOperation(operationId)
+    expect(record).toMatchObject({ kind: 'room-change', status: 'succeeded' })
+    expect(record?.result).toMatchObject({ id: operationId, kind: 'node-version' })
   })
 
   it('reports an unfinished wake as running, never as failed, when the wait runs out', async () => {

@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
+  MAX_EXEC_TIMEOUT_MS,
+  MAX_OPERATION_WAIT_MS,
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   type AgentCreateRoomInput,
   type AbandonAndroidLocaleMatrixRecoveryInput,
@@ -142,6 +144,25 @@ export class DevHotelAmbiguousMutationError extends Error {
   }
 }
 
+/**
+ * The client stopped waiting. This is deliberately not a
+ * {@link DevHotelNotRunningError}: DevHotel answering slowly and DevHotel being
+ * gone need opposite responses, and only the second one means "nothing
+ * happened". A mutation interrupted here has an unknown outcome and is found
+ * again through its operation ID, not by running it a second time.
+ */
+export class DevHotelRequestTimeoutError extends Error {
+  constructor(readonly method: string, readonly path: string, readonly timeoutMs: number, options: { cause?: unknown } = {}) {
+    super(
+      `DevHotel did not answer ${method} ${path} within ${timeoutMs}ms, so this client stopped waiting. ` +
+        'The server may still be working: this is a client deadline, not a DevHotel failure. ' +
+        'Use check_operation with the operation ID, or list_room_operations, before deciding whether to retry.',
+      { cause: options.cause }
+    )
+    this.name = 'DevHotelRequestTimeoutError'
+  }
+}
+
 class DevHotelControlApiError extends Error {
   constructor(readonly status: number, detail: string, options: { cause?: unknown } = {}) {
     super(`DevHotel control API ${status}: ${detail}`, { cause: options.cause })
@@ -165,43 +186,69 @@ export async function loadControlInfo(file = defaultControlFile()): Promise<Cont
   }
 }
 
+/**
+ * The client's own deadline for one control call. The server may legitimately
+ * hold a call for the full operation wait, so this is that bound plus enough
+ * slack for the response itself — long enough never to cut short work the
+ * server contract allows, short enough that a dead connection is noticed.
+ */
+const CONTROL_CALL_TIMEOUT_MS = MAX_OPERATION_WAIT_MS + 60_000
+
 export class ControlClient {
   constructor(private readonly info: ControlInfo) {}
 
-  private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async req<T>(method: string, path: string, body?: unknown, timeoutMs = CONTROL_CALL_TIMEOUT_MS): Promise<T> {
     const url = `http://127.0.0.1:${this.info.port}${path}`
-    let res: Response
+    // One abort signal per call, covering the response body as well as the
+    // headers. Without it a stalled connection is indistinguishable from a
+    // server still doing the work, and the two need different answers.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const timedOut = (err: unknown): DevHotelRequestTimeoutError | null =>
+      controller.signal.aborted ? new DevHotelRequestTimeoutError(method, path, timeoutMs, { cause: err }) : null
     try {
-      res = await fetch(url, {
-        method,
-        headers: {
-          authorization: `Bearer ${this.info.token}`,
-          ...(body !== undefined ? { 'content-type': 'application/json' } : {})
-        },
-        body: body !== undefined ? JSON.stringify(body) : undefined
-      })
-    } catch (err) {
-      throw new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`, {
-        cause: err
-      })
-    }
-    if (!res.ok) {
-      let text: string
+      let res: Response
       try {
-        text = await res.text()
+        res = await fetch(url, {
+          method,
+          headers: {
+            authorization: `Bearer ${this.info.token}`,
+            ...(body !== undefined ? { 'content-type': 'application/json' } : {})
+          },
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          signal: controller.signal
+        })
       } catch (err) {
-        throw new DevHotelControlApiError(res.status, res.statusText || 'response body unavailable', { cause: err })
+        throw (
+          timedOut(err) ??
+          new DevHotelNotRunningError(`cannot reach control API on port ${this.info.port}: ${String(err)}`, {
+            cause: err
+          })
+        )
       }
-      throw new DevHotelControlApiError(res.status, text || res.statusText)
-    }
-    if (res.status === 204) return undefined as T
-    try {
-      return (await res.json()) as T
-    } catch (err) {
-      throw new DevHotelNotRunningError(
-        `control API response body ended before valid JSON was received on port ${this.info.port}: ${String(err)}`,
-        { cause: err, responseStarted: true }
-      )
+      if (!res.ok) {
+        let text: string
+        try {
+          text = await res.text()
+        } catch (err) {
+          throw timedOut(err) ?? new DevHotelControlApiError(res.status, res.statusText || 'response body unavailable', { cause: err })
+        }
+        throw new DevHotelControlApiError(res.status, text || res.statusText)
+      }
+      if (res.status === 204) return undefined as T
+      try {
+        return (await res.json()) as T
+      } catch (err) {
+        throw (
+          timedOut(err) ??
+          new DevHotelNotRunningError(
+            `control API response body ended before valid JSON was received on port ${this.info.port}: ${String(err)}`,
+            { cause: err, responseStarted: true }
+          )
+        )
+      }
+    } finally {
+      clearTimeout(timer)
     }
   }
 
@@ -305,11 +352,18 @@ export class ControlClient {
     return this.req<void>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/sleep`)
   }
   execInRoom(roomId: string, cmd: string[], timeoutMs?: number, output?: OutputSelection) {
-    return this.req<RoomExecResponse>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/exec`, {
-      cmd,
-      timeoutMs,
-      ...(output && Object.keys(output).length > 0 ? { output } : {})
-    })
+    return this.req<RoomExecResponse>(
+      'POST',
+      `/v1/rooms/${encodeURIComponent(roomId)}/exec`,
+      {
+        cmd,
+        timeoutMs,
+        ...(output && Object.keys(output).length > 0 ? { output } : {})
+      },
+      // The command owns the server-side deadline; this client only refuses to
+      // wait past it, so a long build is never cut short by the client instead.
+      (timeoutMs ?? MAX_EXEC_TIMEOUT_MS) + 60_000
+    )
   }
   listRuns(roomId: string) {
     return this.req<{ runs: unknown[] }>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/runs`)

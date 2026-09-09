@@ -6,10 +6,11 @@ import type {
   OperationStage,
   OperationStageKey
 } from '@devhotel/shared'
+import { MAX_OPERATION_WAIT_MS } from '@devhotel/shared'
 import type { OperationsRepo } from './store/operationsRepo'
 
 /** Longest server-side wait a caller may ask for on one call. */
-export const MAX_OPERATION_WAIT_MS = 600_000
+export { MAX_OPERATION_WAIT_MS }
 
 /**
  * What a running operation reports about itself. Stages are advisory progress,
@@ -29,6 +30,12 @@ export interface OperationReporter {
    * operation needs to be told the outcome explicitly.
    */
   fail(message: string, error?: unknown): void
+  /**
+   * Hand the operation the answer the original call would have returned. It is
+   * published with the terminal record, which is what lets a caller who never
+   * received the response read the outcome instead of repeating the mutation.
+   */
+  result(value: unknown): void
 }
 
 export interface OperationHandle {
@@ -111,11 +118,16 @@ export class OperationTracker {
     return this.store.listForRoom(roomId, limit)
   }
 
-  /** Forget any in-memory snapshots after the owning Room has been deleted. */
-  forgetRoom(roomId: string): void {
+  /**
+   * Forget any in-memory snapshots after the owning Room has been deleted.
+   * `exceptOperationId` keeps the operation performing the deletion live, so
+   * its own waiters still settle on its real terminal record rather than
+   * waking to a Room-shaped hole.
+   */
+  forgetRoom(roomId: string, exceptOperationId?: string): void {
     const forgotten = new Set<string>()
     for (const [id, live] of this.live) {
-      if (live.record.roomId !== roomId) continue
+      if (live.record.roomId !== roomId || id === exceptOperationId) continue
       forgotten.add(id)
       this.live.delete(id)
       for (const wake of [...live.waiters]) wake()
@@ -303,6 +315,13 @@ export class OperationTracker {
         closeOpen('skipped', detail)
         touch()
       },
+      result: (value) => {
+        if (reportedFailure !== undefined) return
+        // Held until finish() so the payload is published together with the
+        // terminal status: a poll must never read an answer from an operation
+        // that still says it is running.
+        record.result = value
+      },
       fail: (message, error) => {
         if (reportedFailure !== undefined) return
         // Keep the public snapshot coherent while the task performs any final
@@ -364,6 +383,9 @@ export class OperationTracker {
       }
       record.error = { stage: record.stage, message: failureMessage }
       record.status = 'failed'
+      // There is no answer to hand back for work that did not complete; the
+      // error is the outcome.
+      delete record.result
     } else {
       if (open?.status === 'running') {
         open.status = 'done'
