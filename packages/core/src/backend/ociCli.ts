@@ -2660,10 +2660,18 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  async webState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
+  async webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
     const result = await runDocker(['inspect', '--format', '{{.State.Status}}', webName(roomId)])
     if (result.code !== 0) return 'missing'
-    return result.stdout.trim() === 'running' ? 'running' : 'exited'
+    if (result.stdout.trim() !== 'running') return 'exited'
+    const topResult = await runDocker(['top', webName(roomId)])
+    if (topResult.code !== 0) return 'degraded'
+    const lines = topResult.stdout.trim().split(/\r?\n/).filter((l) => l.trim().length > 0)
+    if (lines.length <= 1) return 'degraded'
+    const processLines = lines.slice(1)
+    const allDefunct = processLines.every((line) => line.includes('<defunct>') || /\bZ\b/.test(line))
+    if (allDefunct) return 'degraded'
+    return 'running'
   }
 
   async listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]> {
@@ -4925,13 +4933,21 @@ export class OciCliBackend implements IsolationBackend {
     await this.removeRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
   }
 
-  async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
+  async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
     await this.assertPinnedEngineIdentity()
     const existing = await this.inspectContainer(emulatorName(roomId))
-    if (!existing) return 'missing'
+    if (!existing) {
+      const anchor = await this.inspectContainer(anchorName(roomId))
+      if (anchor && anchor.State?.Status === 'running') return 'degraded'
+      return 'missing'
+    }
     const owned = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator', existing)
     exactContainerId(owned, roomId)
-    if (owned.State?.Status !== 'running') return 'exited'
+    if (owned.State?.Status !== 'running') {
+      const anchor = await this.inspectContainer(anchorName(roomId))
+      if (anchor && anchor.State?.Status === 'running') return 'degraded'
+      return 'exited'
+    }
     await this.assertFencedEmulatorTopology(roomId)
     return 'running'
   }

@@ -187,4 +187,89 @@ describe('Room runtime status', () => {
     })
     expect(backend.execInRoom).not.toHaveBeenCalled()
   })
+
+  it('container-up but workload process dead reports degraded with exact component in a single read-only status pass without start/repair', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      workspaceMode: 'hotel',
+      syncStatus: 'synced',
+      workspaceFingerprint: 'baseline',
+      status: 'ready'
+    })
+    orch.rooms.create(room)
+    backend.webStateValue = 'degraded'
+
+    const inspection = await orch.inspectRoomRuntime(room.id)
+    const listed = await orch.listRoomsRuntime()
+    const hotel = await orch.hotelStatus()
+
+    expect(inspection.room.status).toBe('attention')
+    expect(inspection.runtimeStatus).toMatchObject({
+      state: 'degraded',
+      recordedStatus: 'ready',
+      main: 'degraded',
+      emulator: null
+    })
+    expect(inspection.runtimeStatus.detail).toContain('web workload is degraded')
+    expect(listed[0]).toMatchObject({
+      status: 'attention',
+      runtimeStatus: { state: 'degraded', recordedStatus: 'ready', main: 'degraded' }
+    })
+    expect(hotel.rooms[0]).toMatchObject({
+      status: 'attention',
+      runtimeStatus: { state: 'degraded', recordedStatus: 'ready', main: 'degraded' }
+    })
+    expect(backend.calls.some((call) => /start|create|recreate/i.test(call))).toBe(false)
+  })
+
+  it('reports partial emulator topology as degraded rather than collapsing to unknown', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      internalPort: 6080,
+      android: { device: 'Pixel 6', version: '11.0' },
+      status: 'ready'
+    })
+    orch.rooms.create(room)
+    backend.webStateValue = 'running'
+    backend.emulatorState = async () => {
+      throw new Error('Android execution topology participant disappeared: dh-test-anchor')
+    }
+
+    const inspection = await orch.inspectRoomRuntime(room.id)
+
+    expect(inspection.room.status).toBe('attention')
+    expect(inspection.runtimeStatus).toMatchObject({
+      state: 'degraded',
+      recordedStatus: 'ready',
+      main: 'running',
+      emulator: 'degraded'
+    })
+    expect(inspection.runtimeStatus.detail).toContain('partially available')
+  })
+
+  it('surfaces a stray runtime for a recorded-sleeping Room as degraded', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      workspaceMode: 'hotel',
+      syncStatus: 'synced',
+      status: 'sleeping',
+      hostPort: null
+    })
+    orch.rooms.create(room)
+    backend.webStateValue = 'running'
+
+    const inspection = await orch.inspectRoomRuntime(room.id)
+
+    expect(inspection.room.status).toBe('sleeping')
+    expect(inspection.runtimeStatus).toMatchObject({
+      state: 'degraded',
+      expected: 'stopped',
+      recordedStatus: 'sleeping',
+      main: 'running'
+    })
+    expect(inspection.runtimeStatus.detail).toContain('stray runtime')
+  })
 })

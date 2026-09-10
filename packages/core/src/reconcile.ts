@@ -20,7 +20,8 @@ export async function reconcile(
 ): Promise<ReconcileResult> {
   const knownOciRooms = new Set(rooms.list().filter((room) => room.provider !== 'windows').map((room) => room.id))
   const straysRemoved: string[] = []
-  for (const c of await backend.listManagedContainers()) {
+  const managedContainers = await backend.listManagedContainers()
+  for (const c of managedContainers) {
     // A one-shot process is owned by the client operation that started it.
     // At process startup no such operation is live, even when its Room still
     // exists, so every surviving job container is stale and must be reaped.
@@ -58,14 +59,27 @@ export async function reconcile(
     // Some startup recovery protocols retain an exact live runtime as durable
     // restoration authority. Stopping or sleeping it here would turn their
     // mutation gate into a permanent recovery deadlock.
-    if (room.status === 'sleeping') continue
-    if (
-      options.preserveAwakeRoomIds?.has(room.id) &&
-      (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
-    ) {
-      // A persistent Android mutation still needs this exact target. The
-      // durable gate rejects all ordinary Room work while recovery retries.
-      log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
+    if (options.preserveAwakeRoomIds?.has(room.id)) {
+      if (room.status === 'running' || room.status === 'ready' || room.status === 'attention') {
+        log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
+      } else {
+        log(`reconcile: preserving fenced Room ${room.id} for recovery`)
+      }
+      continue
+    }
+    if (room.status === 'sleeping') {
+      const hasStray = managedContainers.some(
+        (c) => c.roomId === room.id && !straysRemoved.includes(c.name) && (c.state === 'running' || c.state === 'restarting')
+      )
+      if (hasStray) {
+        log(`reconcile: room ${room.id} is sleeping but has stray runtimes — stopping proven owned resources`)
+        try {
+          await backend.stopRoomPod(room.id)
+        } catch (err) {
+          log(`reconcile: could not stop stray runtime for room ${room.id}: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        rooms.update(room.id, { hostPort: null })
+      }
       continue
     }
     if (room.status === 'preparing') {

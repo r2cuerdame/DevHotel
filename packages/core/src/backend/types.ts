@@ -255,7 +255,7 @@ export interface IsolationBackend {
     expected: RoomArtifactExpectation,
     stageToken: string
   ): Promise<RoomArtifactRecoveryOutcome>
-  webState(roomId: string): Promise<'running' | 'exited' | 'missing'>
+  webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
   listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]>
   /** Remove a container after re-validating exact DevHotel ownership metadata. */
   removeManagedContainer(name: string): Promise<void>
@@ -368,5 +368,5 @@ export interface IsolationBackend {
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
   captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>
   removeEmulator(roomId: string): Promise<void>
-  emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'>
+  emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
 }
