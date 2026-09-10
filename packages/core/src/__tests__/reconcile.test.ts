@@ -107,6 +107,105 @@ describe('reconcile interrupted preparation', () => {
     expect(result.roomsSlept).toEqual([])
     expect(backend.calls).toEqual([])
   })
+
+  it('reclaims partially created containers and bridge networks of interrupted preparing rooms', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'prep01', status: 'preparing', hostPort: 41001 }))
+    const backend = new FakeBackend()
+    backend.managedContainers = [
+      { roomId: 'prep01', role: 'anchor', state: 'running', name: 'dh-prep01-anchor' },
+      { roomId: 'prep01', role: 'web', state: 'running', name: 'dh-prep01-web' }
+    ]
+    backend.managedNetworks = [
+      { roomId: 'prep01', name: 'dh-prep01-net' }
+    ]
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(rooms.get('prep01')?.status).toBe('broken')
+    expect(result.straysRemoved).toEqual(['dh-prep01-anchor', 'dh-prep01-web'])
+    expect(result.networksRemoved).toEqual(['dh-prep01-net'])
+    expect(backend.calls).toContain('removeManagedContainer:dh-prep01-anchor')
+    expect(backend.calls).toContain('removeManagedContainer:dh-prep01-web')
+    expect(backend.calls).toContain('removeManagedNetwork:dh-prep01-net')
+    expect(backend.calls).not.toContain('adoptManagedNetwork:dh-prep01-net')
+    db.close()
+  })
+
+  it('reclaims orphaned bridge networks of broken rooms instead of adopting them', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'broken01', status: 'broken', hostPort: null }))
+    const backend = new FakeBackend()
+    backend.managedNetworks = [
+      { roomId: 'broken01', name: 'dh-broken01-net' }
+    ]
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(result.networksRemoved).toEqual(['dh-broken01-net'])
+    expect(backend.calls).toContain('removeManagedNetwork:dh-broken01-net')
+    expect(backend.calls).not.toContain('adoptManagedNetwork:dh-broken01-net')
+    db.close()
+  })
+})
+
+describe('reconcile deleting rooms', () => {
+  const dirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('completes teardown and purges SQLite row for rooms in deleting status', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'deleting01', status: 'deleting' }))
+    const backend = new FakeBackend()
+    backend.managedContainers = [
+      { roomId: 'deleting01', role: 'anchor', state: 'exited', name: 'dh-deleting01-anchor' }
+    ]
+    backend.managedNetworks = [
+      { roomId: 'deleting01', name: 'dh-deleting01-net' }
+    ]
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line), { userData: dir })
+
+    expect(rooms.get('deleting01')).toBeNull()
+    expect(backend.calls).toContain('deleteRoomPod:deleting01')
+    expect(result.roomsDeleted).toEqual(['deleting01'])
+    expect(logs.some((line) => line.includes('resuming deletion of room deleting01'))).toBe(true)
+    db.close()
+  })
+
+  it('is idempotent under repeated restart injection when resources were already removed', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'deleting02', status: 'deleting' }))
+    const backend = new FakeBackend()
+
+    // First restart resumes and deletes
+    const result1 = await reconcile(backend, rooms, () => undefined, { userData: dir })
+    expect(rooms.get('deleting02')).toBeNull()
+    expect(result1.roomsDeleted).toEqual(['deleting02'])
+
+    // Second restart sees clean state
+    const result2 = await reconcile(backend, rooms, () => undefined, { userData: dir })
+    expect(result2.roomsDeleted).toBeUndefined()
+    db.close()
+  })
 })
 
 describe('reconcile stale one-shot jobs', () => {
