@@ -383,6 +383,9 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`removeManagedNetwork:${name}`)
     this.managedNetworks = this.managedNetworks.filter((network) => network.name !== name)
   }
+  async adoptManagedNetwork(name: string) {
+    this.calls.push(`adoptManagedNetwork:${name}`)
+  }
   async cloneIntoVolume() {}
   async importHostFolder(_roomId: string, hostPath: string, revision: number) {
     this.calls.push(`importHostFolder:${hostPath}:r${revision}`)
