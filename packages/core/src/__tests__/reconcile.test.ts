@@ -136,7 +136,7 @@ describe('reconcile interrupted preparation', () => {
     db.close()
   })
 
-  it('reclaims orphaned bridge networks of broken rooms instead of adopting them', async () => {
+  it('adopts surviving bridge networks of broken rooms instead of removing them', async () => {
     const dir = tempDir()
     dirs.push(dir)
     const db = openDb(dir)
@@ -150,9 +150,9 @@ describe('reconcile interrupted preparation', () => {
 
     const result = await reconcile(backend, rooms, (line) => logs.push(line))
 
-    expect(result.networksRemoved).toEqual(['dh-broken01-net'])
-    expect(backend.calls).toContain('removeManagedNetwork:dh-broken01-net')
-    expect(backend.calls).not.toContain('adoptManagedNetwork:dh-broken01-net')
+    expect(result.networksRemoved).toEqual([])
+    expect(backend.calls).toContain('adoptManagedNetwork:dh-broken01-net')
+    expect(backend.calls).not.toContain('removeManagedNetwork:dh-broken01-net')
     db.close()
   })
 })
@@ -162,6 +162,50 @@ describe('reconcile deleting rooms', () => {
 
   afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('never sends Windows VM rooms through OCI deleting reconciliation', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    const windows = makeRoom({
+      id: 'windows1',
+      provider: 'windows',
+      status: 'deleting',
+      runtime: { kind: 'windows', version: '11' },
+      packageManager: { kind: 'none' },
+      windows: { backend: 'vmware', templateId: 'c'.repeat(64), snapshot: 'clean' }
+    })
+    rooms.create(windows)
+    const backend = new FakeBackend()
+
+    const result = await reconcile(backend, rooms, () => undefined, { userData: dir })
+
+    expect(backend.calls).toEqual([])
+    expect(rooms.get('windows1')?.status).toBe('deleting')
+    expect(result.roomsDeleted).toBeUndefined()
+    db.close()
+  })
+
+  it('preserves room record in deleting status when deleteRoomPod fails during reconciliation', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'deleting-fail', status: 'deleting' }))
+    const backend = new FakeBackend()
+    backend.deleteRoomPod = async () => {
+      throw new Error('volume is in use')
+    }
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line), { userData: dir })
+
+    expect(rooms.get('deleting-fail')?.status).toBe('deleting')
+    expect(result.roomsDeleted).toBeUndefined()
+    expect(logs.some((line) => line.includes('could not finish deleting room pod deleting-fail: volume is in use'))).toBe(true)
+    db.close()
   })
 
   it('completes teardown and purges SQLite row for rooms in deleting status', async () => {

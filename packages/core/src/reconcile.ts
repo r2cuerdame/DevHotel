@@ -27,12 +27,13 @@ export async function reconcile(
   options: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
   const roomsDeleted: string[] = []
-  for (const room of rooms.list().filter((r) => r.status === 'deleting')) {
+  for (const room of rooms.list().filter((r) => r.provider !== 'windows' && r.status === 'deleting')) {
     log(`reconcile: resuming deletion of room ${room.id}`)
     try {
       await backend.deleteRoomPod(room.id, { volumes: true })
     } catch (err) {
       log(`reconcile: could not finish deleting room pod ${room.id}: ${err instanceof Error ? err.message : String(err)}`)
+      continue
     }
     if (options.userData) {
       rmSync(join(options.userData, 'rooms', room.id), { recursive: true, force: true })
@@ -43,9 +44,6 @@ export async function reconcile(
 
   const preparingRoomIds = new Set(
     rooms.list().filter((r) => r.provider !== 'windows' && r.status === 'preparing').map((r) => r.id)
-  )
-  const brokenRoomIds = new Set(
-    rooms.list().filter((r) => r.provider !== 'windows' && r.status === 'broken').map((r) => r.id)
   )
   const knownOciRooms = new Set(
     rooms.list().filter((room) => room.provider !== 'windows' && room.status !== 'deleting').map((room) => room.id)
@@ -74,8 +72,7 @@ export async function reconcile(
   const networksRemoved: string[] = []
   for (const network of await backend.listManagedNetworks()) {
     const isPreparing = network.roomId ? preparingRoomIds.has(network.roomId) : false
-    const isBroken = network.roomId ? brokenRoomIds.has(network.roomId) : false
-    if (!network.roomId || !knownOciRooms.has(network.roomId) || isPreparing || isBroken) {
+    if (!network.roomId || !knownOciRooms.has(network.roomId) || isPreparing) {
       log(`reconcile: removing stray network ${network.name} (room ${network.roomId || 'unknown'})`)
       try {
         await backend.removeManagedNetwork(network.name)
@@ -100,7 +97,7 @@ export async function reconcile(
     // Some startup recovery protocols retain an exact live runtime as durable
     // restoration authority. Stopping or sleeping it here would turn their
     // mutation gate into a permanent recovery deadlock.
-    if (room.status === 'sleeping') continue
+    if (room.status === 'sleeping' || room.status === 'deleting') continue
     if (
       options.preserveAwakeRoomIds?.has(room.id) &&
       (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
