@@ -112,7 +112,7 @@ export async function verifyWebUp(ctx: ChangeCtx, opts?: { timeoutMs?: number })
     for (let i = 0; i < 5; i++) {
       const state = await ctx.backend.webState(room.id)
       if (state === 'running') return { ok: true, detail: 'build container running' }
-      if (state === 'missing') return { ok: false, detail: 'build container missing' }
+      if (state === 'missing' || state === 'degraded') return { ok: false, detail: state === 'missing' ? 'build container missing' : 'build container degraded' }
       await sleep(1000)
     }
     return { ok: false, detail: 'build container exited' }

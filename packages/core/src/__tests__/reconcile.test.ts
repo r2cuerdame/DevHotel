@@ -112,15 +112,15 @@ describe('reconcile interrupted preparation', () => {
 describe('reconcile stale one-shot jobs', () => {
   it('removes every startup job for a known Room while preserving canonical persistent containers', async () => {
     const room = makeRoom({ id: 'knownroom', status: 'sleeping' })
-    const rooms = { list: () => [room] } as ReturnType<typeof roomsRepo>
+    const rooms = { list: () => [room], update: () => undefined } as unknown as ReturnType<typeof roomsRepo>
     const backend = new FakeBackend()
     const runningJob = jobName(room.id, '11111111-2222-4333-8444-555555555555')
     const exitedJob = jobName(room.id, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
     const interruptedEmulator = `dh-${room.id}-svc-emulator`
     backend.managedContainers = [
-      { roomId: room.id, role: 'anchor', state: 'running', name: `dh-${room.id}-anchor` },
-      { roomId: room.id, role: 'web', state: 'running', name: `dh-${room.id}-web` },
-      { roomId: room.id, role: 'svc-postgres', state: 'running', name: `dh-${room.id}-svc-postgres` },
+      { roomId: room.id, role: 'anchor', state: 'exited', name: `dh-${room.id}-anchor` },
+      { roomId: room.id, role: 'web', state: 'exited', name: `dh-${room.id}-web` },
+      { roomId: room.id, role: 'svc-postgres', state: 'exited', name: `dh-${room.id}-svc-postgres` },
       { roomId: room.id, role: 'job', state: 'running', name: runningJob },
       { roomId: room.id, role: 'job', state: 'exited', name: exitedJob },
       { roomId: room.id, role: 'svc-emulator', state: 'created', name: interruptedEmulator }
@@ -138,5 +138,95 @@ describe('reconcile stale one-shot jobs', () => {
     ])
     expect(logs.slice(0, 2).every((line) => line.includes('stale job container'))).toBe(true)
     expect(logs[2]).toContain('interrupted emulator create')
+  })
+})
+
+describe('reconcile sleeping room stray runtimes', () => {
+  const dirs: string[] = []
+  const dbs: ReturnType<typeof openDb>[] = []
+
+  afterEach(() => {
+    for (const db of dbs.splice(0)) db.close()
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('detects and stops proven owned non-fenced stray containers for a sleeping room while preserving explicit recovery fences', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    dbs.push(db)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'sleepstray', domain: 'sleepstray.localhost', status: 'sleeping', hostPort: null }))
+    rooms.create(makeRoom({ id: 'sleepfenced', domain: 'sleepfenced.localhost', provider: 'android', status: 'sleeping', hostPort: null }))
+    rooms.create(makeRoom({ id: 'sleepclean', domain: 'sleepclean.localhost', status: 'sleeping', hostPort: null }))
+
+    const backend = new FakeBackend()
+    backend.managedContainers = [
+      { roomId: 'sleepstray', role: 'web', state: 'running', name: 'dh-sleepstray-web' },
+      { roomId: 'sleepfenced', role: 'svc-emulator', state: 'running', name: 'dh-sleepfenced-svc-emulator' }
+    ]
+    const logs: string[] = []
+
+    const result = await reconcile(
+      backend,
+      rooms,
+      (line) => logs.push(line),
+      { preserveAwakeRoomIds: new Set(['sleepfenced']) }
+    )
+
+    expect(result.roomsSlept).toEqual([])
+    expect(result.straysRemoved).toEqual([])
+    expect(backend.calls).toContain('stopRoomPod:sleepstray')
+    expect(backend.calls).not.toContain('stopRoomPod:sleepfenced')
+    expect(backend.calls).not.toContain('stopRoomPod:sleepclean')
+    expect(rooms.get('sleepstray')?.status).toBe('sleeping')
+    expect(rooms.get('sleepfenced')?.status).toBe('sleeping')
+    expect(rooms.get('sleepclean')?.status).toBe('sleeping')
+    expect(logs.some((l) => l.includes('sleepstray') && l.includes('stray runtime'))).toBe(true)
+    expect(logs.some((l) => l.includes('sleepfenced') && l.includes('fenced'))).toBe(true)
+  })
+
+  it('marks an interrupted preparing room as broken even when included in preserveAwakeRoomIds', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    dbs.push(db)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'prepfenced', domain: 'prepfenced.localhost', status: 'preparing', hostPort: 41005 }))
+    const backend = new FakeBackend()
+    const logs: string[] = []
+
+    const result = await reconcile(
+      backend,
+      rooms,
+      (line) => logs.push(line),
+      { preserveAwakeRoomIds: new Set(['prepfenced']) }
+    )
+
+    expect(rooms.get('prepfenced')?.status).toBe('broken')
+    expect(rooms.get('prepfenced')?.hostPort).toBeNull()
+    expect(result.roomsSlept).toEqual([])
+    expect(backend.calls).toContain('stopRoomPod:prepfenced')
+    expect(logs.some((line) => line.includes('interrupted while preparing'))).toBe(true)
+  })
+
+  it('detects and stops paused stray containers for sleeping rooms', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    dbs.push(db)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'sleeppaused', domain: 'sleeppaused.localhost', status: 'sleeping', hostPort: null }))
+    const backend = new FakeBackend()
+    backend.managedContainers = [
+      { roomId: 'sleeppaused', role: 'web', state: 'paused', name: 'dh-sleeppaused-web' }
+    ]
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(backend.calls).toContain('stopRoomPod:sleeppaused')
+    expect(result.roomsSlept).toEqual([])
+    expect(logs.some((l) => l.includes('sleeppaused') && l.includes('stray runtime'))).toBe(true)
   })
 })

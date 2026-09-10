@@ -201,7 +201,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
       : {
           step: 'process',
           status: 'broken',
-          summary: state === 'exited' ? 'web process exited' : 'web container missing',
+          summary: state === 'exited' ? 'web process exited' : state === 'degraded' ? 'web workload degraded' : 'web container missing',
           fix: { kind: 'restart-web' }
         }
   )

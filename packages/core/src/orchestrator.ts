@@ -1390,7 +1390,7 @@ export class RoomOrchestrator {
       )
     }
     await this.reconcileWindowsRooms()
-    await this.markInterruptedChanges()
+    await this.markInterruptedChanges(new Set(reconciled?.roomsSlept ?? []))
     return { backendOk: health.ok, reconciled }
   }
 
@@ -2144,10 +2144,11 @@ export class RoomOrchestrator {
     }
   }
 
-  private async markInterruptedChanges(): Promise<void> {
+  private async markInterruptedChanges(roomsSlept: Set<string> = new Set()): Promise<void> {
     for (const room of this.rooms.list()) {
       const pending = this.changes.list(room.id).filter((entry) => entry.status === 'pending')
       if (pending.length === 0) continue
+      let hasUncleanRetry = false
       for (const entry of pending) {
         if (entry.kind === 'android-build' || entry.kind === 'android-run') {
           try {
@@ -2171,6 +2172,7 @@ export class RoomOrchestrator {
           if (artifactCleanupError) cleanupFailures.push(artifactCleanupError)
           if (entry.kind === 'android-run') this.androidInstalls.removeForChange(room.id, entry.id)
           if (cleanupFailures.length > 0) {
+            hasUncleanRetry = true
             const detail = `interrupted Android snapshot cleanup will retry on next startup: ${cleanupFailures.join('; ')}`
             this.changes.setStatus(entry.id, 'pending', { verify: { ok: false, detail } })
             this.olog(room.id, detail)
@@ -2192,7 +2194,12 @@ export class RoomOrchestrator {
         this.olog(room.id, detail)
       }
       const current = this.rooms.get(room.id)
-      if (current && current.status !== 'broken') this.rooms.update(room.id, { status: 'attention' })
+      if (current && current.status !== 'broken') {
+        const wasAwake = roomsSlept.has(room.id) || current.status !== 'sleeping'
+        if (wasAwake || hasUncleanRetry) {
+          this.rooms.update(room.id, { status: 'attention' })
+        }
+      }
     }
   }
 
@@ -2970,15 +2977,74 @@ export class RoomOrchestrator {
   private async observeRuntimeStatus(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
     const observedAt = new Date().toISOString()
     const expected = this.runtimeExpectation(room)
-    if (expected !== 'running') {
+    if (expected === 'stopped') {
+      let available = backendAvailable
+      if (available === undefined) {
+        try {
+          available = (await this.backend.health()).ok
+        } catch {
+          available = false
+        }
+      }
+      if (room.status === 'sleeping' && available && room.provider !== 'windows') {
+        const [main, emulator] = await Promise.all([
+          this.backend.webState(room.id).catch(() => 'unknown' as const),
+          room.provider === 'android'
+            ? this.backend.emulatorState(room.id).catch(async () => {
+                try {
+                  const h = await this.backend.health()
+                  if (h.ok) return 'degraded' as const
+                } catch {
+                  // backend unreachable
+                }
+                return 'unknown' as const
+              })
+            : Promise.resolve(null)
+        ])
+        const hasStray = main === 'running' || main === 'degraded' || emulator === 'running' || emulator === 'degraded'
+        if (hasStray) {
+          return {
+            state: 'degraded',
+            expected,
+            recordedStatus: room.status,
+            main,
+            emulator,
+            observedAt,
+            detail: `The recorded Room is ${room.status}, but a stray runtime is running (main: ${main}${emulator ? `; emulator: ${emulator}` : ''}).`,
+            recoveryHint: this.runtimeRecoveryHint(room)
+          }
+        }
+        return {
+          state: 'stopped',
+          expected,
+          recordedStatus: room.status,
+          main,
+          emulator,
+          observedAt,
+          detail: 'The recorded Room state does not expect a running runtime.',
+          recoveryHint: null
+        }
+      }
       return {
-        state: expected === 'stopped' ? 'stopped' : 'unknown',
+        state: 'stopped',
         expected,
         recordedStatus: room.status,
         main: 'not-checked',
         emulator: null,
         observedAt,
-        detail: expected === 'stopped' ? 'The recorded Room state does not expect a running runtime.' : 'The Room is transitioning.',
+        detail: 'The recorded Room state does not expect a running runtime.',
+        recoveryHint: null
+      }
+    }
+    if (expected !== 'running') {
+      return {
+        state: 'unknown',
+        expected,
+        recordedStatus: room.status,
+        main: 'not-checked',
+        emulator: null,
+        observedAt,
+        detail: 'The Room is transitioning.',
         recoveryHint: null
       }
     }
@@ -3047,27 +3113,49 @@ export class RoomOrchestrator {
     const [main, emulator] = await Promise.all([
       this.backend.webState(room.id).catch(() => 'unknown' as const),
       room.provider === 'android'
-        ? this.backend.emulatorState(room.id).catch(() => 'unknown' as const)
+        ? this.backend.emulatorState(room.id).catch(async () => {
+            try {
+              const h = await this.backend.health()
+              if (h.ok) return 'degraded' as const
+            } catch {
+              // backend unreachable
+            }
+            return 'unknown' as const
+          })
         : Promise.resolve(null)
     ])
     if (room.provider !== 'android') {
       const running = main === 'running'
+      const degraded = main === 'degraded'
       return {
-        state: running ? 'running' : main === 'unknown' ? 'unknown' : 'dead',
+        state: running ? 'running' : degraded ? 'degraded' : main === 'unknown' ? 'unknown' : 'dead',
         expected,
         recordedStatus: room.status,
         main,
         emulator: null,
         observedAt,
-        detail: running ? 'The Room runtime is running.' : main === 'unknown' ? 'Runtime liveness could not be determined.' : `The recorded Room is ${room.status}, but its runtime is ${main}.`,
+        detail: running
+          ? 'The Room runtime is running.'
+          : degraded
+            ? `The recorded Room is ${room.status}, but its web workload is degraded (main: ${main}).`
+            : main === 'unknown'
+              ? 'Runtime liveness could not be determined.'
+              : `The recorded Room is ${room.status}, but its runtime is ${main}.`,
         recoveryHint: running ? null : this.runtimeRecoveryHint(room)
       }
     }
 
     const bothRunning = main === 'running' && emulator === 'running'
     const eitherRunning = main === 'running' || emulator === 'running'
+    const eitherDegraded = main === 'degraded' || emulator === 'degraded'
     const eitherUnknown = main === 'unknown' || emulator === 'unknown'
-    const state = bothRunning ? 'running' : eitherRunning ? 'degraded' : eitherUnknown ? 'unknown' : 'dead'
+    const state = bothRunning
+      ? 'running'
+      : (eitherRunning || eitherDegraded)
+        ? 'degraded'
+        : eitherUnknown
+          ? 'unknown'
+          : 'dead'
 
     const pendingLocale = this.settings.get(pendingAndroidLocaleRestoreKey(room.id))
     if (pendingLocale !== null) {
@@ -7454,16 +7542,16 @@ export class RoomOrchestrator {
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
     gateway: ReturnType<Gateway['status']>
-    rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
+    rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
     devices: DeviceBrokerStatus
   }> {
     const backend = await this.backend.health()
-    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
+    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
       const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
-        ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
+        ? runtimeStatus.emulator as 'running' | 'exited' | 'missing' | 'degraded'
         : null
       const url = runtimeStatus.state === 'running' ? this.inspectRoom(room.id).urls.app : null
       rooms.push({

@@ -101,7 +101,7 @@ export class FakeBackend implements IsolationBackend {
   }[] = []
   managedContainers: { roomId: string; role: string; state: string; name: string }[] = []
   managedNetworks: { roomId: string; name: string }[] = []
-  webStateValue: 'running' | 'exited' | 'missing' = 'running'
+  webStateValue: 'running' | 'exited' | 'missing' | 'degraded' = 'running'
   oneShotResult: ExecResult = ok
   exportedArtifacts: ExportedArtifact[] = [
     { relativePath: 'app/build/outputs/apk/debug/app-debug.apk', size: 8, sha256: 'a'.repeat(64) }
@@ -587,7 +587,7 @@ export class FakeBackend implements IsolationBackend {
       stderr: opts?.onStderr ? '' : result.stderr
     }
   }
-  emulatorStateValue: 'running' | 'exited' | 'missing' = 'missing'
+  emulatorStateValue: 'running' | 'exited' | 'missing' | 'degraded' = 'missing'
   emulatorScreenPng = 'ZmFrZS1lbXVsYXRvci1zY3JlZW4tcG5nLWJ5dGVzLWZvci10ZXN0cw=='
   async startExistingEmulatorForRecovery(roomId: string) {
     this.calls.push(`startExistingEmulatorForRecovery:${roomId}`)
