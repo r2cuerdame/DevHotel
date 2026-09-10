@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Status and wake stay inside a Docker-process budget
+
+- `hotel_status`, the Room list, and Room inspection answer from one engine
+  health read plus one bulk owned-container inventory instead of inspecting
+  Rooms one at a time, and report their own `budget` (Docker processes started,
+  elapsed time). A running Android emulator still gets its fenced topology
+  proof, now from a single inspect.
+- The pinned Docker engine identity is proven once per process and reused by
+  Room operations; every health read re-proves it from the same `docker info`,
+  and any transport or context failure drops the proof so the next operation
+  must re-prove the endpoint before touching anything.
+- Wake re-proves the relay credential once per verification instead of on every
+  poll, reads the published relay port from the anchor it already inspected,
+  inspects only the network the anchor is attached to, and settles already
+  labelled volumes from the volume listing. Room logs record the Docker
+  processes each wake used.
+- One Room event now triggers at most one renderer refresh of each kind and one
+  debounced tray rebuild, instead of duplicate refreshes and a tray rebuild
+  with its own health probe per event.
+
 ## 0.5.2 — 2026-09-07
 
 ### Interrupted Android locale runs recover after a restart

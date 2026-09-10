@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RoomRecord } from '@devhotel/shared'
+import type { RoomRuntimeObservation } from '../backend/types'
 import type {
   AnchorSpec,
   ExecOpts,
@@ -368,6 +369,16 @@ export class FakeBackend implements IsolationBackend {
   }
   async webState() {
     return this.webStateValue
+  }
+  observeRoomRuntimesCalls: string[][] = []
+  async observeRoomRuntimes(roomIds: readonly string[]) {
+    this.calls.push(`observeRoomRuntimes:${roomIds.length}`)
+    this.observeRoomRuntimesCalls.push([...roomIds])
+    const observations = new Map<string, RoomRuntimeObservation>()
+    for (const roomId of roomIds) {
+      observations.set(roomId, { main: await this.webState(), emulator: await this.emulatorState() })
+    }
+    return observations
   }
   async listManagedContainers() {
     return this.managedContainers

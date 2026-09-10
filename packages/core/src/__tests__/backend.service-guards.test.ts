@@ -55,6 +55,9 @@ describe('service process ownership guards', () => {
     const backend = new OciCliBackend({ identityFile: join(root, 'engine.json') })
     await backend.health()
     engineId = 'engine-two'
+    // Drift is observed by the next health read; Room operations then refuse
+    // to run until a fresh identity read proves the pinned engine again.
+    await expect(backend.health()).resolves.toMatchObject({ ok: false })
     mockedRunDocker.mockClear()
 
     const guarded = [

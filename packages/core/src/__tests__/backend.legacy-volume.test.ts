@@ -234,4 +234,38 @@ describe('legacy Room volume adoption', () => {
       })
     ])
   })
+
+  it('settles already labelled volumes from the listing and inspects only unlabeled candidates', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    const unlabeled = `dh-${ROOM_ID}-src`
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'ls') {
+        return {
+          code: 0,
+          stdout: [
+            JSON.stringify({ Name: VOLUME, Labels: `devhotel.managed=1,devhotel.role=volume,devhotel.room=${ROOM_ID}` }),
+            JSON.stringify({ Name: unlabeled, Labels: '' })
+          ].join('\n'),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return { code: 0, stdout: legacyInspect('local', { Name: unlabeled }), stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const backend = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: (roomId, name) => roomId === ROOM_ID && name === unlabeled
+    })
+
+    await expect(backend.adoptLegacyRoomVolumes(ROOM_ID)).resolves.toEqual([unlabeled])
+    expect(
+      mockedRunDocker.mock.calls
+        .filter(([args]) => args[0] === 'volume' && args[1] === 'inspect')
+        .map(([args]) => args[2])
+    ).toEqual([unlabeled])
+  })
 })

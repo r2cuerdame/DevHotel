@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildDockerSpawnEnv, createPinnedDockerRuntime, resolveDockerExecutable } from '../backend/cli'
+import { isDockerTransportFailure } from '../backend/dockerBudget'
 
 describe('resolveDockerExecutable', () => {
   it('uses DEVHOTEL_DOCKER_PATH before PATH and Docker Desktop', () => {
@@ -114,5 +115,32 @@ describe('resolveDockerExecutable', () => {
     expect(childEnv.Path).toBe('C:\\Docker\\bin;C:\\Windows\\System32;D:\\tools')
     expect(childEnv.PATH).toBeUndefined()
     expect(sourceEnv.Path).toBe('C:\\Windows\\System32;D:\\tools')
+  })
+})
+
+describe('isDockerTransportFailure', () => {
+  it.each([
+    ['daemon unreachable over the Windows pipe', 'error during connect: Head "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/_ping": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.'],
+    ['daemon unreachable over a unix socket', 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'],
+    ['pinned context missing', 'context "devhotel" does not exist'],
+    ['connection reset mid-request', 'error during connect: Get "http://docker/v1.47/info": read tcp 127.0.0.1: connection reset by peer'],
+    ['request deadline exceeded', 'error during connect: Post "http://docker/v1.47/containers/create": context deadline exceeded'],
+    ['runDocker timeout notice', '\ndocker inspect timed out after 15000ms']
+  ])('treats %s as a transport failure', (_label, stderr) => {
+    expect(isDockerTransportFailure({ code: 1, stdout: '', stderr })).toBe(true)
+  })
+
+  it.each([
+    ['a missing container', 'Error response from daemon: No such container: dh-room1abc-web'],
+    ['a name conflict', 'Error response from daemon: Conflict. The container name "/dh-room1abc-web" is already in use'],
+    ['a successful command', '']
+  ])('does not treat %s as a transport failure', (_label, stderr) => {
+    expect(isDockerTransportFailure({ code: stderr ? 1 : 0, stdout: '', stderr })).toBe(false)
+  })
+
+  it('treats a CLI that could not be spawned as a transport failure', () => {
+    const spawnError = Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' })
+    expect(isDockerTransportFailure(spawnError)).toBe(true)
+    expect(isDockerTransportFailure(new Error('Room room1abc container ownership metadata is invalid'))).toBe(false)
   })
 })

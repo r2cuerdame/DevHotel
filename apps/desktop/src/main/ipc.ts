@@ -149,10 +149,9 @@ export function registerIpc(opts: {
   // dismissal so a hidden DOM cannot retain a code until the app is reopened.
   win.on('hide', () => androidPairing.dispose())
 
-  orch.onEvent((e) => {
-    send(IPC.evRoomEvent, e)
-    if (e.kind === 'created' || e.kind === 'deleted' || e.kind === 'status') send(IPC.evRoomsChanged)
-  })
+  // One Room event is one renderer message; the renderer coalesces what it
+  // refreshes from it, so a status revision never fans out into duplicates.
+  orch.onEvent((e) => send(IPC.evRoomEvent, e))
   orch.onLogLine((e) => {
     if (activeTails.has(`${e.roomId}:${e.kind}`)) {
       send(IPC.evLogLine, { roomId: e.roomId, kind: e.kind, line: e.line })

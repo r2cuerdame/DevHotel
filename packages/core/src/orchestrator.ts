@@ -128,6 +128,7 @@ import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
 import { runDocker } from './backend/cli'
+import { dockerSpawnCount } from './backend/dockerBudget'
 import { gitCloneRun, splitGitCredential } from './backend/gitClone'
 import {
   EMULATOR_ADB_SERIAL,
@@ -147,6 +148,7 @@ import {
   type RoomArtifactWebRuntimeFence,
   type WebSpec
 } from './backend/types'
+import type { RoomRuntimeObservation } from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -2943,12 +2945,49 @@ export class RoomOrchestrator {
     } catch {
       // Each OCI Room reports unknown below; Windows Rooms use their own provider probe.
     }
-    const rooms: RuntimeRoomRecord[] = []
-    for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
-      rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
+    const rooms = this.rooms.list()
+    const observations = await this.inventoryRoomRuntimes(rooms, backendAvailable)
+    return mapWithConcurrency(rooms, STATUS_PROBE_CONCURRENCY, async (room) => {
+      const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable, observations?.get(room.id))
+      return { ...this.effectiveRoom(room, runtimeStatus), runtimeStatus }
+    })
+  }
+
+  /**
+   * One bulk owned-container inventory for every Room whose record expects a
+   * running OCI runtime, so a status read costs one `docker ps` rather than
+   * one inspect per Room. `null` means the inventory itself failed and callers
+   * fall back to per-Room probes; an empty map means nothing needed probing.
+   */
+  private async inventoryRoomRuntimes(
+    rooms: readonly RoomRecord[],
+    backendAvailable: boolean
+  ): Promise<Map<string, RoomRuntimeObservation> | null> {
+    const roomIds = rooms
+      .filter((room) => room.provider !== 'windows' && this.runtimeExpectation(room) === 'running')
+      .map((room) => room.id)
+    if (!backendAvailable || roomIds.length === 0) return new Map()
+    try {
+      return await this.backend.observeRoomRuntimes(roomIds)
+    } catch {
+      return null
     }
-    return rooms
+  }
+
+  /**
+   * The inventory already proved container liveness; a running Android
+   * emulator still gets the fenced topology proof, exactly as the per-Room
+   * probe gives it.
+   */
+  private async componentStatesFromObservation(
+    room: RoomRecord,
+    observation: RoomRuntimeObservation
+  ): Promise<[RoomRuntimeStatus['main'], RoomRuntimeStatus['emulator']]> {
+    if (room.provider !== 'android') return [observation.main, null]
+    const emulator = observation.emulator === 'running'
+      ? await this.backend.emulatorState(room.id).catch(() => 'unknown' as const)
+      : observation.emulator
+    return [observation.main, emulator]
   }
 
   backendHealth(): Promise<{ ok: boolean; detail: string }> {
@@ -2967,7 +3006,11 @@ export class RoomOrchestrator {
       : 'Start or restart the Room, then retry.'
   }
 
-  private async observeRuntimeStatus(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+  private async observeRuntimeStatus(
+    room: RoomRecord,
+    backendAvailable?: boolean,
+    observation?: RoomRuntimeObservation
+  ): Promise<RoomRuntimeStatus> {
     const observedAt = new Date().toISOString()
     const expected = this.runtimeExpectation(room)
     if (expected !== 'running') {
@@ -3044,12 +3087,14 @@ export class RoomOrchestrator {
       }
     }
 
-    const [main, emulator] = await Promise.all([
-      this.backend.webState(room.id).catch(() => 'unknown' as const),
-      room.provider === 'android'
-        ? this.backend.emulatorState(room.id).catch(() => 'unknown' as const)
-        : Promise.resolve(null)
-    ])
+    const [main, emulator] = observation
+      ? await this.componentStatesFromObservation(room, observation)
+      : await Promise.all([
+          this.backend.webState(room.id).catch(() => 'unknown' as const),
+          room.provider === 'android'
+            ? this.backend.emulatorState(room.id).catch(() => 'unknown' as const)
+            : Promise.resolve(null)
+        ])
     if (room.provider !== 'android') {
       const running = main === 'running'
       return {
@@ -3734,6 +3779,10 @@ export class RoomOrchestrator {
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
+    // Process-wide delta: exact when this wake is the only Docker work running.
+    const dockerSpawnsBefore = dockerSpawnCount()
+    const logWakeBudget = (): void =>
+      this.olog(roomId, `wake used ${dockerSpawnCount() - dockerSpawnsBefore} docker processes`)
     try {
       // Recreate containers from the current record so changes made while
       // asleep are materialized on wake.
@@ -3789,6 +3838,7 @@ export class RoomOrchestrator {
       })
       this.olog(roomId, `wake: ${verify.detail}`)
       report.detail(verify.detail)
+      logWakeBudget()
       if (!verify.ok) {
         // The Room is left in `attention`, exactly as before — but the caller
         // now gets a terminal answer instead of a call that merely returned.
@@ -3798,6 +3848,7 @@ export class RoomOrchestrator {
       }
       if (emulatorStarted) await this.reportEmulatorReady(roomId, report)
     } catch (err) {
+      logWakeBudget()
       this.olog(roomId, `wake failed: ${err instanceof Error ? err.message : String(err)}`)
       this.rooms.update(roomId, { status: 'broken' })
       report.fail('wake failed', err)
@@ -7450,23 +7501,32 @@ export class RoomOrchestrator {
     }
   }
 
-  /** One-call answer to "is DevHotel ready and what is running" for agents. */
+  /**
+   * One-call answer to "is DevHotel ready and what is running" for agents.
+   * `budget` reports how many Docker processes the call started and how long
+   * it took; the spawn count is a process-wide delta, so it is exact only when
+   * no Room mutation runs concurrently.
+   */
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     devices: DeviceBrokerStatus
+    budget: { dockerSpawns: number; elapsedMs: number }
   }> {
+    const startedAt = performance.now()
+    const spawnsBefore = dockerSpawnCount()
     const backend = await this.backend.health()
-    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
-    for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
+    const recorded = this.rooms.list()
+    const observations = await this.inventoryRoomRuntimes(recorded, backend.ok)
+    const rooms = await mapWithConcurrency(recorded, STATUS_PROBE_CONCURRENCY, async (room) => {
+      const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok, observations?.get(room.id))
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
         : null
       const url = runtimeStatus.state === 'running' ? this.inspectRoom(room.id).urls.app : null
-      rooms.push({
+      return {
         id: room.id,
         project: room.project,
         nickname: room.nickname,
@@ -7476,9 +7536,18 @@ export class RoomOrchestrator {
         url,
         emulator,
         runtimeStatus
-      })
+      }
+    })
+    return {
+      backend,
+      gateway: this.gateway.status(),
+      rooms,
+      devices: this.devices.status(),
+      budget: {
+        dockerSpawns: dockerSpawnCount() - spawnsBefore,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      }
     }
-    return { backend, gateway: this.gateway.status(), rooms, devices: this.devices.status() }
   }
 
   inspectRoom(roomId: string): RoomInspection {
@@ -7519,7 +7588,10 @@ export class RoomOrchestrator {
   /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
   async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
     const recorded = this.mustGet(roomId)
-    const runtimeStatus = await this.observeRuntimeStatus(recorded)
+    // A Room-scoped inventory is one process; when it answered, the backend
+    // evidently did too, so only the fallback path needs its own health read.
+    const observation = (await this.inventoryRoomRuntimes([recorded], true))?.get(roomId)
+    const runtimeStatus = await this.observeRuntimeStatus(recorded, observation ? true : undefined, observation)
     const inspection = this.inspectRoom(roomId)
     return {
       ...inspection,
@@ -9274,6 +9346,26 @@ export class RoomOrchestrator {
   private emit(roomId: string, kind: OrchestratorEvent['kind'], detail?: string): void {
     this.emitter.emit('event', { roomId, kind, detail } satisfies OrchestratorEvent)
   }
+}
+
+/** Status reads probe Rooms concurrently, but never more Docker processes at once than this. */
+const STATUS_PROBE_CONCURRENCY = 4
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 function deriveProjectName(sourceType: SourceType, sourceRef: string): string {

@@ -18,6 +18,7 @@ import { IPC } from '@devhotel/shared'
 import { api } from '../api'
 import { detectLocale, isLocaleId, translate } from '../i18n'
 import type { LocaleId, TFunc, Translation } from '../i18n'
+import { createRefreshCoalescer } from './refreshCoalescer'
 import { listRoomsWithRuntimeRetry } from './roomRefresh'
 
 export interface Toast {
@@ -94,14 +95,20 @@ export const useStore = create<DhState>((set, get) => ({
     void get().refreshRooms()
     void get().refreshGateway()
     void api.ca.status().then((caStatus) => set({ caStatus })).catch(() => undefined)
+    // One logical Room revision may be announced more than once; it still
+    // costs one list refresh and one inspection refresh per Room.
+    const refresh = createRefreshCoalescer({
+      refreshRooms: () => get().refreshRooms(),
+      refreshInspection: (roomId) => get().refreshInspection(roomId)
+    })
     api.on(IPC.evRoomsChanged, () => {
-      void get().refreshRooms()
+      refresh.rooms()
       const v = get().view
-      if (v.name === 'room') void get().refreshInspection(v.roomId)
+      if (v.name === 'room') refresh.inspection(v.roomId)
     })
     api.on(IPC.evRoomEvent, (ev: { roomId: string }) => {
-      void get().refreshRooms()
-      void get().refreshInspection(ev.roomId)
+      refresh.rooms()
+      refresh.inspection(ev.roomId)
     })
     api.on(IPC.evLogLine, (p: { roomId: string; kind: string; line: string }) => {
       get().appendLog(`${p.roomId}:${p.kind}`, [p.line])
