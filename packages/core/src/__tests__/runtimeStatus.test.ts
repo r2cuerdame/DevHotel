@@ -2,7 +2,16 @@ import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
+import { runDocker } from '../backend/cli'
+import { OciCliBackend } from '../backend/ociCli'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
+
+vi.mock('../backend/cli', () => ({
+  getPinnedDockerRuntime: vi.fn(() => ({ context: 'test-context' })),
+  runDocker: vi.fn()
+}))
+
+const mockedRunDocker = vi.mocked(runDocker)
 
 describe('Room runtime status', () => {
   const dirs: string[] = []
@@ -271,5 +280,145 @@ describe('Room runtime status', () => {
       main: 'running'
     })
     expect(inspection.runtimeStatus.detail).toContain('stray runtime')
+  })
+
+  it('does not flag a broken room with a running container as having a stray runtime', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      workspaceMode: 'hotel',
+      syncStatus: 'synced',
+      status: 'broken',
+      hostPort: null
+    })
+    orch.rooms.create(room)
+    backend.webStateValue = 'running'
+
+    const inspection = await orch.inspectRoomRuntime(room.id)
+
+    expect(inspection.room.status).toBe('broken')
+    expect(inspection.runtimeStatus).toMatchObject({
+      state: 'stopped',
+      expected: 'stopped',
+      recordedStatus: 'broken'
+    })
+    expect(inspection.runtimeStatus.detail).not.toContain('stray runtime')
+    expect(inspection.runtimeStatus.state).not.toBe('degraded')
+  })
+})
+
+describe('OciCliBackend.webState liveness detection', () => {
+  it('accurately determines liveness with stubbed runDocker payloads (empty/header-only, all-defunct, non-zero exit, live PID 1)', async () => {
+    const backend = new OciCliBackend()
+    const roomId = 'room123'
+
+    // 1. Header-only top output yields degraded
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('degraded')
+
+    // Empty top output yields degraded
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('degraded')
+
+    // 2. all-defunct yields degraded (via <defunct>)
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return {
+          code: 0,
+          stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1234 1 0 00:00 ? 00:00:00 [node] <defunct>\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('degraded')
+
+    // all-defunct via STAT column Z
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return {
+          code: 0,
+          stdout: 'USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND\nroot 1234 0.0 0.0 0 0 ? Z 00:00 00:00 [node]\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('degraded')
+
+    // 3. non-zero exit from docker top yields degraded
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return { code: 1, stdout: '', stderr: 'Error response from daemon: container is not running' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('degraded')
+
+    // 4. live PID 1 yields running
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'running\n', stderr: '' }
+      }
+      if (args[0] === 'top') {
+        return {
+          code: 0,
+          stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:00 node index.js\n',
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('running')
+
+    // 5. container stopped in inspect yields exited
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 0, stdout: 'exited\n', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('exited')
+
+    // 6. inspect fails yields missing
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') {
+        return { code: 1, stdout: '', stderr: 'No such container' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    expect(await backend.webState(roomId)).toBe('missing')
   })
 })

@@ -2668,8 +2668,18 @@ export class OciCliBackend implements IsolationBackend {
     if (topResult.code !== 0) return 'degraded'
     const lines = topResult.stdout.trim().split(/\r?\n/).filter((l) => l.trim().length > 0)
     if (lines.length <= 1) return 'degraded'
+    const headerLine = lines[0]?.trim() ?? ''
+    const headers = headerLine.split(/\s+/)
+    const statIndex = headers.findIndex((h) => h.toUpperCase() === 'STAT' || h.toUpperCase() === 'S')
     const processLines = lines.slice(1)
-    const allDefunct = processLines.every((line) => line.includes('<defunct>') || /\bZ\b/.test(line))
+    const allDefunct = processLines.every((line) => {
+      if (line.includes('<defunct>')) return true
+      if (statIndex !== -1) {
+        const cols = line.trim().split(/\s+/)
+        if (cols[statIndex] && cols[statIndex].startsWith('Z')) return true
+      }
+      return false
+    })
     if (allDefunct) return 'degraded'
     return 'running'
   }

@@ -59,17 +59,20 @@ export async function reconcile(
     // Some startup recovery protocols retain an exact live runtime as durable
     // restoration authority. Stopping or sleeping it here would turn their
     // mutation gate into a permanent recovery deadlock.
-    if (options.preserveAwakeRoomIds?.has(room.id)) {
-      if (room.status === 'running' || room.status === 'ready' || room.status === 'attention') {
-        log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
-      } else {
+    if (
+      options.preserveAwakeRoomIds?.has(room.id) &&
+      (room.status === 'running' || room.status === 'ready' || room.status === 'attention' || room.status === 'sleeping')
+    ) {
+      if (room.status === 'sleeping') {
         log(`reconcile: preserving fenced Room ${room.id} for recovery`)
+      } else {
+        log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
       }
       continue
     }
     if (room.status === 'sleeping') {
       const hasStray = managedContainers.some(
-        (c) => c.roomId === room.id && !straysRemoved.includes(c.name) && (c.state === 'running' || c.state === 'restarting')
+        (c) => c.roomId === room.id && !straysRemoved.includes(c.name) && (c.state === 'running' || c.state === 'restarting' || c.state === 'paused')
       )
       if (hasStray) {
         log(`reconcile: room ${room.id} is sleeping but has stray runtimes — stopping proven owned resources`)

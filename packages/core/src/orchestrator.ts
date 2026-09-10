@@ -2986,7 +2986,7 @@ export class RoomOrchestrator {
           available = false
         }
       }
-      if (available && room.provider !== 'windows') {
+      if (room.status === 'sleeping' && available && room.provider !== 'windows') {
         const [main, emulator] = await Promise.all([
           this.backend.webState(room.id).catch(() => 'unknown' as const),
           room.provider === 'android'
