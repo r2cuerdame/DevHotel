@@ -1,6 +1,7 @@
 import { app, Menu, nativeImage, Tray, type BrowserWindow } from 'electron'
 import type { RoomOrchestrator } from '@devhotel/core'
 import type { UpdateStatusInfo } from '@devhotel/shared'
+import { TRAY_REBUILD_EVENT_KINDS, createRebuildScheduler } from './trayRebuildScheduler'
 import { updateTrayMenuItem } from './updateTrayMenu'
 
 /** 16×16 brass key-plate tray icon, generated in code (no asset pipeline needed). */
@@ -82,9 +83,14 @@ export function createTray(opts: {
     tray.setContextMenu(menu)
   }
 
-  void rebuild()
-  orch.onEvent(() => void rebuild())
-  opts.onUpdateStatusChange(() => void rebuild())
+  // Every rebuild probes the backend once; a wake emits several events in a
+  // row, so they are debounced into one rebuild instead of one probe each.
+  const scheduler = createRebuildScheduler(rebuild)
+  void scheduler.now()
+  orch.onEvent((e) => {
+    if (TRAY_REBUILD_EVENT_KINDS.has(e.kind)) scheduler.request()
+  })
+  opts.onUpdateStatusChange(() => scheduler.request())
   tray.on('click', show)
   return tray
 }
