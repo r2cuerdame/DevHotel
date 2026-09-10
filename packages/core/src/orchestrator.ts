@@ -3982,7 +3982,7 @@ export class RoomOrchestrator {
   }
 
   deleteRoom(roomId: string, actor: Actor): Promise<{ reclaimedBytes: number }> {
-    if (this.deletingRooms.has(roomId) || this.rooms.get(roomId)?.status === 'deleting') {
+    if (this.deletingRooms.has(roomId)) {
       return Promise.reject(new Error(`Room ${roomId} is already being deleted`))
     }
     // Reserve deletion synchronously. A concurrent start must fail before it

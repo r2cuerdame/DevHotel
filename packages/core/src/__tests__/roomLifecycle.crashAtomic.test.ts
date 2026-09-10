@@ -181,6 +181,41 @@ describe('Crash-atomic Room lifecycle and rollback', () => {
       // Once deleted, record must be purged
       expect(orch.rooms.get(room.id)).toBeNull()
     })
+
+    it('allows deleteRoom retry when deleteRoomPod fails on first attempt, leaving start blocked', async () => {
+      const { backend, orch } = await setup()
+      const room = makeRoom({ id: 'retrydel1', project: 'demo', nickname: 'del', domain: 'retrydel1.localhost', status: 'ready' })
+      orch.rooms.create(room)
+
+      const originalDelete = backend.deleteRoomPod.bind(backend)
+      let attempt = 0
+      backend.deleteRoomPod = async (roomId: string) => {
+        attempt++
+        if (attempt === 1) {
+          throw new Error('volume is in use: temporary lock contention')
+        }
+        return originalDelete(roomId)
+      }
+
+      // First delete attempt fails
+      await expect(orch.deleteRoom(room.id, 'user')).rejects.toThrow('volume is in use')
+
+      // Room status in SQLite must be persisted as 'deleting'
+      const failedRoom = orch.rooms.get(room.id)
+      expect(failedRoom).not.toBeNull()
+      expect(failedRoom?.status).toBe('deleting')
+
+      // Starting the room must be rejected while in deleting status
+      expect(() => orch.startRoomOperation(room.id, 'agent')).toThrow(/being deleted and cannot be started/)
+
+      // Second deleteRoom call must succeed without requiring process restart
+      const result = await orch.deleteRoom(room.id, 'user')
+      expect(result).toBeDefined()
+      expect(attempt).toBe(2)
+
+      // Room record must be purged from SQLite
+      expect(orch.rooms.get(room.id)).toBeNull()
+    })
   })
 
   describe('startup reconciliation for deleting and preparing rooms', () => {
