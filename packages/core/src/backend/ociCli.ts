@@ -1307,6 +1307,10 @@ export class OciCliBackend implements IsolationBackend {
     this.relayTokenFactory = opts.relayTokenFactory ?? (() => randomBytes(32).toString('hex'))
   }
 
+  get subnetAllocator(): SubnetAllocator {
+    return this.ipam
+  }
+
   async health(): Promise<{ ok: boolean; detail: string }> {
     let result: ExecResult
     try {
@@ -2786,6 +2790,30 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`network cleanup incomplete: ${name}`)
     }
     this.ipam.release(name)
+  }
+
+  async adoptManagedNetwork(name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    assertManagedNetworkName(name)
+    const network = await this.inspectNetwork(name)
+    if (!network) return
+    const labels = network.Labels ?? {}
+    const roomId = labels['devhotel.room'] ?? ''
+    if (
+      network.Name !== name ||
+      labels['devhotel.managed'] !== '1' ||
+      labels['devhotel.role'] !== 'network' ||
+      !roomId ||
+      (name !== roomNetworkName(roomId) && name !== androidControlNetworkName(roomId))
+    ) {
+      throw new Error(`refusing to adopt network not owned by DevHotel: ${name}`)
+    }
+    assertRoomNetwork(network, roomId, name)
+    for (const cfg of network.IPAM?.Config ?? []) {
+      if (cfg.Subnet) {
+        this.ipam.adopt(name, cfg.Subnet)
+      }
+    }
   }
 
   async cloneIntoVolume(
@@ -5377,19 +5405,56 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  private async collectDockerSubnets(): Promise<Set<string>> {
+  async collectDockerSubnets(): Promise<Set<string>> {
     const used = new Set<string>()
     try {
       const result = await runDocker(['network', 'ls', '--format', '{{.Name}}'])
       if (result.code === 0 && result.stdout.trim()) {
         const names = result.stdout.trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
         if (names.length > 0) {
-          const inspectResult = await runDocker(['network', 'inspect', ...names])
-          if (inspectResult.code === 0 && inspectResult.stdout.trim()) {
-            const parsed = JSON.parse(inspectResult.stdout) as DockerNetworkInspect[]
-            for (const net of parsed) {
-              for (const cfg of net.IPAM?.Config ?? []) {
-                if (cfg.Subnet) used.add(cfg.Subnet)
+          const inspectedNames = new Set<string>()
+          let batchSuccess = false
+          try {
+            const inspectResult = await runDocker(['network', 'inspect', ...names])
+            if (inspectResult.stdout.trim()) {
+              try {
+                const parsed = JSON.parse(inspectResult.stdout) as DockerNetworkInspect[]
+                for (const net of parsed) {
+                  if (net.Name) inspectedNames.add(net.Name)
+                  for (const cfg of net.IPAM?.Config ?? []) {
+                    if (cfg.Subnet) used.add(cfg.Subnet)
+                  }
+                }
+              } catch {
+                // stdout was not parseable as complete JSON
+              }
+            }
+            if (inspectResult.code === 0) {
+              batchSuccess = true
+            }
+          } catch {
+            // batch execution failed
+          }
+
+          if (!batchSuccess) {
+            const remaining = names.filter((n) => !inspectedNames.has(n))
+            for (const name of remaining) {
+              try {
+                const single = await runDocker(['network', 'inspect', name])
+                if (single.stdout.trim()) {
+                  try {
+                    const parsed = JSON.parse(single.stdout) as DockerNetworkInspect[]
+                    for (const net of parsed) {
+                      for (const cfg of net.IPAM?.Config ?? []) {
+                        if (cfg.Subnet) used.add(cfg.Subnet)
+                      }
+                    }
+                  } catch {
+                    // ignore malformed output for single network
+                  }
+                }
+              } catch {
+                // ignore single network inspect failure
               }
             }
           }

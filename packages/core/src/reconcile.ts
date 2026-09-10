@@ -47,6 +47,12 @@ export async function reconcile(
       } catch (err) {
         log(`reconcile: could not remove stray network ${network.name}: ${err instanceof Error ? err.message : String(err)}`)
       }
+    } else {
+      try {
+        await backend.adoptManagedNetwork?.(network.name)
+      } catch (err) {
+        log(`reconcile: could not adopt network ${network.name}: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
 

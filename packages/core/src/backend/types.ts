@@ -262,6 +262,8 @@ export interface IsolationBackend {
   listManagedNetworks(): Promise<ManagedNetwork[]>
   /** Remove a network already verified as DevHotel-managed. */
   removeManagedNetwork(name: string): Promise<void>
+  /** Adopt a surviving DevHotel-managed network and its subnet into internal allocator tracking. */
+  adoptManagedNetwork?(name: string): Promise<void>
   cloneIntoVolume(
     roomId: string,
     gitUrl: string,
