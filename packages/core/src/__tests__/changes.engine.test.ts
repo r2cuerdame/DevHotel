@@ -4,6 +4,7 @@ import { registerQuickChanges } from '../changes/definitions/index'
 import { androidRunChange } from '../changes/definitions/androidRun'
 import { ANDROID_SNAPSHOT_CLEAN_SCRIPT, cleanupAndroidBuildArtifacts } from '../changes/definitions/androidBuild'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
+import { serviceRemoveChange } from '../changes/definitions/services'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
   LINE_ENDING_NORMALIZE_SCRIPT,
@@ -408,6 +409,113 @@ describe('services', () => {
     await engine.undo(ctx(), entry.id, 'user')
     expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '8' })
     expect(backend.calls).toContain('copyToService:redis:/data/dump.rdb')
+  })
+
+  it('remove refuses a sleeping room before any backup or volume deletion', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    rooms.update('room1abc', { status: 'sleeping', hostPort: null })
+    backend.calls.length = 0
+
+    await expect(engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')).rejects.toThrow(
+      /Start the room and its Redis app before removing it/
+    )
+    expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '8' })
+    expect(backend.calls.some((call) => call.startsWith('removeService:redis'))).toBe(false)
+    expect(changes.list('room1abc').filter((c) => c.kind === 'service-remove')).toHaveLength(0)
+  })
+
+  it('remove refuses a stopped service container before any volume deletion', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'postgres' }, 'user')
+    backend.serviceStates.set('postgres', 'exited')
+    backend.calls.length = 0
+
+    await expect(engine.execute(ctx(), 'service-remove', { service: 'postgres' }, 'user')).rejects.toThrow(
+      /Start the room and its PostgreSQL app before removing it/
+    )
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(backend.serviceStates.get('postgres')).toBe('exited')
+    expect(backend.calls.some((call) => call.startsWith('removeService:postgres'))).toBe(false)
+    expect(changes.list('room1abc').filter((c) => c.kind === 'service-remove')).toHaveLength(0)
+  })
+
+  it('remove refuses a missing service container instead of deleting its volume', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'missing')
+
+    await expect(engine.execute(ctx(), 'service-remove', { service: 'postgres' }, 'user')).rejects.toThrow(
+      /Start the room and its PostgreSQL app before removing it/
+    )
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(backend.calls.some((call) => call.startsWith('removeService:postgres'))).toBe(false)
+  })
+
+  it('remove aborts with the service intact when the safety backup fails', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    backend.execInService = async (_roomId, svc, cmd) => {
+      backend.calls.push(`execInService:${svc}:${cmd[0]}`)
+      return { code: 1, stdout: '', stderr: 'MISCONF disk full' }
+    }
+    backend.calls.length = 0
+
+    await expect(engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')).rejects.toThrow(
+      /redis SAVE failed.*disk full/
+    )
+    expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '8' })
+    expect(backend.serviceStates.get('redis')).toBe('running')
+    expect(backend.calls.some((call) => call.startsWith('removeService:redis'))).toBe(false)
+    expect(changes.list('room1abc').filter((c) => c.kind === 'service-remove')).toHaveLength(0)
+  })
+
+  it('remove verify names the preserved safety backup', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    const captured = entry.captured as { backupFile: string }
+    const { basename } = await import('node:path')
+    expect(entry.status).toBe('verified')
+    expect(entry.verify?.detail).toContain(basename(captured.backupFile))
+  })
+
+  it('remove only rolls back an apply failure when a safety backup was captured', () => {
+    const guard = serviceRemoveChange.canRollbackApplyFailure!
+    expect(guard(ctx(), { service: 'redis' }, null)).toBe(false)
+    expect(guard(ctx(), { service: 'redis' }, { version: '8', backupFile: null })).toBe(false)
+    expect(guard(ctx(), { service: 'redis' }, { version: '8', backupFile: '/backups/redis-x.rdb' })).toBe(true)
+  })
+
+  it('remove undo refuses to recreate an empty service when the safety backup is missing', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    const captured = entry.captured as { backupFile: string; version: string }
+    const { rmSync } = await import('node:fs')
+    rmSync(captured.backupFile)
+    backend.calls.length = 0
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/safety backup.*missing/i)
+    expect(rooms.get('room1abc')!.services.redis).toBeUndefined()
+    expect(backend.calls.some((call) => call.startsWith('createService:redis'))).toBe(false)
+    expect(changes.get(entry.id)!.status).toBe('verified')
+  })
+
+  it('remove undo refuses a change whose record lost its safety backup', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    changes.setStatus(entry.id, 'verified', { captured: { version: '8', backupFile: null } })
+    backend.calls.length = 0
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/safety backup.*missing/i)
+    expect(rooms.get('room1abc')!.services.redis).toBeUndefined()
+    expect(backend.calls.some((call) => call.startsWith('createService:redis'))).toBe(false)
+  })
+
+  it('remove undo refuses a sleeping room instead of deferring an empty service to next wake', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    rooms.update('room1abc', { status: 'sleeping', hostPort: null })
+    backend.calls.length = 0
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/Wake the room first/)
+    expect(rooms.get('room1abc')!.services.redis).toBeUndefined()
+    expect(backend.calls).toHaveLength(0)
   })
 
   it('db-backup produces a non-empty dump file', async () => {

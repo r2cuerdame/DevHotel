@@ -273,6 +273,16 @@ function inferService(title: string): ServiceKind {
   return title.startsWith('Redis') ? 'redis' : 'postgres'
 }
 
+interface RemoveCaptured {
+  version: string
+  backupFile: string
+}
+
+function removeCapturedBackup(captured: unknown): string | null {
+  const blob = captured as { backupFile?: unknown } | null
+  return typeof blob?.backupFile === 'string' && blob.backupFile ? blob.backupFile : null
+}
+
 export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
   kind: 'service-remove',
   plan(ctx, p) {
@@ -289,15 +299,25 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
   },
   async preflight(ctx, p) {
     if (!ctx.room().services[p.service]) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
-  },
-  async capture(ctx, p) {
-    const version = ctx.room().services[p.service]!.version
-    if (ctx.isAwake() && (await ctx.backend.serviceState(ctx.roomId, p.service)) === 'running') {
-      const backupFile = await backupServiceToFile(ctx, p.service)
-      ctx.log(`safety backup: ${backupFile}`)
-      return { version, backupFile }
+    // the safety dump is taken by talking to the running service, so refuse
+    // early and say why rather than deleting the volume with nothing saved
+    if (!ctx.isAwake() || (await ctx.backend.serviceState(ctx.roomId, p.service)) !== 'running') {
+      throw new Error(
+        `Start the room and its ${SERVICE_LABEL[p.service]} app before removing it — the safety backup needs it running`
+      )
     }
-    return { version, backupFile: null }
+  },
+  /**
+   * The interlock: capture runs before the change is admitted, so a failed
+   * dump aborts the removal with the container and volume still intact.
+   * Nothing below this point may delete data this dump does not cover.
+   */
+  async capture(ctx, p): Promise<RemoveCaptured> {
+    const version = ctx.room().services[p.service]!.version
+    const backupFile = await backupServiceToFile(ctx, p.service)
+    if (!existsSync(backupFile)) throw new Error(`${SERVICE_LABEL[p.service]} safety backup was not written: ${backupFile}`)
+    ctx.log(`safety backup: ${backupFile}`)
+    return { version, backupFile }
   },
   async apply(ctx, p, steps) {
     const services = { ...ctx.room().services }
@@ -306,23 +326,40 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
     steps.push(`Remove ${SERVICE_LABEL[p.service]} and its data volume`)
     await ctx.backend.removeService(ctx.roomId, p.service, { volume: true })
   },
-  async verify(ctx, p) {
+  canRollbackApplyFailure(_ctx, _p, captured) {
+    return removeCapturedBackup(captured) !== null
+  },
+  async verify(ctx, p, captured) {
     const state = await ctx.backend.serviceState(ctx.roomId, p.service)
-    return state === 'missing'
-      ? { ok: true, detail: `${SERVICE_LABEL[p.service]} removed; safety backup kept in the room's backups folder` }
-      : { ok: false, detail: `${SERVICE_LABEL[p.service]} container still exists` }
+    if (state !== 'missing') return { ok: false, detail: `${SERVICE_LABEL[p.service]} container still exists` }
+    const backupFile = removeCapturedBackup(captured)
+    if (!backupFile || !existsSync(backupFile)) {
+      return { ok: false, detail: `${SERVICE_LABEL[p.service]} removed but its safety backup is missing` }
+    }
+    return {
+      ok: true,
+      detail: `${SERVICE_LABEL[p.service]} removed; safety backup ${basename(backupFile)} kept in the room's backups folder`
+    }
   },
   async undo(ctx, entry) {
-    const captured = entry.captured as { version: string; backupFile: string | null } | null
     const service = inferService(entry.title)
+    const label = SERVICE_LABEL[service]
+    const captured = entry.captured as Partial<RemoveCaptured> | null
+    const backupFile = removeCapturedBackup(captured)
+    // an undo that only recreates an empty database is not a restore — refuse
+    // before touching the record so the operator can find the dump instead
+    if (!backupFile || !existsSync(backupFile)) {
+      throw new Error(
+        `${label} safety backup is missing — undo cannot restore its data; add ${label} again and restore a backup you still have`
+      )
+    }
+    if (!ctx.isAwake()) throw new Error(`Wake the room first — restoring ${label} from its safety backup needs it running`)
     const version = captured?.version ?? SERVICE_DEFAULT_VERSIONS[service]
     ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version } } })
-    if (ctx.isAwake()) {
-      await materializeService(ctx, service, version)
-      const ping = await pingService(ctx, service)
-      if (!ping.ok) throw new Error(ping.detail)
-      if (captured?.backupFile) await restoreServiceFromFile(ctx, service, captured.backupFile)
-    }
+    await materializeService(ctx, service, version)
+    const ping = await pingService(ctx, service)
+    if (!ping.ok) throw new Error(ping.detail)
+    await restoreServiceFromFile(ctx, service, backupFile)
   }
 }
 
