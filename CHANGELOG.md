@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- fix(core): revoke gateway ingress when hostPort is cleared, on wake/check failure, and when runtime observation proves workload is dead (#87)
+
 ## 0.5.2 — 2026-09-07
 
 ### Interrupted Android locale runs recover after a restart

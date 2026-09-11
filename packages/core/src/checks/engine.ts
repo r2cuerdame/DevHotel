@@ -225,7 +225,7 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
 
   // 12 gateway route (self-heals)
   let routed = gateway.status().routes.some((r) => r.domain === room.domain)
-  if (!routed) {
+  if (!routed && state === 'running') {
     try {
       await ctx.syncRoute()
       routed = gateway.status().routes.some((r) => r.domain === room.domain)
@@ -237,6 +237,8 @@ export async function runChecks(ctx: CheckCtx): Promise<CheckReport> {
         ? { step: 'gateway', status: 'healthy', summary: 'route was missing — restored' }
         : { step: 'gateway', status: 'broken', summary: `no gateway route for ${room.domain}` }
     )
+  } else if (!routed) {
+    push({ step: 'gateway', status: 'unknown', summary: 'not routed — web process not running' })
   } else {
     push({ step: 'gateway', status: 'healthy', summary: `${room.domain} routed` })
   }
@@ -399,7 +401,7 @@ async function androidChecks(
   )
 
   let routed = ctx.gateway.status().routes.some((r) => r.domain === room.domain)
-  if (!routed) {
+  if (!routed && state === 'running') {
     try {
       await ctx.syncRoute()
       routed = ctx.gateway.status().routes.some((r) => r.domain === room.domain)
@@ -411,6 +413,8 @@ async function androidChecks(
         ? { step: 'gateway', status: 'healthy', summary: 'route was missing — restored' }
         : { step: 'gateway', status: 'broken', summary: `no gateway route for ${room.domain}` }
     )
+  } else if (!routed) {
+    push({ step: 'gateway', status: 'unknown', summary: 'not routed — web process not running' })
   } else {
     push({ step: 'gateway', status: 'healthy', summary: `${room.domain} routed` })
   }
