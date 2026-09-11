@@ -60,6 +60,7 @@ import type {
   CloneRoomInput,
   CreateRoomInput,
   OperationRecord,
+  RoomMutationKind,
   HostResyncDriftFacts,
   HostResyncStateFacts,
   ProviderKind,
@@ -185,6 +186,24 @@ import {
 } from './runOutput'
 import { writeManifest } from './manifest'
 import { OperationTracker, type OperationReporter } from './operations'
+
+/** The two fields every tracked Room mutation accepts from its caller. */
+export interface RoomMutationRequest {
+  /** Client-assigned idempotency key; a repeat replays instead of re-running. */
+  operationId?: string
+  /** Bounded server-side wait. Omitted means "hold until the work settles". */
+  waitMs?: number
+}
+
+/**
+ * `result` is present exactly when this call saw the operation succeed. When it
+ * is absent the operation is still running, and `operation.id` is how the
+ * caller finds out how it ended.
+ */
+export interface RoomMutationOutcome<T> {
+  operation: OperationRecord
+  result?: T
+}
 import { operationsRepo, type OperationsRepo } from './store/operationsRepo'
 import { reconcile, type ReconcileResult } from './reconcile'
 import {
@@ -1259,6 +1278,8 @@ export class RoomOrchestrator {
   private readonly activeRoomLocks = new Set<string>()
   private readonly activeMutations = new Set<Promise<unknown>>()
   private readonly deletingRooms = new Set<string>()
+  /** Room ID → the tracked delete operation that must survive its own cascade. */
+  private readonly deletingRoomOperations = new Map<string, string>()
   private readonly materializingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
@@ -3135,13 +3156,41 @@ export class RoomOrchestrator {
     }
   }
 
-  createRoom(input: CreateRoomInput): Promise<RoomRecord> {
-    return this.trackMutation(() => this.createRoomAdmitted(input))
+  createRoom(input: CreateRoomInput, roomId?: string): Promise<RoomRecord> {
+    return this.trackMutation(() => this.createRoomAdmitted(input, roomId))
   }
 
-  private async createRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
+  /**
+   * Create a Room as a tracked operation. The Room ID is minted here, before
+   * anything is cloned, imported or started, so the durable record already
+   * names its Room when the first side effect runs and a caller who lost the
+   * response can poll instead of creating a second Room.
+   */
+  createRoomOperation(input: CreateRoomInput, request: RoomMutationRequest = {}): Promise<RoomMutationOutcome<RoomRecord>> {
+    const roomId = this.freshRoomId()
+    return this.runRoomMutation(
+      'room-create',
+      roomId,
+      input.actor,
+      `Create Room ${input.project}/${input.nickname}`,
+      { ...request, identity: `${input.sourceType}\u0000${input.sourceRef}\u0000${input.project}\u0000${input.nickname}` },
+      () => this.createRoom(input, roomId),
+      // There is no Room-scoped queue to extend yet; `trackMutation` already
+      // drains room creation for shutdown and delete-all.
+      { trackAsRoomOp: false }
+    )
+  }
+
+  /** A Room ID no current Room is using. */
+  private freshRoomId(): string {
+    let id = newRoomId()
+    while (this.rooms.get(id)) id = newRoomId()
+    return id
+  }
+
+  private async createRoomAdmitted(input: CreateRoomInput, preallocatedRoomId?: string): Promise<RoomRecord> {
     const providerKind: ProviderKind = input.provider ?? 'web'
-    if (providerKind === 'windows') return this.createWindowsRoomAdmitted(input)
+    if (providerKind === 'windows') return this.createWindowsRoomAdmitted(input, preallocatedRoomId)
     const provider = getProvider(providerKind)
     // A token pasted into the URL is used for this Room's clones and never stored.
     const { url: sourceRef, credential: urlCredential } = splitGitCredential(input.sourceRef)
@@ -3162,7 +3211,7 @@ export class RoomOrchestrator {
       cleanup()
     }
 
-    const id = newRoomId()
+    const id = preallocatedRoomId ?? this.freshRoomId()
     const now = new Date().toISOString()
     const domain = this.uniqueDomain(input.planOverrides?.domain ?? plan.domain)
     const workspaceMode = input.sourceType === 'empty' ? 'empty' : 'hotel'
@@ -3300,7 +3349,7 @@ export class RoomOrchestrator {
     return room
   }
 
-  private async createWindowsRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
+  private async createWindowsRoomAdmitted(input: CreateRoomInput, preallocatedRoomId?: string): Promise<RoomRecord> {
     if (input.actor !== 'user') throw new Error('Windows Rooms require a user-approved VMware template')
     if (input.sourceType !== 'empty' || input.sourceRef !== '') {
       throw new Error('Windows Rooms currently start empty; source ingress arrives with the guest agent')
@@ -3320,7 +3369,7 @@ export class RoomOrchestrator {
       nickname: input.nickname
     })
 
-    const id = newRoomId()
+    const id = preallocatedRoomId ?? this.freshRoomId()
     const now = new Date().toISOString()
     const record: RoomRecord = {
       id,
@@ -3394,6 +3443,22 @@ export class RoomOrchestrator {
     await writeManifest(this.userData, room)
     this.emit(id, 'status')
     return room
+  }
+
+  /**
+   * Clone a Room as a tracked operation. The record belongs to the *source*
+   * Room, which exists for the whole clone and therefore stays pollable even
+   * when the target is rolled back.
+   */
+  cloneRoomOperation(input: CloneRoomInput, request: RoomMutationRequest = {}): Promise<RoomMutationOutcome<RoomRecord>> {
+    return this.runRoomMutation(
+      'room-clone',
+      input.sourceRoomId,
+      input.actor,
+      `Clone the Room as ${input.nickname}`,
+      { ...request, identity: `${input.sourceRoomId}\u0000${input.nickname}` },
+      () => this.cloneRoom(input)
+    )
   }
 
   cloneRoom(input: CloneRoomInput): Promise<RoomRecord> {
@@ -3710,6 +3775,121 @@ export class RoomOrchestrator {
     return handle
   }
 
+  /**
+   * Runs one long Room mutation as a tracked operation.
+   *
+   * The tracker persists the record *before* it invokes the work, so the
+   * durable ID exists ahead of the first side effect. That is the whole point:
+   * a caller whose connection died — or whose own deadline expired — can poll
+   * that ID to a terminal state instead of guessing whether the mutation
+   * happened, and a client-assigned `operationId` makes the retry replay the
+   * same operation rather than perform a second one.
+   *
+   * `waitMs` only chooses how long this call holds. Omitting it keeps the
+   * original contract exactly: the call waits for the work and answers with
+   * the value it always answered with.
+   */
+  private runRoomMutation<T>(
+    kind: RoomMutationKind,
+    roomId: string,
+    actor: Actor,
+    label: string,
+    request: RoomMutationRequest & { identity: string },
+    task: (report: OperationReporter) => Promise<T>,
+    opts: { trackAsRoomOp?: boolean; deleteOwnRoom?: boolean; operationId?: string } = {}
+  ): Promise<RoomMutationOutcome<T>> {
+    const operationId = request.operationId ?? opts.operationId ?? randomUUID()
+    // Identity is bound only when the caller supplied the ID. A server-minted
+    // ID is never replayed, so it needs no idempotency key — and giving it one
+    // would only make it survive display pruning for no reader.
+    const requestKey =
+      request.operationId === undefined
+        ? undefined
+        : createHash('sha256').update(`${kind}\0`).update(request.identity).digest('hex')
+
+    let captured: { value: T } | undefined
+    let handle: ReturnType<OperationTracker['run']>
+    try {
+      handle = this.operations.run(
+        kind,
+        roomId,
+        actor,
+        async (report) => {
+          report.begin('mutate', label)
+          const value = await task(report)
+          captured = { value }
+          report.result(value === undefined ? null : value)
+        },
+        {
+          operationId,
+          requestKey,
+          // Every accepted request keeps its own durable ID. The Room lock, not
+          // the operation key, is what stops two mutations from interleaving;
+          // joining by kind here would alias two different requested changes.
+          joinRunningByRoom: false
+        }
+      )
+    } catch (error) {
+      // Publication refused (a reused ID bound to a different request, or a
+      // durable save that failed). This API answers with a promise, so the
+      // refusal is a rejection rather than a synchronous throw.
+      return Promise.reject(error)
+    }
+    // Delete and drain must wait for the terminal record to be written, not
+    // just for the work: otherwise they could remove the Room and then lose a
+    // race to the final operation INSERT. Room creation has no Room-scoped
+    // queue to join yet, and is already drained through `trackMutation`.
+    if (handle.newlyStarted && opts.trackAsRoomOp !== false) {
+      this.roomOps.set(roomId, handle.completion.catch(() => undefined))
+    }
+    if (opts.deleteOwnRoom && handle.newlyStarted) {
+      this.deletingRoomOperations.set(roomId, operationId)
+      // Bound to the work, not to this call: with `waitMs: 0` the caller is
+      // already gone by the time the Room row — and its operation cascade —
+      // is actually removed.
+      void handle.completion.catch(() => undefined).then(() => {
+        if (this.deletingRoomOperations.get(roomId) === operationId) {
+          this.deletingRoomOperations.delete(roomId)
+        }
+      })
+    }
+
+    return (async () => {
+      if (request.waitMs === undefined) {
+        // The legacy contract: hold for the work and rethrow its error.
+        await handle.completion
+        return this.settleRoomMutation<T>(operationId, handle.record, captured)
+      }
+      const record =
+        request.waitMs > 0 ? await this.operations.wait(operationId, request.waitMs) : handle.record
+      const current = record ?? handle.record
+      if (current.status === 'running') return { operation: current }
+      return this.settleRoomMutation<T>(operationId, current, captured)
+    })()
+  }
+
+  /**
+   * Turns a terminal operation back into the answer the call owes its caller.
+   * A replay of an operation this process did not run has no in-memory value,
+   * so the stored result is the answer — and a replay of a failed operation
+   * must fail again rather than look like a success with nothing in it.
+   */
+  private settleRoomMutation<T>(
+    operationId: string,
+    fallback: OperationRecord,
+    captured: { value: T } | undefined
+  ): RoomMutationOutcome<T> {
+    const operation = this.operations.get(operationId) ?? fallback
+    if (captured) return { operation, result: captured.value }
+    if (operation.status === 'failed') {
+      throw new Error(operation.error?.message ?? `Operation ${operationId} failed`)
+    }
+    if (operation.status === 'succeeded' && operation.result !== undefined) {
+      return { operation, result: operation.result as T }
+    }
+    return { operation }
+  }
+
   /** The Room's recent operations, newest first. */
   listOperations(roomId: string, limit?: number): OperationRecord[] {
     return this.operations.listForRoom(roomId, limit)
@@ -3871,6 +4051,21 @@ export class RoomOrchestrator {
     )
   }
 
+  /** Sleep the Room as a tracked operation. */
+  sleepRoomOperation(roomId: string, actor: Actor, request: RoomMutationRequest = {}): Promise<RoomMutationOutcome<null>> {
+    return this.runRoomMutation(
+      'room-sleep',
+      roomId,
+      actor,
+      'Sleep the Room',
+      { ...request, identity: roomId },
+      async () => {
+        await this.sleepRoom(roomId, actor)
+        return null
+      }
+    )
+  }
+
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
     return this.withRoomLock(
       roomId,
@@ -3906,6 +4101,22 @@ export class RoomOrchestrator {
     })
     await writeManifest(this.userData, this.mustGet(roomId))
     this.emit(roomId, 'status')
+  }
+
+  /** Restart the Room's web process as a tracked operation. */
+  restartWebOperation(
+    roomId: string,
+    actor: Actor,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<ChangeEntry>> {
+    return this.runRoomMutation(
+      'room-restart-web',
+      roomId,
+      actor,
+      'Restart the web process',
+      { ...request, identity: roomId },
+      () => this.restartWeb(roomId, actor)
+    )
   }
 
   restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
@@ -3979,6 +4190,28 @@ export class RoomOrchestrator {
       this.emit(roomId, 'change', 'Clean VM reset')
       this.emit(roomId, 'status')
     })
+  }
+
+  /**
+   * Delete the Room as a tracked operation. Deletion is irreversible and long,
+   * so the durable record is the only honest answer to "did that happen?" —
+   * and it is deliberately kept out of the Room's own cascade so it survives
+   * the Room it removed.
+   */
+  deleteRoomOperation(
+    roomId: string,
+    actor: Actor,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<{ reclaimedBytes: number }>> {
+    return this.runRoomMutation(
+      'room-delete',
+      roomId,
+      actor,
+      'Delete the Room',
+      { ...request, identity: roomId },
+      () => this.deleteRoom(roomId, actor),
+      { deleteOwnRoom: true }
+    )
   }
 
   deleteRoom(roomId: string, actor: Actor): Promise<{ reclaimedBytes: number }> {
@@ -4066,8 +4299,8 @@ export class RoomOrchestrator {
       const windowsVm = this.mustWindowsVm()
       this.rooms.update(roomId, { status: 'deleting' })
       const { reclaimedBytes } = await windowsVm.delete(roomId)
-      this.rooms.delete(roomId)
-      this.operations.forgetRoom(roomId)
+      this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
+      this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
       this.pendingHostResyncConfirmations.delete(roomId)
       rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
       this.emit(roomId, 'deleted')
@@ -4077,8 +4310,8 @@ export class RoomOrchestrator {
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
-    this.rooms.delete(roomId)
-    this.operations.forgetRoom(roomId)
+    this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
+    this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
     this.pendingHostResyncConfirmations.delete(roomId)
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
@@ -7571,8 +7804,45 @@ export class RoomOrchestrator {
     }
   }
 
+  /** Replace the Room workspace from its linked Host folder, as a tracked operation. */
+  syncFromHostOperation(
+    roomId: string,
+    actor: Actor,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<RoomRecord>> {
+    return this.runRoomMutation(
+      'room-sync-from-host',
+      roomId,
+      actor,
+      'Sync the workspace from the Host folder',
+      { ...request, identity: roomId },
+      () => this.syncFromHost(roomId, actor)
+    )
+  }
+
   syncFromHost(roomId: string, actor: Actor): Promise<RoomRecord> {
     return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
+  }
+
+  /**
+   * The inspect-or-publish Host resync, as a tracked operation. A refusal is a
+   * real outcome, not a failure: `confirmation-required` is carried in the
+   * operation result so a caller who lost the response reads the same answer.
+   */
+  safeResyncFromHostOperation(
+    roomId: string,
+    actor: Actor,
+    confirmationToken: string | undefined,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<SafeHostResyncOutcome>> {
+    return this.runRoomMutation(
+      'room-safe-resync',
+      roomId,
+      actor,
+      'Safely resync the workspace from the Host folder',
+      { ...request, identity: `${roomId}\u0000${confirmationToken ?? ''}` },
+      () => this.safeResyncFromHost(roomId, actor, confirmationToken)
+    )
   }
 
   /**
@@ -8138,10 +8408,6 @@ export class RoomOrchestrator {
     if (room.provider === 'web' && change.kind === 'android-build') {
       throw new Error('Builds are only available in Android rooms')
     }
-    if (change.kind !== 'android-run' && (operationId !== undefined || waitMs !== undefined)) {
-      throw new Error('operationId and waitMs are supported only for android-run changes')
-    }
-
     if (change.kind === 'android-run') {
       const androidRunOperationId = operationId ?? randomUUID()
       const requestKey = operationId === undefined
@@ -8221,6 +8487,30 @@ export class RoomOrchestrator {
       })
     }
 
+    // Every other change kind can outlive a client deadline too (a dependency
+    // install, a service start), so it also runs as a tracked operation: the
+    // durable ID is persisted before the change engine touches anything, and a
+    // lost response is answered by polling that ID instead of applying the
+    // change a second time.
+    const changeOperationId = operationId ?? randomUUID()
+    return this.runRoomMutation(
+      'room-change',
+      roomId,
+      actor,
+      `Apply the ${change.kind} change`,
+      { operationId, waitMs, identity: JSON.stringify(change) },
+      () => this.applyChangeLocked(roomId, change, actor, changeOperationId),
+      { operationId: changeOperationId }
+    ).then((outcome) => outcome.result ?? { operation: outcome.operation })
+  }
+
+  /** The change entry shares the operation's ID, so one lookup finds either. */
+  private applyChangeLocked(
+    roomId: string,
+    change: QuickChange,
+    actor: Actor,
+    operationId: string
+  ): Promise<ChangeEntry> {
     return this.withRoomLock(roomId, async () => {
       const current = this.mustGet(roomId)
       if (actor === 'agent' && current.workspaceMode === 'legacy-host-bind') {
@@ -8256,6 +8546,23 @@ export class RoomOrchestrator {
       this.emit(roomId, 'status')
       return entry
     })
+  }
+
+  /** Undo a change as a tracked operation. */
+  undoChangeOperation(
+    roomId: string,
+    changeId: string,
+    actor: Actor,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<ChangeEntry>> {
+    return this.runRoomMutation(
+      'room-undo',
+      roomId,
+      actor,
+      'Undo the change',
+      { ...request, identity: changeId },
+      () => this.undoChange(roomId, changeId, actor)
+    )
   }
 
   undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
@@ -8318,6 +8625,22 @@ export class RoomOrchestrator {
       this.logs.detach(roomId)
       this.logs.attach(roomId)
     }
+  }
+
+  /** Run the Room's health checks as a tracked operation. */
+  runChecksOperation(
+    roomId: string,
+    actor: Actor,
+    request: RoomMutationRequest = {}
+  ): Promise<RoomMutationOutcome<CheckReport>> {
+    return this.runRoomMutation(
+      'room-checks',
+      roomId,
+      actor,
+      'Run the Room health checks',
+      { ...request, identity: roomId },
+      () => this.runChecks(roomId)
+    )
   }
 
   runChecks(roomId: string): Promise<CheckReport> {
@@ -8467,7 +8790,7 @@ export class RoomOrchestrator {
   execInRoom(
     roomId: string,
     cmd: string[],
-    opts?: { timeoutMs?: number; output?: OutputSelection },
+    opts?: { timeoutMs?: number; output?: OutputSelection; responseLost?: () => boolean },
     actor: Actor = 'agent'
   ): Promise<RoomExecResult> {
     return this.withRoomLock(roomId, async () => {
@@ -8497,7 +8820,7 @@ export class RoomOrchestrator {
           }
         })
       } catch (error) {
-        this.runs.complete(run, -1)
+        this.runs.complete(run, -1, opts?.responseLost?.() === true)
         if (error instanceof DevHotelError) throw error
         const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
         if (after !== 'running') throw this.runtimeNotRunningError(room, after, error)
@@ -8506,7 +8829,9 @@ export class RoomOrchestrator {
       // A backend that buffers instead of streaming still gets bounded here.
       if (!sawStdout && result.stdout) run.push('stdout', result.stdout)
       if (!sawStderr && result.stderr) run.push('stderr', result.stderr)
-      const outcome = this.runs.complete(run, result.code)
+      // Asked at completion, not at call time: the connection that will carry
+      // this answer has either survived the command or it has not.
+      const outcome = this.runs.complete(run, result.code, opts?.responseLost?.() === true)
       if (result.code !== 0) {
         const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
         if (after !== 'running') throw this.runtimeNotRunningError(room, after)

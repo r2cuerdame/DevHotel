@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
+import type { OperationRecord } from '@devhotel/shared'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -10,6 +11,24 @@ const roots: string[] = []
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
+
+/** The record every tracked mutation now returns alongside its answer. */
+function trackedOperation(kind: OperationRecord['kind']): OperationRecord {
+  const at = '2026-09-08T00:00:00.000Z'
+  return {
+    id: 'c4a1b2d3-e4f5-4061-8273-8495a6b7c8d9',
+    kind,
+    roomId: 'room1abc',
+    actor: 'agent',
+    status: 'succeeded',
+    stage: 'complete',
+    stages: [],
+    error: null,
+    startedAt: at,
+    updatedAt: at,
+    finishedAt: at
+  }
+}
 
 describe('agent control API host boundary', () => {
   it('redacts Host paths from list and inspect responses', async () => {
@@ -101,8 +120,16 @@ describe('agent control API host boundary', () => {
     roots.push(userData)
     mkdirSync(userData, { recursive: true })
     const createRoom = vi.fn(async (input: Record<string, unknown>) => ({ id: 'room9xyz', ...input }))
+    const createRoomOperation = vi.fn(async (input: Record<string, unknown>) => ({
+      operation: trackedOperation('room-create'),
+      result: await createRoom(input)
+    }))
     const applyChange = vi.fn()
-    const control = await startControlApi({ createRoom, applyChange } as unknown as RoomOrchestrator, userData, 'test')
+    const control = await startControlApi(
+      { createRoomOperation, applyChange } as unknown as RoomOrchestrator,
+      userData,
+      'test'
+    )
 
     try {
       const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms`, {
@@ -180,13 +207,17 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-sync-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\code\\demo' }
-    const syncFromHost = vi.fn(async () => ({ ...room, syncStatus: 'synced' }))
+    const syncFromHost = vi.fn(async (_roomId: string, _actor: string) => ({ ...room, syncStatus: 'synced' }))
+    const syncFromHostOperation = vi.fn(async (roomId: string, actor: string) => ({
+      operation: trackedOperation('room-sync-from-host'),
+      result: await syncFromHost(roomId, actor)
+    }))
     let granted = true
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => granted,
-        syncFromHost
+        syncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -216,14 +247,14 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-drift-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\private\\project' }
-    const syncFromHost = vi.fn(async () => {
+    const syncFromHostOperation = vi.fn(async () => {
       throw new WorkspaceDriftError([{ path: 'app/src/main/java/App.kt', reason: 'modified' }])
     })
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => true,
-        syncFromHost
+        syncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -277,11 +308,17 @@ describe('agent control API host boundary', () => {
             recoveryGuidance: ['export or commit first']
           }
     )
+    const safeResyncFromHostOperation = vi.fn(
+      async (roomId: string, actor: string, token: string | undefined) => ({
+        operation: trackedOperation('room-safe-resync'),
+        result: await safeResyncFromHost(roomId, actor, token)
+      })
+    )
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => true,
-        safeResyncFromHost
+        safeResyncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -334,9 +371,13 @@ describe('agent control API host boundary', () => {
       ['room1abc', { id: 'room1abc', sourceType: 'linked-folder', workspaceMode: 'hotel' }],
       ['room2def', { id: 'room2def', sourceType: 'managed-git', workspaceMode: 'hotel' }]
     ])
-    const deleteRoom = vi.fn(async () => ({ reclaimedBytes: 42 }))
+    const deleteRoom = vi.fn(async (_roomId: string, _actor: string) => ({ reclaimedBytes: 42 }))
+    const deleteRoomOperation = vi.fn(async (roomId: string, actor: string) => ({
+      operation: trackedOperation('room-delete'),
+      result: await deleteRoom(roomId, actor)
+    }))
     const control = await startControlApi(
-      { rooms: { get: (id: string) => rooms.get(id) }, deleteRoom } as unknown as RoomOrchestrator,
+      { rooms: { get: (id: string) => rooms.get(id) }, deleteRoomOperation } as unknown as RoomOrchestrator,
       userData,
       'test'
     )

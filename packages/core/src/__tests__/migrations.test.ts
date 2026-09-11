@@ -35,14 +35,18 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
       })
-      expect(
+      const operationColumns =
         (sqlite.prepare('PRAGMA table_info(operations)').all() as { name: string }[]).map(({ name }) => name)
-      ).toContain('request_key')
+      expect(operationColumns).toContain('request_key')
+      // A record written before result payloads existed simply has none; the
+      // column is nullable so the upgrade cannot invent an answer it never had.
+      expect(operationColumns).toContain('result_json')
+      expect(sqlite.prepare('SELECT result_json FROM operations').get()).toEqual({ result_json: null })
       expect(
         (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
           .map(({ name }) => name)
@@ -215,7 +219,7 @@ describe('database migrations', () => {
       expect(sqlite.prepare(
         "SELECT length(value) AS bytes FROM android_acceptance_secrets WHERE name = 'acceptance-hmac-v1'"
       ).get()).toEqual({ bytes: 32 })
-      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 })
+      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 13 })
     } finally {
       sqlite.close()
     }

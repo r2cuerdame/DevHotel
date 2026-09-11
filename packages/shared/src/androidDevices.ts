@@ -336,7 +336,8 @@ export class DeviceLeaseError extends Error {
 }
 
 /**
- * What a Room may send when it asks for a phone. oomId comes from the route
+ * What a Room may send when it asks for a phone. 
+oomId comes from the route
  * and project from the Room record — a caller must not be able to book the
  * phone under someone else's project name.
  */
@@ -347,10 +348,12 @@ export const zHeartbeatBody = z
   .strict()
 export const zDeviceNicknameBody = z.object({ nickname: zDeviceNickname }).strict()
 export const zCancelRequestBody = z.object({ requestId: z.string().uuid() }).strict()
+/** The longest ADB timeout the control API accepts, mirrored by clients. */
+export const MAX_ADB_TIMEOUT_MS = 600_000
 /** An ADB argv a Room may submit; the broker still decides whether it runs. */
 export const zAgentAdbBody = z
   .object({
     args: z.array(z.string().max(4096)).min(1).max(64),
-    timeoutMs: z.number().int().positive().max(600_000).optional()
+    timeoutMs: z.number().int().positive().max(MAX_ADB_TIMEOUT_MS).optional()
   })
   .strict()

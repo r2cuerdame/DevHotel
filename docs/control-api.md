@@ -110,6 +110,39 @@ than being polled forever.
 `waitMs` is a convenience, not a requirement: with `waitMs=0` on both calls you
 can drive the whole thing by polling.
 
+### Every long mutation, not only the wake
+
+Creating, cloning, deleting, sleeping, restarting the web process, syncing from
+the Host, running checks, applying a change and undoing one are all tracked the
+same way. Each of them accepts two optional fields — in the JSON body, or as
+query text on `DELETE /v1/rooms/:id`:
+
+| Field | Meaning |
+|---|---|
+| `operationId` | A UUID **you** choose. The operation is created under it before the first side effect, and repeating the request with the same ID replays that one operation instead of mutating a second time. |
+| `waitMs` | How long this call may hold before answering, `0`–`600000`. **Omit it and nothing changes**: the call waits for the work and returns exactly what it always returned. |
+
+When a bounded `waitMs` runs out first, the reply is `202` with
+`{ operation }` — `status: "running"`, and the ID is how you finish the story.
+
+A terminal record carries `result`: the value the original response would have
+had. That is what makes a lost response recoverable —
+
+```
+POST /v1/rooms/room1abc/sleep   { "operationId": "b1c2…", "waitMs": 0 }
+  → 202 { "operation": { "id": "b1c2…", "status": "running" } }
+    (connection dies here)
+GET  /v1/operations/b1c2…
+  → 200 { "operation": { "id": "b1c2…", "status": "succeeded", "result": null } }
+```
+
+— and it is why a retry is safe: with the same `operationId`, the second call
+returns the first call's answer without sleeping the Room again. Reusing an ID
+for a *different* request is refused rather than silently aliased.
+
+A Room's deletion receipt deliberately outlives the Room: it is the only way a
+caller who lost that response can learn the Room is gone.
+
 ## Endpoints
 
 ### Hotel
@@ -272,22 +305,22 @@ credential connected to the GitHub Service even when the URL carries none.
 | Method & path | Body / query | Result |
 |---|---|---|
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
-| `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
+| `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides?, operationId?, waitMs? }` | created `RoomRecord` |
 | `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
-| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
+| `DELETE /v1/rooms/:id` | `?operationId=&waitMs=` | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
-| `POST /v1/rooms/:id/sleep` | | `204` |
-| `POST /v1/rooms/:id/restart-web` | | change entry |
-| `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
+| `POST /v1/rooms/:id/sleep` | `{ operationId?, waitMs? }` | `204` |
+| `POST /v1/rooms/:id/restart-web` | `{ operationId?, waitMs? }` | change entry |
+| `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude', operationId?, waitMs? }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
-| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs?, output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
+| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? (max 600000), output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
 | `GET /v1/rooms/:id/runs` | | `{ runs[] }` — commands running now, plus finished runs whose full output the Room still holds |
 | `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&encoding=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
-| `POST /v1/rooms/:id/checks` | | 15-step check report (includes `line-endings`) |
-| `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
-| `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
-| `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
-| `POST /v1/rooms/:id/safe-resync-from-host` | `{ confirmationToken?: uuid }` | preferred inspect/refuse-or-confirm/reset/resync operation. With meaningful or unprovable drift and no token, returns `409` with `status: 'confirmation-required'`, exact Room-relative paths when available, before facts, recovery guidance, and an opaque single-use token without importing or persisting anything. Repeat with that token only after review. A stale, wrong, cross-Room, or replayed token returns a fresh non-mutating preview; a later edit aborts the staged import. Success returns structured before/after facts and the retained recovery generation. |
+| `POST /v1/rooms/:id/checks` | `{ operationId?, waitMs? }` | 15-step check report (includes `line-endings`) |
+| `POST /v1/rooms/:id/changes` | `{ change: QuickChange, operationId?, waitMs? }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …). The change entry's `id` is the operation ID. |
+| `POST /v1/rooms/:id/undo` | `{ changeId, operationId?, waitMs? }` | change entry |
+| `POST /v1/rooms/:id/sync-from-host` | `{ operationId?, waitMs? }` | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
+| `POST /v1/rooms/:id/safe-resync-from-host` | `{ confirmationToken?: uuid, operationId?, waitMs? }` | preferred inspect/refuse-or-confirm/reset/resync operation. With meaningful or unprovable drift and no token, returns `409` with `status: 'confirmation-required'`, exact Room-relative paths when available, before facts, recovery guidance, and an opaque single-use token without importing or persisting anything. Repeat with that token only after review. A stale, wrong, cross-Room, or replayed token returns a fresh non-mutating preview; a later edit aborts the staged import. Success returns structured before/after facts and the retained recovery generation. |
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |
@@ -385,6 +418,12 @@ Whenever the response could not carry everything — truncated, or narrowed by a
 filter — the **complete raw output is retained under the Room** and read back
 by run id. When the response did carry everything, nothing is retained and
 `runId` refers to a run that is already gone: there is nothing left to fetch.
+
+There is one more case where everything is retained: **the response was never
+delivered.** If the connection closes before the reply is written, "the caller
+already has every byte" is false no matter how small the output was, so the
+complete raw output is kept. Find it again with `GET /v1/rooms/:id/runs`, which
+lists the command, when it started, and its run id.
 
 Retention lives in Hotel storage beside the Room's logs and artifacts, is
 deleted with the Room, and is bounded — a Room keeps its most recent 20

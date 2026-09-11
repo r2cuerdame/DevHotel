@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
+  MAX_ADB_TIMEOUT_MS,
+  MAX_EXEC_TIMEOUT_MS,
   type OperationRecord,
   zAndroidActivityName,
   zAndroidAcceptanceReportId,
@@ -264,7 +266,10 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
-        timeoutMs: z.number().int().positive().optional(),
+        // Capped at the control API's own maximum so an over-long request is
+        // refused here, with the real bound in the schema, instead of becoming
+        // a 400 the caller has to decode.
+        timeoutMs: z.number().int().positive().max(MAX_EXEC_TIMEOUT_MS).optional(),
         ...outputControls
       },
       handler: wrap(async (a) => (await getClient()).execInRoom(a.roomId, a.cmd, a.timeoutMs, outputSelection(a)))
@@ -942,7 +947,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       schema: {
         roomId: zRoomId,
         args: z.array(z.string()).min(1).describe('adb argv without the leading adb, e.g. ["install","-r","/workspace/app.apk"]'),
-        timeoutMs: z.number().int().positive().optional()
+        timeoutMs: z.number().int().positive().max(MAX_ADB_TIMEOUT_MS).optional()
       },
       handler: wrap(async (a) => (await getClient()).adbOnDevice(a.roomId, a.args, a.timeoutMs))
     },

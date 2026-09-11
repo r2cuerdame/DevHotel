@@ -441,6 +441,16 @@ export const migrations: Migration[] = [
     sql: `
       ALTER TABLE operations ADD COLUMN request_key TEXT;
     `
+  },
+  {
+    // A caller that lost its response needs the answer, not just the status:
+    // the terminal payload the original call would have returned is stored
+    // with the operation so polling recovers it instead of repeating the
+    // mutation.
+    version: 13,
+    sql: `
+      ALTER TABLE operations ADD COLUMN result_json TEXT;
+    `
   }
 ]
 

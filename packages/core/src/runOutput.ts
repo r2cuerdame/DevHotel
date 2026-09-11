@@ -648,7 +648,12 @@ class RunSink {
     })
   }
 
-  finish(): { retained: boolean; error: string | null } {
+  /**
+   * `force` keeps the complete raw copy even when the response window held
+   * nothing back. It exists for one case: the response was never delivered, so
+   * "the caller already has every byte" is false.
+   */
+  finish(force = false): { retained: boolean; error: string | null } {
     this.window.end()
     if (this.fd !== null) {
       try {
@@ -669,7 +674,7 @@ class RunSink {
     if (!this.window.bytes) return { retained: false, error: null }
     // Nothing was held back: the caller already has every byte, so keeping a
     // second copy would only grow Hotel storage.
-    if (!this.window.withheld) {
+    if (!this.window.withheld && !force) {
       try {
         rmSync(this.file, { force: true })
       } catch {
@@ -753,10 +758,10 @@ export class ActiveRun {
     }
   }
 
-  finish(code: number): { outcome: RunOutcome; summary: RunSummary } {
+  finish(code: number, retainAll = false): { outcome: RunOutcome; summary: RunSummary } {
     this.finished = true
-    const stdout = this.sinks.stdout.finish()
-    const stderr = this.sinks.stderr.finish()
+    const stdout = this.sinks.stdout.finish(retainAll)
+    const stderr = this.sinks.stderr.finish(retainAll)
     const notes: string[] = []
     if (stdout.error) notes.push(`stdout could not be retained: ${stdout.error}`)
     if (stderr.error) notes.push(`stderr could not be retained: ${stderr.error}`)
@@ -895,8 +900,14 @@ export class RunOutputStore {
     return run
   }
 
-  complete(run: ActiveRun, code: number): RunOutcome {
-    const { outcome, summary } = run.finish(code)
+  /**
+   * `retainAll` keeps the full raw output even when it all fit in the response.
+   * The control API sets it when the response was not delivered: the run ID in
+   * a reply nobody received is worthless unless the output it names still
+   * exists, and `list_room_runs` is how the caller finds it again.
+   */
+  complete(run: ActiveRun, code: number, retainAll = false): RunOutcome {
+    const { outcome, summary } = run.finish(code, retainAll)
     // ISO timestamps only carry milliseconds. Make completion order strict so
     // several tiny commands finishing in one tick still prune oldest-first.
     this.lastFinishedAtMs = Math.max(Date.now(), this.lastFinishedAtMs + 1)
