@@ -10,7 +10,15 @@ changes bump the path version (`/v1/`).
 While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.2" }
+{
+  "port": 6084,
+  "token": "…48 hex chars…",
+  "pid": 12345,
+  "version": "0.5.2",
+  "commit": "98a292c82209eb586409ceec1ea27b5fe21ccf0b",
+  "buildTime": "2026-09-08T12:34:56.789Z",
+  "sourceVerified": true
+}
 ```
 
 - Base URL: `http://127.0.0.1:<port>` — loopback only, never remote.
@@ -19,6 +27,12 @@ While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
   when it can reclaim it and otherwise falls back to a new loopback port, so
   re-read the file on connection or authorization errors; treat a missing file
   as "DevHotel is not running".
+- `version`, `commit`, and `buildTime` are compile-time literals for the exact
+  packaged source. `sourceVerified` is true only when the embedded commit is
+  `HEAD` and the source tree was clean; dirty development builds expose false
+  and cannot pass installed-artifact verification. The fields are identical in
+  discovery, `/v1/ping`, `/v1/status`, MCP `hotel_status`, and new Android
+  acceptance reports.
 - Errors are JSON `{ "error": "…" }` with 4xx/5xx status. Stable DevHotel
   contract failures also include `code` and `recoveryHint`; engine-specific
   diagnostics are not exposed as the public error contract.
@@ -116,9 +130,9 @@ can drive the whole thing by polling.
 
 | Method & path | Result |
 |---|---|
-| `GET /v1/ping` | `{ version }` |
+| `GET /v1/ping` | `{ version, commit, buildTime, sourceVerified }` |
 | `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
-| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
+| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
 

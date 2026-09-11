@@ -13,6 +13,7 @@ import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
+const CONTROL_BUILD = { version: '0.4.1', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z', sourceVerified: true }
 const RUN_ID = '11111111-2222-3333-4444-555555555555'
 const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
 const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -79,7 +80,17 @@ beforeAll(async () => {
     req.on('data', (c) => (raw += c))
     req.on('end', () => {
       seen.push({ method: req.method!, url: req.url!, body: raw ? JSON.parse(raw) : null })
-      if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.4.1' }))
+      if (req.url === '/v1/ping') return void res.end(JSON.stringify(CONTROL_BUILD))
+      if (req.url === '/v1/status') {
+        return void res.end(JSON.stringify({
+          ...CONTROL_BUILD,
+          update: { state: 'ready', targetVersion: '0.5.0' },
+          backend: { ok: true, detail: 'ready' },
+          gateway: { running: true, httpPort: 80, httpsPort: 443, routes: [] },
+          rooms: [],
+          devices: { available: true, detail: 'ready', devices: [], recentEvents: [] }
+        }))
+      }
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
       }
@@ -256,7 +267,7 @@ beforeAll(async () => {
 afterAll(() => server.close())
 
 function client(): ControlClient {
-  return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.4.1' })
+  return new ControlClient({ port, token: TOKEN, pid: 0, ...CONTROL_BUILD })
 }
 
 async function closedLoopbackPort(): Promise<number> {
@@ -278,7 +289,7 @@ describe('ControlClient', () => {
   })
 
   it('sends bearer token (401 without)', async () => {
-    const bad = new ControlClient({ port, token: 'wrong', pid: 0, version: '0.4.1' })
+    const bad = new ControlClient({ port, token: 'wrong', pid: 0, ...CONTROL_BUILD })
     await expect(bad.listRooms()).rejects.toThrow(/401/)
   })
 
@@ -298,7 +309,7 @@ describe('ControlClient', () => {
 describe('resilientClient', () => {
   it('re-reads control info and retries a read-only request once when DevHotel restarted', async () => {
     let connects = 0
-    const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, version: 'x' })
+    const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, ...CONTROL_BUILD })
     const wrapped = resilientClient(async () => (connects++ === 0 ? stale : client()))
     const rooms = await wrapped.listRooms()
     expect(rooms).toHaveLength(1)
@@ -308,7 +319,7 @@ describe('resilientClient', () => {
   it('retries a mutation only when ECONNREFUSED proves the first request never connected', async () => {
     let connects = 0
     const closedPort = await closedLoopbackPort()
-    const unavailable = new ControlClient({ port: closedPort, token: TOKEN, pid: 0, version: 'x' })
+    const unavailable = new ControlClient({ port: closedPort, token: TOKEN, pid: 0, ...CONTROL_BUILD })
     const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
     const wrapped = resilientClient(async () => (connects++ === 0 ? unavailable : client()))
 
@@ -382,7 +393,7 @@ describe('resilientClient', () => {
   it('reconnects and retries a mutation rejected with 401 before routing', async () => {
     let connects = 0
     const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
-    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, ...CONTROL_BUILD })
     const wrapped = resilientClient(async () => (connects++ === 0 ? unauthorized : client()))
 
     await expect(wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })).resolves.toEqual(
@@ -395,7 +406,7 @@ describe('resilientClient', () => {
   it('reports a transport failure on the safe 401 replay as an ambiguous mutation', async () => {
     let connects = 0
     let replayCalls = 0
-    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, ...CONTROL_BUILD })
     const disconnected = {
       async applyChange() {
         replayCalls++
@@ -433,7 +444,7 @@ describe('resilientClient', () => {
     // not attempt to resolve it as a promise (this crashed the stdio server)
     const returned = await (async () => wrapped)()
     expect(returned).toBe(wrapped)
-    await expect(returned.ping()).resolves.toEqual({ version: '0.4.1' })
+    await expect(returned.ping()).resolves.toEqual(CONTROL_BUILD)
   })
 
   it('does not mask real API errors with a reconnect', async () => {
@@ -532,6 +543,15 @@ describe('makeTools', () => {
     const res = await byName.list_rooms!.handler({})
     expect(res.isError).toBeUndefined()
     expect(firstText(res)).toContain('abc12345')
+  })
+
+  it('hotel_status returns the exact build and sanitized update target', async () => {
+    const res = await byName.hotel_status!.handler({})
+    const status = JSON.parse(firstText(res))
+    expect(status).toMatchObject({
+      ...CONTROL_BUILD,
+      update: { state: 'ready', targetVersion: '0.5.0' }
+    })
   })
 
   it('run_in_room forwards argv and returns exec result', async () => {

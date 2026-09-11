@@ -23,8 +23,10 @@ import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGa
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
 import { GITHUB_SERVICE_DEFAULT_ENABLED, GITHUB_SERVICE_MANIFEST, GitHubService, PINNED_GH } from './githubService'
 import { roomPreviewPartition } from './previewSecurity'
+import { assertPackagedVersion, BUILD_IDENTITY } from './buildIdentity'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
+assertPackagedVersion(BUILD_IDENTITY, app.getVersion())
 
 // A development build must never take the installed app's single-instance
 // lock or mutate its durable Room state. Keeping a separate Electron profile
@@ -136,6 +138,7 @@ async function bootstrap(): Promise<void> {
     gateway,
     db,
     appVersion: app.getVersion(),
+    appBuild: BUILD_IDENTITY,
     // The Room's browser profile is an Electron session partition, so only the
     // desktop app can clear it; core asks through this hook.
     clearBrowserData: async (roomId) => {
@@ -163,7 +166,7 @@ async function bootstrap(): Promise<void> {
   }
 
   const hotelForAgents: import('./controlApi').HotelServicesRef = { github: null }
-  const control = await startControlApi(orch, userData, app.getVersion(), hotelForAgents).catch((err) => {
+  const control = await startControlApi(orch, userData, BUILD_IDENTITY, hotelForAgents).catch((err) => {
     console.error('control api failed to start:', err)
     return null
   })
@@ -179,6 +182,7 @@ async function bootstrap(): Promise<void> {
   const terms = new TermManager(orch)
   const cleanRemoval = new CleanRemovalGate()
   const updater = setupUpdater(mainWindow)
+  hotelForAgents.updateStatus = updater.status
   const github = new GitHubService(
     userData,
     app.isPackaged ? join(process.resourcesPath, 'github', PINNED_GH.asset) : null,

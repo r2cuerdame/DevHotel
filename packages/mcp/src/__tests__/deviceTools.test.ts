@@ -4,6 +4,7 @@ import { ControlClient } from '../client'
 import { makeTools } from '../tools'
 
 const TOKEN = 'device-token'
+const CONTROL_BUILD = { version: '0.5.2', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z', sourceVerified: true }
 let server: Server
 let port: number
 const seen: { method: string; url: string; body: any }[] = []
@@ -58,7 +59,7 @@ beforeAll(async () => {
 afterAll(() => server.close())
 
 function tools() {
-  const client = new ControlClient({ port, token: TOKEN, pid: 0, version: 'test' })
+  const client = new ControlClient({ port, token: TOKEN, pid: 0, ...CONTROL_BUILD })
   return makeTools(async () => client)
 }
 

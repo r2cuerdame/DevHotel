@@ -25,6 +25,23 @@ passes. This is deliberate — see "Why not CI" below.
      --config.directories.output="$LOCALAPPDATA/Temp/dh-release-X-Y-Z"
    ```
 
+   The desktop build embeds one identity and emits the same
+   `out/main/build-identity.json`; packaging refuses any non-ignored tracked or
+   untracked source change, then deletes and rebuilds the ignored `out/` package
+   input from that clean source. It also refuses any identity not marked
+   `sourceVerified: true` or whose version/commit differs from exact `HEAD`.
+   Development-server builds always advertise `sourceVerified: false`, because
+   they can rebuild after the config is evaluated. After packaging,
+   `build-identity.json` is emitted beside the installer with SHA-256 digests
+   for the packaged `app.asar` and MCP entry. Once signing and all targets
+   finish, that detached release manifest also receives a sorted
+   `runtimePayloads` list covering the signed app executable and every shipped
+   runtime file (excluding licenses and the self-referential installed manifest).
+   Main-process chunks stay inside `app.asar`; packaging and installed-artifact
+   verification fail if an executable `app.asar.unpacked/out/main/chunks`
+   payload appears. The manifest is also carried as
+   `resources/build-identity.json` for acceptance.
+
 6. **Rename to the hyphenated names** electron-builder writes into
    `latest.yml` (`DevHotel-Setup-X.Y.Z.exe`, `…exe.blockmap`), then confirm the
    trio agrees before uploading anything:
@@ -41,13 +58,32 @@ passes. This is deliberate — see "Why not CI" below.
 
    ```
    gh release create vX.Y.Z --title "X.Y.Z" --notes-file notes.md \
-     "DevHotel-Setup-X.Y.Z.exe" "DevHotel-Setup-X.Y.Z.exe.blockmap" latest.yml
+     "DevHotel-Setup-X.Y.Z.exe" "DevHotel-Setup-X.Y.Z.exe.blockmap" \
+     latest.yml build-identity.json
    ```
 
    Never mix CI-built and locally built artifacts in one release.
 8. **Check the result**: `gh release list` should show your version as `Latest`
    and **no drafts**. `gh api repos/<owner>/<repo>/releases/latest` is what
    auto-update reads.
+
+After an explicitly approved installation, compare the expected release
+manifest with discovery and both live identity endpoints. The checker consumes
+the bearer token but prints only the public identity and exits non-zero on any
+mismatch. It also resolves the discovery PID through the operating system,
+requires the supplied `app.asar` and MCP entry to belong to that live process's
+installation, and matches the complete runtime payload file set and hashes.
+Artifacts from a second installation, a replaced executable, or an injected
+native payload therefore cannot satisfy the check:
+
+```
+pnpm --filter devhotel verify:installed-build -- \
+  --expected <downloaded-release-build-identity.json> \
+  --control <control.json> --app-asar <installed-resources/app.asar>
+```
+
+This is verification only. It never installs an update, approves a prompt, or
+bypasses Room shutdown gates.
 
 ## Publishing an older release afterwards
 

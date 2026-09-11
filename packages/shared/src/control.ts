@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { BuildIdentity } from './buildIdentity'
 
 /** Zod schemas shared by the loopback control API (main process) and the MCP server. */
 
@@ -232,11 +233,10 @@ export const zRunInRoomInput = z.object({
   timeoutMs: z.number().int().positive().max(600_000).optional()
 }).strict()
 
-export interface ControlInfo {
+export interface ControlInfo extends BuildIdentity {
   port: number
   token: string
   pid: number
-  version: string
 }
 
 /**

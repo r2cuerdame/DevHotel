@@ -42,9 +42,14 @@ import {
   zSafeHostResyncBody,
   zUndoChangeBody,
   zVolumeGcBody,
+  zBuildIdentity,
+  zSemanticVersion,
   DeviceLeaseError,
   type ArtifactExportResult,
+  type BuildIdentity,
   type ControlInfo,
+  type PublicUpdateStatus,
+  type UpdateStatusInfo,
   type RoomArtifact
 } from '@devhotel/shared'
 import {
@@ -126,6 +131,25 @@ function parseWaitMs(raw: string | null): number {
 /** Hotel Services reachable by agents; populated after app startup wiring. */
 export interface HotelServicesRef {
   github: { status(): Promise<GitHubServiceStatus>; install(): Promise<GitHubServiceStatus> } | null
+  updateStatus?: () => UpdateStatusInfo
+}
+
+function buildIdentityFrom(input: BuildIdentity | string): BuildIdentity {
+  return zBuildIdentity.parse(typeof input === 'string'
+    ? {
+        version: zSemanticVersion.safeParse(input).success ? input : '0.0.0-dev',
+        commit: '0'.repeat(40),
+        buildTime: '1970-01-01T00:00:00.000Z',
+        sourceVerified: false
+      }
+    : input)
+}
+
+/** Keep updater failures and implementation detail private while exposing the target agents need. */
+export function publicUpdateStatus(status: UpdateStatusInfo): PublicUpdateStatus {
+  const pending = status.state === 'available' || status.state === 'downloading' || status.state === 'ready'
+  const target = pending ? zSemanticVersion.safeParse(status.version) : null
+  return { state: status.state, targetVersion: target?.success ? target.data : null }
 }
 
 /**
@@ -135,10 +159,11 @@ export interface HotelServicesRef {
 export async function startControlApi(
   orch: RoomOrchestrator,
   userData: string,
-  version: string,
+  build: BuildIdentity | string,
   hotel: HotelServicesRef = { github: null }
 ): Promise<{ server: Server; info: ControlInfo; stop: () => void }> {
   const token = randomBytes(24).toString('hex')
+  const buildIdentity = buildIdentityFrom(build)
 
   const server = createServer((req, res) => {
     req.on('error', () => {})
@@ -174,13 +199,17 @@ export async function startControlApi(
     }
 
     if (parts[1] === 'ping' && req.method === 'GET') {
-      sendJson(res, 200, { version })
+      sendJson(res, 200, buildIdentity)
       return
     }
 
     if (parts[1] === 'status' && req.method === 'GET') {
       const status = await orch.hotelStatus()
-      sendJson(res, 200, { version, ...status })
+      sendJson(res, 200, {
+        ...status,
+        ...buildIdentity,
+        update: publicUpdateStatus(hotel.updateStatus?.() ?? { state: 'idle' })
+      })
       return
     }
 
@@ -719,7 +748,7 @@ export async function startControlApi(
   }
 
   const port = (server.address() as { port: number }).port
-  const info: ControlInfo = { port, token, pid: process.pid, version }
+  const info: ControlInfo = { port, token, pid: process.pid, ...buildIdentity }
   // Keep the non-secret port preference across graceful relaunches while the
   // token-bearing control file remains a live-process signal and is removed on
   // shutdown. Falling back to control.json also preserves crash-upgrade reuse.

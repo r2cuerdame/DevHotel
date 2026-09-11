@@ -53,6 +53,7 @@ import type {
   AndroidAcceptanceReportSummary,
   ArtifactExportResult,
   BackupInfo,
+  BuildIdentity,
   ChangeEntry,
   CheckReport,
   CheckResult,
@@ -1209,6 +1210,8 @@ export interface OrchestratorOptions {
   gateway: Gateway
   db: Db
   appVersion: string
+  /** Exact desktop build that seals new acceptance evidence. */
+  appBuild?: BuildIdentity
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
   /**
@@ -1269,6 +1272,7 @@ export class RoomOrchestrator {
   private readonly windowsVm?: WindowsVmLifecycle
   private readonly gateway: Gateway
   private readonly appVersion: string
+  private readonly appBuild: BuildIdentity
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
@@ -1281,6 +1285,12 @@ export class RoomOrchestrator {
     this.windowsVm = opts.windowsVm
     this.gateway = opts.gateway
     this.appVersion = opts.appVersion
+    this.appBuild = opts.appBuild ?? {
+      version: /^\d+\.\d+\.\d+/.test(opts.appVersion) ? opts.appVersion : '0.0.0-dev',
+      commit: '0'.repeat(40),
+      buildTime: '1970-01-01T00:00:00.000Z',
+      sourceVerified: false
+    }
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
     this.rooms = roomsRepo(opts.db)
@@ -5809,7 +5819,7 @@ export class RoomOrchestrator {
           pids: [...finalProof.pids]
         }
         const report = sealAndroidAcceptanceReport({
-          schema: 1,
+          schema: 3,
           id: randomUUID(),
           roomId,
           stage: 'final-physical',
@@ -5817,6 +5827,7 @@ export class RoomOrchestrator {
           applicationId: input.applicationId,
           createdAt: new Date().toISOString(),
           actor,
+          devhotelBuild: this.appBuild,
           room: {
             stateRevision: room.stateRevision,
             workspaceVolumeRevision: provenance.workspaceVolumeRevision,
@@ -6496,7 +6507,7 @@ export class RoomOrchestrator {
       const createdAt = new Date().toISOString()
       const systemLocaleTag = artifactLocale(finalProof.evidence.context.status.locale)
       reportCandidate = sealAndroidAcceptanceReport({
-        schema: 1,
+        schema: 3,
         id: randomUUID(),
         roomId,
         stage: input.stage,
@@ -6504,6 +6515,7 @@ export class RoomOrchestrator {
         applicationId: input.applicationId,
         createdAt,
         actor,
+        devhotelBuild: this.appBuild,
         room: {
           stateRevision: room.stateRevision,
           workspaceVolumeRevision: room.workspaceVolumeRevision,
