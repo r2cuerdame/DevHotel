@@ -1,4 +1,4 @@
-export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken'
+export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken' | 'deleting'
 export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
 export type PmKind = 'npm' | 'pnpm' | 'gradle' | 'none'

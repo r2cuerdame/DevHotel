@@ -1,3 +1,5 @@
+import { rmSync } from 'node:fs'
+import { join } from 'node:path'
 import type { IsolationBackend } from './backend/types'
 import type { RoomsRepo } from './store/roomsRepo'
 
@@ -5,6 +7,12 @@ export interface ReconcileResult {
   straysRemoved: string[]
   networksRemoved: string[]
   roomsSlept: string[]
+  roomsDeleted?: string[]
+}
+
+export interface ReconcileOptions {
+  preserveAwakeRoomIds?: ReadonlySet<string>
+  userData?: string
 }
 
 /**
@@ -16,21 +24,45 @@ export async function reconcile(
   backend: IsolationBackend,
   rooms: RoomsRepo,
   log: (line: string) => void,
-  options: { preserveAwakeRoomIds?: ReadonlySet<string> } = {}
+  options: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
-  const knownOciRooms = new Set(rooms.list().filter((room) => room.provider !== 'windows').map((room) => room.id))
+  const roomsDeleted: string[] = []
+  for (const room of rooms.list().filter((r) => r.provider !== 'windows' && r.status === 'deleting')) {
+    log(`reconcile: resuming deletion of room ${room.id}`)
+    try {
+      await backend.deleteRoomPod(room.id, { volumes: true })
+    } catch (err) {
+      log(`reconcile: could not finish deleting room pod ${room.id}: ${err instanceof Error ? err.message : String(err)}`)
+      continue
+    }
+    if (options.userData) {
+      rmSync(join(options.userData, 'rooms', room.id), { recursive: true, force: true })
+    }
+    rooms.delete(room.id)
+    roomsDeleted.push(room.id)
+  }
+
+  const preparingRoomIds = new Set(
+    rooms.list().filter((r) => r.provider !== 'windows' && r.status === 'preparing').map((r) => r.id)
+  )
+  const knownOciRooms = new Set(
+    rooms.list().filter((room) => room.provider !== 'windows' && room.status !== 'deleting').map((room) => room.id)
+  )
   const straysRemoved: string[] = []
   for (const c of await backend.listManagedContainers()) {
     // A one-shot process is owned by the client operation that started it.
     // At process startup no such operation is live, even when its Room still
     // exists, so every surviving job container is stale and must be reaped.
     const interruptedEmulatorCreate = c.role === 'svc-emulator' && c.state === 'created'
-    if (c.role === 'job' || interruptedEmulatorCreate || !c.roomId || !knownOciRooms.has(c.roomId)) {
+    const interruptedPreparing = c.roomId ? preparingRoomIds.has(c.roomId) : false
+    if (c.role === 'job' || interruptedEmulatorCreate || interruptedPreparing || !c.roomId || !knownOciRooms.has(c.roomId)) {
       const kind = c.role === 'job'
         ? 'stale job container'
         : interruptedEmulatorCreate
           ? 'interrupted emulator create'
-          : 'stray container'
+          : interruptedPreparing
+            ? 'interrupted preparing container'
+            : 'stray container'
       log(`reconcile: removing ${kind} ${c.name} (room ${c.roomId || 'unknown'})`)
       await backend.removeManagedContainer(c.name)
       straysRemoved.push(c.name)
@@ -39,7 +71,8 @@ export async function reconcile(
 
   const networksRemoved: string[] = []
   for (const network of await backend.listManagedNetworks()) {
-    if (!network.roomId || !knownOciRooms.has(network.roomId)) {
+    const isPreparing = network.roomId ? preparingRoomIds.has(network.roomId) : false
+    if (!network.roomId || !knownOciRooms.has(network.roomId) || isPreparing) {
       log(`reconcile: removing stray network ${network.name} (room ${network.roomId || 'unknown'})`)
       try {
         await backend.removeManagedNetwork(network.name)
@@ -64,7 +97,7 @@ export async function reconcile(
     // Some startup recovery protocols retain an exact live runtime as durable
     // restoration authority. Stopping or sleeping it here would turn their
     // mutation gate into a permanent recovery deadlock.
-    if (room.status === 'sleeping') continue
+    if (room.status === 'sleeping' || room.status === 'deleting') continue
     if (
       options.preserveAwakeRoomIds?.has(room.id) &&
       (room.status === 'running' || room.status === 'ready' || room.status === 'attention')
@@ -98,5 +131,10 @@ export async function reconcile(
     rooms.update(room.id, { status: 'sleeping', hostPort: null })
     roomsSlept.push(room.id)
   }
-  return { straysRemoved, networksRemoved, roomsSlept }
+  return {
+    straysRemoved,
+    networksRemoved,
+    roomsSlept,
+    ...(roomsDeleted.length > 0 ? { roomsDeleted } : {})
+  }
 }

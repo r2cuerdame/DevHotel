@@ -318,7 +318,8 @@ const STATUS_KEY: Record<RoomRecord['status'], keyof Translation> = {
   ready: 'status.ready',
   sleeping: 'status.sleeping',
   attention: 'status.attention',
-  broken: 'status.broken'
+  broken: 'status.broken',
+  deleting: 'busy.deleting'
 }
 
 export function statusLabel(t: TFunc, status: RoomRecord['status']): string {

@@ -1385,7 +1385,8 @@ export class RoomOrchestrator {
           preserveAwakeRoomIds: new Set([
             ...pendingAndroidLocaleRecoveryRooms,
             ...acceptanceRecoveryRooms
-          ])
+          ]),
+          userData: this.userData
         }
       )
     }
@@ -2956,7 +2957,7 @@ export class RoomOrchestrator {
   }
 
   private runtimeExpectation(room: RoomRecord): RoomRuntimeStatus['expected'] {
-    if (room.status === 'preparing') return 'transitional'
+    if (room.status === 'preparing' || room.status === 'deleting') return 'transitional'
     if (room.status === 'running' || room.status === 'ready' || room.status === 'attention') return 'running'
     return 'stopped'
   }
@@ -3252,7 +3253,44 @@ export class RoomOrchestrator {
         this.olog(id, `room up: ${verify.detail}`)
       } catch (err) {
         this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
-        this.rooms.update(id, { status: 'broken' })
+        this.logs.detach(id)
+        this.gateway.removeRoute(record.domain)
+        await this.releaseAndroidDeviceLocked(id, 'Room creation failed').catch(() => undefined)
+        try {
+          await this.backend.deleteRoomPod(id, { volumes: true })
+          rmSync(join(this.userData, 'rooms', id), { recursive: true, force: true })
+          this.rooms.delete(id)
+          this.operations.forgetRoom(id)
+          this.pendingHostResyncConfirmations.delete(id)
+          this.emit(id, 'deleted')
+        } catch (cleanupError) {
+          const detail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          this.rooms.update(id, { status: 'broken' })
+          this.appendJournal(
+            id,
+            'create-room-cleanup-required',
+            `Create failed; cleanup required for room ${id}`,
+            input.actor,
+            'Room',
+            null,
+            { error: err instanceof Error ? err.message : String(err), cleanupError: detail }
+          )
+          this.olog(id, `automatic cleanup failed; room ownership retained for retry: ${detail}`)
+          try {
+            await writeManifest(this.userData, this.mustGet(id))
+          } catch {
+            // best-effort
+          }
+          this.emit(id, 'status')
+        }
+        if (err instanceof DevHotelError && err.code === 'ROOM_CREATION_FAILED') {
+          throw err
+        }
+        throw new DevHotelError(
+          'ROOM_CREATION_FAILED',
+          `Room creation failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err }
+        )
       }
     }, { admittedBeforeGate: true })
 
@@ -3648,7 +3686,9 @@ export class RoomOrchestrator {
     // cleanup cannot be followed by a terminal write that resurrects an orphan
     // operation row.
     if (this.mutationGate !== 'open') throw this.mutationGateError()
-    if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
+    if (this.deletingRooms.has(roomId) || this.rooms.get(roomId)?.status === 'deleting') {
+      throw new Error(`Room ${roomId} is being deleted and cannot be started`)
+    }
     // Fail an unknown Room before an operation exists: there is nothing to poll.
     this.mustGet(roomId)
     this.assertNoPendingArtifactExport(roomId)
@@ -4024,6 +4064,7 @@ export class RoomOrchestrator {
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
+      this.rooms.update(roomId, { status: 'deleting' })
       const { reclaimedBytes } = await windowsVm.delete(roomId)
       this.rooms.delete(roomId)
       this.operations.forgetRoom(roomId)
@@ -4032,6 +4073,7 @@ export class RoomOrchestrator {
       this.emit(roomId, 'deleted')
       return { reclaimedBytes }
     }
+    this.rooms.update(roomId, { status: 'deleting' })
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })

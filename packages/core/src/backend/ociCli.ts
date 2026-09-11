@@ -1348,7 +1348,11 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureImage(imageFor(spec))
     if (spec.workspaceMode === 'hotel') {
       if (initializeManagedSource && spec.sourceType === 'managed-git') await this.ensureImage(CLONE_IMAGE)
-      await this.ensureRoomVolume(spec.roomId, srcVolume(spec.roomId, spec.workspaceVolumeRevision))
+      await this.ensureRoomVolume(
+        spec.roomId,
+        srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 }
+      )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
@@ -1825,7 +1829,11 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureImage(imageFor(spec))
     await this.ensureRoomNetwork(spec.roomId)
     if (spec.workspaceMode === 'hotel') {
-      await this.ensureRoomVolume(spec.roomId, srcVolume(spec.roomId, spec.workspaceVolumeRevision))
+      await this.ensureRoomVolume(
+        spec.roomId,
+        srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 }
+      )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
@@ -2028,7 +2036,8 @@ export class OciCliBackend implements IsolationBackend {
     if (spec.workspaceMode === 'hotel') {
       await this.ensureRoomVolume(
         spec.roomId,
-        spec.workspaceVolumeOverride ?? srcVolume(spec.roomId, spec.workspaceVolumeRevision)
+        spec.workspaceVolumeOverride ?? srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 && !spec.workspaceVolumeOverride }
       )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
@@ -5311,12 +5320,23 @@ export class OciCliBackend implements IsolationBackend {
     throw new Error(`volume name collision or invalid ownership metadata: ${name}`)
   }
 
-  private async ensureRoomVolume(roomId: string, name: string): Promise<void> {
+  private async ensureRoomVolume(
+    roomId: string,
+    name: string,
+    opts?: { mustExist?: boolean }
+  ): Promise<void> {
     assertExpectedRoomVolumeName(roomId, name)
     const existing = await this.inspectVolume(name)
     if (existing) {
       await this.assertRoomVolumeOwnership(existing, roomId, name)
       return
+    }
+    if (opts?.mustExist) {
+      throw new DevHotelError(
+        'DATA_LOSS',
+        `Recorded volume ${name} for Room ${roomId} does not exist. Refusing to recreate an empty volume.`,
+        { recoveryHint: 'Restore the missing volume or reset the room.' }
+      )
     }
     must(
       await runDocker([
