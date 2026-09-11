@@ -2946,7 +2946,7 @@ export class RoomOrchestrator {
     }
     const rooms: RuntimeRoomRecord[] = []
     for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backendAvailable)
       rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
     }
     return rooms
@@ -3110,6 +3110,21 @@ export class RoomOrchestrator {
   private effectiveRoom(room: RoomRecord, runtimeStatus: RoomRuntimeStatus): RoomRecord {
     if (runtimeStatus.expected !== 'running' || runtimeStatus.state === 'running') return room
     return { ...room, status: runtimeStatus.state === 'dead' ? 'broken' : 'attention' }
+  }
+
+  /** Runtime revalidation plus invariant I2: a proven-dead workload loses ingress on observation. */
+  private async observeRuntimeStatusForIngress(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+    const opsBefore = this.roomOps.get(room.id)
+    const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+    if (
+      runtimeStatus.expected === 'running' &&
+      runtimeStatus.state === 'dead' &&
+      this.roomOps.get(room.id) === opsBefore &&
+      !this.activeRoomLocks.has(room.id)
+    ) {
+      this.revokeRouteFor(room.id, `runtime is dead (${runtimeStatus.detail})`)
+    }
+    return runtimeStatus
   }
 
   async planRoom(input: {
@@ -3840,6 +3855,7 @@ export class RoomOrchestrator {
     } catch (err) {
       this.olog(roomId, `wake failed: ${err instanceof Error ? err.message : String(err)}`)
       this.rooms.update(roomId, { status: 'broken' })
+      this.revokeRouteFor(roomId, 'wake failed')
       report.fail('wake failed', err)
     }
     this.emit(roomId, 'status')
@@ -3884,6 +3900,7 @@ export class RoomOrchestrator {
     const room = this.mustGet(roomId)
     const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
+    this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
@@ -3897,7 +3914,6 @@ export class RoomOrchestrator {
       return
     }
     this.logs.detach(roomId)
-    this.gateway.removeRoute(room.domain)
     await this.backend.stopRoomPod(roomId)
     this.rooms.update(roomId, {
       status: artifactRecoveryPending ? 'broken' : 'sleeping',
@@ -4061,6 +4077,7 @@ export class RoomOrchestrator {
     this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
+    this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
@@ -4075,7 +4092,6 @@ export class RoomOrchestrator {
     }
     this.rooms.update(roomId, { status: 'deleting' })
     this.logs.detach(roomId)
-    this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
     this.operations.forgetRoom(roomId)
@@ -7502,7 +7518,7 @@ export class RoomOrchestrator {
     const backend = await this.backend.health()
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backend.ok)
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
@@ -7561,7 +7577,7 @@ export class RoomOrchestrator {
   /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
   async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
     const recorded = this.mustGet(roomId)
-    const runtimeStatus = await this.observeRuntimeStatus(recorded)
+    const runtimeStatus = await this.observeRuntimeStatusForIngress(recorded)
     const inspection = this.inspectRoom(roomId)
     return {
       ...inspection,
@@ -8344,6 +8360,8 @@ export class RoomOrchestrator {
       )
       const anyBad = report.results.some((r) => r.status === 'broken' || r.status === 'warning')
       this.rooms.update(roomId, { status: coreBroken ? 'broken' : anyBad ? 'attention' : 'ready' })
+      const processDead = report.results.some((r) => r.step === 'process' && r.status === 'broken')
+      if (processDead) this.revokeRouteFor(roomId, 'check proved the web workload is not running')
     }
     this.emit(roomId, 'check', report.overall)
     return report
@@ -9138,20 +9156,54 @@ export class RoomOrchestrator {
       status: 'broken',
       hostPort: null
     })
+    const isRouted = this.gateway.status().routes.some((r) => r.domain === room.domain)
+    if (isRouted) {
+      this.gateway.removeRoute(room.domain)
+    }
   }
 
+  /**
+   * Derive the Room's gateway route from its record (invariant I1).
+   * Entitled  → setRoute (fetches the relay token; Docker-costly).
+   * Otherwise → removeRoute (pure in-memory; never touches the backend).
+   * If the relay token cannot be issued the route is revoked before rethrowing:
+   * ingress must fail closed without a valid relay credential.
+   */
   private async syncRouteFor(roomId: string): Promise<void> {
     const room = this.mustGet(roomId)
-    if (room.hostPort != null) {
-      const relayToken = await this.backend.relayToken(room.id)
-      await this.gateway.setRoute({
-        domain: room.domain,
-        roomId: room.id,
-        targetPort: room.hostPort,
-        https: room.https,
-        relayToken
-      })
+    const entitled =
+      room.provider !== 'windows' &&
+      room.hostPort != null &&
+      room.status !== 'sleeping' &&
+      room.status !== 'preparing' &&
+      room.status !== 'deleting'
+    if (!entitled) {
+      this.gateway.removeRoute(room.domain)
+      return
     }
+    let relayToken: string
+    try {
+      relayToken = await this.backend.relayToken(room.id)
+    } catch (error) {
+      this.gateway.removeRoute(room.domain)
+      throw error
+    }
+    await this.gateway.setRoute({
+      domain: room.domain,
+      roomId: room.id,
+      targetPort: room.hostPort!,
+      https: room.https,
+      relayToken
+    })
+  }
+
+  /** Invariant I2: revoke ingress now. Sync, idempotent, in-memory, no backend calls. */
+  private revokeRouteFor(roomId: string, reason: string): void {
+    const room = this.rooms.get(roomId)
+    if (!room) return
+    const wasRouted = this.gateway.status().routes.some((r) => r.domain === room.domain)
+    this.gateway.removeRoute(room.domain)
+    if (wasRouted) this.olog(roomId, `ingress revoked: ${reason}`)
   }
 
   private uniqueDomain(domain: string): string {
