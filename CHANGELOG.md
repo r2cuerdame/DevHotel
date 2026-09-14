@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.3 — 2026-09-14
+
+### Agents acquire and reuse compatible Rooms
+
+- `acquire_room` now selects an existing Room for the same canonical source,
+  project, provider, and runtime settings, wakes it when needed, and preserves
+  its working state. Task and issue identities still allow intentional parallel
+  work without creating accidental duplicates. ([#98](https://github.com/r2cuerdame/DevHotel/pull/98))
+- Direct agent creation now fails with `ROOM_REUSE_REQUIRED` when a compatible
+  Room already exists, and concurrent acquisition is serialized per source so
+  two requests cannot race into duplicate Rooms.
+
+### Idle Rooms follow a safe automatic lifecycle
+
+- Desktop lifecycle sweeps can sleep idle Rooms after one hour and mark them
+  for expiry after seven days, with a 24-hour grace period before deletion.
+  Valid command use wakes lifecycle-slept Rooms and records every transition.
+- Automatic deletion fails closed for pinned, modified, database-bearing,
+  non-Web, or otherwise unsafe Rooms, so activity management cannot discard
+  valuable working state. ([#99](https://github.com/r2cuerdame/DevHotel/pull/99))
+
+### Anonymous daily startup telemetry
+
+- Packaged builds now send one privacy-safe PurplePulse startup ping per local
+  day with an anonymous install ID, app version, normalized OS, and Electron
+  platform metadata; test builds are isolated from production telemetry and
+  failures remain silent. ([#103](https://github.com/r2cuerdame/DevHotel/pull/103),
+  [#102](https://github.com/r2cuerdame/DevHotel/issues/102))
+
 ## 0.5.2 — 2026-09-07
 
 ### Interrupted Android locale runs recover after a restart
