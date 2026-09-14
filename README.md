@@ -91,11 +91,13 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "<path-to-DevHotel.
 ```
 *Always register using absolute paths so agents started outside DevHotel's environment can resolve the executable.*
 
-### MCP tool surface (52 tools)
+Agents should start with `acquire_room`. Matching ignores nicknames and uses canonical source, project, provider and requested runtime settings. Existing modified state is preserved. Direct `create_room` rejects compatible duplicates with `ROOM_REUSE_REQUIRED` and `evidence.roomId`; a distinct `taskId` or `issueRef` permits parallel work and is persisted for subsequent reuse. Manual desktop creation remains available.
 
-The bundled MCP server exposes 52 tools across the complete development lifecycle:
+### MCP tool surface (53 tools)
 
-- **Room Lifecycle & Health (12):** `list_rooms`, `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
+The bundled MCP server exposes 53 tools across the complete development lifecycle:
+
+- **Room Lifecycle & Health (13):** `list_rooms`, `acquire_room` (default; reuses/wakes compatible Rooms), `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
 - **Working State, Changes & Sync (10):** `apply_quick_change`, `undo_change`, `list_changes`, `room_components`, `restart_web`, `clone_room`, `reset_room`, `safe_resync_from_host`, `sync_from_host`, `reset_sync_baseline`.
 - **Execution & Output Retention (3):** `run_in_room` (bounded output with server-side substring filter), `read_run_output` (paging retained output by byte offset with optional base64), `list_room_runs`.
 - **Room Files (2):** `room_pull_file`, `room_push_file` (workspace-scoped file transfer).
@@ -151,7 +153,7 @@ packages/core     Orchestrator — OCI room backend (docker CLI), VMware backend
                   local gateway (*.localhost + SNI TLS + local CA), SQLite store,
                   change transaction engine with undo, 15-step check pipeline,
                   secret-redacted diagnostics, device broker
-packages/mcp      devhotel-mcp — stdio MCP server (52 tools over the control API)
+packages/mcp      devhotel-mcp — stdio MCP server (53 tools over the control API)
 packages/shared   Shared schemas, contracts, and host input boundary definitions
 ```
 

@@ -132,7 +132,13 @@ export const zRendererPlanRoomInput = zPlanRoomInput.superRefine((input, ctx) =>
 })
 export type RendererPlanRoomInput = z.infer<typeof zRendererPlanRoomInput>
 
+export const zRoomTaskIdentity = z.object({
+  taskId: z.string().trim().min(1).max(200).optional(),
+  issueRef: z.string().trim().min(1).max(500).optional()
+}).strict()
+
 export const zCreateRoomInput = z.object({
+  ...zRoomTaskIdentity.shape,
   sourceType: zSourceType,
   sourceRef: z.string().max(4096),
   project: z.string().trim().min(1).max(100),
@@ -169,6 +175,9 @@ export const zAgentCreateRoomInput = zPublicCreateRoomInput
     message: 'Agents cannot create linked-folder Rooms without a user-approved host-folder grant',
     path: ['sourceType']
   })
+/** Acquisition uses the same strict agent source and provider boundary. */
+export const zAgentAcquireRoomInput = zAgentCreateRoomInput
+export type AgentAcquireRoomInput = z.infer<typeof zAgentAcquireRoomInput>
 export type AgentCreateRoomInput = z.infer<typeof zAgentCreateRoomInput>
 
 /** Room mutations agents may request through the control API, beyond create/change. */
@@ -248,6 +257,7 @@ export const CONTROL_ROUTES = {
   ping: { method: 'GET', path: '/v1/ping' },
   listRooms: { method: 'GET', path: '/v1/rooms' },
   createRoom: { method: 'POST', path: '/v1/rooms' },
+  acquireRoom: { method: 'POST', path: '/v1/rooms/acquire' },
   inspectRoom: { method: 'GET', path: '/v1/rooms/:id' },
   startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
   getOperation: { method: 'GET', path: '/v1/operations/:operationId' },

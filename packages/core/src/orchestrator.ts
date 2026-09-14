@@ -58,6 +58,7 @@ import type {
   CheckResult,
   CheckStatus,
   CloneRoomInput,
+  AcquireRoomResult,
   CreateRoomInput,
   OperationRecord,
   HostResyncDriftFacts,
@@ -197,6 +198,7 @@ import type { Db } from './store/db'
 import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
 import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
+import { roomIdentityKey } from './roomIdentity'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey, workspaceSyncBaseKey } from './workingState'
 import {
@@ -3135,8 +3137,67 @@ export class RoomOrchestrator {
     }
   }
 
+  private readonly roomAdmissions = new Map<string, Promise<unknown>>()
+
+  /** Match and create share a source-level queue, including differing profiles and task IDs. */
+  private admitRoom<T>(input: CreateRoomInput, fn: () => Promise<T>): Promise<T> {
+    return this.trackMutation(async () => {
+      const key = roomIdentityKey(input)
+      const previous = this.roomAdmissions.get(key) ?? Promise.resolve()
+      const next = previous.catch(() => undefined).then(fn)
+      this.roomAdmissions.set(key, next)
+      try {
+        return await next
+      } finally {
+        if (this.roomAdmissions.get(key) === next) this.roomAdmissions.delete(key)
+      }
+    })
+  }
+
   createRoom(input: CreateRoomInput): Promise<RoomRecord> {
-    return this.trackMutation(() => this.createRoomAdmitted(input))
+    return this.admitRoom(input, async () => {
+      if (input.actor === 'agent') {
+        const candidate = this.rooms.findCompatible(input)
+        if (candidate) throw new DevHotelError('ROOM_REUSE_REQUIRED', `Reuse Room ${candidate.id} with acquire_room.`, {
+          evidence: { roomId: candidate.id },
+          recoveryHint: 'Use acquire_room, or supply a distinct taskId or issueRef for parallel work.'
+        })
+      }
+      return this.createRoomAdmitted(input)
+    })
+  }
+
+  acquireRoom(input: CreateRoomInput): Promise<AcquireRoomResult> {
+    return this.admitRoom(input, async () => {
+      const candidate = this.rooms.findCompatible(input)
+      let room: RoomRecord
+      let disposition: AcquireRoomResult['disposition']
+      if (!candidate) {
+        room = await this.createRoomAdmitted(input)
+        disposition = 'created'
+      } else {
+        room = candidate
+        disposition = 'reused'
+        if (room.status === 'sleeping') {
+          await this.startRoom(room.id, input.actor)
+          room = this.mustGet(room.id)
+          if (room.status !== 'ready' && room.status !== 'running') {
+            throw new DevHotelError('ROOM_WAKE_FAILED', `Room ${room.id} could not be woken.`, {
+              evidence: { roomId: room.id, status: room.status },
+              recoveryHint: 'Inspect the existing Room and its start operation before retrying.'
+            })
+          }
+          disposition = 'woken'
+        }
+      }
+      const modified = room.syncStatus === 'modified'
+      const reason = disposition === 'created'
+        ? 'No compatible Room exists for this source, project, provider, profile and task identity.'
+        : 'Matched canonical source, project, provider, requested profile and task identity; existing state preserved.'
+      this.appendJournal(room.id, 'acquire-room', `Room ${disposition}: ${room.id}`, input.actor, 'Room', null,
+        { roomId: room.id, disposition, reason, modified })
+      return { room, disposition, reason, modified }
+    })
   }
 
   private async createRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
@@ -3171,6 +3232,8 @@ export class RoomOrchestrator {
       id,
       project: input.project,
       nickname: input.nickname,
+      ...(input.taskId?.trim() ? { taskId: input.taskId.trim() } : {}),
+      ...(input.issueRef?.trim() ? { issueRef: input.issueRef.trim() } : {}),
       roomNumber: this.rooms.nextRoomNumber(),
       provider: providerKind,
       sourceType: input.sourceType,
@@ -3326,6 +3389,8 @@ export class RoomOrchestrator {
       id,
       project: input.project,
       nickname: input.nickname,
+      ...(input.taskId?.trim() ? { taskId: input.taskId.trim() } : {}),
+      ...(input.issueRef?.trim() ? { issueRef: input.issueRef.trim() } : {}),
       roomNumber: this.rooms.nextRoomNumber(),
       provider: 'windows',
       sourceType: 'empty',

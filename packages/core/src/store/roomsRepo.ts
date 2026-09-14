@@ -1,4 +1,5 @@
 import type {
+  CreateRoomInput,
   PmKind,
   ProviderKind,
   RuntimeKind,
@@ -11,6 +12,7 @@ import type {
   WorkspaceSyncStatus
 } from '@devhotel/shared'
 import type { Db } from './db'
+import { isCompatibleRoom } from '../roomIdentity'
 
 interface RoomRow {
   id: string
@@ -44,6 +46,8 @@ interface RoomRow {
 }
 
 interface ExtraJson {
+  taskId?: string
+  issueRef?: string
   services?: RoomServices
   os?: RoomOsSettings
   agentHostSync?: boolean
@@ -72,6 +76,8 @@ function rowToRoom(row: RoomRow): RoomRecord {
 
   return {
     id: row.id,
+    ...(extra.taskId ? { taskId: extra.taskId } : {}),
+    ...(extra.issueRef ? { issueRef: extra.issueRef } : {}),
     project: row.project,
     nickname: row.nickname,
     roomNumber: row.room_number,
@@ -218,6 +224,7 @@ export interface RoomsRepo {
   create(r: RoomRecord): void
   get(id: string): RoomRecord | null
   list(): RoomRecord[]
+  findCompatible(input: CreateRoomInput): RoomRecord | null
   update(id: string, patch: Partial<RoomRecord>): void
   /** Atomically publish the Room workspace pointer and its matching dependency pointer. */
   publishWorkingState(input: {
@@ -286,6 +293,8 @@ export function roomsRepo(db: Db): RoomsRepo {
           r.lastUsedAt,
           r.thumbPath,
           JSON.stringify({
+            taskId: r.taskId,
+            issueRef: r.issueRef,
             services: r.services ?? {},
             os: r.os ?? { env: {} },
             ...(r.agentHostSync !== undefined ? { agentHostSync: r.agentHostSync } : {}),
@@ -304,9 +313,14 @@ export function roomsRepo(db: Db): RoomsRepo {
         .all() as unknown as RoomRow[]
       return rows.map(rowToRoom)
     },
+    findCompatible(input) {
+      return this.list().find((room) => isCompatibleRoom(room, input)) ?? null
+    },
     update(id, patch) {
       const cols = patchToColumns(patch)
       if (
+        patch.taskId !== undefined ||
+        patch.issueRef !== undefined ||
         patch.services !== undefined ||
         patch.os !== undefined ||
         patch.android !== undefined ||
@@ -316,6 +330,8 @@ export function roomsRepo(db: Db): RoomsRepo {
         const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
         const parsedExtra = parseExtra(row?.extra ?? '{}')
         const extra = isRecord(parsedExtra) ? parsedExtra as ExtraJson : {}
+        if (patch.taskId !== undefined) extra.taskId = patch.taskId
+        if (patch.issueRef !== undefined) extra.issueRef = patch.issueRef
         if (patch.services !== undefined) extra.services = patch.services
         if (patch.os !== undefined) extra.os = patch.os
         if (patch.android !== undefined) extra.android = patch.android

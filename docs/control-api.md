@@ -437,3 +437,23 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "C:\…\DevHotel.ex
 
 `-s user` registers it once for every project. Registration only takes effect
 for agent sessions started afterwards — a running session must reconnect.
+
+### Room acquisition
+
+`POST /v1/rooms/acquire` is the default agent entry point (`acquire_room` in MCP).
+It accepts the same strict agent body as `POST /v1/rooms`, including optional
+`taskId` and `issueRef`. It returns `{ room, disposition, reason, modified }`,
+where disposition is `created`, `reused`, or `woken`. Sleeping Rooms are woken;
+existing source state is preserved, with no automatic resync or reset. A failed
+wake returns `ROOM_WAKE_FAILED` with the existing Room ID. Other Room states
+are surfaced in `room.status` for inspection/recovery.
+
+Matching uses canonical source identity, case-insensitive project, provider,
+and explicit plan overrides; nickname is only a display label. With no task
+identity supplied, compatible task-bound Rooms are also candidates. A distinct
+`taskId` or `issueRef` selects a separate parallel lane; repeating that identity
+reuses its existing Room. Direct agent creation returns HTTP 409,
+`ROOM_REUSE_REQUIRED`, and `evidence.roomId` when a candidate exists. Neither a
+nickname change nor a force flag grants an exception. User/manual creation is
+unchanged. Selection, disposition and preservation reason are journaled on the
+selected Room as `acquire-room`.
