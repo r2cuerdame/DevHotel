@@ -28,6 +28,14 @@ function calendarDate(now: Date): string {
   return `${year}-${month}-${day}`
 }
 
+export function normalizeTelemetryOs(platform: string): string {
+  const normalized = platform.toLowerCase()
+  if (normalized === 'win32') return 'windows'
+  if (normalized === 'darwin') return 'macos'
+  if (normalized === 'linux') return 'linux'
+  return normalized
+}
+
 function readState(path: string): TelemetryState {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<TelemetryState>
@@ -71,7 +79,7 @@ export async function sendStartupTelemetry(options: StartupTelemetryOptions): Pr
     project_id: PROJECT_ID,
     install_id: state.installId,
     version: options.version,
-    os: options.os,
+    os: normalizeTelemetryOs(options.os),
     platform: 'electron',
     ...(options.environment ? { environment: options.environment } : {})
   }

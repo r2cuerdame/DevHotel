@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { sendStartupTelemetry } from './startupTelemetry'
+import { normalizeTelemetryOs, sendStartupTelemetry } from './startupTelemetry'
 
 const directories: string[] = []
 
@@ -17,6 +17,15 @@ afterEach(() => {
 })
 
 describe('startup telemetry', () => {
+  it.each([
+    ['win32', 'windows'],
+    ['darwin', 'macos'],
+    ['linux', 'linux'],
+    ['FreeBSD', 'freebsd']
+  ])('normalizes the OS platform %s to %s', (platform, expected) => {
+    expect(normalizeTelemetryOs(platform)).toBe(expected)
+  })
+
   it('persists an anonymous install id and sends only the allowed production fields', async () => {
     const userData = temporaryUserData()
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
@@ -40,7 +49,7 @@ describe('startup telemetry', () => {
       project_id: 'pp_devhotel_a0d37c00',
       install_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
       version: '0.5.3',
-      os: 'win32',
+      os: 'windows',
       platform: 'electron'
     })
     expect(JSON.parse(readFileSync(join(userData, 'telemetry.json'), 'utf8')).installId).toBe(payload.install_id)
