@@ -18,6 +18,7 @@ import { createTray } from './tray'
 import { setupUpdater } from './updater'
 import { startControlApi } from './controlApi'
 import { startDeviceSweeper } from './deviceSweeper'
+import { startRoomLifecycleSweeper } from './roomLifecycleSweeper'
 import { ensureDataOwnership } from './cleanRemoval'
 import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGate'
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
@@ -173,6 +174,9 @@ async function bootstrap(): Promise<void> {
   const deviceSweeper = startDeviceSweeper(orch, {
     onError: (error) => console.error('Android device sweep failed:', error)
   })
+  const roomLifecycleSweeper = startRoomLifecycleSweeper(orch, {
+    onError: (error) => console.error('Room lifecycle sweep failed:', error)
+  })
 
   mainWindow = createWindow()
   const previews = new PreviewManager(mainWindow, orch, userData)
@@ -213,6 +217,7 @@ async function bootstrap(): Promise<void> {
     previews.dispose()
     terms.dispose()
     deviceSweeper.stop()
+    roomLifecycleSweeper.stop()
     control?.stop()
     void executeShutdownPolicy(action, {
       shutdown: () => orch.shutdown(),

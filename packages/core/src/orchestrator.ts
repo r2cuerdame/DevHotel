@@ -1221,6 +1221,26 @@ export interface OrchestratorOptions {
   gitCredential?: GitCredentialResolver
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
+  lifecyclePolicy?: Partial<RoomLifecyclePolicy>
+}
+
+export interface RoomLifecyclePolicy {
+  idleSleepAfterMs: number
+  expireAfterMs: number
+  graceAfterMs: number
+}
+
+export const DEFAULT_ROOM_LIFECYCLE_POLICY: Readonly<RoomLifecyclePolicy> = {
+  idleSleepAfterMs: 60 * 60 * 1000,
+  expireAfterMs: 7 * 24 * 60 * 60 * 1000,
+  graceAfterMs: 24 * 60 * 60 * 1000
+}
+
+export interface RoomLifecycleSweepResult {
+  slept: string[]
+  expired: string[]
+  deleted: string[]
+  retained: Array<{ roomId: string; reason: string }>
 }
 
 type ExactRoomRuntimeFenceBackend = IsolationBackend & {
@@ -1275,6 +1295,7 @@ export class RoomOrchestrator {
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
   private readonly gitCredential?: GitCredentialResolver
+  private readonly lifecyclePolicy: RoomLifecyclePolicy
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -1285,6 +1306,10 @@ export class RoomOrchestrator {
     this.appVersion = opts.appVersion
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
+    this.lifecyclePolicy = { ...DEFAULT_ROOM_LIFECYCLE_POLICY, ...opts.lifecyclePolicy }
+    for (const [name, value] of Object.entries(this.lifecyclePolicy)) {
+      if (!Number.isFinite(value) || value <= 0) throw new Error(`Room lifecycle ${name} must be a positive duration`)
+    }
     this.rooms = roomsRepo(opts.db)
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
@@ -3257,6 +3282,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
     this.rooms.create(record)
@@ -3415,6 +3443,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
     this.rooms.create(record)
@@ -3519,6 +3550,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
 
@@ -3794,6 +3828,7 @@ export class RoomOrchestrator {
 
   private async startRoomLocked(roomId: string, _actor: Actor, report: OperationReporter): Promise<void> {
     const room = this.mustGet(roomId)
+    this.recordRoomActivity(roomId)
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
     report.begin('preparing', 'Prepare the Room record')
     if (room.provider === 'windows') {
@@ -3939,7 +3974,10 @@ export class RoomOrchestrator {
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
     return this.withRoomLock(
       roomId,
-      () => this.sleepRoomLocked(roomId, actor),
+      () => {
+        this.recordRoomActivity(roomId)
+        return this.sleepRoomLocked(roomId, actor)
+      },
       { allowPendingArtifactExport: true }
     )
   }
@@ -3971,6 +4009,159 @@ export class RoomOrchestrator {
     })
     await writeManifest(this.userData, this.mustGet(roomId))
     this.emit(roomId, 'status')
+  }
+
+  /** Pinning is durable and immediately cancels an outstanding expiry grace period. */
+  setRoomPinned(roomId: string, pinned: boolean, actor: Actor): Promise<RoomRecord> {
+    return this.withRoomLock(roomId, async () => {
+      const before = this.mustGet(roomId)
+      const now = new Date().toISOString()
+      this.rooms.update(roomId, {
+        pinned,
+        lastActivityAt: now,
+        lifecycle: { state: 'active', expiredAt: null }
+      })
+      this.appendJournal(
+        roomId,
+        pinned ? 'pin-room' : 'unpin-room',
+        pinned ? 'Room pinned against automatic deletion' : 'Room unpinned',
+        actor,
+        'Room lifecycle',
+        { pinned: before.pinned ?? false },
+        { pinned }
+      )
+      this.emit(roomId, 'change')
+      return this.mustGet(roomId)
+    })
+  }
+
+  /**
+   * Apply one bounded lifecycle pass. Deletion is fail-closed: only a clean,
+   * untouched managed-Git Web Room without Room Services is eligible.
+   */
+  async sweepRoomLifecycle(now = new Date()): Promise<RoomLifecycleSweepResult> {
+    const result: RoomLifecycleSweepResult = { slept: [], expired: [], deleted: [], retained: [] }
+    for (const snapshot of this.rooms.list()) {
+      if (this.deletingRooms.has(snapshot.id) || snapshot.status === 'preparing' || snapshot.status === 'deleting') continue
+      try {
+        await this.withRoomLock(snapshot.id, async () => {
+          let room = this.mustGet(snapshot.id)
+          const activityMs = Date.parse(room.lastActivityAt ?? room.lastUsedAt)
+          if (!Number.isFinite(activityMs)) {
+            result.retained.push({ roomId: room.id, reason: 'invalid activity timestamp' })
+            return
+          }
+          const inactiveFor = Math.max(0, now.getTime() - activityMs)
+          const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+          if (awake && inactiveFor >= this.lifecyclePolicy.idleSleepAfterMs) {
+            await this.sleepRoomLocked(room.id, 'devhotel')
+            const autoSleptAt = now.toISOString()
+            this.rooms.update(room.id, {
+              lifecycle: { ...(room.lifecycle ?? { state: 'active', expiredAt: null }), autoSleptAt }
+            })
+            this.appendJournal(
+              room.id,
+              'auto-sleep-room',
+              'Room slept after its idle timeout',
+              'devhotel',
+              'Room lifecycle',
+              { status: room.status, lastActivityAt: room.lastActivityAt ?? room.lastUsedAt },
+              { status: 'sleeping', autoSleptAt }
+            )
+            this.emit(room.id, 'change')
+            result.slept.push(room.id)
+            room = this.mustGet(room.id)
+          }
+
+          if (room.pinned) {
+            result.retained.push({ roomId: room.id, reason: 'pinned' })
+            return
+          }
+          const unsafeReason = this.automaticDeletionUnsafeReason(room)
+          if (unsafeReason) {
+            result.retained.push({ roomId: room.id, reason: unsafeReason })
+            return
+          }
+          const lifecycle = room.lifecycle ?? { state: 'active' as const, expiredAt: null }
+          if (lifecycle.state === 'active') {
+            if (inactiveFor < this.lifecyclePolicy.expireAfterMs) return
+            const expiredAt = now.toISOString()
+            this.rooms.update(room.id, { lifecycle: { ...lifecycle, state: 'expired', expiredAt } })
+            this.appendJournal(
+              room.id,
+              'expire-room',
+              'Room entered expiry grace',
+              'devhotel',
+              'Room lifecycle',
+              { state: 'active', lastActivityAt: room.lastActivityAt ?? room.lastUsedAt },
+              { state: 'expired', expiredAt }
+            )
+            this.emit(room.id, 'change')
+            result.expired.push(room.id)
+            return
+          }
+          const expiredMs = lifecycle.expiredAt === null ? Number.NaN : Date.parse(lifecycle.expiredAt)
+          if (!Number.isFinite(expiredMs)) {
+            result.retained.push({ roomId: room.id, reason: 'invalid expiry timestamp' })
+            return
+          }
+          if (now.getTime() - expiredMs < this.lifecyclePolicy.graceAfterMs) return
+          this.appendJournal(
+            room.id,
+            'auto-delete-room',
+            'Room grace elapsed; automatic deletion started',
+            'devhotel',
+            'Room lifecycle',
+            { state: 'expired', expiredAt: lifecycle.expiredAt },
+            { state: 'deleting' }
+          )
+          this.deletingRooms.add(room.id)
+          try {
+            await this.deleteRoomLocked(room.id, 'devhotel')
+            result.deleted.push(room.id)
+          } finally {
+            this.deletingRooms.delete(room.id)
+          }
+        })
+      } catch (error) {
+        result.retained.push({
+          roomId: snapshot.id,
+          reason: `lifecycle action failed: ${error instanceof Error ? error.message : String(error)}`
+        })
+      }
+    }
+    return result
+  }
+
+  private automaticDeletionUnsafeReason(room: RoomRecord): string | null {
+    if (room.provider !== 'web') return 'provider state is not safely disposable'
+    if (Object.keys(room.services).length > 0) return 'Room has database or service data'
+    if (room.sourceType !== 'managed-git' || room.workspaceMode !== 'hotel') return 'workspace ownership is unsafe'
+    if (room.syncStatus !== 'synced') return 'workspace is modified or uncommitted'
+    if (room.stateRevision !== 1) return 'workspace clean-import revision is uncertain'
+    return null
+  }
+
+  private recordRoomActivity(roomId: string): void {
+    const room = this.mustGet(roomId)
+    const wasExpired = room.lifecycle?.state === 'expired'
+    const lastActivityAt = new Date().toISOString()
+    this.rooms.update(roomId, {
+      lastActivityAt,
+      lifecycle: { state: 'active', expiredAt: null, autoSleptAt: null }
+    })
+    if (wasExpired) {
+      this.appendJournal(
+        roomId,
+        'reactivate-room',
+        'Room activity cancelled expiry grace',
+        'devhotel',
+        'Room lifecycle',
+        room.lifecycle,
+        { state: 'active', lastActivityAt }
+      )
+      this.emit(roomId, 'change')
+    }
   }
 
   restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
@@ -8529,12 +8720,16 @@ export class RoomOrchestrator {
     })
   }
 
-  execInRoom(
+  async execInRoom(
     roomId: string,
     cmd: string[],
     opts?: { timeoutMs?: number; output?: OutputSelection },
     actor: Actor = 'agent'
   ): Promise<RoomExecResult> {
+    const beforeUse = this.mustGet(roomId)
+    if (beforeUse.status === 'sleeping' && beforeUse.lifecycle?.autoSleptAt) {
+      await this.startRoom(roomId, actor)
+    }
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
@@ -8544,6 +8739,7 @@ export class RoomOrchestrator {
       if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
       const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
       if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
+      this.recordRoomActivity(roomId)
       this.advanceStateRevision(roomId)
       const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
       let sawStdout = false

@@ -29,6 +29,15 @@ export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
 export type RuntimeComponentState = 'running' | 'exited' | 'stopped' | 'missing' | 'unknown' | 'not-checked'
 export type RoomRuntimeState = 'running' | 'degraded' | 'dead' | 'stopped' | 'unknown'
+export type RoomLifecycleState = 'active' | 'expired'
+
+export interface RoomLifecycleMetadata {
+  state: RoomLifecycleState
+  /** Set when the Room first enters expiry grace; null while active. */
+  expiredAt: string | null
+  /** Present only when policy, rather than a person or recovery gate, slept the Room. */
+  autoSleptAt?: string | null
+}
 
 /** Live, read-only runtime observation. This never replaces persisted working-state or sync metadata. */
 export interface RoomRuntimeStatus {
@@ -129,6 +138,12 @@ export interface RoomRecord extends RoomTaskIdentity {
   hostPort: number | null
   createdAt: string
   lastUsedAt: string
+  /** Durable activity clock used by automatic sleep and expiry policy. */
+  lastActivityAt?: string
+  /** Pinned Rooms may sleep but are never expired or automatically deleted. */
+  pinned?: boolean
+  /** Durable lifecycle transition metadata. Missing legacy data means active. */
+  lifecycle?: RoomLifecycleMetadata
   thumbPath: string | null
 }
 

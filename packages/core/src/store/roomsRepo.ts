@@ -4,6 +4,7 @@ import type {
   ProviderKind,
   RuntimeKind,
   RoomOsSettings,
+  RoomLifecycleMetadata,
   RoomRecord,
   RoomServices,
   RoomStatus,
@@ -58,6 +59,9 @@ interface ExtraJson {
     orientation?: 'portrait' | 'landscape'
   }
   windows?: unknown
+  lastActivityAt?: string
+  pinned?: boolean
+  lifecycle?: RoomLifecycleMetadata
 }
 
 function parseExtra(extra: string): unknown {
@@ -111,6 +115,9 @@ function rowToRoom(row: RoomRow): RoomRecord {
     hostPort: row.host_port,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
+    ...(extra.lastActivityAt !== undefined ? { lastActivityAt: extra.lastActivityAt } : {}),
+    ...(extra.pinned !== undefined ? { pinned: extra.pinned } : {}),
+    ...(extra.lifecycle !== undefined ? { lifecycle: extra.lifecycle } : {}),
     thumbPath: row.thumb_path,
   }
 }
@@ -299,7 +306,10 @@ export function roomsRepo(db: Db): RoomsRepo {
             os: r.os ?? { env: {} },
             ...(r.agentHostSync !== undefined ? { agentHostSync: r.agentHostSync } : {}),
             ...(r.android ? { android: r.android } : {}),
-            ...(r.windows ? { windows: r.windows } : {})
+            ...(r.windows ? { windows: r.windows } : {}),
+            ...(r.lastActivityAt !== undefined ? { lastActivityAt: r.lastActivityAt } : {}),
+            ...(r.pinned !== undefined ? { pinned: r.pinned } : {}),
+            ...(r.lifecycle !== undefined ? { lifecycle: r.lifecycle } : {})
           }),
         )
     },
@@ -325,7 +335,10 @@ export function roomsRepo(db: Db): RoomsRepo {
         patch.os !== undefined ||
         patch.android !== undefined ||
         patch.agentHostSync !== undefined ||
-        patch.windows !== undefined
+        patch.windows !== undefined ||
+        patch.lastActivityAt !== undefined ||
+        patch.pinned !== undefined ||
+        patch.lifecycle !== undefined
       ) {
         const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
         const parsedExtra = parseExtra(row?.extra ?? '{}')
@@ -337,6 +350,9 @@ export function roomsRepo(db: Db): RoomsRepo {
         if (patch.android !== undefined) extra.android = patch.android
         if (patch.agentHostSync !== undefined) extra.agentHostSync = patch.agentHostSync
         if (patch.windows !== undefined) extra.windows = patch.windows
+        if (patch.lastActivityAt !== undefined) extra.lastActivityAt = patch.lastActivityAt
+        if (patch.pinned !== undefined) extra.pinned = patch.pinned
+        if (patch.lifecycle !== undefined) extra.lifecycle = patch.lifecycle
         cols['extra'] = JSON.stringify(extra)
       }
       const names = Object.keys(cols)
