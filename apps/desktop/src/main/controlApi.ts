@@ -20,6 +20,7 @@ import {
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
+  zAgentAcquireRoomInput,
   zAgentAdbBody,
   zArtifactId,
   zArtifactListLimit,
@@ -246,6 +247,13 @@ export async function startControlApi(
         sendJson(res, 200, await orch.gcVolumes(body))
         return
       }
+    }
+
+    if (parts[1] === 'rooms' && parts[2] === 'acquire' && parts.length === 3 && req.method === 'POST') {
+      const body = zAgentAcquireRoomInput.parse(await readBody(req))
+      const result = await orch.acquireRoom({ ...body, actor: 'agent' })
+      sendJson(res, 200, { ...result, room: roomForAgent(result.room) })
+      return
     }
 
     if (parts[1] === 'rooms') {

@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   type AgentCreateRoomInput,
+  type AgentAcquireRoomInput,
+  type AcquireRoomResult,
   type AbandonAndroidLocaleMatrixRecoveryInput,
   type AbandonAndroidLocaleMatrixRecoveryResult,
   type AndroidAutomationStatus,
@@ -275,6 +277,9 @@ export class ControlClient {
   }
   listRooms() {
     return this.req<unknown[]>('GET', '/v1/rooms')
+  }
+  acquireRoom(input: AgentAcquireRoomInput) {
+    return this.req<AcquireRoomResult>('POST', '/v1/rooms/acquire', input)
   }
   createRoom(input: AgentCreateRoomInput) {
     return this.req<unknown>('POST', '/v1/rooms', input)

@@ -70,7 +70,21 @@ export interface VmwareRoomConfig {
   snapshot: string
 }
 
-export interface RoomRecord {
+export interface RoomTaskIdentity {
+  /** Stable task ID; changing a display nickname never creates a new identity. */
+  taskId?: string
+  issueRef?: string
+}
+
+export interface AcquireRoomResult {
+  room: RoomRecord
+  disposition: 'created' | 'reused' | 'woken'
+  reason: string
+  /** Existing Room source state is preserved, including unsynced modifications. */
+  modified: boolean
+}
+
+export interface RoomRecord extends RoomTaskIdentity {
   id: string
   project: string
   nickname: string
@@ -185,7 +199,7 @@ export interface RoomPlan {
   warnings: string[]
 }
 
-export interface CreateRoomInput {
+export interface CreateRoomInput extends RoomTaskIdentity {
   sourceType: SourceType
   sourceRef: string
   project: string

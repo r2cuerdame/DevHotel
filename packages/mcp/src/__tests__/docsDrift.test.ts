@@ -20,15 +20,15 @@ describe('documentation and capability drift', () => {
     expect(controlApiDoc).toContain(`"version": "${rootPackageJson.version}"`)
   })
 
-  it('proves the exact MCP tool count matches across implementation, README, and CHANGELOG', () => {
-    expect(tools).toHaveLength(52)
-    expect(new Set(toolNames).size).toBe(52)
+  it('proves the exact MCP tool count matches across implementation and README, retaining historical CHANGELOG counts', () => {
+    expect(tools).toHaveLength(53)
+    expect(new Set(toolNames).size).toBe(53)
 
     // README documents the exact count
-    expect(readme).toContain(`MCP tool surface (52 tools)`)
-    expect(readme).toContain(`52 tools across the complete development lifecycle`)
+    expect(readme).toContain(`MCP tool surface (53 tools)`)
+    expect(readme).toContain(`53 tools across the complete development lifecycle`)
 
-    // CHANGELOG 0.5.0 documents the full 52-tool surface without stale counts
+    // Keep the historical 0.5.0 release count intact.
     expect(changelog).toContain(`Fifty-two MCP tools are now available`)
     expect(changelog).not.toContain(`Thirty tools now`)
   })
