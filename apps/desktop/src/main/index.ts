@@ -24,6 +24,7 @@ import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGa
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
 import { GITHUB_SERVICE_DEFAULT_ENABLED, GITHUB_SERVICE_MANIFEST, GitHubService, PINNED_GH } from './githubService'
 import { roomPreviewPartition } from './previewSecurity'
+import { sendStartupTelemetry } from './startupTelemetry'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
@@ -101,6 +102,9 @@ function createWindow(): BrowserWindow {
 
 async function bootstrap(): Promise<void> {
   const userData = app.getPath('userData')
+  if (app.isPackaged) {
+    void sendStartupTelemetry({ userData, version: app.getVersion(), os: process.platform })
+  }
   const dataOwnershipId = ensureDataOwnership(userData)
   const db = openDb(userData)
   const hotelServices = hotelServicesRepo(db)
