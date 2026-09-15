@@ -257,6 +257,21 @@ describe('ManagedHyperVRuntime', () => {
     expect(fake.scripts.filter((script) => script.includes('New-VM -Name'))).toHaveLength(createCount)
   })
 
+  it('rebuilds only the exact owned disks when an interrupted provision left no VM', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    const image = await releaseImage()
+    await managed.provision(image)
+    fake.vm = null
+
+    await expect(managed.repair(image)).resolves.toMatchObject({ state: 'ready' })
+
+    const recreated = fake.scripts.filter((script) => script.includes('New-VM -Name')).at(-1)!
+    expect(recreated).toContain('Remove-Item -LiteralPath $diskPath -Force -ErrorAction Stop')
+    expect(recreated).toContain('Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop')
+    expect(recreated.indexOf('Remove-Item -LiteralPath $seedPath')).toBeLessThan(recreated.indexOf('New-VHD -Path $seedPath'))
+  })
+
   it('saves the exact owned VM and leaves it recoverable across app or Host restart', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
