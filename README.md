@@ -57,6 +57,8 @@ DevHotel is currently in developer preview. While the long-term goal is a zero-p
 
 Run the installer and DevHotel starts in the system tray. Auto-updates verify checksums against `latest.yml` before downloading. Releases are cut locally — see [Releasing](./docs/releasing.md).
 
+Packaged DevHotel sends at most one anonymous PurplePulse startup ping per UTC day containing only install ID, app version, OS, platform, and telemetry schema version; the payload does not include usernames, device names, paths, arguments, or an IP field.
+
 ## Hotel Services
 
 A **Hotel Service** is shared infrastructure owned once by DevHotel and lent or bound to Rooms with explicit permissions, rather than being re-installed in every Room:

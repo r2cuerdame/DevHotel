@@ -16,6 +16,9 @@
   KVM bootstrap identity before restart. This prevents a sleep/recovery cycle
   from leaving the container running while qemu never relaunches because
   `/dev/kvm` ownership could no longer be repaired.
+- PurplePulse startup telemetry now sends schema v2, uses a UTC daily boundary,
+  preserves existing installation identity/state across the upgrade, and keeps
+  the request bounded to a short no-retry timeout.
 
 ## 0.5.3 — 2026-09-14
 

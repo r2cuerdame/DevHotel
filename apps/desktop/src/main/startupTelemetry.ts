@@ -15,17 +15,14 @@ export interface StartupTelemetryOptions {
   userData: string
   version: string
   os: string
-  environment?: 'test'
+  environment?: 'test' | 'dev' | 'prod'
   fetch?: typeof globalThis.fetch
   now?: Date
   timeoutMs?: number
 }
 
-function calendarDate(now: Date): string {
-  const year = now.getFullYear()
-  const month = String(now.getMonth() + 1).padStart(2, '0')
-  const day = String(now.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
+function utcDate(now: Date): string {
+  return now.toISOString().slice(0, 10)
 }
 
 export function normalizeTelemetryOs(platform: string): string {
@@ -65,7 +62,7 @@ function writeState(path: string, state: TelemetryState): void {
 export async function sendStartupTelemetry(options: StartupTelemetryOptions): Promise<void> {
   const statePath = join(options.userData, 'telemetry.json')
   const state = readState(statePath)
-  const today = calendarDate(options.now ?? new Date())
+  const today = utcDate(options.now ?? new Date())
   if (state.lastAttemptDate === today) return
 
   try {
@@ -81,6 +78,7 @@ export async function sendStartupTelemetry(options: StartupTelemetryOptions): Pr
     version: options.version,
     os: normalizeTelemetryOs(options.os),
     platform: 'electron',
+    schema_version: 2,
     ...(options.environment ? { environment: options.environment } : {})
   }
 
@@ -89,7 +87,7 @@ export async function sendStartupTelemetry(options: StartupTelemetryOptions): Pr
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(options.timeoutMs ?? 3_000)
+      signal: AbortSignal.timeout(options.timeoutMs ?? 1_500)
     })
   } catch {
     // Telemetry must never delay or disrupt startup.
