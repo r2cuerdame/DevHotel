@@ -45,7 +45,8 @@ describe('Room runtime status', () => {
         hypervisorPresent: true,
         virtualizationFirmwareEnabled: true,
         slat: true,
-        hyperVPowerShellAvailable: true
+        hyperVPowerShellAvailable: true,
+        hyperVManagementAccessible: true
       },
       runtimeId: 'runtime-observed',
       runtimeVersion: '0.1.0',
