@@ -130,6 +130,7 @@ import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
 import { runDocker } from './backend/cli'
 import { gitCloneRun, splitGitCredential } from './backend/gitClone'
+import type { ManagedRuntimeObservation } from './backend/managedRuntime'
 import {
   EMULATOR_ADB_SERIAL,
   EMULATOR_DEFAULT_DEVICE,
@@ -1211,6 +1212,10 @@ export interface OrchestratorOptions {
   gateway: Gateway
   db: Db
   appVersion: string
+  /** Product-level runtime readiness; separate from the currently selected Room backend. */
+  managedRuntimeStatus?: () => Promise<ManagedRuntimeObservation>
+  /** Semantic selection exposed to clients without leaking a provider command or native identifier. */
+  runtimeMode?: 'managed' | 'compatibility'
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
   /**
@@ -1291,6 +1296,8 @@ export class RoomOrchestrator {
   private readonly windowsVm?: WindowsVmLifecycle
   private readonly gateway: Gateway
   private readonly appVersion: string
+  private readonly managedRuntimeStatus?: () => Promise<ManagedRuntimeObservation>
+  private readonly runtimeMode: 'managed' | 'compatibility'
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
@@ -1304,6 +1311,8 @@ export class RoomOrchestrator {
     this.windowsVm = opts.windowsVm
     this.gateway = opts.gateway
     this.appVersion = opts.appVersion
+    this.managedRuntimeStatus = opts.managedRuntimeStatus
+    this.runtimeMode = opts.runtimeMode ?? 'compatibility'
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
     this.lifecyclePolicy = { ...DEFAULT_ROOM_LIFECYCLE_POLICY, ...opts.lifecyclePolicy }
@@ -7751,11 +7760,13 @@ export class RoomOrchestrator {
   /** One-call answer to "is DevHotel ready and what is running" for agents. */
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
+    runtime: { mode: 'managed' | 'compatibility'; managed: ManagedRuntimeObservation | null }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     devices: DeviceBrokerStatus
   }> {
     const backend = await this.backend.health()
+    const managedRuntime = this.managedRuntimeStatus ? await this.managedRuntimeStatus() : null
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
       const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
@@ -7776,7 +7787,13 @@ export class RoomOrchestrator {
         runtimeStatus
       })
     }
-    return { backend, gateway: this.gateway.status(), rooms, devices: this.devices.status() }
+    return {
+      backend,
+      runtime: { mode: this.runtimeMode, managed: managedRuntime },
+      gateway: this.gateway.status(),
+      rooms,
+      devices: this.devices.status()
+    }
   }
 
   inspectRoom(roomId: string): RoomInspection {

@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell } from 'electron'
 import {
   Gateway,
+  ManagedRuntimeBootstrap,
   OciCliBackend,
   RoomOrchestrator,
   WindowsVmBackend,
@@ -106,6 +107,10 @@ async function bootstrap(): Promise<void> {
     void sendStartupTelemetry({ userData, version: app.getVersion(), os: process.platform })
   }
   const dataOwnershipId = ensureDataOwnership(userData)
+  const managedRuntime = new ManagedRuntimeBootstrap({
+    userData,
+    installId: dataOwnershipId
+  })
   const db = openDb(userData)
   const hotelServices = hotelServicesRepo(db)
   hotelServices.register({
@@ -141,6 +146,10 @@ async function bootstrap(): Promise<void> {
     gateway,
     db,
     appVersion: app.getVersion(),
+    managedRuntimeStatus: () => managedRuntime.observe(),
+    // Until a managed IsolationBackend actually passes the clean-Windows gate,
+    // the selected Room executor remains an explicitly observable compatibility path.
+    runtimeMode: 'compatibility',
     // The Room's browser profile is an Electron session partition, so only the
     // desktop app can clear it; core asks through this hook.
     clearBrowserData: async (roomId) => {
