@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -53,7 +53,7 @@ describe('downloadManagedRuntimeArtifact', () => {
       sha256: artifact().sha256,
       sha512: artifact().sha512
     })
-    expect(path.dirname(result.file)).toBe(await import('node:fs/promises').then(({ realpath }) => realpath(destinationRoot)))
+    expect(path.dirname(result.file)).toBe(await realpath(destinationRoot))
     expect(fetcher).toHaveBeenCalledOnce()
   })
 
@@ -66,7 +66,7 @@ describe('downloadManagedRuntimeArtifact', () => {
 
     await expect(
       downloadManagedRuntimeArtifact({ artifact: expected, destinationRoot, allowedHosts, fetch: fetcher })
-    ).resolves.toMatchObject({ file: target })
+    ).resolves.toMatchObject({ file: await realpath(target) })
     expect(fetcher).not.toHaveBeenCalled()
 
     await writeFile(target, Buffer.from('forged'))
