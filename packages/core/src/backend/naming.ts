@@ -150,18 +150,19 @@ const EMULATOR_DEVICE_LCD: Record<string, { width: number; height: number; densi
 
 const EMULATOR_RESOLUTION_SCALE: Record<EmulatorResolution, number> = {
   native: 1,
-  balanced: 0.75,
-  fast: 0.5
+  balanced: 0.5,
+  fast: 0.375
 }
 
 /**
  * AVD config.ini override. The emulator has no GPU passthrough in the room
  * (swiftshader renders in software), so shrinking the guest LCD is the single
- * biggest speed lever; 'balanced' is the default for a usable phone.
+ * biggest speed lever. 'fast' matches the 540px preview width for the default phone,
+ * avoiding a second software-render/downscale pass in the normal Room view.
  */
 export function emulatorAvdOverride(
   device?: string,
-  resolution: EmulatorResolution = 'balanced',
+  resolution: EmulatorResolution = 'fast',
   orientation: EmulatorOrientation = 'portrait'
 ): string {
   const lcd = EMULATOR_DEVICE_LCD[device ?? EMULATOR_DEFAULT_DEVICE] ?? EMULATOR_DEVICE_LCD[EMULATOR_DEFAULT_DEVICE]!

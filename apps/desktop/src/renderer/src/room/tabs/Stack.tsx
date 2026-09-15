@@ -17,7 +17,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
   const [port, setPort] = useState(room.internalPort)
   const [device, setDevice] = useState(room.android?.device ?? ANDROID_DEVICES[0]!)
   const [osVersion, setOsVersion] = useState(room.android?.version ?? ANDROID_VERSIONS[0]!)
-  const [resolution, setResolution] = useState<AndroidResolution>(room.android?.resolution ?? 'balanced')
+  const [resolution, setResolution] = useState<AndroidResolution>(room.android?.resolution ?? 'fast')
   const [orientation, setOrientation] = useState<AndroidOrientation>(room.android?.orientation ?? 'portrait')
   const [pending, setPending] = useState<string | null>(null)
 
@@ -92,7 +92,7 @@ export function StackTab({ room }: { room: RoomRecord }): React.JSX.Element {
                 pending !== null ||
                 (device === (room.android?.device ?? ANDROID_DEVICES[0]) &&
                   osVersion === (room.android?.version ?? ANDROID_VERSIONS[0]) &&
-                  resolution === (room.android?.resolution ?? 'balanced') &&
+                  resolution === (room.android?.resolution ?? 'fast') &&
                   orientation === (room.android?.orientation ?? 'portrait'))
               }
               onClick={() =>

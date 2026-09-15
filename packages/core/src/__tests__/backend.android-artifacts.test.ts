@@ -1701,6 +1701,11 @@ describe('OciCliBackend Android artifact export', () => {
       if (args[0] === 'info') {
         return { code: 0, stdout: JSON.stringify({ ID: 'engine-recovery-test' }), stderr: '' }
       }
+      if (args[0] === 'cp' && args[1] === `${ids.emulator}:/etc/passwd`) {
+        writeFileSync(args[2]!, 'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n', 'utf8')
+        return ok
+      }
+      if (args[0] === 'cp' && args[2] === `${ids.emulator}:/etc/passwd`) return ok
       if (args[0] === 'start') {
         if (args[1] === ids.anchor) {
           anchorState = 'running'
@@ -1969,6 +1974,13 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls
       .filter(([args]) => args[0] === 'start')
       .map(([args]) => args[1])).toEqual([ids.anchor, ids.emulator])
+    const recoveryCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    const passwdReadAt = recoveryCalls.findIndex((args) => args[0] === 'cp' && args[1] === `${ids.emulator}:/etc/passwd`)
+    const passwdRestoreAt = recoveryCalls.findIndex((args) => args[0] === 'cp' && args[2] === `${ids.emulator}:/etc/passwd`)
+    const emulatorStartAt = recoveryCalls.findIndex((args) => args[0] === 'start' && args[1] === ids.emulator)
+    expect(passwdReadAt).toBeGreaterThanOrEqual(0)
+    expect(passwdRestoreAt).toBeGreaterThan(passwdReadAt)
+    expect(emulatorStartAt).toBeGreaterThan(passwdRestoreAt)
     expect(runtimeAnchorState).toBe('exited')
     expect(webState).toBe('exited')
     expect(existsSync(join(

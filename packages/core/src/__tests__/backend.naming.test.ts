@@ -330,25 +330,27 @@ describe('buildWebCreateArgs', () => {
     // the panel itself must be landscape-shaped: Android reads its orientation
     // from the panel, and qemu keeps the panel aspect no matter the X screen
     const land = emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'landscape')
-    expect(land).toContain('hw.lcd.width=2280')
-    expect(land).toContain('hw.lcd.height=1080')
+    expect(land).toContain('hw.lcd.width=1520')
+    expect(land).toContain('hw.lcd.height=720')
     expect(land).toContain('hw.initialOrientation=landscape')
     // native resolution still has to swap the axes, or landscape does nothing
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'native', 'landscape')).toContain('hw.lcd.width=3040')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).not.toContain('hw.initialOrientation')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).toContain('hw.lcd.width=1080')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).toContain('hw.lcd.width=720')
     // portrait stays the default
     expect(buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })).toContain('SCREEN_WIDTH=540')
   })
 
   it('scales the guest LCD per resolution preset for software rendering speed', () => {
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=1080')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=2280')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'fast')).toContain('hw.lcd.width=720')
-    expect(emulatorAvdOverride('Nexus 5', 'fast')).toContain('hw.lcd.height=960')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=720')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=1520')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'fast')).toContain('hw.lcd.width=540')
+    expect(emulatorAvdOverride('Nexus 5', 'fast')).toContain('hw.lcd.height=720')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'native')).not.toContain('hw.lcd')
-    // default preset is 'balanced'
-    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.width=1080')
+    // default preset is 'fast' and matches the normal 540px Room preview
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.width=540')
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.height=1140')
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.density=240')
   })
 
   it('carries the devhotel labels', () => {

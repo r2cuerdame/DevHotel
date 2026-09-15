@@ -68,6 +68,8 @@ import type {
 import { isDockerUnitSizeKnown, parseDockerUnitSize } from '../volumeGc'
 
 const DU_IMAGE = 'alpine'
+const DOCKER_ANDROID_ROOT_PASSWD = 'root:x:0:0:root:/root:/bin/bash'
+const DOCKER_ANDROID_PASSWD_MAX_BYTES = 128 * 1024
 /**
  * Opt-in phase timing for one fenced ADB command, written to a file because the
  * packaged app has no console anyone can read. Off unless DEVHOTEL_FENCE_TIMING
@@ -4726,7 +4728,7 @@ export class OciCliBackend implements IsolationBackend {
         writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), fitEmulatorPy(screen.width, screen.height))
         writeFileSync(
           join(staging, 'avd-override.ini'),
-          emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced', opts?.orientation ?? 'portrait')
+          emulatorAvdOverride(opts?.device, opts?.resolution ?? 'fast', opts?.orientation ?? 'portrait')
         )
         must(
           await runDocker(['cp', join(staging, 'openbox'), `${emulatorId}:/home/androidusr/.config/`]),
@@ -4767,6 +4769,45 @@ export class OciCliBackend implements IsolationBackend {
         throw new AggregateError([error, cleanupError], 'emulator creation and exact cleanup both failed')
       }
       throw error
+    }
+  }
+
+  /**
+   * docker-android's emulator bootstrap chowns /dev/kvm through sudo, then
+   * deliberately deletes the root passwd entry. Docker restores the KVM device
+   * node on a later container start, so a retained container cannot run that
+   * bootstrap again: sudo fails before qemu is launched. Restore the one
+   * canonical root line only while the exact owned container is stopped; the
+   * image removes it again immediately after it has repaired /dev/kvm.
+   */
+  private async prepareDockerAndroidEmulatorRestart(emulatorId: string): Promise<void> {
+    const staging = mkdtempSync(join(tmpdir(), 'dh-emulator-restart-'))
+    const passwdPath = join(staging, 'passwd')
+    try {
+      must(
+        await runDocker(['cp', `${emulatorId}:/etc/passwd`, passwdPath], { timeoutMs: 30_000 }),
+        'read retained emulator passwd'
+      )
+      const passwd = readFileSync(passwdPath, 'utf8')
+      if (!passwd || Buffer.byteLength(passwd, 'utf8') > DOCKER_ANDROID_PASSWD_MAX_BYTES || passwd.includes('\0')) {
+        throw new Error('retained emulator passwd is not a bounded text file')
+      }
+      const lines = passwd.split(/\r?\n/)
+      const rootLines = lines.filter((line) => line.startsWith('root:'))
+      if (rootLines.length > 1) throw new Error('retained emulator passwd has duplicate root identities')
+      if (rootLines.length === 1) {
+        if (lines[0] !== DOCKER_ANDROID_ROOT_PASSWD) {
+          throw new Error('retained emulator root identity is not the expected bootstrap identity')
+        }
+        return
+      }
+      writeFileSync(passwdPath, `${DOCKER_ANDROID_ROOT_PASSWD}\n${passwd}`, 'utf8')
+      must(
+        await runDocker(['cp', passwdPath, `${emulatorId}:/etc/passwd`], { timeoutMs: 30_000 }),
+        'restore retained emulator bootstrap identity'
+      )
+    } finally {
+      rmSync(staging, { recursive: true, force: true })
     }
   }
 
@@ -4866,6 +4907,9 @@ export class OciCliBackend implements IsolationBackend {
           sandboxId: this.exactRunningSandboxId(authority, 'Android recovery control anchor'),
           startedAt: exactDockerStartedAt(authority, 'Android recovery control anchor')
         }
+      }
+      if (participant.role === 'svc-emulator') {
+        await this.prepareDockerAndroidEmulatorRestart(participant.id)
       }
       must(await runDocker(['start', participant.id]), `start exact Android recovery ${participant.role}`)
       if (participant.role === 'svc-emulator') {

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.4 - 2026-09-15
+
+### Android Rooms are materially faster in use
+
+- New Android Rooms default to the fast software-rendering profile, matching the
+  normal 540x1140 Room preview instead of spending SwiftShader work on pixels
+  that are immediately downscaled. The balanced profile is also reduced from
+  75% to 50%, so existing balanced Rooms become lighter on their next emulator
+  recreation without changing their saved profile choice.
+- Measured on the same KVM-backed Room, guest screen capture dropped from about
+  919 ms at 1080x2280 to about 298 ms at 540x1140, while repeated Settings
+  launches also became consistently faster.
+- Retained docker-android emulator containers now repair the image's one-shot
+  KVM bootstrap identity before restart. This prevents a sleep/recovery cycle
+  from leaving the container running while qemu never relaunches because
+  `/dev/kvm` ownership could no longer be repaired.
+
 ## 0.5.3 — 2026-09-14
 
 ### Agents acquire and reuse compatible Rooms
