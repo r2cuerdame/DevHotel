@@ -237,7 +237,7 @@ export function buildEmulatorArgs(
     // ADB authentication is disabled only for this managed emulator: its ADB
     // transport has no Host port or Room-network path, and immutable-ID
     // helpers can reach it only through the proved private control netns.
-    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth',
+    'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth',
     '-e',
     `SCREEN_WIDTH=${screen.width}`,
     '-e',
