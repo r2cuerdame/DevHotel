@@ -229,4 +229,27 @@ describe('ManagedRuntimeManager', () => {
     await expect(manager.prepare()).rejects.toThrow('guest boot failed')
     expect(bootstrap.current).toMatchObject({ status: 'broken', phase: 'broken', failure: 'guest boot failed' })
   })
+
+  it('still saves an owned VM when guest health is broken during shutdown', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.current = manifest('ready')
+    const stop = vi.fn(async (): Promise<ManagedHyperVRuntimeObservation> => ({
+      ...readyProviderObservation(),
+      state: 'stopped'
+    }))
+    const hyperv = provider({
+      observe: vi.fn(async () => ({ ...readyProviderObservation(), state: 'broken' as const })),
+      stop
+    })
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotel',
+      installId: 'install-1234',
+      bootstrap,
+      providerFactory: () => hyperv
+    })
+
+    await manager.stop()
+
+    expect(stop).toHaveBeenCalledOnce()
+  })
 })

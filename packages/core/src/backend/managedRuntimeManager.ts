@@ -154,7 +154,10 @@ export class ManagedRuntimeManager {
     if (!manifest) return
     const provider = this.providerFactory(manifest)
     const observation = await provider.observe()
-    if (observation.state === 'not-installed' || observation.state === 'broken') return
+    if (observation.state === 'not-installed') return
+    // A failed guest health check must not strand an otherwise owned VM during
+    // shutdown. The provider re-proves Host marker + Hyper-V object ownership
+    // before Save-VM and therefore remains fail-closed on an unowned object.
     await provider.stop()
   }
 
