@@ -320,7 +320,22 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('SCREEN_HEIGHT=1140')
     expect(args).toContain('EMULATOR_DEVICE=Samsung Galaxy S10')
     expect(args).toContain('EMULATOR_CONFIG_PATH=/home/androidusr/devhotel-avd-override.ini')
-    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth')
+    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth')
+  })
+
+  it('budgets emulator CPU and RAM while preserving KVM and the image software renderer', () => {
+    for (const args of [
+      buildEmulatorArgs('r1'),
+      buildEmulatorArgs('r1', { device: 'Nexus 5', version: '13.0', resolution: 'fast', orientation: 'landscape' })
+    ]) {
+      expect(envs(args).filter((env) => env.startsWith('EMULATOR_ADDITIONAL_ARGS='))).toEqual([
+        'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth'
+      ])
+      expect(args.flatMap((arg, index) => arg === '--device' ? [args[index + 1]] : [])).toEqual(['/dev/kvm'])
+      expect(args).not.toContain('--gpus')
+      // Leave the image's swiftshader_indirect renderer in place.
+      expect(args.join(' ')).not.toContain('-gpu')
+    }
   })
 
   it('rotates the X screen and AVD orientation for landscape emulators', () => {
