@@ -295,12 +295,10 @@ export class ManagedRuntimeBootstrap {
   async beginProvision(runtimeVersion: string): Promise<ManagedRuntimeManifest> {
     await this.ensureOwnedRoot()
     const existing = await this.readManifest()
-    if (existing?.status === 'ready') {
-      if (existing.runtimeVersion !== runtimeVersion) {
-        throw new Error('Managed runtime update requires an explicit migration')
-      }
-      return existing
+    if (existing && existing.runtimeVersion !== runtimeVersion) {
+      throw new Error('Managed runtime update requires an explicit migration')
     }
+    if (existing?.status === 'ready' || existing?.status === 'provisioning') return existing
     const now = this.now().toISOString()
     const manifest: ManagedRuntimeManifest = {
       schemaVersion: 2,

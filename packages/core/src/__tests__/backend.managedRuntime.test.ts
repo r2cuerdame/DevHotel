@@ -157,10 +157,18 @@ describe('ManagedRuntimeBootstrap ownership', () => {
       installId: 'install-resume'
     })
     expect(await resumed.observe()).toMatchObject({ state: 'preparing', phase: 'verifying-runtime-manifest' })
+    expect(await resumed.beginProvision('0.1.0')).toMatchObject({ phase: 'verifying-runtime-manifest' })
     expect(await resumed.verifyRelease('runtime-resume', release(), staging)).toMatchObject({
       phase: 'provisioning-runtime-provider',
       artifactDigests: { 'linux-runtime': artifactDigest }
     })
+  })
+
+  it('does not silently change the runtime version during provisioning', async () => {
+    const userData = await tempDir()
+    const bootstrap = new ManagedRuntimeBootstrap({ userData })
+    await bootstrap.beginProvision('0.1.0')
+    await expect(bootstrap.beginProvision('0.2.0')).rejects.toThrow('explicit migration')
   })
 
   it('rejects staged artifact traversal and out-of-order readiness', async () => {
