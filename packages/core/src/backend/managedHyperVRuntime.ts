@@ -78,6 +78,10 @@ function isDigest(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value)
 }
 
+function isOpaqueId(value: string): boolean {
+  return /^[0-9A-Za-z._-]{8,128}$/.test(value)
+}
+
 function psLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
@@ -230,7 +234,7 @@ export class ManagedHyperVRuntime {
   private readonly pipePath: string
 
   constructor(opts: ManagedHyperVRuntimeOptions) {
-    if (opts.installId.length < 8 || opts.runtimeId.length < 8 || !/^[0-9A-Za-z._-]+$/.test(opts.runtimeVersion)) {
+    if (!isOpaqueId(opts.installId) || !isOpaqueId(opts.runtimeId) || !/^[0-9A-Za-z._-]{1,64}$/.test(opts.runtimeVersion)) {
       throw new Error('Managed Hyper-V identity is invalid')
     }
     this.root = path.resolve(opts.userData, 'runtime', 'managed-linux', 'hyperv')

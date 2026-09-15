@@ -119,6 +119,19 @@ async function runtime(fake: FakeHyperV, guest = health()) {
 }
 
 describe('ManagedHyperVRuntime', () => {
+  it('rejects identities that could escape generated guest or PowerShell data', async () => {
+    const userData = await tempDir()
+    expect(
+      () =>
+        new ManagedHyperVRuntime({
+          userData,
+          installId: "install'; reboot",
+          runtimeId: 'runtime-owned',
+          runtimeVersion: '0.1.0'
+        })
+    ).toThrow('identity is invalid')
+  })
+
   it('copies a verified immutable image and creates an owned separate-kernel VM', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
