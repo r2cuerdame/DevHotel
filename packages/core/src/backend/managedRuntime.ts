@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process'
 export type ManagedRuntimeSupportCode =
   | 'ready'
   | 'virtualization-ready'
+  | 'elevation-required'
   | 'unsupported-platform'
   | 'virtualization-disabled'
   | 'probe-failed'
@@ -19,6 +20,7 @@ export interface ManagedRuntimeSupport {
   virtualizationFirmwareEnabled: boolean
   slat: boolean
   hyperVPowerShellAvailable: boolean
+  hyperVManagementAccessible: boolean
 }
 
 export interface ManagedRuntimeCommandResult {
@@ -111,7 +113,8 @@ function parseProbe(stdout: string): Omit<ManagedRuntimeSupport, 'supported' | '
       hypervisorPresent: value['HypervisorPresent'] === true,
       virtualizationFirmwareEnabled: value['VirtualizationFirmwareEnabled'] === true,
       slat: value['SecondLevelAddressTranslationExtensions'] === true,
-      hyperVPowerShellAvailable: value['HyperVPowerShellAvailable'] === true
+      hyperVPowerShellAvailable: value['HyperVPowerShellAvailable'] === true,
+      hyperVManagementAccessible: value['HyperVManagementAccessible'] === true
     }
   } catch {
     return null
@@ -130,7 +133,8 @@ export async function probeManagedRuntimeSupport(opts: {
       hypervisorPresent: false,
       virtualizationFirmwareEnabled: false,
       slat: false,
-      hyperVPowerShellAvailable: false
+      hyperVPowerShellAvailable: false,
+      hyperVManagementAccessible: false
     }
   }
 
@@ -139,7 +143,9 @@ export async function probeManagedRuntimeSupport(opts: {
     '$cs=Get-CimInstance Win32_ComputerSystem',
     '$cpu=Get-CimInstance Win32_Processor | Select-Object -First 1',
     '$hyperv=Get-Command New-VM -ErrorAction SilentlyContinue',
-    '[pscustomobject]@{HypervisorPresent=[bool]$cs.HypervisorPresent;VirtualizationFirmwareEnabled=[bool]$cpu.VirtualizationFirmwareEnabled;SecondLevelAddressTranslationExtensions=[bool]$cpu.SecondLevelAddressTranslationExtensions;HyperVPowerShellAvailable=[bool]$hyperv}|ConvertTo-Json -Compress'
+    '$hypervAccess=$false',
+    'if ($hyperv) { try { Get-VMHost -ErrorAction Stop | Out-Null; $hypervAccess=$true } catch {} }',
+    '[pscustomobject]@{HypervisorPresent=[bool]$cs.HypervisorPresent;VirtualizationFirmwareEnabled=[bool]$cpu.VirtualizationFirmwareEnabled;SecondLevelAddressTranslationExtensions=[bool]$cpu.SecondLevelAddressTranslationExtensions;HyperVPowerShellAvailable=[bool]$hyperv;HyperVManagementAccessible=[bool]$hypervAccess}|ConvertTo-Json -Compress'
   ].join(';')
   const result = await runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
   const parsed = result.code === 0 ? parseProbe(result.stdout) : null
@@ -151,12 +157,21 @@ export async function probeManagedRuntimeSupport(opts: {
       hypervisorPresent: false,
       virtualizationFirmwareEnabled: false,
       slat: false,
-      hyperVPowerShellAvailable: false
+      hyperVPowerShellAvailable: false,
+      hyperVManagementAccessible: false
     }
   }
 
-  if (parsed.hypervisorPresent && parsed.hyperVPowerShellAvailable) {
+  if (parsed.hypervisorPresent && parsed.hyperVPowerShellAvailable && parsed.hyperVManagementAccessible) {
     return { supported: true, code: 'ready', detail: 'Windows hypervisor is active.', ...parsed }
+  }
+  if (parsed.hypervisorPresent && parsed.hyperVPowerShellAvailable) {
+    return {
+      supported: true,
+      code: 'elevation-required',
+      detail: 'DevHotel needs approval to manage its private Windows hypervisor runtime.',
+      ...parsed
+    }
   }
   if (parsed.hypervisorPresent || (parsed.virtualizationFirmwareEnabled && parsed.slat)) {
     return {

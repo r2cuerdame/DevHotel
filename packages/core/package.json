@@ -8,7 +8,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --maxWorkers=1 --testTimeout=20000"
+    "test": "vitest run --maxWorkers=1 --testTimeout=20000",
+    "probe:managed-runtime": "vitest run scripts/probe-managed-runtime.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=180000"
   },
   "dependencies": {
     "@devhotel/shared": "workspace:*",

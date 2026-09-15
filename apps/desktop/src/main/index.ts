@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell } from 'electron'
 import {
   Gateway,
-  ManagedRuntimeBootstrap,
+  ManagedRuntimeManager,
   OciCliBackend,
   RoomOrchestrator,
   WindowsVmBackend,
@@ -107,10 +107,15 @@ async function bootstrap(): Promise<void> {
     void sendStartupTelemetry({ userData, version: app.getVersion(), os: process.platform })
   }
   const dataOwnershipId = ensureDataOwnership(userData)
-  const managedRuntime = new ManagedRuntimeBootstrap({
+  const managedRuntime = new ManagedRuntimeManager({
     userData,
-    installId: dataOwnershipId
+    installId: dataOwnershipId,
+    fetch: (url, init) => net.fetch(url, init)
   })
+  // Preparation is resumable and intentionally does not block the Lobby. The
+  // product status reports capability/elevation/reboot gates while Room create
+  // remains on the explicit compatibility backend until #107 migrates it.
+  void managedRuntime.prepare().catch((error) => console.error('managed runtime preparation failed:', error))
   const db = openDb(userData)
   const hotelServices = hotelServicesRepo(db)
   hotelServices.register({
@@ -233,7 +238,10 @@ async function bootstrap(): Promise<void> {
     roomLifecycleSweeper.stop()
     control?.stop()
     void executeShutdownPolicy(action, {
-      shutdown: () => orch.shutdown(),
+      shutdown: async () => {
+        await orch.shutdown()
+        await managedRuntime.stop()
+      },
       installUpdate: updater.install,
       relaunch: () => app.relaunch(),
       exit: (code) => app.exit(code),
