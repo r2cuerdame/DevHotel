@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { expect, it } from 'vitest'
 import {
-  MANAGED_HYPERV_BASE_IMAGE,
+  MANAGED_HYPERV_BOOT_ISO,
   downloadManagedRuntimeArtifact,
   probeManagedRuntimeSupport
 } from '../src/index'
@@ -17,7 +17,7 @@ it('records the local managed-runtime capability and optional pinned-artifact ev
     const root = await mkdtemp(path.join(os.tmpdir(), 'devhotel-managed-runtime-probe-'))
     try {
       const artifact = await downloadManagedRuntimeArtifact({
-        artifact: MANAGED_HYPERV_BASE_IMAGE,
+        artifact: MANAGED_HYPERV_BOOT_ISO,
         destinationRoot: root,
         allowedHosts: new Set(['dl-cdn.alpinelinux.org'])
       })
@@ -28,9 +28,9 @@ it('records the local managed-runtime capability and optional pinned-artifact ev
         sizeBytes: artifact.sizeBytes
       }
       expect(result['artifact']).toMatchObject({
-        sha256: MANAGED_HYPERV_BASE_IMAGE.sha256,
-        sha512: MANAGED_HYPERV_BASE_IMAGE.sha512,
-        sizeBytes: MANAGED_HYPERV_BASE_IMAGE.sizeBytes
+        sha256: MANAGED_HYPERV_BOOT_ISO.sha256,
+        sha512: MANAGED_HYPERV_BOOT_ISO.sha512,
+        sizeBytes: MANAGED_HYPERV_BOOT_ISO.sizeBytes
       })
     } finally {
       await rm(root, { recursive: true, force: true })

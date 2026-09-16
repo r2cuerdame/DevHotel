@@ -5,6 +5,11 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
 import type { ManagedRuntimeCommandResult, ManagedRuntimeCommandRunner } from './managedRuntime'
+import {
+  MANAGED_RUNTIME_OVERLAY_FILE,
+  buildManagedRuntimeGuestOverlay,
+  type ManagedRuntimeGuestOverlay
+} from './managedRuntimeGuestOverlay'
 
 export interface ManagedHyperVRuntimeOptions {
   userData: string
@@ -36,7 +41,7 @@ export interface ManagedHyperVGuestTransport {
 }
 
 export interface ManagedHyperVRuntimeMarker {
-  schemaVersion: 1
+  schemaVersion: 2
   owner: 'devhotel'
   backend: 'hyper-v'
   installId: string
@@ -45,10 +50,17 @@ export interface ManagedHyperVRuntimeMarker {
   vmName: string
   vmId: string | null
   vmPath: string
-  diskPath: string
+  /** Owned, immutable copy of the pinned Alpine boot ISO. */
+  isoPath: string
+  /** Disposable FAT disk carrying the DevHotel apkovl overlay. */
   seedPath: string
+  /** Persistent Room and runtime state; never rebuilt by a repair. */
+  statePath: string
   pipePath: string
+  /** SHA-256 of the pinned boot ISO. */
   baseImageDigest: string
+  /** SHA-256 of the generated overlay, binding the guest identity payload. */
+  overlayDigest: string
   status: 'provisioning' | 'stopped' | 'starting' | 'ready' | 'broken'
   createdAt: string
   updatedAt: string
@@ -144,17 +156,19 @@ async function sha256File(file: string): Promise<{ digest: string; sizeBytes: nu
 
 function markerNotes(marker: ManagedHyperVRuntimeMarker): string {
   return JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     owner: marker.owner,
     backend: marker.backend,
     installId: marker.installId,
     runtimeId: marker.runtimeId,
     runtimeVersion: marker.runtimeVersion,
     vmPath: marker.vmPath,
-    diskPath: marker.diskPath,
+    isoPath: marker.isoPath,
     seedPath: marker.seedPath,
+    statePath: marker.statePath,
     pipePath: marker.pipePath,
-    baseImageDigest: marker.baseImageDigest
+    baseImageDigest: marker.baseImageDigest,
+    overlayDigest: marker.overlayDigest
   })
 }
 
@@ -167,17 +181,19 @@ function validateNotes(raw: string | null, marker: ManagedHyperVRuntimeMarker): 
   try {
     const value = JSON.parse(raw) as Record<string, unknown>
     return (
-      value['schemaVersion'] === 1 &&
+      value['schemaVersion'] === 2 &&
       value['owner'] === 'devhotel' &&
       value['backend'] === 'hyper-v' &&
       value['installId'] === marker.installId &&
       value['runtimeId'] === marker.runtimeId &&
       value['runtimeVersion'] === marker.runtimeVersion &&
       value['baseImageDigest'] === marker.baseImageDigest &&
+      value['overlayDigest'] === marker.overlayDigest &&
       value['pipePath'] === marker.pipePath &&
       assertExactPath(value['vmPath'], marker.vmPath) &&
-      assertExactPath(value['diskPath'], marker.diskPath) &&
-      assertExactPath(value['seedPath'], marker.seedPath)
+      assertExactPath(value['isoPath'], marker.isoPath) &&
+      assertExactPath(value['seedPath'], marker.seedPath) &&
+      assertExactPath(value['statePath'], marker.statePath)
     )
   } catch {
     return false
@@ -188,7 +204,7 @@ function validateMarker(value: unknown, expected: Omit<ManagedHyperVRuntimeOptio
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Managed Hyper-V ownership marker is invalid')
   const marker = value as Partial<ManagedHyperVRuntimeMarker>
   if (
-    marker.schemaVersion !== 1 ||
+    marker.schemaVersion !== 2 ||
     marker.owner !== 'devhotel' ||
     marker.backend !== 'hyper-v' ||
     marker.installId !== expected.installId ||
@@ -198,12 +214,15 @@ function validateMarker(value: unknown, expected: Omit<ManagedHyperVRuntimeOptio
     !/^DevHotel-[a-f0-9]{16}$/.test(marker.vmName) ||
     (marker.vmId !== null && (typeof marker.vmId !== 'string' || !/^[a-f0-9-]{36}$/i.test(marker.vmId))) ||
     typeof marker.vmPath !== 'string' ||
-    typeof marker.diskPath !== 'string' ||
+    typeof marker.isoPath !== 'string' ||
     typeof marker.seedPath !== 'string' ||
+    typeof marker.statePath !== 'string' ||
     typeof marker.pipePath !== 'string' ||
     !/^\\\\\.\\pipe\\devhotel-runtime-[a-f0-9]{16}$/.test(marker.pipePath) ||
     typeof marker.baseImageDigest !== 'string' ||
     !isDigest(marker.baseImageDigest) ||
+    typeof marker.overlayDigest !== 'string' ||
+    !isDigest(marker.overlayDigest) ||
     !['provisioning', 'stopped', 'starting', 'ready', 'broken'].includes(marker.status ?? '') ||
     typeof marker.createdAt !== 'string' ||
     typeof marker.updatedAt !== 'string'
@@ -229,9 +248,10 @@ export class ManagedHyperVRuntime {
   private readonly now: () => Date
   private readonly vmName: string
   private readonly vmPath: string
-  private readonly diskPath: string
   private readonly seedPath: string
+  private readonly statePath: string
   private readonly pipePath: string
+  private readonly overlay: ManagedRuntimeGuestOverlay
 
   constructor(opts: ManagedHyperVRuntimeOptions) {
     if (!isOpaqueId(opts.installId) || !isOpaqueId(opts.runtimeId) || !/^[0-9A-Za-z._-]{1,64}$/.test(opts.runtimeVersion)) {
@@ -248,9 +268,15 @@ export class ManagedHyperVRuntime {
     const suffix = createHash('sha256').update(`${opts.installId}\0${opts.runtimeId}`).digest('hex').slice(0, 16)
     this.vmName = `DevHotel-${suffix}`
     this.vmPath = path.join(this.root, 'machine')
-    this.diskPath = path.join(this.vmPath, 'runtime.vhdx')
+    this.statePath = path.join(this.vmPath, 'state.vhdx')
     this.seedPath = path.join(this.vmPath, 'seed.vhdx')
     this.pipePath = `\\\\.\\pipe\\devhotel-runtime-${suffix}`
+    this.overlay = buildManagedRuntimeGuestOverlay({
+      installId: this.installId,
+      runtimeId: this.runtimeId,
+      runtimeVersion: this.runtimeVersion,
+      daemonVersion: this.runtimeVersion
+    })
   }
 
   async readMarker(): Promise<ManagedHyperVRuntimeMarker | null> {
@@ -270,8 +296,8 @@ export class ManagedHyperVRuntime {
     })
     if (
       !assertExactPath(marker.vmPath, this.vmPath) ||
-      !assertExactPath(marker.diskPath, this.diskPath) ||
       !assertExactPath(marker.seedPath, this.seedPath) ||
+      !assertExactPath(marker.statePath, this.statePath) ||
       marker.pipePath !== this.pipePath
     ) {
       throw new Error('Managed Hyper-V ownership marker paths are invalid')
@@ -300,7 +326,7 @@ export class ManagedHyperVRuntime {
     if (!marker) {
       const now = this.now().toISOString()
       marker = await this.writeMarker({
-        schemaVersion: 1,
+        schemaVersion: 2,
         owner: 'devhotel',
         backend: 'hyper-v',
         installId: this.installId,
@@ -309,16 +335,24 @@ export class ManagedHyperVRuntime {
         vmName: this.vmName,
         vmId: null,
         vmPath: this.vmPath,
-        diskPath: this.diskPath,
+        isoPath: ownedImage,
         seedPath: this.seedPath,
+        statePath: this.statePath,
         pipePath: this.pipePath,
         baseImageDigest: image.sha256,
+        overlayDigest: this.overlay.sha256,
         status: 'provisioning',
         createdAt: now,
         updatedAt: now
       })
     } else if (marker.baseImageDigest !== image.sha256) {
       throw new Error('Managed Hyper-V runtime update requires an explicit migration')
+    } else if (marker.overlayDigest !== this.overlay.sha256) {
+      // The overlay is derived from the fenced identity, so a digest change can
+      // only mean this build generates a different guest bootstrap. That is a
+      // runtime change, and it has to be migrated deliberately rather than
+      // silently re-seeded underneath a running install.
+      throw new Error('Managed Hyper-V guest overlay changed; a runtime version bump is required')
     }
 
     if (inspection.exists) {
@@ -331,35 +365,38 @@ export class ManagedHyperVRuntime {
       [
         `$vmName=${psLiteral(marker.vmName)}`,
         `$vmPath=${psLiteral(marker.vmPath)}`,
-        `$diskPath=${psLiteral(marker.diskPath)}`,
-        `$parentPath=${psLiteral(ownedImage)}`,
+        `$isoPath=${psLiteral(marker.isoPath)}`,
         `$seedPath=${psLiteral(marker.seedPath)}`,
+        `$statePath=${psLiteral(marker.statePath)}`,
         `$pipePath=${psLiteral(marker.pipePath)}`,
         `$notes=${psLiteral(markerNotes(marker))}`,
-        `$userDataB64=${psLiteral(Buffer.from(this.cloudInitUserData(), 'utf8').toString('base64'))}`,
-        `$metaDataB64=${psLiteral(Buffer.from(this.cloudInitMetaData(), 'utf8').toString('base64'))}`,
+        `$overlayName=${psLiteral(MANAGED_RUNTIME_OVERLAY_FILE)}`,
+        `$overlayB64=${psLiteral(this.overlay.bytes.toString('base64'))}`,
         "if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) { throw 'Managed runtime VM collision' }",
         'New-Item -ItemType Directory -Force -Path $vmPath | Out-Null',
-        // With no VM object, exact retained ownership authorizes rebuilding only
-        // these two provider paths. This discards incomplete VHD headers or a
-        // half-written CIDATA disk left by power loss during first provision.
-        'if (Test-Path -LiteralPath $diskPath) { Remove-Item -LiteralPath $diskPath -Force -ErrorAction Stop }',
+        // With no VM object, exact retained ownership authorizes rebuilding the
+        // seed, which is disposable and regenerated from the marker identity.
+        // The state disk is never destroyed here: it holds Room data, and a
+        // power loss during first provision must not cost the user that.
         'if (Test-Path -LiteralPath $seedPath) { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop }',
-        'New-VHD -Path $diskPath -ParentPath $parentPath -Differencing | Out-Null',
+        'if (-not (Test-Path -LiteralPath $statePath)) { New-VHD -Path $statePath -Dynamic -SizeBytes 64GB | Out-Null }',
         'New-VHD -Path $seedPath -Dynamic -SizeBytes 64MB | Out-Null',
         '$seedDisk=Mount-VHD -Path $seedPath -Passthru',
         'try {',
         '  $seedDisk | Initialize-Disk -PartitionStyle MBR -PassThru | Out-Null',
         '  $partition=$seedDisk | New-Partition -UseMaximumSize -AssignDriveLetter',
-        "  $volume=$partition | Format-Volume -FileSystem FAT -NewFileSystemLabel 'CIDATA' -Confirm:$false",
+        "  $volume=$partition | Format-Volume -FileSystem FAT -NewFileSystemLabel 'DEVHOTEL' -Confirm:$false",
         '  $drive=($volume.DriveLetter + ":\\")',
-        "  [IO.File]::WriteAllBytes((Join-Path $drive 'user-data'),[Convert]::FromBase64String($userDataB64))",
-        "  [IO.File]::WriteAllBytes((Join-Path $drive 'meta-data'),[Convert]::FromBase64String($metaDataB64))",
+        '  [IO.File]::WriteAllBytes((Join-Path $drive $overlayName),[Convert]::FromBase64String($overlayB64))',
         '} finally { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue }',
-        '$vm=New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 4GB -VHDPath $diskPath -Path $vmPath',
+        // The guest runs from the pinned read-only ISO, so the boot media can
+        // never drift from its verified digest.
+        '$vm=New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 4GB -Path $vmPath -NoVHD',
+        '$dvd=Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru',
+        'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $statePath',
         'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $seedPath',
         'Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true',
-        'Set-VMFirmware -VM $vm -EnableSecureBoot Off',
+        'Set-VMFirmware -VM $vm -EnableSecureBoot Off -FirstBootDevice $dvd',
         'Set-VMComPort -VM $vm -Number 2 -Path $pipePath',
         'Set-VM -VM $vm -Notes $notes -AutomaticStartAction StartIfRunning -AutomaticStopAction Save',
         '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State}|ConvertTo-Json -Compress'
@@ -475,10 +512,10 @@ export class ManagedHyperVRuntime {
     await mkdir(imageRoot, { recursive: true })
     const imageRootInfo = await lstat(imageRoot)
     if (!imageRootInfo.isDirectory() || imageRootInfo.isSymbolicLink()) throw new Error('Managed Hyper-V image root is unsafe')
-    if (path.extname(source).toLocaleLowerCase('en-US') !== '.vhd') {
-      throw new Error('Managed Hyper-V release image must use the pinned VHD format')
+    if (path.extname(source).toLocaleLowerCase('en-US') !== '.iso') {
+      throw new Error('Managed Hyper-V release image must use the pinned ISO format')
     }
-    const target = path.join(imageRoot, `${image.sha256}.vhd`)
+    const target = path.join(imageRoot, `${image.sha256}.iso`)
     if (!existsSync(target)) {
       const temporary = path.join(imageRoot, `.${image.sha256}-${randomUUID()}.tmp`)
       try {
@@ -499,42 +536,7 @@ export class ManagedHyperVRuntime {
     if (measured.digest !== image.sha256 || measured.sizeBytes !== image.sizeBytes) {
       throw new Error('Managed Hyper-V owned image no longer matches its release digest')
     }
-    return await this.installParentDisk(canonical, image)
-  }
-
-  /**
-   * A Generation 2 VM boots from a SCSI `.vhdx`; `.vhd` is an IDE-only,
-   * Generation 1 boot device, so the verified upstream VHD cannot be attached
-   * directly. The pinned bytes are converted once into an owned VHDX parent
-   * named after the digest they were produced from, which keeps the
-   * provenance of the differencing chain checkable without re-hashing an
-   * image Hyper-V is free to rewrite in place.
-   */
-  private async installParentDisk(verifiedVhd: string, image: ManagedHyperVReleaseImage): Promise<string> {
-    const parent = path.join(path.dirname(verifiedVhd), `${image.sha256}.vhdx`)
-    if (!existsSync(parent)) {
-      const temporary = path.join(path.dirname(verifiedVhd), `.${image.sha256}-${randomUUID()}.vhdx`)
-      try {
-        await this.runPowerShell(
-          [
-            `$source=${psLiteral(verifiedVhd)}`,
-            `$temporary=${psLiteral(temporary)}`,
-            `$parent=${psLiteral(parent)}`,
-            'if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }',
-            'Convert-VHD -Path $source -DestinationPath $temporary -VHDType Dynamic -ErrorAction Stop',
-            'Set-ItemProperty -LiteralPath $temporary -Name IsReadOnly -Value $true',
-            'Move-Item -LiteralPath $temporary -Destination $parent -ErrorAction Stop'
-          ].join(';')
-        )
-      } finally {
-        // The staged parent is marked read-only before it is moved into place,
-        // so a cleanup after a failed move must not mask the real error.
-        await rm(temporary, { force: true }).catch(() => undefined)
-      }
-    }
-    const parentInfo = await lstat(parent)
-    if (!parentInfo.isFile() || parentInfo.isSymbolicLink()) throw new Error('Managed Hyper-V owned parent disk is unsafe')
-    return await realpath(parent)
+    return canonical
   }
 
   private async inspectVm(): Promise<HyperVInspection> {
@@ -593,63 +595,6 @@ export class ManagedHyperVRuntime {
       throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
     }
     return result.stdout
-  }
-
-  private cloudInitMetaData(): string {
-    return `instance-id: devhotel-${this.runtimeId}\nlocal-hostname: devhotel-runtime\n`
-  }
-
-  private cloudInitUserData(): string {
-    const ownership = JSON.stringify({
-      schemaVersion: 1,
-      owner: 'devhotel',
-      backend: 'hyper-v',
-      installId: this.installId,
-      runtimeId: this.runtimeId,
-      runtimeVersion: this.runtimeVersion
-    })
-    const reply = JSON.stringify({
-      owner: 'devhotel',
-      installId: this.installId,
-      runtimeId: this.runtimeId,
-      runtimeVersion: this.runtimeVersion,
-      daemonVersion: this.runtimeVersion,
-      state: 'ready'
-    })
-    return [
-      '#cloud-config',
-      'write_files:',
-      '  - path: /etc/devhotel/ownership.json',
-      "    permissions: '0600'",
-      '    content: |',
-      `      ${ownership}`,
-      '  - path: /usr/local/sbin/devhotel-runtime-agent',
-      "    permissions: '0755'",
-      '    content: |',
-      '      #!/bin/sh',
-      '      set -eu',
-      "      stty -F /dev/ttyS1 raw -echo 115200 2>/dev/null || true",
-      '      exec 3<>/dev/ttyS1',
-      '      while IFS= read -r request <&3; do',
-      "        case \"$request\" in health:[a-f0-9]*) request_id=${request#health:} ;; *) continue ;; esac",
-      `        printf '%s\\n' '${reply.slice(0, -1)},"requestId":"'"$request_id"'"}' >&3`,
-      '      done',
-      '  - path: /etc/init.d/devhotel-runtime-agent',
-      "    permissions: '0755'",
-      '    content: |',
-      '      #!/sbin/openrc-run',
-      '      name="DevHotel private runtime agent"',
-      '      command=/usr/local/sbin/devhotel-runtime-agent',
-      '      command_background=true',
-      '      pidfile=/run/devhotel-runtime-agent.pid',
-      '      output_log=/var/log/devhotel-runtime-agent.log',
-      '      error_log=/var/log/devhotel-runtime-agent.log',
-      '      depend() { need localmount; }',
-      'runcmd:',
-      '  - [rc-update, add, devhotel-runtime-agent, default]',
-      '  - [rc-service, devhotel-runtime-agent, restart]',
-      ''
-    ].join('\n')
   }
 
   private async writeMarker(marker: ManagedHyperVRuntimeMarker): Promise<ManagedHyperVRuntimeMarker> {

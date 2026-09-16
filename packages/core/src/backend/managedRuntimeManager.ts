@@ -24,18 +24,25 @@ import {
 export const MANAGED_HYPERV_RUNTIME_VERSION = '0.1.0'
 
 /**
- * Official Alpine UEFI image used as the immutable Linux substrate. DevHotel
- * adds its per-install identity and private serial daemon through a CIDATA
- * seed disk; the upstream bytes remain independently reproducible.
+ * Official Alpine `virt` ISO, used read-only as the immutable Linux substrate.
+ *
+ * The cloud VHD images cannot be used: they ship either tiny-cloud with no
+ * cloud-init at all, or a cloud-init pinned to their own provider's
+ * datasource, so DevHotel's seed is never read and guest health can never
+ * pass. A Generation 2 VM boots this ISO from a SCSI DVD, and DevHotel's
+ * identity and private serial daemon are delivered by an apkovl overlay that
+ * Alpine's initramfs discovers on an attached disk — offline, with no
+ * cloud-init and no datasource. The upstream bytes remain independently
+ * reproducible.
  */
-export const MANAGED_HYPERV_BASE_IMAGE: ManagedRuntimeRemoteArtifact = {
-  id: 'alpine-3.22.5-hyperv-base',
-  url: 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/aws_alpine-3.22.5-x86_64-uefi-tiny-r0.vhd',
-  sha256: '9f042de9c7ab3c99093cbfaa46946b0c73138035f0fba382bbf5a3794dc67c83',
+export const MANAGED_HYPERV_BOOT_ISO: ManagedRuntimeRemoteArtifact = {
+  id: 'alpine-3.22.5-virt-iso',
+  url: 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-virt-3.22.5-x86_64.iso',
+  sha256: 'b7b0f2785aeaf23d2c225e01e4a48337de3ebc5688dba196b88d3c515dbba623',
   sha512:
-    'ba667c2b2d6a67183efe08fc1ce007bb6a0dcdbaffe673a72a9e0ce09abb0ab431fa2817733bb083db74774893bf04787724e6e6f97baf6a42dc2aea2b572b43',
-  sizeBytes: 148_898_304,
-  extension: '.vhd'
+    'fa9b1c717dacbc9ca2c40a3766c87c407083c6ea4a0ac074baa094228a035c5a0a863034cb52388634964202b137b391cee72b1376fed29b1f5ea44d5155af45',
+  sizeBytes: 68_157_440,
+  extension: '.iso'
 }
 
 type DownloadArtifact = (opts: {
@@ -141,7 +148,11 @@ export class ManagedRuntimeManager {
   async enableWindowsFeatures(): Promise<ManagedRuntimeObservation> {
     if (this.platform !== 'win32') return await this.observe()
     await this.windowsFeature.enable()
-    return await this.prepare()
+    // Provisioning downloads and boots a runtime and can take minutes. Start it
+    // the same way launch does — without blocking — so the caller gets the gate
+    // back immediately instead of a frozen button.
+    void this.prepare().catch(() => undefined)
+    return await this.observe()
   }
 
   async observe(): Promise<ManagedRuntimeObservation> {
@@ -164,7 +175,7 @@ export class ManagedRuntimeManager {
         provider.state === 'ready' &&
         provider.runtimeId === manifest.runtimeId &&
         provider.runtimeVersion === manifest.runtimeVersion &&
-        provider.baseImageDigest === MANAGED_HYPERV_BASE_IMAGE.sha256
+        provider.baseImageDigest === MANAGED_HYPERV_BOOT_ISO.sha256
       ) {
         return bootstrap
       }
@@ -214,7 +225,7 @@ export class ManagedRuntimeManager {
     let manifest = await this.bootstrap.beginProvision(MANAGED_HYPERV_RUNTIME_VERSION)
     try {
       const downloaded = await this.downloadArtifact({
-        artifact: MANAGED_HYPERV_BASE_IMAGE,
+        artifact: MANAGED_HYPERV_BOOT_ISO,
         destinationRoot: path.join(this.userData, 'runtime', 'downloads'),
         allowedHosts: new Set(['dl-cdn.alpinelinux.org']),
         fetch: this.fetch
@@ -274,7 +285,7 @@ export class ManagedRuntimeManager {
       observation.state !== 'ready' ||
       observation.runtimeId !== manifest.runtimeId ||
       observation.runtimeVersion !== manifest.runtimeVersion ||
-      observation.baseImageDigest !== MANAGED_HYPERV_BASE_IMAGE.sha256
+      observation.baseImageDigest !== MANAGED_HYPERV_BOOT_ISO.sha256
     ) {
       throw new Error('Managed Hyper-V runtime did not produce an exact healthy identity proof')
     }

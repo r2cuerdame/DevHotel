@@ -150,6 +150,11 @@ export const ko: Translation = {
   'settings.caMissing': '아직 만들지 않음',
   'settings.trustCa': 'CA 신뢰',
   'settings.untrustCa': '신뢰 해제',
+  'settings.runtimeTitle': '관리형 Linux 런타임',
+  'settings.runtimeDesc':
+    'DevHotel은 Docker Desktop 대신 자체 Linux 런타임에서 Room을 실행할 수 있습니다. 사용하는 가상화 기능을 켜려면 Windows에서 한 번의 승인이 필요합니다.',
+  'settings.runtimeEnable': 'Windows 기능 켜기',
+  'settings.runtimeRestart': 'DevHotel 런타임 활성화를 완료하려면 Windows를 다시 시작하세요.',
   'settings.about': '정보',
   'settings.aboutLine': 'DevHotel {version} — 모든 프로젝트에 저마다의 Room을.',
 

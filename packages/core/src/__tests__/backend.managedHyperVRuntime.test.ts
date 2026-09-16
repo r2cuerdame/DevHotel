@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import { gunzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ManagedHyperVRuntime,
@@ -24,12 +25,12 @@ afterEach(async () => {
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
-const imageBytes = Buffer.from('test-vhdx-image')
+const imageBytes = Buffer.from('test-alpine-virt-iso')
 const imageDigest = createHash('sha256').update(imageBytes).digest('hex')
 
 async function releaseImage() {
   const root = await tempDir()
-  const file = path.join(root, 'base.vhd')
+  const file = path.join(root, 'base.iso')
   await writeFile(file, imageBytes)
   return { file, sha256: imageDigest, sizeBytes: imageBytes.byteLength }
 }
@@ -54,7 +55,6 @@ function readPowerShellLiteral(script: string, variable: string): string {
 class FakeHyperV {
   vm: FakeVm | null = null
   readonly scripts: string[] = []
-  readonly converted: { source: string; parent: string }[] = []
 
   readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
     expect(executable).toBe('powershell.exe')
@@ -78,16 +78,6 @@ class FakeHyperV {
         notes: readPowerShellLiteral(script, 'notes')
       }
       return { code: 0, stdout: JSON.stringify({ Id: this.vm.id, State: this.vm.state }), stderr: '' }
-    }
-    if (script.includes('Convert-VHD')) {
-      // Hyper-V produces a Generation 2 bootable VHDX from the verified VHD.
-      const temporary = readPowerShellLiteral(script, 'temporary')
-      const parent = readPowerShellLiteral(script, 'parent')
-      const source = readPowerShellLiteral(script, 'source')
-      this.converted.push({ source, parent })
-      await writeFile(temporary, await readFile(source))
-      await rename(temporary, parent)
-      return { code: 0, stdout: '', stderr: '' }
     }
     if (script.includes('Start-VM -Name')) {
       if (!this.vm) return { code: 1, stdout: '', stderr: 'missing VM' }
@@ -164,50 +154,86 @@ describe('ManagedHyperVRuntime', () => {
     expect(fake.scripts.join('\n')).toContain('Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true')
     expect(fake.scripts.join('\n')).toContain('Set-VMComPort -VM $vm -Number 2 -Path $pipePath')
     expect(fake.scripts.join('\n')).toContain('Format-Volume -FileSystem FAT -NewFileSystemLabel')
+
+    // The guest bootstrap travels as an Alpine apkovl the initramfs discovers,
+    // not as a cloud-init seed the pinned image would never read.
     const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
-    const cloudConfig = Buffer.from(readPowerShellLiteral(createScript, 'userDataB64'), 'base64').toString('utf8')
-    expect(cloudConfig).toContain('/etc/devhotel/ownership.json')
-    expect(cloudConfig).toContain('/usr/local/sbin/devhotel-runtime-agent')
-    expect(cloudConfig).toContain('health:[a-f0-9]*')
-    expect(cloudConfig).toContain('runtime-owned')
-    expect(await readFile(path.join(path.dirname(marker.vmPath), 'images', `${imageDigest}.vhd`))).toEqual(imageBytes)
+    expect(readPowerShellLiteral(createScript, 'overlayName')).toBe('devhotel.apkovl.tar.gz')
+    const overlay = gunzipSync(Buffer.from(readPowerShellLiteral(createScript, 'overlayB64'), 'base64')).toString('utf8')
+    expect(overlay).toContain('etc/devhotel/ownership.json')
+    expect(overlay).toContain('usr/local/sbin/devhotel-runtime-agent')
+    expect(overlay).toContain('etc/runlevels/default/devhotel-runtime-agent')
+    expect(overlay).toContain('runtime-owned')
+    expect(createScript).not.toContain('cloud-config')
+    expect(createScript).not.toContain('CIDATA')
+
+    expect(await readFile(path.join(path.dirname(marker.vmPath), 'images', `${imageDigest}.iso`))).toEqual(imageBytes)
+    expect(marker.overlayDigest).toMatch(/^[a-f0-9]{64}$/)
   })
 
-  it('boots the Generation 2 VM from a VHDX converted from the verified image', async () => {
+  it('boots the Generation 2 VM from the pinned ISO on a SCSI DVD', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
 
     const marker = await managed.provision(await releaseImage())
-
-    // A Generation 2 VM boots from a SCSI .vhdx; .vhd is a Generation 1,
-    // IDE-only boot device, so attaching the upstream VHD directly cannot boot.
     const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
-    expect(createScript).toContain('New-VM -Name $vmName -Generation 2')
-    expect(path.extname(readPowerShellLiteral(createScript, 'diskPath'))).toBe('.vhdx')
-    expect(path.extname(readPowerShellLiteral(createScript, 'parentPath'))).toBe('.vhdx')
-    expect(path.extname(readPowerShellLiteral(createScript, 'seedPath'))).toBe('.vhdx')
-    expect(path.extname(marker.diskPath)).toBe('.vhdx')
 
-    // The converted parent is named after the digest that was actually
-    // verified, so the differencing chain's provenance stays checkable. The
-    // provider reports canonical paths, which differ from the constructed ones
-    // wherever the temp root is an 8.3 short path.
-    expect(fake.converted).toHaveLength(1)
-    const images = await realpath(path.join(path.dirname(marker.vmPath), 'images'))
-    expect(fake.converted[0]!.source).toBe(path.join(images, `${imageDigest}.vhd`))
-    expect(fake.converted[0]!.parent).toBe(path.join(images, `${imageDigest}.vhdx`))
+    // Generation 2 boots a SCSI .vhdx or a virtual DVD; it has no IDE
+    // controller, so the boot media must be the DVD, never a .vhd.
+    expect(createScript).toContain('New-VM -Name $vmName -Generation 2')
+    expect(createScript).toContain('-NoVHD')
+    expect(createScript).toContain('$dvd=Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru')
+    expect(createScript).toContain('Set-VMFirmware -VM $vm -EnableSecureBoot Off -FirstBootDevice $dvd')
+    expect(createScript).not.toContain('-VHDPath')
+    expect(path.extname(readPowerShellLiteral(createScript, 'isoPath'))).toBe('.iso')
+    expect(path.extname(marker.isoPath)).toBe('.iso')
   })
 
-  it('converts the pinned image once and reuses the owned parent disk', async () => {
+  it('keeps the runtime state disk out of the disposable seed rebuild', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+
+    const marker = await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+
+    // The seed is regenerated from the marker identity, so destroying it is
+    // safe. The state disk holds Room data and must only ever be created.
+    expect(createScript).toContain('Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop')
+    expect(createScript).not.toContain('Remove-Item -LiteralPath $statePath')
+    expect(createScript).toContain('if (-not (Test-Path -LiteralPath $statePath)) { New-VHD -Path $statePath')
+    expect(path.extname(marker.statePath)).toBe('.vhdx')
+  })
+
+  it('demands a deliberate migration when the generated guest overlay changes', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    const image = await releaseImage()
+    const marker = await managed.provision(image)
+
+    // Simulate a DevHotel build whose overlay bytes differ from the recorded
+    // ones. Re-seeding underneath a running install would silently change the
+    // guest's identity payload, so this must be refused by name.
+    await writeFile(
+      path.join(path.dirname(marker.vmPath), 'provider.json'),
+      JSON.stringify({ ...marker, overlayDigest: 'b'.repeat(64) }),
+      'utf8'
+    )
+    fake.vm = null
+
+    await expect(managed.provision(image)).rejects.toThrow(/overlay changed.*version bump/i)
+  })
+
+  it('reuses the owned ISO instead of copying it again', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
     const image = await releaseImage()
 
-    await managed.provision(image)
-    expect(fake.converted).toHaveLength(1)
+    const first = await managed.provision(image)
+    fake.vm = null
+    const second = await managed.provision(image)
 
-    await managed.provision(image)
-    expect(fake.converted).toHaveLength(1)
+    expect(second.isoPath).toBe(first.isoPath)
+    expect(second.baseImageDigest).toBe(imageDigest)
   })
 
   it('requires a fresh matching nonce from the private named-pipe daemon', async () => {
@@ -315,9 +341,10 @@ describe('ManagedHyperVRuntime', () => {
     await expect(managed.repair(image)).resolves.toMatchObject({ state: 'ready' })
 
     const recreated = fake.scripts.filter((script) => script.includes('New-VM -Name')).at(-1)!
-    expect(recreated).toContain('Remove-Item -LiteralPath $diskPath -Force -ErrorAction Stop')
     expect(recreated).toContain('Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop')
     expect(recreated.indexOf('Remove-Item -LiteralPath $seedPath')).toBeLessThan(recreated.indexOf('New-VHD -Path $seedPath'))
+    // A repair must never destroy Room state.
+    expect(recreated).not.toContain('Remove-Item -LiteralPath $statePath')
   })
 
   it('saves the exact owned VM and leaves it recoverable across app or Host restart', async () => {

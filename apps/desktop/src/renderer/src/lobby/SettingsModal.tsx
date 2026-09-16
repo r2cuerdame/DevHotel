@@ -16,6 +16,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
   const [footprint, setFootprint] = useState<{ dataDir: string; installDir: string; autostart: boolean } | null>(null)
   const [autostart, setAutostart] = useState(false)
   const [cleaning, setCleaning] = useState(false)
+  const [runtimeGate, setRuntimeGate] = useState<{ stage: string; restartRequired: boolean; detail: string } | null>(null)
+  const [enablingRuntime, setEnablingRuntime] = useState(false)
 
   useEffect(() => {
     void api.app.mcpInfo().then(setMcp)
@@ -83,6 +85,35 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
               </button>
             )}
           </div>
+        </div>
+
+        <div className="panel-section settings-card">
+          <h3>🐧 {t('settings.runtimeTitle')}</h3>
+          <p className="small muted" style={{ marginTop: 0 }}>
+            {t('settings.runtimeDesc')}
+          </p>
+          <div className="row">
+            <button
+              className="btn"
+              disabled={enablingRuntime}
+              onClick={() => {
+                setEnablingRuntime(true)
+                void api.app
+                  .enableManagedRuntimeFeatures()
+                  .then((gate) => setRuntimeGate(gate))
+                  .catch((err: unknown) => toast('error', String(err)))
+                  .finally(() => setEnablingRuntime(false))
+              }}
+            >
+              {t('settings.runtimeEnable')}
+            </button>
+          </div>
+          {runtimeGate && (
+            <p className="small" style={{ color: runtimeGate.stage === 'failed' ? 'var(--warn)' : undefined }}>
+              {runtimeGate.detail}
+              {runtimeGate.restartRequired ? ` ${t('settings.runtimeRestart')}` : ''}
+            </p>
+          )}
         </div>
 
         <div className="panel-section settings-card">
