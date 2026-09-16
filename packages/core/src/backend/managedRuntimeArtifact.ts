@@ -9,7 +9,8 @@ export interface ManagedRuntimeRemoteArtifact {
   sha256: string
   sha512: string
   sizeBytes: number
-  extension: '.vhd'
+  /** Only the formats DevHotel knows how to own are downloadable. */
+  extension: '.iso' | '.vhd'
 }
 
 export interface ManagedRuntimeDownloadedArtifact {
@@ -36,7 +37,9 @@ function validateArtifact(artifact: ManagedRuntimeRemoteArtifact, allowedHosts: 
   if (url.protocol !== 'https:' || url.username || url.password || url.port || !allowedHosts.has(url.hostname)) {
     throw new Error('Managed runtime download origin is not allowed')
   }
-  if (artifact.extension !== '.vhd') throw new Error('Managed runtime download format is invalid')
+  if (artifact.extension !== '.iso' && artifact.extension !== '.vhd') {
+    throw new Error('Managed runtime download format is invalid')
+  }
   return url
 }
 

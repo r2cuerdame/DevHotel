@@ -6,7 +6,7 @@ import type {
   ManagedRuntimeSupport
 } from '../backend/managedRuntime'
 import {
-  MANAGED_HYPERV_BASE_IMAGE,
+  MANAGED_HYPERV_BOOT_ISO,
   MANAGED_HYPERV_RUNTIME_VERSION,
   ManagedRuntimeManager,
   type ManagedRuntimeBootstrapController,
@@ -58,7 +58,7 @@ function manifest(phase: ManagedRuntimeManifest['phase'] = 'checking-windows-cap
     status: phase === 'ready' ? 'ready' : phase === 'broken' ? 'broken' : 'provisioning',
     phase,
     runtimeVersion: MANAGED_HYPERV_RUNTIME_VERSION,
-    artifactDigests: phase === 'checking-windows-capabilities' ? {} : { [MANAGED_HYPERV_BASE_IMAGE.id]: MANAGED_HYPERV_BASE_IMAGE.sha256 },
+    artifactDigests: phase === 'checking-windows-capabilities' ? {} : { [MANAGED_HYPERV_BOOT_ISO.id]: MANAGED_HYPERV_BOOT_ISO.sha256 },
     createdAt: '2026-09-16T00:00:00Z',
     updatedAt: '2026-09-16T00:00:00Z'
   }
@@ -133,14 +133,14 @@ function readyProviderObservation(): ManagedHyperVRuntimeObservation {
     runtimeId: 'runtime-owned',
     runtimeVersion: MANAGED_HYPERV_RUNTIME_VERSION,
     daemonVersion: MANAGED_HYPERV_RUNTIME_VERSION,
-    baseImageDigest: MANAGED_HYPERV_BASE_IMAGE.sha256,
+    baseImageDigest: MANAGED_HYPERV_BOOT_ISO.sha256,
     detail: 'ready'
   }
 }
 
 function provider(overrides: Partial<ManagedRuntimeProviderController> = {}): ManagedRuntimeProviderController {
   const marker = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     owner: 'devhotel',
     backend: 'hyper-v',
     installId: 'install-owned',
@@ -149,10 +149,12 @@ function provider(overrides: Partial<ManagedRuntimeProviderController> = {}): Ma
     vmName: 'DevHotel-0123456789abcdef',
     vmId: '11111111-2222-3333-4444-555555555555',
     vmPath: 'C:\\runtime\\machine',
-    diskPath: 'C:\\runtime\\machine\\runtime.vhd',
+    isoPath: 'C:\\runtime\\images\\alpine.iso',
     seedPath: 'C:\\runtime\\machine\\seed.vhdx',
+    statePath: 'C:\\runtime\\machine\\state.vhdx',
     pipePath: '\\\\.\\pipe\\devhotel-runtime-0123456789abcdef',
-    baseImageDigest: MANAGED_HYPERV_BASE_IMAGE.sha256,
+    baseImageDigest: MANAGED_HYPERV_BOOT_ISO.sha256,
+    overlayDigest: 'a'.repeat(64),
     status: 'stopped',
     createdAt: '2026-09-16T00:00:00Z',
     updatedAt: '2026-09-16T00:00:00Z'
@@ -169,11 +171,11 @@ function provider(overrides: Partial<ManagedRuntimeProviderController> = {}): Ma
 }
 
 const downloaded = {
-  id: MANAGED_HYPERV_BASE_IMAGE.id,
-  file: 'C:\\runtime\\downloads\\base.vhd',
-  sha256: MANAGED_HYPERV_BASE_IMAGE.sha256,
-  sha512: MANAGED_HYPERV_BASE_IMAGE.sha512,
-  sizeBytes: MANAGED_HYPERV_BASE_IMAGE.sizeBytes
+  id: MANAGED_HYPERV_BOOT_ISO.id,
+  file: 'C:\\runtime\\downloads\\alpine.iso',
+  sha256: MANAGED_HYPERV_BOOT_ISO.sha256,
+  sha512: MANAGED_HYPERV_BOOT_ISO.sha512,
+  sizeBytes: MANAGED_HYPERV_BOOT_ISO.sizeBytes
 }
 
 describe('ManagedRuntimeManager', () => {
