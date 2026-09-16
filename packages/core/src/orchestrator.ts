@@ -101,6 +101,7 @@ import {
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
+import type { HostFootprint, HostGcResult, LifecycleQuotas, QuotaVerdict } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
@@ -188,6 +189,12 @@ import { writeManifest } from './manifest'
 import { OperationTracker, type OperationReporter } from './operations'
 import { operationsRepo, type OperationsRepo } from './store/operationsRepo'
 import { reconcile, type ReconcileResult } from './reconcile'
+import { buildHostFootprint } from './lifecycle/footprint'
+import { observeHost } from './lifecycle/adapter'
+import { executeHostGc, type HostGcOptions } from './lifecycle/gc'
+import { DEFAULT_LIFECYCLE_QUOTAS, evaluateQuotas, type QuotaRequest } from './lifecycle/quotas'
+import { nodeSharedCacheMounts } from './lifecycle/sharedCache'
+import type { IngressLedger } from './lifecycle/ingressLedger'
 import {
   reconcileVolumesState,
   executeVolumeGc,
@@ -1226,6 +1233,25 @@ export interface OrchestratorOptions {
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
   lifecyclePolicy?: Partial<RoomLifecyclePolicy>
+  /**
+   * Durable record of the Host ingress ports this install opened. Supplied when
+   * the Room executor publishes Host-side ports of its own; without it an
+   * ingress route is invisible to the Host footprint and cannot be revoked
+   * after an unclean exit.
+   */
+  ingressLedger?: IngressLedger
+  /** Closes one inherited Host ingress port and forgets its ledger entry. */
+  revokeIngress?: (roomId: string) => Promise<void>
+  /** The runtime generation serving Rooms; ingress from any other generation is stale. */
+  runtimeId?: string | null
+  /**
+   * Whether Node Rooms share one Hotel-scoped package store. Content-addressed
+   * by construction, so the bytes are identical between Rooms; on by default
+   * because the per-Room copy only ever bought a second download.
+   */
+  sharedPackageCache?: boolean
+  /** Limits DevHotel places on itself; breaches refuse creation, never delete. */
+  quotas?: LifecycleQuotas
 }
 
 export interface RoomLifecyclePolicy {
@@ -1302,6 +1328,11 @@ export class RoomOrchestrator {
   readonly devices: AndroidDeviceBroker
   private readonly gitCredential?: GitCredentialResolver
   private readonly lifecyclePolicy: RoomLifecyclePolicy
+  private readonly ingressLedger: IngressLedger | null
+  private readonly revokeIngressRoute: ((roomId: string) => Promise<void>) | null
+  private readonly runtimeId: string | null
+  private readonly sharedPackageCache: boolean
+  private readonly quotas: LifecycleQuotas
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -1315,6 +1346,11 @@ export class RoomOrchestrator {
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
     this.lifecyclePolicy = { ...DEFAULT_ROOM_LIFECYCLE_POLICY, ...opts.lifecyclePolicy }
+    this.ingressLedger = opts.ingressLedger ?? null
+    this.revokeIngressRoute = opts.revokeIngress ?? null
+    this.runtimeId = opts.runtimeId ?? null
+    this.sharedPackageCache = opts.sharedPackageCache ?? true
+    this.quotas = opts.quotas ?? DEFAULT_LIFECYCLE_QUOTAS
     for (const [name, value] of Object.entries(this.lifecyclePolicy)) {
       if (!Number.isFinite(value) || value <= 0) throw new Error(`Room lifecycle ${name} must be a positive duration`)
     }
@@ -1421,7 +1457,10 @@ export class RoomOrchestrator {
             ...pendingAndroidLocaleRecoveryRooms,
             ...acceptanceRecoveryRooms
           ]),
-          userData: this.userData
+          userData: this.userData,
+          ingressRoutes: this.ingressLedger?.list() ?? [],
+          ...(this.revokeIngressRoute ? { revokeIngress: this.revokeIngressRoute } : {}),
+          currentRuntimeId: this.runtimeId
         }
       )
     }
@@ -4397,6 +4436,101 @@ export class RoomOrchestrator {
           }
           await this.backend.removeManagedVolume(current.name)
           return current.sizeBytes
+        })
+      }
+    })
+  }
+
+  /**
+   * Everything DevHotel owns on this Host, in one list.
+   *
+   * The Room disk verdicts come straight from the fail-closed reconciler above
+   * — this does not get a second opinion about them — and the containers,
+   * isolation domains, Hotel-scoped shared caches and Host ingress ports are
+   * added alongside so the answer is about the Host rather than about one
+   * engine's idea of storage. A call that could not reach part of the engine
+   * comes back incomplete rather than short.
+   */
+  async hostFootprint(): Promise<HostFootprint> {
+    const context = await this.volumeReconciliationContext()
+    const classified = reconcileVolumesState(context)
+    const observation = await observeHost({
+      backend: this.backend,
+      classifiedVolumes: classified.volumes,
+      volumeUsage: context.volumes,
+      ingress: this.ingressLedger?.list() ?? [],
+      ingressLedgerDamaged: this.ingressLedger?.isDamaged() ?? false,
+      runtimeMode: this.runtimeMode
+    })
+    return buildHostFootprint(observation, {
+      rooms: context.rooms,
+      ...(context.roomDirExists ? { roomDirExists: context.roomDirExists } : {}),
+      currentRuntimeId: this.runtimeId
+    })
+  }
+
+  /**
+   * May this Host take on one more of something?
+   *
+   * Answers from the footprint and nothing else, and never acts. A breach is a
+   * refusal to create, with the limit and the numbers behind it; what to free is
+   * a decision for a human holding the footprint, and freeing it still has to
+   * satisfy the GC proofs.
+   */
+  async checkQuotas(request: QuotaRequest = {}): Promise<QuotaVerdict> {
+    return evaluateQuotas(await this.hostFootprint(), this.quotas, request)
+  }
+
+  /**
+   * Bounded collection across every kind of owned artifact.
+   *
+   * Dry by default. A real pass re-proves each artifact under the Room lock
+   * immediately before removing it, because a plan describes the moment it was
+   * made and a Room can wake in between. Anything whose ownership, reachability
+   * or size cannot be established again is left exactly where it is, and the
+   * refusal is reported rather than swallowed.
+   */
+  async gcHostFootprint(opts: HostGcOptions = {}): Promise<HostGcResult> {
+    const footprint = await this.hostFootprint()
+    return await executeHostGc(footprint, opts, {
+      collect: async (artifact, remainingBytes) => {
+        if (artifact.kind === 'shared-cache') {
+          // Hotel-scoped: no Room lock applies, and the reachability proof is
+          // "no Room remains", which is re-established from a fresh footprint.
+          const refreshed = await this.hostFootprint()
+          const current = refreshed.artifacts.find((candidate) => candidate.id === artifact.id)
+          if (!current || !current.collectable || current.sizeBytes > remainingBytes) {
+            throw new Error(`Shared cache ${artifact.id} changed state before guarded removal`)
+          }
+          await this.backend.removeSharedCache(current.id.slice('shared-cache:'.length))
+          return current.sizeBytes
+        }
+        if (!artifact.roomId) throw new Error(`Artifact ${artifact.id} has no Room ownership identity`)
+        return await this.withRoomLock(artifact.roomId, async () => {
+          const refreshed = await this.hostFootprint()
+          const current = refreshed.artifacts.find((candidate) => candidate.id === artifact.id)
+          if (!current) throw new Error(`Artifact ${artifact.id} disappeared before guarded removal`)
+          if (!current.collectable || current.sizeBytes > remainingBytes) {
+            throw new Error(`Artifact ${artifact.id} changed state before guarded removal`)
+          }
+          if (current.kind === 'room-disk') {
+            await this.backend.removeManagedVolume(current.id.slice('disk:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'room-container') {
+            await this.backend.removeManagedContainer(current.id.slice('container:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'room-network') {
+            await this.backend.removeManagedNetwork(current.id.slice('network:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'ingress-route') {
+            if (!this.revokeIngressRoute) throw new Error('No ingress revoker is configured for this runtime')
+            await this.revokeIngressRoute(current.roomId ?? '')
+            return current.sizeBytes
+          }
+          throw new Error(`Unsupported artifact kind for collection: ${current.kind}`)
         })
       }
     })
@@ -9371,6 +9505,10 @@ export class RoomOrchestrator {
       startCommand: room.startCommand,
       env: osEnv,
       depsVolumeOverride: gen > 0 ? depsVolumeForGen(room.id, room.runtime.version, gen) : undefined,
+      // The package store is content-addressed, so every Room that mounts this
+      // holds the same bytes. `/cache` stays per-Room for everything a Room can
+      // actually dirty.
+      ...(this.sharedPackageCache ? { sharedCaches: nodeSharedCacheMounts() } : {}),
       ...osOverlay,
       ...overrides
     }

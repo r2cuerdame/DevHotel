@@ -1,4 +1,5 @@
 import net from 'node:net'
+import type { IngressLedger } from '../lifecycle/ingressLedger'
 
 /**
  * Host loopback forwarders for Rooms whose published ports live inside the
@@ -43,16 +44,33 @@ export interface ManagedRuntimeIngressOptions {
    */
   connect?: (target: ManagedIngressTarget) => net.Socket
   onError?: (error: Error) => void
+  /**
+   * Durable record of the Host ports this process opened.
+   *
+   * Without it a forwarder exists only in this `Map`, and an unclean exit
+   * leaves a listening socket that nothing on the machine can attribute to a
+   * Room or reclaim. With it, an ingress route is an owned artifact like any
+   * other: it appears in the Host footprint, and the next start can prove it is
+   * stale and revoke it. Optional so tests and the compatibility backend need
+   * not carry one.
+   */
+  ledger?: IngressLedger
+  /** The runtime generation publishing these routes; recorded so a later start can spot a stale one. */
+  runtimeId?: string | null
 }
 
 export class ManagedRuntimeIngress {
   private readonly routes = new Map<string, ManagedIngressRoute>()
   private readonly connect: (target: ManagedIngressTarget) => net.Socket
   private readonly onError: (error: Error) => void
+  private readonly ledger: IngressLedger | null
+  private readonly runtimeId: string | null
 
   constructor(opts: ManagedRuntimeIngressOptions = {}) {
     this.connect = opts.connect ?? ((target) => net.connect(target.port, target.host))
     this.onError = opts.onError ?? (() => {})
+    this.ledger = opts.ledger ?? null
+    this.runtimeId = opts.runtimeId ?? null
   }
 
   /**
@@ -103,6 +121,16 @@ export class ManagedRuntimeIngress {
         await new Promise<void>((resolve) => server.close(() => resolve()))
       }
     })
+    // Written after the bind so the ledger never claims a port that was never
+    // opened, and before the port is handed to the Gateway so it can never be
+    // in use while unrecorded. A ledger write that fails must not fail the
+    // Room: losing the record costs one unattributable port at next start,
+    // which the footprint reports; refusing to serve the Room costs the Room.
+    try {
+      this.ledger?.record({ roomId, hostPort, target: `${target.host}:${target.port}`, runtimeId: this.runtimeId })
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error(String(error)))
+    }
     return hostPort
   }
 
@@ -111,15 +139,44 @@ export class ManagedRuntimeIngress {
     return this.routes.get(roomId)?.hostPort ?? null
   }
 
+  /**
+   * Closes a Room's forwarder and forgets it.
+   *
+   * The ledger entry is dropped even when this process holds no forwarder for
+   * the Room, because that is exactly the case a restart inherits: the socket
+   * died with the previous process and only the record survived.
+   */
   async revoke(roomId: string): Promise<void> {
     const route = this.routes.get(roomId)
-    if (!route) return
-    this.routes.delete(roomId)
-    await route.close()
+    if (route) {
+      this.routes.delete(roomId)
+      await route.close()
+    }
+    try {
+      this.ledger?.forget(roomId)
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error(String(error)))
+    }
   }
 
   /** Every forwarder, closed. Used on shutdown so no Host port outlives the app. */
   async revokeAll(): Promise<void> {
     for (const roomId of [...this.routes.keys()]) await this.revoke(roomId)
+    try {
+      this.ledger?.forgetAll()
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  /** Routes this install believes it published, including ones inherited from a previous run. */
+  recordedRoutes(): { roomId: string; hostPort: number; target: string; runtimeId: string | null; createdAt: string }[] {
+    return this.ledger?.list() ?? [...this.routes.entries()].map(([roomId, route]) => ({
+      roomId,
+      hostPort: route.hostPort,
+      target: '',
+      runtimeId: this.runtimeId,
+      createdAt: ''
+    }))
   }
 }

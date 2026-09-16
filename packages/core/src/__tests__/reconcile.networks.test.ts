@@ -16,10 +16,17 @@ describe('reconcile managed Room networks', () => {
 
     const result = await reconcile(backend, rooms, (line) => logs.push(line))
 
-    expect(result).toEqual({ straysRemoved: [], networksRemoved: ['dh-orphan-net'], roomsSlept: [] })
-    expect(backend.calls).toEqual(['adoptManagedNetwork:dh-known-net', 'removeManagedNetwork:dh-orphan-net'])
+    expect(result.straysRemoved).toEqual([])
+    expect(result.networksRemoved).toEqual(['dh-orphan-net'])
+    expect(result.roomsSlept).toEqual([])
+    // Strays go before adoptions: the allocator should never take a surviving
+    // subnet back while a stray network still holds an overlapping one.
+    expect(backend.calls).toEqual(['removeManagedNetwork:dh-orphan-net', 'adoptManagedNetwork:dh-known-net'])
     expect(backend.managedNetworks).toEqual([{ roomId: 'known', name: 'dh-known-net' }])
-    expect(logs[0]).toMatch(/removing stray network dh-orphan-net/)
+    // The plan is logged before anything acts on it, so recovery is inspectable
+    // without having to let it happen first.
+    expect(logs[0]).toMatch(/^reconcile: plan [a-f0-9]{12} with \d+ action\(s\)$/)
+    expect(logs[1]).toMatch(/removing stray network dh-orphan-net/)
   })
 
   it('adopts surviving networks across multiple known rooms on startup', async () => {
@@ -37,10 +44,12 @@ describe('reconcile managed Room networks', () => {
     const result = await reconcile(backend, rooms, (line) => logs.push(line))
 
     expect(result.networksRemoved).toEqual([])
+    // Adoption order follows the network name, not whatever order the engine
+    // happened to list them in: the same Host must reconcile the same way twice.
     expect(backend.calls).toEqual([
       'adoptManagedNetwork:dh-roomA-net',
-      'adoptManagedNetwork:dh-roomB-net',
-      'adoptManagedNetwork:dh-roomB-android-control-net'
+      'adoptManagedNetwork:dh-roomB-android-control-net',
+      'adoptManagedNetwork:dh-roomB-net'
     ])
   })
 

@@ -1,5 +1,6 @@
 import type { AnchorSpec, WebSpec } from './types'
 import { RELAY_PREAMBLE_PREFIX } from '../relayProtocol'
+import { NODE_PACKAGE_SHARED_CACHE, sharedCacheVolume } from '../lifecycle/sharedCache'
 
 export const ANCHOR_IMAGE = 'alpine/socat'
 export const RELAY_PORT = 3999
@@ -487,14 +488,33 @@ function mountArgs(spec: WebSpec): string[] {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   if (!spec.noCacheVolume) args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
+  for (const shared of spec.sharedCaches ?? []) {
+    args.push('-v', `${shared.volume}:${shared.path}`)
+  }
   for (const extra of spec.extraVolumes ?? []) {
     args.push('-v', `${extra.volume}:${extra.path}`)
   }
   return args
 }
 
+/**
+ * Where a Room's package manager keeps its store.
+ *
+ * `/cache` is the Room's own and always exists. When a Hotel-scoped package
+ * cache is mounted as well, the store moves into it: the contents are
+ * content-addressed, so they are identical between Rooms by construction and
+ * the per-Room copy bought nothing but a second download. Everything else a
+ * Room dirties stays under `/cache`, where one Room cannot reach another's.
+ */
+function packageStorePaths(spec: WebSpec): { npm: string; pnpm: string } {
+  const shared = (spec.sharedCaches ?? []).find((mount) => mount.volume === sharedCacheVolume(NODE_PACKAGE_SHARED_CACHE))
+  if (!shared) return { npm: '/cache/npm', pnpm: '/cache/pnpm' }
+  return { npm: `${shared.path}/npm`, pnpm: `${shared.path}/pnpm` }
+}
+
 function envArgs(spec: WebSpec): string[] {
-  const args = ['-e', 'npm_config_cache=/cache/npm', '-e', 'PNPM_HOME=/cache/pnpm']
+  const store = packageStorePaths(spec)
+  const args = ['-e', `npm_config_cache=${store.npm}`, '-e', `PNPM_HOME=${store.pnpm}`]
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }
