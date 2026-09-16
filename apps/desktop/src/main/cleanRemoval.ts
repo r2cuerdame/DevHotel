@@ -117,6 +117,21 @@ export function isTrustedRendererUrl(
   }
 }
 
+/**
+ * How much an uninstall takes with it.
+ *
+ * These are genuinely different promises, and only the person uninstalling can
+ * say which one they meant. `app-only` leaves the Rooms, their disks and the
+ * managed runtime exactly where they are, so a reinstall finds the work rather
+ * than a clean machine; `complete` is the promise that nothing DevHotel made
+ * outlives it. Offering one and silently doing the other is how a tool loses
+ * either a user's work or their trust.
+ */
+export type CleanRemovalScope = 'app-only' | 'complete'
+
+/** Which scope a dialog response chose, or `null` when it was cancelled. */
+export const CLEAN_REMOVAL_RESPONSES: readonly (CleanRemovalScope | null)[] = [null, 'app-only', 'complete']
+
 export function cleanRemovalConfirmation(roomCount: number): {
   type: 'warning'
   title: string
@@ -130,11 +145,13 @@ export function cleanRemovalConfirmation(roomCount: number): {
   const rooms = `${roomCount} Room${roomCount === 1 ? '' : 's'}`
   return {
     type: 'warning',
-    title: 'Remove DevHotel and all data?',
-    message: `Permanently delete ${rooms} and uninstall DevHotel?`,
+    title: 'Uninstall DevHotel?',
+    message: `Uninstall DevHotel, and what should happen to ${rooms}?`,
     detail:
-      'This deletes Room containers, volumes, databases, backups and app data; removes DevHotel CA trust and autostart; then launches the uninstaller. This cannot be undone.',
-    buttons: ['Cancel', `Delete ${rooms} & Uninstall`],
+      `Uninstall app only: removes the DevHotel application, DevHotel CA trust and autostart. Your ${rooms}, their disks and the DevHotel runtime stay on this computer, and reinstalling picks them back up.\n\n` +
+      `Delete everything: also deletes Room containers, volumes, databases, backups and app data, and removes the DevHotel runtime virtual machine and its disks. This cannot be undone.\n\n` +
+      'Neither option touches WSL distributions, virtual machines or images DevHotel did not create.',
+    buttons: ['Cancel', 'Uninstall app only', `Delete ${rooms} & Uninstall`],
     defaultId: 0,
     cancelId: 0,
     noLink: true
@@ -180,10 +197,15 @@ export interface CleanRemovalCoordinatorInput {
   ownershipId: string
   uninstaller: string
   failureLog: string
+  /** Omitted means `complete`, which is what every caller before scopes meant. */
+  scope?: CleanRemovalScope
 }
 
 function validateCoordinatorInput(input: CleanRemovalCoordinatorInput): void {
   if (!Number.isSafeInteger(input.parentPid) || input.parentPid <= 0) throw new Error('Invalid DevHotel parent PID')
+  if (input.scope !== undefined && input.scope !== 'app-only' && input.scope !== 'complete') {
+    throw new Error('Invalid DevHotel clean-removal scope')
+  }
   if (!UUID.test(input.ownershipId)) throw new Error('Invalid DevHotel data ownership identity')
   if (comparable(input.target) !== comparable(join(input.appData, APP_DATA_DIR))) {
     throw new Error('Clean-removal coordinator target is not the exact DevHotel app-data directory')
@@ -211,6 +233,7 @@ export function cleanRemovalCoordinatorScript(input: CleanRemovalCoordinatorInpu
     `$ownershipId = ${psLiteral(input.ownershipId)}`,
     `$uninstaller = ${psLiteral(resolve(input.uninstaller))}`,
     `$failureLog = ${psLiteral(resolve(input.failureLog))}`,
+    `$deleteData = $${(input.scope ?? 'complete') === 'complete' ? 'true' : 'false'}`,
     `$parentExitTimeoutMs = ${PARENT_EXIT_TIMEOUT_MS}`,
     `$uninstallTimeoutMs = ${UNINSTALL_TIMEOUT_MS}`,
     'function Assert-ExactOwnedTarget {',
@@ -261,6 +284,10 @@ export function cleanRemovalCoordinatorScript(input: CleanRemovalCoordinatorInpu
     '  if ($uninstall.ExitCode -ne 0) {',
     "    throw ('DevHotel uninstaller failed with exit code ' + $uninstall.ExitCode)",
     '  }',
+    // An app-only uninstall stops here, with the uninstaller run and the data
+    // deliberately left standing. The ownership assertion below is the only
+    // thing that authorises a delete, so it is never reached in that case.
+    '  if (-not $deleteData) { exit 0 }',
     '  if (-not (Assert-ExactOwnedTarget)) { exit 0 }',
     '  Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop',
     "  if (Test-Path -LiteralPath $target) { throw 'DevHotel data directory still exists after removal' }",

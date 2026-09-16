@@ -184,7 +184,8 @@ disk: a power loss during provisioning must not cost the user Room data.
 
 Settings → **Managed Linux runtime** reports the live runtime state and phase,
 the runtime identity and version, the verified digest of each pinned artifact,
-and whether this Host granted nested virtualization. That is deliberate rather
+whether this Host granted nested virtualization, and any update that did not
+end on the version it aimed for. That is deliberate rather
 than decorative: the clean Windows machine this is proven on has no Node, no
 adb and no shell tooling, so the app window is the only place those values can
 be read, and the digest is what separates a runtime actually running the pinned
@@ -196,7 +197,77 @@ elevation text, which is Host detail of exactly the kind the provider keeps
 private everywhere else. The gate's `stage` and `detail` say what the user can
 do without quoting Windows back at them.
 
+## Updating the runtime, and putting it back
+
+The runtime is a versioned product component, not a build artifact. Every
+version this build can stand up is listed in `managedRuntimeRelease.ts` with the
+pinned artifacts that make it, and older entries stay in that list on purpose:
+an update that cannot be made healthy has to be able to re-fetch and re-verify
+exactly the release the install came from, and "whatever this build happens to
+ship" is not that.
+
+A launch that finds an ownership manifest naming an older version runs one
+update, in this order:
+
+1. **Journal first.** `update.json` lands beside `ownership.json` before
+   anything else happens, naming the source version, the target version and the
+   digests the install had already verified. It is what makes every later step
+   recoverable.
+2. **Fetch and verify.** The target's boot image is downloaded and digest-checked
+   while the old runtime is still running. A failure here costs nothing: the
+   install has not moved.
+3. **Apply.** The manifest adopts the new version — the one place a version may
+   change, and only after the journal says an apply is in flight — and the
+   provider migrates the VM. The object is proved owned at the *old* version,
+   turned off, de-registered and rebuilt at the new one. `state.vhdx` is never
+   named by the teardown, never detached and never recreated, so the Rooms on it
+   survive the move; the seed disk is disposable and is regenerated from the new
+   identity.
+4. **Verify.** The runtime is started and has to produce an exact healthy
+   identity proof — runtime id, version, and the base-image digest of the
+   release the manifest names — before the journal commits and superseded boot
+   images are pruned.
+
+Because the manifest and the journal are written in that order, no crash or
+reboot can leave a runtime whose version nobody can name. The recovery rules are
+mechanical:
+
+| What the last run left | What the next launch does |
+| --- | --- |
+| Journal `staging` | Re-runs the update; nothing was applied. |
+| Journal `applying`/`verifying`, manifest on the target | Finishes forward: proves health and commits. Re-migrating a move that already landed would be the destructive answer. |
+| Journal `applying`, manifest still on the source | Re-runs the update and counts the attempt. |
+| Two attempts already spent | Rolls back, even if the target might work now. A Host that cannot survive this update twice has already cost two launches without a runtime. |
+| Journal `rolled-back`/`failed` for this target | Stays on the version that works, starts it, and reports why. |
+
+A rollback is the same migration run backwards, which is deliberate: one code
+path means every update test exercises the rollback too, rather than leaving it
+as the branch nobody runs until it matters. It fails closed — a source version
+this build no longer carries cannot be re-verified, so the runtime is reported
+as needing repair instead of being rebuilt from a guess.
+
+The last update that did not end on the version it aimed for is reported in the
+observation, and reaches Settings. An install that quietly went back to its
+previous version and said nothing would be indistinguishable from one that never
+tried, and the difference is the whole reason the update is not being retried.
+The provider's raw failure text stays out of the renderer, as everywhere else.
+
 ## Uninstall
+
+Uninstall asks which of two different promises the user meant, because only
+they can say:
+
+- **Uninstall app only** removes the DevHotel application, DevHotel CA trust and
+  autostart. Rooms, their disks and the managed runtime VM stay exactly where
+  they are; the runtime is stopped with its state saved, and a reinstall picks
+  the work back up. Host trust and startup state go in this scope too — they are
+  the two things an uninstalled application cannot come back and clean up, and
+  neither is worth anything without the app that installed it.
+- **Delete everything** additionally deletes Rooms, app data and the runtime VM
+  with its disks.
+
+Cancel is both the default and the Escape key. Neither scope touches WSL
+distributions, virtual machines, switches or images DevHotel did not create.
 
 Deleting DevHotel's app data is not sufficient on Windows. A registered Hyper-V
 VM keeps its configuration and its VHDX attachments open, so a recursive delete
@@ -204,14 +275,19 @@ of `%APPDATA%\DevHotel` either fails on the lock or succeeds and leaves Hyper-V
 holding a VM whose disks no longer exist. The Hyper-V object therefore has to go
 first, and only a running DevHotel still holds the proof that it may.
 
-Clean removal runs `ManagedRuntimeManager.remove()` in-process, after the Rooms
-are deleted and **before** the detached coordinator that runs the uninstaller
-and deletes app data is launched. The provider re-proves the Host marker and
+Clean removal runs `ManagedRuntimeManager.remove(scope)` in-process, after the
+Rooms are deleted and **before** the detached coordinator that runs the
+uninstaller and deletes app data is launched. An app-only scope stops there and
+reports `preserved`; the coordinator it launches runs the uninstaller and exits
+before it ever reaches the ownership assertion that authorises a delete. The provider re-proves the Host marker and
 the exact Notes payload inside the same PowerShell pass that removes the VM, so
 nothing can be swapped onto the name in between; a running guest is turned off
 rather than saved, since a saved state would only hold the attachments open
 against the delete that follows. It then removes its own machine directory and
-runtime root, and nothing outside them.
+runtime root, and nothing outside them. Superseded boot images are pruned by
+name — only `<sha256>.iso` entries in the directory this provider created, and
+never the live one — so a file it did not write is left alone rather than
+guessed about.
 
 Without that proof the removal reports `refused` and touches nothing, and clean
 removal stops and says so. An orphaned VM the user can see and delete is a

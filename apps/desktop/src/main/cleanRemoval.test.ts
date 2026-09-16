@@ -4,6 +4,7 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  CLEAN_REMOVAL_RESPONSES,
   cleanRemovalCoordinatorScript,
   cleanRemovalConfirmation,
   encodedCleanRemovalCoordinatorCommand,
@@ -82,7 +83,48 @@ describe('clean-removal safety helpers', () => {
     const options = cleanRemovalConfirmation(3)
     expect(options.cancelId).toBe(0)
     expect(options.defaultId).toBe(0)
-    expect(options.buttons[1]).toContain('3 Rooms')
+    expect(options.buttons[2]).toContain('3 Rooms')
+  })
+
+  it('offers app-only and complete uninstall as separate, named choices', () => {
+    const options = cleanRemovalConfirmation(2)
+
+    // Three buttons, and the destructive one is neither the default nor the
+    // one you reach by pressing Escape.
+    expect(options.buttons).toEqual(['Cancel', 'Uninstall app only', 'Delete 2 Rooms & Uninstall'])
+    expect(CLEAN_REMOVAL_RESPONSES).toEqual([null, 'app-only', 'complete'])
+    expect(CLEAN_REMOVAL_RESPONSES[options.cancelId]).toBeNull()
+    expect(CLEAN_REMOVAL_RESPONSES[options.defaultId]).toBeNull()
+    // Each choice says what it keeps, because that is the only difference that
+    // matters and it is not recoverable if the user guesses wrong.
+    expect(options.detail).toContain('stay on this computer')
+    expect(options.detail).toContain('cannot be undone')
+    expect(options.detail).toContain('DevHotel did not create')
+  })
+
+  it('never lets an app-only coordinator reach the app-data delete', () => {
+    const fixture = coordinatorFixture()
+
+    const appOnly = cleanRemovalCoordinatorScript({ ...fixture, scope: 'app-only' })
+    const complete = cleanRemovalCoordinatorScript({ ...fixture, scope: 'complete' })
+
+    expect(appOnly).toContain('$deleteData = $false')
+    // The scope is checked before the ownership assertion, which is the only
+    // thing that authorises a delete: app-only exits before reaching it.
+    expect(appOnly.indexOf('if (-not $deleteData) { exit 0 }')).toBeLessThan(appOnly.indexOf('Assert-ExactOwnedTarget)'))
+    expect(complete).toContain('$deleteData = $true')
+    // Both still run the exact validated uninstaller.
+    for (const script of [appOnly, complete]) expect(script).toContain('Start-Process -FilePath $uninstaller')
+  })
+
+  it('defaults an unscoped coordinator to the complete removal its callers meant', () => {
+    expect(cleanRemovalCoordinatorScript(coordinatorFixture())).toContain('$deleteData = $true')
+    expect(() =>
+      cleanRemovalCoordinatorScript({
+        ...coordinatorFixture(),
+        scope: 'everything' as unknown as 'complete'
+      })
+    ).toThrow('Invalid DevHotel clean-removal scope')
   })
 
   it('validates one exact regular uninstaller inside the install directory', () => {

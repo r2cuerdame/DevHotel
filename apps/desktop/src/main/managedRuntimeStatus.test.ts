@@ -63,4 +63,33 @@ describe('managedRuntimeStatusInfo', () => {
     expect(JSON.stringify(status)).not.toContain('private')
     expect(JSON.stringify(status)).not.toContain('DISM')
   })
+  it('reports a rolled-back update so the older runtime is explained, without the raw failure', () => {
+    const status = managedRuntimeStatusInfo(
+      observation({
+        update: {
+          stage: 'rolled-back',
+          fromVersion: '0.1.0',
+          toVersion: '0.2.0',
+          attempts: 1,
+          detail: 'The DevHotel-managed runtime stayed on 0.1.0: the update to 0.2.0 was rolled back with Room data intact.',
+          failure: "Hyper-V: 'DevHotel-0123456789abcdef' failed to start (Virtual machine ID …)"
+        }
+      })
+    )
+
+    expect(status.update).toEqual({
+      stage: 'rolled-back',
+      fromVersion: '0.1.0',
+      toVersion: '0.2.0',
+      attempts: 1,
+      detail: 'The DevHotel-managed runtime stayed on 0.1.0: the update to 0.2.0 was rolled back with Room data intact.'
+    })
+    // The provider's own words about a Host object never cross this boundary.
+    expect(JSON.stringify(status)).not.toContain('Hyper-V:')
+  })
+
+  it('says nothing about updates when there is nothing to explain', () => {
+    expect(managedRuntimeStatusInfo(observation()).update).toBeNull()
+    expect(managedRuntimeStatusInfo(observation({ update: null })).update).toBeNull()
+  })
 })

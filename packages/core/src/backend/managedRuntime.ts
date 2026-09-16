@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'n
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import type { ManagedRuntimeFeatureObservation } from './managedRuntimeWindowsFeature'
+import type { ManagedRuntimeUpdateStage } from './managedRuntimeUpdate'
 
 export type ManagedRuntimeSupportCode =
   | 'ready'
@@ -82,6 +83,24 @@ export interface ManagedRuntimeManifest {
   failure?: string
 }
 
+/**
+ * What the last, or current, runtime version change did.
+ *
+ * Reported rather than hidden, because a rollback changes which runtime the
+ * user is on: an install that quietly went back to its previous version and
+ * says nothing is indistinguishable from one that never tried to update, and
+ * the difference is the whole reason the update is not being retried.
+ */
+export interface ManagedRuntimeUpdateSummary {
+  stage: ManagedRuntimeUpdateStage
+  fromVersion: string
+  toVersion: string
+  attempts: number
+  detail: string
+  /** Why the target version was abandoned. Never raw Host text. */
+  failure?: string
+}
+
 export interface ManagedRuntimeObservation {
   state: 'unsupported' | 'not-installed' | 'preparing' | 'ready' | 'broken'
   phase: ManagedRuntimeProvisionPhase | null
@@ -96,6 +115,11 @@ export interface ManagedRuntimeObservation {
    * can later run KVM-backed Android emulators. `null` means not recorded.
    */
   nestedVirtualization?: boolean | null
+  /**
+   * The runtime version change in flight, or the last one that did not end on
+   * the version it was aiming for. `null`/absent means nothing to report.
+   */
+  update?: ManagedRuntimeUpdateSummary | null
   /**
    * The Windows optional-feature gate, when one stands between this Host and a
    * provisionable runtime. Populated by the manager, which owns the harness;
@@ -342,6 +366,44 @@ export class ManagedRuntimeBootstrap {
       updatedAt: now
     }
     return await this.persistManifest(manifest)
+  }
+
+  /**
+   * Re-points the ownership manifest at another runtime version.
+   *
+   * This is the one place a version may change, and it exists so that it
+   * cannot happen by accident: `beginProvision` still refuses a version it did
+   * not install, because a build that quietly re-stamps a live runtime is
+   * indistinguishable from one that lost track of what is on the Host. An
+   * update calls this deliberately, after its journal is already on disk, so
+   * the manifest and the journal can never disagree about which version this
+   * install is moving to — including across a reboot.
+   *
+   * Identity is preserved on purpose: same install, same runtime, same
+   * creation time, and therefore the same Room state the runtime is carrying.
+   */
+  async adoptVersion(
+    runtimeId: string,
+    runtimeVersion: string,
+    artifactDigests: Record<string, string>
+  ): Promise<ManagedRuntimeManifest> {
+    if (!/^[0-9A-Za-z._-]{1,64}$/.test(runtimeVersion)) throw new Error('Managed runtime version is invalid')
+    if (
+      Object.entries(artifactDigests).some(
+        ([id, digest]) => !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id) || !/^[a-f0-9]{64}$/.test(digest)
+      )
+    ) {
+      throw new Error('Managed runtime artifact digests are invalid')
+    }
+    const manifest = await this.requireManifest(runtimeId)
+    return await this.writeStatus({
+      ...manifest,
+      status: 'provisioning',
+      phase: 'provisioning-runtime-provider',
+      runtimeVersion,
+      artifactDigests: { ...artifactDigests },
+      failure: undefined
+    })
   }
 
   async verifyRelease(

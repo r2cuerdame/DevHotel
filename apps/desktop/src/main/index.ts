@@ -319,7 +319,7 @@ async function bootstrap(): Promise<void> {
     github,
     requestRelaunch: () => requestShutdown('relaunch'),
     runCleanRemoval: (operation) => cleanRemoval.run(operation),
-    removeManagedRuntime: () => managedRuntime.remove(),
+    removeManagedRuntime: (scope) => managedRuntime.remove(scope),
     // Read-only: reports what the runtime is, and never provisions or elevates.
     managedRuntimeStatus: async () => managedRuntimeStatusInfo(await managedRuntime.observe()),
     enableManagedRuntimeFeatures: async () => {
