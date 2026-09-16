@@ -118,6 +118,11 @@ export const de: Translation = {
   'settings.caMissing': 'noch nicht erstellt',
   'settings.trustCa': 'CA vertrauen',
   'settings.untrustCa': 'Vertrauen entfernen',
+  'settings.runtimeTitle': 'Verwaltete Linux-Laufzeit',
+  'settings.runtimeDesc':
+    'DevHotel kann Rooms in einer eigenen Linux-Laufzeit statt in Docker Desktop ausführen. Windows benötigt eine einmalige Zustimmung, um die verwendeten Virtualisierungsfeatures zu aktivieren.',
+  'settings.runtimeEnable': 'Windows-Features aktivieren',
+  'settings.runtimeRestart': 'Starten Sie Windows neu, um die Aktivierung der DevHotel-Laufzeit abzuschließen.',
   'settings.about': 'Über',
   'settings.aboutLine': 'DevHotel {version} — jedes Projekt bekommt sein eigenes Zimmer.',
 
