@@ -151,7 +151,7 @@ do without quoting Windows back at them.
 
 Deleting DevHotel's app data is not sufficient on Windows. A registered Hyper-V
 VM keeps its configuration and its VHDX attachments open, so a recursive delete
-of `%APPDATA%DevHotel` either fails on the lock or succeeds and leaves Hyper-V
+of `%APPDATA%\DevHotel` either fails on the lock or succeeds and leaves Hyper-V
 holding a VM whose disks no longer exist. The Hyper-V object therefore has to go
 first, and only a running DevHotel still holds the proof that it may.
 
