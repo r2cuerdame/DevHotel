@@ -279,7 +279,8 @@ describe('reconcile stale one-shot jobs', () => {
       `removeManagedContainer:${exitedJob}`,
       `removeManagedContainer:${interruptedEmulator}`
     ])
-    expect(logs.slice(0, 2).every((line) => line.includes('stale job container'))).toBe(true)
-    expect(logs[2]).toContain('interrupted emulator create')
+    // logs[0] is the plan digest line the reconciler emits before it acts.
+    expect(logs.slice(1, 3).every((line) => line.includes('stale job container'))).toBe(true)
+    expect(logs[3]).toContain('interrupted emulator create')
   })
 })
