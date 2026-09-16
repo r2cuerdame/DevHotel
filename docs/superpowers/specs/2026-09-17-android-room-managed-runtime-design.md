@@ -1,11 +1,24 @@
 # Android Rooms on the managed runtime (#108)
 
 Status: **implemented** — docker-android dependency removed from the managed path.
-The managed emulator uses a DevHotel-owned container image
-(`ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe...`) for its
-X11/VNC preview runtime, and provisions the Android SDK from pinned artifacts
+The managed emulator uses a DevHotel-owned container image for its X11/VNC
+preview runtime, and provisions the Android SDK from pinned artifacts
 (`ANDROID_SDK_TOOLS` + `ANDROID_SYSTEM_IMAGES`) into a shared per-API-level volume.
 End-to-end KVM acceptance is tracked in #111.
+
+**Amended for #111:** that preview image was first published to
+`ghcr.io/r2cuerdame/devhotel-android-emulator-preview` and pulled by digest. The
+published package is private, and #111's Android claim is about a clean Windows
+11 machine, which has no GitHub credential — so the pull failed at the first
+step, for a reason unrelated to Android. DevHotel now **builds** the image inside
+its own managed runtime from `images/android-emulator-preview/Dockerfile`, which
+is embedded in `managedEmulatorPreviewImage.ts` because the packaged app ships
+compiled JavaScript rather than the repository tree. The tag is the Dockerfile's
+own SHA-256, so it is a cache across Rooms and a rename across edits, and the
+build stamps that digest into a label a cache hit has to match before the image
+is adopted. The only bytes that cross the network are Ubuntu's, pinned by digest
+and served anonymously. Nothing is published, and nothing is pulled from a
+DevHotel registry.
 
 Supersedes nothing. Extends
 [the managed-runtime design](2026-08-10-devhotel-managed-runtime-design.md)

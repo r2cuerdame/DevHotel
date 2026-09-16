@@ -1,6 +1,6 @@
 import { basename } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OciCliBackend, openboxFramelessRc, fitEmulatorPy, type OciCliBackendOptions } from './ociCli'
@@ -15,6 +15,15 @@ import {
   MANAGED_EMULATOR_PREVIEW_IMAGE
 } from './androidEmulatorLaunch'
 import { pinnedAndroidVersions, androidApiLevel, buildAndroidSdkProvisionArgs } from './androidSdkPin'
+import {
+  MANAGED_EMULATOR_PREVIEW_DOCKERFILE,
+  MANAGED_EMULATOR_PREVIEW_DOCKERFILE_SHA256,
+  MANAGED_EMULATOR_PREVIEW_IMAGE_REF,
+  buildManagedEmulatorPreviewBuildArgs,
+  managedEmulatorPreviewInspectArgs,
+  managedEmulatorPreviewImageIsUsable,
+  managedEmulatorPreviewStageDir
+} from './managedEmulatorPreviewImage'
 import { anchorName, emulatorName, emulatorScreen, androidSdkVolume } from './naming'
 
 
@@ -189,6 +198,70 @@ export class ManagedRoomBackend extends OciCliBackend {
   }
 
   /**
+   * Make the managed emulator preview image present in the runtime, building it
+   * if it is not already there.
+   *
+   * This is the step that removes a registry from #111's Android claim. It
+   * previously pulled a digest from GHCR; that package is private, and a clean
+   * Windows 11 VM — the only machine the claim is about — has no credential to
+   * pull it with, so the row failed before an emulator was ever created. The
+   * bytes that cross the network now are Ubuntu's, pinned by digest and served
+   * anonymously.
+   *
+   * Three things have to be true and are checked rather than assumed:
+   *
+   * 1. **It is a cache, not a rebuild.** The tag is the Dockerfile's digest, so
+   *    the second Room of the same version finds the image and builds nothing.
+   *    The first pays an apt install once per runtime.
+   * 2. **A hit is DevHotel's own image.** A tag proves nothing by itself, so the
+   *    build's source-digest label has to agree before the image is adopted. A
+   *    tag carrying anything else is rebuilt over, not trusted — and because the
+   *    tag is content-addressed, rebuilding produces exactly the image the label
+   *    claims.
+   * 3. **The build actually produced it.** The label is re-read afterwards, so a
+   *    build that reported success without leaving a usable image fails here,
+   *    where the cause is still visible, rather than at `docker create` with a
+   *    missing-image error that names nothing.
+   *
+   * The Dockerfile is staged into the guest for the build because the engine is
+   * on the other side of a hypervisor boundary: a Host path passed to
+   * `docker build` would resolve inside the guest and find nothing. That is the
+   * same crossing `copyIntoRoom` makes, and it is cleaned up the same way.
+   */
+  private async ensureEmulatorPreviewImage(): Promise<void> {
+    const cached = await this.managedEngine.run(managedEmulatorPreviewInspectArgs())
+    if (cached.code === 0 && managedEmulatorPreviewImageIsUsable(cached.stdout)) return
+
+    const stageDir = managedEmulatorPreviewStageDir(randomUUID())
+    const hostDir = mkdtempSync(join(tmpdir(), 'devhotel-emulator-preview-'))
+    const hostDockerfile = join(hostDir, 'Dockerfile')
+    try {
+      writeFileSync(hostDockerfile, MANAGED_EMULATOR_PREVIEW_DOCKERFILE, 'utf8')
+      await this.managedEngine.putFile(hostDockerfile, `${stageDir}/Dockerfile`)
+
+      const build = await this.managedEngine.run(
+        buildManagedEmulatorPreviewBuildArgs(`${MANAGED_RUNTIME_GUEST_STAGE_ROOT}/${stageDir}`),
+        { timeoutMs: null }
+      )
+      if (build.code !== 0) {
+        throw new Error(
+          `managed emulator: could not build the preview image ${MANAGED_EMULATOR_PREVIEW_IMAGE_REF}: ${build.stderr.slice(-500)}`
+        )
+      }
+
+      const built = await this.managedEngine.run(managedEmulatorPreviewInspectArgs())
+      if (built.code !== 0 || !managedEmulatorPreviewImageIsUsable(built.stdout)) {
+        throw new Error(
+          `managed emulator: the preview image build reported success but ${MANAGED_EMULATOR_PREVIEW_IMAGE_REF} does not carry the expected Dockerfile digest ${MANAGED_EMULATOR_PREVIEW_DOCKERFILE_SHA256}`
+        )
+      }
+    } finally {
+      rmSync(hostDir, { recursive: true, force: true })
+      await this.discardStaged(stageDir)
+    }
+  }
+
+  /**
    * Create the Android emulator sidecar for a managed Room (#108).
    *
    * **Managed path (pinned Android version):** uses `androidAvdPlan` +
@@ -227,10 +300,11 @@ export class ManagedRoomBackend extends OciCliBackend {
     const plan = androidAvdPlan(roomId, opts)
     const launch = androidEmulatorLaunch(roomId, opts, limits)
 
-    // Pull the DevHotel-owned preview image. This image provides the X11/VNC
-    // stack (Xvfb, openbox, x11vnc, websockify/novnc, ffmpeg, python3) and
-    // is completely independent of docker-android.
-    await this.managedEngine.run(['pull', MANAGED_EMULATOR_PREVIEW_IMAGE], { timeoutMs: null })
+    // Make the DevHotel-owned preview image present in the runtime. This image
+    // provides the X11/VNC stack (Xvfb, openbox, x11vnc, websockify/novnc,
+    // ffmpeg, python3), is independent of docker-android, and is built here
+    // rather than pulled — see ensureEmulatorPreviewImage.
+    await this.ensureEmulatorPreviewImage()
 
     // Provision the Android SDK into the shared SDK volume if not already done.
     //

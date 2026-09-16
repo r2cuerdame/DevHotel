@@ -110,12 +110,17 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
     // Image ref appears immediately after --entrypoint sh
     const epIdx = args.indexOf('--entrypoint')
     expect(args[epIdx + 2]).toBe(MANAGED_EMULATOR_PREVIEW_IMAGE)
-    // Must be the DevHotel GHCR image, not docker-android
-    expect(args[epIdx + 2]).toContain('ghcr.io/r2cuerdame/devhotel-android-emulator-preview')
+    // Must be the DevHotel-owned preview image, not docker-android
+    expect(args[epIdx + 2]).toContain('devhotel/android-emulator-preview')
     expect(args[epIdx + 2]).not.toContain('budtmo')
     expect(args[epIdx + 2]).not.toContain('docker-android')
-    // Must be digest-pinned
-    expect(args[epIdx + 2]).toMatch(/@sha256:[a-f0-9]{64}$/)
+    // Must name no registry. #111's Android claim is about a clean Windows 11
+    // machine, which has no credential; the image is built in the runtime from
+    // the Dockerfile this repository carries rather than pulled. The tag is the
+    // Dockerfile's own digest, which is what a registry digest used to provide.
+    expect(args[epIdx + 2]).not.toContain('ghcr.io')
+    expect(args[epIdx + 2]).not.toContain('@sha256:')
+    expect(args[epIdx + 2]).toMatch(/^devhotel\/android-emulator-preview:[a-f0-9]{12}$/)
     expect(args[epIdx + 3]).toBe('-c')
     // The script is the last element
     const script = args[args.length - 1]!
