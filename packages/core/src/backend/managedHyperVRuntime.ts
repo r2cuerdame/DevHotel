@@ -102,6 +102,31 @@ function encodedPowerShell(script: string): string[] {
   return [...POWERSHELL_ARGS, Buffer.from(script, 'utf16le').toString('base64')]
 }
 
+/** `NT VIRTUAL MACHINE\Virtual Machines`, the group every VM worker account joins. */
+const HYPERV_VM_GROUP_SID = 'S-1-5-83-0'
+
+/**
+ * Every directory from the volume root down to `leaf`, outermost first.
+ *
+ * A Hyper-V VM worker process runs as a per-VM virtual account that belongs to
+ * no ordinary group, so it cannot traverse a user profile path such as
+ * `%APPDATA%\devhotel\runtime\managed-linux`. Hyper-V grants the VM access to
+ * the attachment *files* when they are added, but a file it cannot reach still
+ * fails the VM start with "failed to open attachment … Access is denied", so
+ * the ancestors have to be walked and granted explicitly.
+ */
+function ancestorChain(leaf: string): string[] {
+  const chain: string[] = []
+  let current = path.resolve(leaf)
+  for (;;) {
+    chain.push(current)
+    const parent = path.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return chain.reverse()
+}
+
 function defaultRunner(executable: string, args: readonly string[]): Promise<ManagedRuntimeCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, [...args], { windowsHide: true })
@@ -372,8 +397,13 @@ export class ManagedHyperVRuntime {
         `$notes=${psLiteral(markerNotes(marker))}`,
         `$overlayName=${psLiteral(MANAGED_RUNTIME_OVERLAY_FILE)}`,
         `$overlayB64=${psLiteral(this.overlay.bytes.toString('base64'))}`,
+        `$traverse=@(${ancestorChain(this.vmPath).map(psLiteral).join(',')})`,
         "if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) { throw 'Managed runtime VM collision' }",
         'New-Item -ItemType Directory -Force -Path $vmPath | Out-Null',
+        // Traverse only, and never inherited: this lets a VM worker account
+        // resolve a path down to its own attachments without being able to
+        // list these directories or read anything else inside them.
+        `foreach ($dir in $traverse) { & icacls $dir /grant ${psLiteral(`*${HYPERV_VM_GROUP_SID}:(X)`)} | Out-Null }`,
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a
