@@ -186,9 +186,16 @@ describe('managed runtime guest overlay', () => {
     expect(tar).toContain('"state":"ready"')
     expect(tar).toContain(identity.installId)
     expect(tar).toContain(identity.runtimeId)
-    // No Host-reachable network listener is ever installed in the guest.
-    expect(tar).not.toMatch(/\b(nc|socat|sshd|iptables)\b.*-l/)
-    expect(tar).not.toContain('0.0.0.0')
+
+    // The serial agent itself still opens nothing on the network: the identity
+    // proof the Host trusts has to stay on the channel no Room can reach.
+    // The Room command channel *is* a listener, deliberately, and what bounds
+    // it is asserted in `backend.managedRuntimeRoomAgent.test.ts`.
+    const serialAgent = agentSource(overlay)
+    expect(serialAgent).not.toMatch(/\b(nc|socat|sshd)\b/)
+    expect(serialAgent).not.toContain('0.0.0.0')
+    // No general remote shell is installed either, on any channel.
+    expect(tar).not.toMatch(/\bsshd\b/)
   })
 
   it('generates an agent script a POSIX shell accepts', async (ctx) => {

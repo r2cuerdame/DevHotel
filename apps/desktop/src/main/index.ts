@@ -5,12 +5,12 @@ import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell 
 import {
   Gateway,
   ManagedRuntimeManager,
-  OciCliBackend,
   RoomOrchestrator,
   WindowsVmBackend,
   hotelServicesRepo,
   openDb,
-  roomsRepo
+  roomsRepo,
+  selectRoomRuntime
 } from '@devhotel/core'
 import { registerIpc } from './ipc'
 import { PreviewManager } from './previewManager'
@@ -113,9 +113,10 @@ async function bootstrap(): Promise<void> {
     installId: dataOwnershipId,
     fetch: (url, init) => net.fetch(url, init)
   })
-  // Preparation is resumable and intentionally does not block the Lobby. The
-  // product status reports capability/elevation/reboot gates while Room create
-  // remains on the explicit compatibility backend until #107 migrates it.
+  // Preparation is resumable and intentionally does not block the Lobby. It is
+  // awaited only far enough to answer one question — is there a usable runtime
+  // to run Rooms on — because a Room's volumes live in exactly one engine and
+  // that choice cannot be revised after the first Room operation.
   void managedRuntime.prepare().catch((error) => console.error('managed runtime preparation failed:', error))
   const db = openDb(userData)
   const hotelServices = hotelServicesRepo(db)
@@ -127,14 +128,26 @@ async function bootstrap(): Promise<void> {
   })
   const gateway = new Gateway({ caDir: join(userData, 'ca') })
   const ownershipRooms = roomsRepo(db)
-  const backend = new OciCliBackend({
-    identityFile: join(userData, 'runtime', 'docker-engine.json'),
-    legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
-    networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
-    canAdoptLegacyVolume: (roomId) =>
-      ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
-    isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
+  // The managed runtime is preferred; a Host whose Hyper-V gate has not been
+  // passed, or whose runtime is still preparing, keeps working on the external
+  // compatibility engine and is told which one it got.
+  const runtime = await selectRoomRuntime({
+    ...(await managedRuntime.roomChannel().catch(() => null).then((ready) => ({
+      channel: ready?.channel ?? null,
+      runtimeId: ready?.runtimeId ?? null
+    }))),
+    compatibility: {
+      identityFile: join(userData, 'runtime', 'docker-engine.json'),
+      legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
+      networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
+      canAdoptLegacyVolume: (roomId) =>
+        ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
+      isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
+    },
+    onIngressError: (error) => console.error('managed runtime ingress failed:', error)
   })
+  console.log(`DevHotel Room runtime: ${runtime.mode} — ${runtime.detail}`)
+  const backend = runtime.backend
   const windowsVm = new WindowsVmBackend({
     userData,
     consoleLauncher: async (vmxPath) => {
@@ -153,9 +166,9 @@ async function bootstrap(): Promise<void> {
     db,
     appVersion: app.getVersion(),
     managedRuntimeStatus: () => managedRuntime.observe(),
-    // Until a managed IsolationBackend actually passes the clean-Windows gate,
-    // the selected Room executor remains an explicitly observable compatibility path.
-    runtimeMode: 'compatibility',
+    // Reported, never assumed: this is the executor Rooms actually got, which is
+    // the only thing that explains why a Room behaves the way it does.
+    runtimeMode: runtime.mode,
     // The Room's browser profile is an Electron session partition, so only the
     // desktop app can clear it; core asks through this hook.
     clearBrowserData: async (roomId) => {
@@ -241,6 +254,9 @@ async function bootstrap(): Promise<void> {
     void executeShutdownPolicy(action, {
       shutdown: async () => {
         await orch.shutdown()
+        // Host ports the managed backend opened for Room ingress must not
+        // outlive the app that opened them.
+        await runtime.dispose()
         await managedRuntime.stop()
       },
       installUpdate: updater.install,

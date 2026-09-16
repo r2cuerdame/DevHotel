@@ -5,26 +5,17 @@ import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, listeningPort, tempDir, testDb } from './fakes'
 
 /**
- * Source detection clones for real through docker. This stub stands in for that one
- * command so the test can read exactly what would have been sent, argv and stdin alike.
+ * Source detection clones through the Room backend, which is the only layer that
+ * knows how its engine reaches the Host filesystem. What this file proves is the
+ * orchestrator half: the credential the vault resolved reaches that call, and the
+ * secret never reaches the URL the Room stores. The argv and stdin shaping of the
+ * clone itself belongs to the backend, and is proven in
+ * `backend.engineExecutor.test.ts` against a real `OciCliBackend`.
  */
-const dockerRuns: { args: string[]; input?: string }[] = []
-vi.mock('../backend/cli', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../backend/cli')>()
-  return {
-    ...actual,
-    runDocker: async (args: string[], opts: { input?: string } = {}) => {
-      dockerRuns.push({ args, ...(opts.input === undefined ? {} : { input: opts.input }) })
-      // `<host path>:/workspace` — a Windows host path has its own colon, so split off the target
-      const workspace = args[args.indexOf('-v') + 1]?.replace(/:\/workspace$/, '')
-      if (workspace) {
-        mkdirSync(workspace, { recursive: true })
-        writeFileSync(`${workspace}/package.json`, JSON.stringify({ name: 'private-app' }))
-      }
-      return { code: 0, stdout: '', stderr: '' }
-    }
-  }
-})
+function writeDetectableProject(hostPath: string): void {
+  mkdirSync(hostPath, { recursive: true })
+  writeFileSync(`${hostPath}/package.json`, JSON.stringify({ name: 'private-app' }))
+}
 
 /**
  * A private repository needs a credential; the Room record, manifest.yaml and the logs
@@ -36,7 +27,6 @@ describe('private repository clone credentials', () => {
   const listeners: (() => void)[] = []
 
   afterEach(() => {
-    dockerRuns.length = 0
     for (const close of listeners.splice(0)) close()
     for (const db of dbs.splice(0)) db.close()
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
@@ -48,6 +38,7 @@ describe('private repository clone credentials', () => {
     const db = testDb()
     dbs.push(db)
     const backend = new FakeBackend()
+    backend.cloneToHostDirectoryHandler = (_gitUrl, hostPath) => writeDetectableProject(hostPath)
     // the Room is verified by connecting to its published port, so give it a real one
     const listener = await listeningPort()
     backend.hostPort = listener.port
@@ -77,13 +68,11 @@ describe('private repository clone credentials', () => {
     expect(room.sourceRef).toBe('https://github.com/acme/private.git')
     expect(JSON.stringify(orch.rooms.get(room.id))).not.toContain(secret)
     expect(backend.lastGitCredential).toEqual({ username: 'octocat', secret })
-    // detection cloned with the same credential, on stdin and never in argv
-    const detection = dockerRuns.at(-1)!
-    expect(detection.args.join(' ')).not.toContain(secret)
-    expect(detection.args).toContain('https://github.com/acme/private.git')
-    expect(detection.input).toBe(`octocat
-${secret}
-`)
+    // detection cloned the stripped URL, with the credential the URL carried
+    expect(backend.planClones.at(-1)).toEqual({
+      gitUrl: 'https://github.com/acme/private.git',
+      credential: { username: 'octocat', secret }
+    })
   })
 
   it('hands a managed-git Room the connected GitHub Service credential', async () => {
@@ -118,6 +107,6 @@ ${secret}
     })
 
     expect(backend.lastGitCredential).toBeNull()
-    expect(dockerRuns.at(-1)?.input).toBeUndefined()
+    expect(backend.planClones.at(-1)?.credential).toBeNull()
   })
 })
