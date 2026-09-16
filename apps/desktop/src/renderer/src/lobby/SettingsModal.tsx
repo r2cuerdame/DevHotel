@@ -99,7 +99,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
           <div className="row">
             <button
               className="btn"
-              disabled={enablingRuntime}
+              // A policy refusal is not retryable: the same approval prompt
+              // would reach the same refusal, so the button stops offering it.
+              disabled={enablingRuntime || runtimeGate?.stage === 'blocked-by-policy'}
               onClick={() => {
                 setEnablingRuntime(true)
                 void api.app
@@ -125,7 +127,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
             </button>
           </div>
           {runtimeGate && (
-            <p className="small" style={{ color: runtimeGate.stage === 'failed' ? 'var(--warn)' : undefined }}>
+            <p
+              className="small"
+              style={{
+                color:
+                  runtimeGate.stage === 'failed' || runtimeGate.stage === 'blocked-by-policy' ? 'var(--warn)' : undefined
+              }}
+            >
               {runtimeGate.detail}
               {runtimeGate.restartRequired ? ` ${t('settings.runtimeRestart')}` : ''}
             </p>

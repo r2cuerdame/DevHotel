@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   MANAGED_RUNTIME_WINDOWS_FEATURES,
   ManagedRuntimeWindowsFeatureHarness,
-  type ManagedRuntimeFeatureRecord
+  classifyWindowsFeatureFailure,
+  type ManagedRuntimeFeatureRecord,
+  type ManagedRuntimeVirtualizationPolicy
 } from '../backend/managedRuntimeWindowsFeature'
 import type { ManagedRuntimeCommandRunner } from '../backend/managedRuntime'
 
@@ -38,7 +40,15 @@ interface FakeWindowsOptions {
   featureState?: string
   caption?: string
   /** Result the elevated child writes, or `null` to write nothing. */
-  elevatedResult?: { Ok: boolean; RestartNeeded: boolean; Error?: string } | null
+  elevatedResult?: { Ok: boolean; RestartNeeded: boolean; Error?: string; HResult?: number } | null
+  /** Servicing policy this fake Host reports; absent means an unmanaged Host. */
+  policy?: { Wsus?: boolean; RepairRestricted?: boolean; LocalSource?: boolean; Readable?: boolean }
+  /**
+   * Which source answered for the feature states. `cim` is the unelevated
+   * fallback a real DevHotel launch actually gets, because the DISM online
+   * query requires elevation the app does not have.
+   */
+  featureRead?: 'dism' | 'cim' | 'none'
   /** Non-zero simulates a declined UAC prompt. */
   elevatedExitCode?: number
 }
@@ -83,7 +93,14 @@ class FakeWindows {
           Edition: this.opts.caption ?? 'Microsoft Windows 11 Pro',
           Sku: 48,
           BootId: this.bootId,
-          Elevated: false
+          Elevated: false,
+          Policy: {
+            Wsus: this.opts.policy?.Wsus ?? false,
+            RepairRestricted: this.opts.policy?.RepairRestricted ?? false,
+            LocalSource: this.opts.policy?.LocalSource ?? false,
+            Readable: this.opts.policy?.Readable ?? true
+          },
+          FeatureRead: this.opts.featureRead ?? 'dism'
         }),
         stderr: ''
       }
@@ -290,5 +307,167 @@ describe('managed runtime Windows feature harness', () => {
       runner: async () => ({ code: 0, stdout: '{}', stderr: '' })
     })
     await expect(subject.inspect()).rejects.toThrow(/Windows 11/)
+  })
+})
+
+/**
+ * The enterprise case #111 names: a Host where the user *can* elevate and
+ * Windows still refuses, because an administrator decided the answer. The
+ * distinction that matters is retryable vs. not — a policy refusal must never
+ * be dressed up as a failed attempt with a button next to it.
+ */
+/**
+ * DevHotel runs unelevated, so `Get-WindowsOptionalFeature -Online` — a DISM
+ * online operation — is refused on every ordinary launch. Reading that refusal
+ * as "Absent" is what made a Host that had already enabled Hyper-V, and already
+ * restarted for it, ask for the same approval again.
+ */
+describe('managed runtime Windows feature state without elevation', () => {
+  it('resumes to completed across the restart when only the unelevated read is available', async () => {
+    const { subject, fake } = await harness({ featureState: 'Disabled', featureRead: 'cim' })
+    await subject.enable()
+    expect((await subject.observe()).stage).toBe('awaiting-restart')
+
+    // Windows restarts. The unelevated read now reports the feature enabled;
+    // it never reported EnablePending, because CIM cannot express it.
+    fake.featureState = 'Enabled'
+    fake.restart()
+
+    const resumed = await subject.observe()
+    expect(resumed.stage).toBe('completed')
+    // One approval for one piece of work: the restart must not cost a second.
+    expect(fake.elevations).toBe(1)
+  })
+
+  it('does not call an un-restarted Host ready when the unelevated read cannot see the pending restart', async () => {
+    const { subject, fake } = await harness({ featureState: 'Disabled', featureRead: 'cim' })
+    await subject.enable()
+
+    // CIM reports the feature enabled the moment DISM stages it, with the
+    // restart still outstanding. The recorded boot identity is what proves it.
+    fake.featureState = 'Enabled'
+
+    const observation = await subject.observe()
+    expect(observation.stage).toBe('awaiting-restart')
+    expect(observation.restartRequired).toBe(true)
+  })
+
+  it('reports which source answered so a pending restart is never inferred from CIM', async () => {
+    const dism = await harness({ featureState: 'Enabled' })
+    expect((await dism.subject.inspect()).featureRead).toBe('dism')
+
+    const cim = await harness({ featureState: 'Enabled', featureRead: 'cim' })
+    expect((await cim.subject.inspect()).featureRead).toBe('cim')
+  })
+})
+
+describe('managed runtime Windows feature policy refusals', () => {
+  const unmanaged: ManagedRuntimeVirtualizationPolicy = {
+    wsusManaged: false,
+    repairSourceRestricted: false,
+    localSourceConfigured: false,
+    readable: true
+  }
+
+  it('classifies the DISM source HRESULTs an administrator policy produces', () => {
+    for (const hresult of [0x800f0906, 0x800f0954, 0x800f081f, 0x80070005]) {
+      expect(classifyWindowsFeatureFailure(hresult, 'Enable-WindowsOptionalFeature failed', unmanaged)).toMatch(
+        /Ask whoever manages this machine/
+      )
+    }
+  })
+
+  it('reads a negative signed HRESULT as the unsigned code Windows meant', () => {
+    // PowerShell surfaces 0x80070005 as -2147024891 through Exception.HResult.
+    expect(classifyWindowsFeatureFailure(-2147024891, 'denied', unmanaged)).not.toBeNull()
+  })
+
+  it('leaves an ordinary failure retryable', () => {
+    expect(classifyWindowsFeatureFailure(0x800f0922, 'A rollback occurred', unmanaged)).toBeNull()
+    expect(classifyWindowsFeatureFailure(null, 'The download timed out', unmanaged)).toBeNull()
+  })
+
+  it('recognises a policy refusal from Windows wording when no HRESULT arrives', () => {
+    expect(classifyWindowsFeatureFailure(null, 'This setting is managed by your system administrator', unmanaged)).toMatch(
+      /Ask whoever manages this machine/
+    )
+  })
+
+  it('names the managed servicing source when the Host has one', () => {
+    const managed: ManagedRuntimeVirtualizationPolicy = { ...unmanaged, wsusManaged: true }
+    expect(classifyWindowsFeatureFailure(0x800f0954, 'failed', managed)).toMatch(/servicing source is set by administrator policy/)
+    expect(classifyWindowsFeatureFailure(0x800f0954, 'failed', unmanaged)).not.toMatch(/servicing source/)
+  })
+
+  it('treats an unreadable policy surface as no finding rather than as a managed Host', () => {
+    const unreadable: ManagedRuntimeVirtualizationPolicy = { ...unmanaged, wsusManaged: true, readable: false }
+    expect(classifyWindowsFeatureFailure(0x800f0954, 'failed', unreadable)).not.toMatch(/servicing source/)
+  })
+
+  it('records a policy refusal as blocked-by-policy, not as a failed attempt', async () => {
+    const { subject, record } = await harness({
+      featureState: 'Disabled',
+      elevatedResult: { Ok: false, RestartNeeded: false, Error: 'DISM failed', HResult: 0x800f0954 },
+      policy: { Wsus: true, Readable: true }
+    })
+
+    const observation = await subject.enable()
+    expect(observation.stage).toBe('blocked-by-policy')
+    expect(observation.restartRequired).toBe(false)
+    expect(observation.detail).toMatch(/servicing source is set by administrator policy/)
+
+    const stored = await record()
+    expect(stored?.stage).toBe('blocked-by-policy')
+    // The raw Windows text is kept for diagnostics but is not the user's sentence.
+    expect(stored?.failure).toBe('DISM failed')
+    expect(stored?.policyReason).not.toContain('DISM failed')
+  })
+
+  it('keeps reporting the refusal on the next launch without asking for approval again', async () => {
+    const { subject, fake } = await harness({
+      featureState: 'Disabled',
+      elevatedResult: { Ok: false, RestartNeeded: false, Error: 'DISM failed', HResult: 0x800f0906 },
+      policy: { Wsus: true, Readable: true }
+    })
+    await subject.enable()
+    const elevations = fake.elevations
+
+    const observation = await subject.observe()
+    expect(observation.stage).toBe('blocked-by-policy')
+    expect(fake.elevations).toBe(elevations)
+  })
+
+  it('still reports a non-policy failure as failed and therefore retryable', async () => {
+    const { subject } = await harness({
+      featureState: 'Disabled',
+      elevatedResult: { Ok: false, RestartNeeded: false, Error: 'The download timed out', HResult: 0x800f0922 },
+      policy: { Readable: true }
+    })
+    const observation = await subject.enable()
+    expect(observation.stage).toBe('failed')
+  })
+
+  it('clears a recorded refusal once an administrator has enabled the features', async () => {
+    const { subject, fake } = await harness({
+      featureState: 'Disabled',
+      elevatedResult: { Ok: false, RestartNeeded: false, Error: 'DISM failed', HResult: 0x800f0954 },
+      policy: { Wsus: true, Readable: true }
+    })
+    expect((await subject.enable()).stage).toBe('blocked-by-policy')
+
+    // The administrator lifts the policy and enables Hyper-V out of band.
+    fake.featureState = 'Enabled'
+    expect((await subject.observe()).stage).toBe('completed')
+  })
+
+  it('reports an unmanaged Host as unmanaged rather than assuming policy', async () => {
+    const { subject } = await harness({ featureState: 'Disabled' })
+    const inspection = await subject.inspect()
+    expect(inspection.policy).toEqual({
+      wsusManaged: false,
+      repairSourceRestricted: false,
+      localSourceConfigured: false,
+      readable: true
+    })
   })
 })

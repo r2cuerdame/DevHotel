@@ -328,7 +328,9 @@ export interface IpcApi {
      * Asks Windows, through one consented elevation, to enable the optional
      * features the DevHotel-managed runtime needs. Returns the resulting gate:
      * `completed`, `awaiting-restart` when Windows still wants a reboot,
-     * `unsupported-edition`, or `failed` when approval was declined.
+     * `unsupported-edition`, `blocked-by-policy` when an administrator policy
+     * refuses the change approval cannot buy, or `failed` when approval was
+     * declined.
      */
     enableManagedRuntimeFeatures(): Promise<{
       stage: string
