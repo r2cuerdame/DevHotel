@@ -123,6 +123,19 @@ export function emulatorName(roomId: string): string {
   return `dh-${roomId}-svc-emulator`
 }
 
+/**
+ * Per-Room persistent AVD storage volume for the managed emulator path (#108).
+ *
+ * Keeping the AVD outside the container image is the precondition for warm-Room
+ * AVD reuse (#78): the emulator container can be recreated or updated without
+ * losing the booted snapshot that makes a warm Room reach ADB-ready in under 60s.
+ * On the compatibility (docker-android) path the AVD is baked into the image and
+ * there is no equivalent — this volume is managed-runtime-only.
+ */
+export function androidAvdVolume(roomId: string): string {
+  return `dh-${roomId}-android-avd`
+}
+
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 export type EmulatorOrientation = 'portrait' | 'landscape'
 

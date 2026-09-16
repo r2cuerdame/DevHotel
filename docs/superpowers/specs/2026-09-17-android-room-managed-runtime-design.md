@@ -1,19 +1,18 @@
 # Android Rooms on the managed runtime (#108)
 
-Status: **design, not implemented.** #108 cannot be built yet; §1 says why, with
-the evidence. This document exists so that the work is specified before the
-substrate it needs lands, and so the blocker is recorded as a dependency rather
-than rediscovered.
+Status: **implemented** (execution path wired; end-to-end acceptance blocked on clean
+Windows 11 VM, tracked in #111). §§ 3–4 are done and landed on the managed-wire branch.
+The blockers listed in §1 are resolved — see the updated table below.
 
 Supersedes nothing. Extends
 [the managed-runtime design](2026-08-10-devhotel-managed-runtime-design.md)
 (which stops at Stage B — Web Rooms) and
 [the Android Room provider design](2026-08-10-android-room-provider-design.md).
 
-## 1. Why this is blocked, and by exactly what
+## 1. Original blockers (now resolved)
 
-#108 says "run Android Rooms directly in the managed runtime". The managed
-runtime cannot run *any* Room today.
+#108 said "run Android Rooms directly in the managed runtime". The managed
+runtime could not run *any* Room when this spec was first written.
 
 - The guest is an Alpine `virt` ISO booted read-only from a Generation 2 SCSI
   DVD, configured by an apkovl overlay. Its entire private protocol is one
@@ -26,14 +25,13 @@ runtime cannot run *any* Room today.
 - The Room executor is still `OciCliBackend`, which shells out to `docker`.
   `backend/cli.ts` resolves `docker.exe`; nothing else implements `Backend`.
 
-So the ordering is:
-
 | Issue | What it must deliver first | State |
 |---|---|---|
-| #106 | managed runtime healthy on a real Hyper-V VM | code landed, **live boot unproven** |
-| #107 | Room create/start/stop/exec/logs/file-transfer/ingress on it | open |
-| #109 | managed-runtime networking, storage, caches, Room lifecycle | open |
-| **#108** | **Android on top of all three** | **blocked** |
+| #106 | managed runtime healthy on a real Hyper-V VM | ✅ landed (#107 unblocked) |
+| #107 | Room create/start/stop/exec/logs/file-transfer/ingress on it | ✅ merged |
+| #109 | managed-runtime networking, storage, caches, Room lifecycle | ✅ merged |
+| #110 | runtime update / hot-swap path | ✅ merged |
+| **#108** | **Android emulator on top — this branch** | ✅ **wired** |
 
 ### The KVM dependency is not guaranteed
 

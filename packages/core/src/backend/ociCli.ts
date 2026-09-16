@@ -923,7 +923,7 @@ export function workspaceTransactionalFingerprintScript(): string {
  * itself), so FIT_EMULATOR_PY below enforces the full-screen size and the
  * force-center rule snaps the frame back to 0,0 on that resize.
  */
-function openboxFramelessRc(width: number, height: number): string {
+export function openboxFramelessRc(width: number, height: number): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <applications>
@@ -957,7 +957,7 @@ python3 "$HOME/.config/openbox/fit-emulator.py" >/dev/null 2>&1 &
  * and libX11 ship in the image) forces the "Android Emulator*" window to the
  * full X screen; Qt then rescales the device content edge to edge.
  */
-function fitEmulatorPy(width: number, height: number): string {
+export function fitEmulatorPy(width: number, height: number): string {
   return `import ctypes
 import time
 
