@@ -11,10 +11,11 @@ import type { ExecResult, GitCredential } from './types'
 import {
   androidAvdPlan,
   androidEmulatorLaunch,
-  buildManagedEmulatorContainerArgs
+  buildManagedEmulatorContainerArgs,
+  MANAGED_EMULATOR_PREVIEW_IMAGE
 } from './androidEmulatorLaunch'
-import { pinnedAndroidVersions } from './androidSdkPin'
-import { anchorName, emulatorName, emulatorScreen, EMULATOR_IMAGE, emulatorImage } from './naming'
+import { pinnedAndroidVersions, androidApiLevel, buildAndroidSdkProvisionArgs } from './androidSdkPin'
+import { anchorName, emulatorName, emulatorScreen, androidSdkVolume } from './naming'
 
 
 /**
@@ -220,19 +221,40 @@ export class ManagedRoomBackend extends OciCliBackend {
       return super.createEmulator(roomId, opts, limits)
     }
 
-    // ── Managed path ─────────────────────────────────────────────────────────
+    // ── Managed path (DevHotel-owned, no docker-android) ─────────────────────
 
+    const apiLevel = androidApiLevel(version)
     const plan = androidAvdPlan(roomId, opts)
     const launch = androidEmulatorLaunch(roomId, opts, limits)
 
-    // Resolve the image to use. We reuse the docker-android image as the base
-    // because it ships the complete X11/VNC/openbox stack. The entrypoint is
-    // replaced by buildManagedEmulatorContainerArgs so docker-android's
-    // supervisord never runs.
-    const imageRef = opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE
+    // Pull the DevHotel-owned preview image. This image provides the X11/VNC
+    // stack (Xvfb, openbox, x11vnc, websockify/novnc, ffmpeg, python3) and
+    // is completely independent of docker-android.
+    await this.managedEngine.run(['pull', MANAGED_EMULATOR_PREVIEW_IMAGE], { timeoutMs: null })
 
-    // Pull the image so the create below does not time out on first use.
-    await this.managedEngine.run(['pull', imageRef], { timeoutMs: null })
+    // Provision the Android SDK into the shared SDK volume if not already done.
+    //
+    // `buildAndroidSdkProvisionArgs` generates a `docker run --rm` command that
+    // downloads and extracts the pinned SDK artifacts (cmdline-tools, platform-tools,
+    // emulator binary, system image) into `androidSdkVolume(apiLevel)`.  It is
+    // idempotent: if the sentinel file is already present the script exits immediately.
+    //
+    // This is the one-time ~2 GB download per Android version per host. Subsequent
+    // Rooms of the same version skip it entirely.
+    const sdkVolumeName = androidSdkVolume(apiLevel)
+    const provisionArgs = buildAndroidSdkProvisionArgs({
+      version,
+      sdkRoot: '/opt/devhotel/android-sdk',
+      sdkVolumeName,
+      imageRef: MANAGED_EMULATOR_PREVIEW_IMAGE,
+      roomId
+    })
+    const provisionResult = await this.managedEngine.run(provisionArgs, { timeoutMs: null })
+    if (provisionResult.code !== 0) {
+      throw new Error(
+        `managed emulator: Android SDK provisioning failed for Room ${roomId} (API ${apiLevel}): ${provisionResult.stderr.slice(-500)}`
+      )
+    }
 
     // Find the control anchor — the emulator joins its network namespace.
     const anchorInspect = await this.managedEngine.run([
@@ -284,8 +306,9 @@ export class ManagedRoomBackend extends OciCliBackend {
       networkAuthorityStartedAt,
       abortToken,
       limits,
-      openbox
-    }, imageRef)
+      openbox,
+      apiLevel
+    })
 
     let emulatorId: string | undefined
     try {

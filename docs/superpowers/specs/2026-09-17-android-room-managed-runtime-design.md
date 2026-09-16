@@ -1,8 +1,11 @@
 # Android Rooms on the managed runtime (#108)
 
-Status: **implemented** (execution path wired; end-to-end acceptance blocked on clean
-Windows 11 VM, tracked in #111). §§ 3–4 are done and landed on the managed-wire branch.
-The blockers listed in §1 are resolved — see the updated table below.
+Status: **implemented** — docker-android dependency removed from the managed path.
+The managed emulator uses a DevHotel-owned container image
+(`ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe...`) for its
+X11/VNC preview runtime, and provisions the Android SDK from pinned artifacts
+(`ANDROID_SDK_TOOLS` + `ANDROID_SYSTEM_IMAGES`) into a shared per-API-level volume.
+End-to-end KVM acceptance is tracked in #111.
 
 Supersedes nothing. Extends
 [the managed-runtime design](2026-08-10-devhotel-managed-runtime-design.md)

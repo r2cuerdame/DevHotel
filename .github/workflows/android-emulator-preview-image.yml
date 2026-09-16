@@ -1,0 +1,72 @@
+name: Android Emulator Preview Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images/android-emulator-preview/Dockerfile'
+  pull_request:
+    paths:
+      - 'images/android-emulator-preview/Dockerfile'
+  # Allow manual build to get the digest for pinning
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: r2cuerdame/devhotel-android-emulator-preview
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: images/android-emulator-preview
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          # PRs build but do not push — the digest is available in the build metadata
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache keeps subsequent builds fast
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image digest
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "## Image digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pin this in \`androidEmulatorLaunch.ts\` as \`MANAGED_EMULATOR_PREVIEW_IMAGE\`:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/$IMAGE_NAME@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

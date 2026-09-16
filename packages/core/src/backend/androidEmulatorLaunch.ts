@@ -6,6 +6,7 @@ import {
   emulatorName,
   emulatorScreen,
   androidAvdVolume,
+  androidSdkVolume,
   type EmulatorLimits,
   type EmulatorOpts
 } from './naming'
@@ -14,13 +15,10 @@ import { androidApiLevel, ANDROID_SYSTEM_IMAGES, UnpinnedAndroidSystemImageError
 /**
  * The direct `emulator` launch plan for a managed Android Room (#108).
  *
- * `budtmo/docker-android` takes its configuration as environment variables
- * (`EMULATOR_DEVICE`, `EMULATOR_ADDITIONAL_ARGS`, `SCREEN_*`, …) and builds the
- * command line itself. Owning the emulator means owning that argv, so this
- * module produces it directly from the same Room inputs `buildEmulatorArgs`
- * uses today. It is deliberately backend-neutral and free of Docker: whatever
- * executes it — the external compatibility backend today, the managed runtime
- * once #107/#109 land — only has to run the argv.
+ * DevHotel owns the entire emulator launch pipeline: it provisions the SDK and
+ * system image from pinned artifacts (see `androidSdkPin.ts`), manages the
+ * per-Room AVD directory on a named volume, and runs the emulator directly
+ * against the managed runtime's KVM instead of delegating to docker-android.
  *
  * Every option below was verified against the pinned emulator build's own
  * option table rather than recalled, including that `-accel` takes `on|off|auto`
@@ -34,6 +32,25 @@ export const ANDROID_SDK_ROOT = '/opt/devhotel/android-sdk'
 export const ANDROID_AVD_HOME = '/opt/devhotel/android-avd'
 /** The X display the emulator window is mapped into and x11vnc exports. */
 export const ANDROID_EMULATOR_DISPLAY = ':0'
+
+/**
+ * DevHotel-owned managed emulator preview container image.
+ *
+ * Provides the X11/VNC preview runtime (Xvfb, openbox, x11vnc, novnc/websockify,
+ * python3/python3-xlib, ffmpeg, curl, unzip, openjdk-17-jre-headless) without
+ * any Android SDK baked in — the SDK is provisioned from pinned artifacts and
+ * mounted as a volume at {@link ANDROID_SDK_ROOT}.
+ *
+ * This is NOT docker-android. It is a DevHotel-owned image built from
+ * `images/android-emulator-preview/Dockerfile` in this repository and published
+ * to GHCR via `.github/workflows/android-emulator-preview-image.yml`.
+ *
+ * The digest is pinned so the managed emulator path never implicitly updates.
+ * To update: rebuild the image, replace the digest below, run
+ * `pnpm typecheck && pnpm test`, and open a PR.
+ */
+export const MANAGED_EMULATOR_PREVIEW_IMAGE =
+  'ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe3869a5d049a0d328873d4594a49435a348f34ef6f07413165e8fd8118c'
 
 /**
  * Fixed console/adb ports.
@@ -197,42 +214,45 @@ export interface ManagedEmulatorContainerLifecycle {
    * be auto-fitted). Always pass this in production.
    */
   openbox?: ManagedEmulatorOpenboxConfig
+  /**
+   * Android API level — used to derive the shared SDK volume name.
+   * Set from the Room's Android version via `androidApiLevel(version)`.
+   */
+  apiLevel: number
 }
 
 /**
  * `docker create` args for a managed Android emulator container (#108).
  *
- * This is the managed-path equivalent of `buildEmulatorArgs` in `naming.ts`.
- * Where `buildEmulatorArgs` uses `budtmo/docker-android`'s env-var interface
- * (so the image's supervisord sets up the AVD and launches the emulator itself),
- * this function produces a `docker create` command that overrides the entrypoint
- * with a DevHotel-owned shell script that:
+ * This is the managed-path equivalent of `buildEmulatorArgs` in `naming.ts`,
+ * except it uses the DevHotel-owned preview image instead of docker-android, and
+ * mounts the SDK from a pre-provisioned shared volume rather than having it
+ * baked into the image.
  *
- * 1. Writes the DevHotel openbox rc.xml and fit-emulator.py into `/root/.config/`
- *    (embedded as base64 in the script — no `docker cp` staging step needed).
- * 2. Creates the AVD from the pinned system image if `ANDROID_AVD_HOME/<name>.avd`
- *    does not yet exist (idempotent on warm restarts).
- * 3. Appends the DevHotel config.ini overrides (resolution, orientation) to the
- *    freshly-created or existing AVD's `config.ini`.
- * 4. Starts Xvfb, openbox, x11vnc and websockify exactly as docker-android does,
- *    then launches the emulator with the direct argv from `androidEmulatorLaunch`.
+ * The container entrypoint script:
+ * 1. Writes openbox `rc.xml` + `fit-emulator.py` from embedded base64.
+ * 2. Creates the AVD via `avdmanager` if the per-Room AVD directory is absent
+ *    (idempotent on warm restarts — does not overwrite a saved quickboot snapshot).
+ * 3. Appends DevHotel config.ini overrides (resolution/orientation).
+ * 4. Starts Xvfb, openbox, x11vnc and websockify — same port 6080, same noVNC path.
+ * 5. Execs the emulator directly using `androidEmulatorLaunch` argv.
  *
- * `budtmo/docker-android` is still used as the base image because it already
- * ships the complete X11/VNC/openbox stack — removing that dependency is a
- * separate step after the managed path is running.
- *
- * The per-Room AVD is mounted from `androidAvdVolume(roomId)` at
- * `ANDROID_AVD_HOME`, so its quickboot snapshot persists across container
- * recreations — the precondition for #78 warm-Room reuse.
+ * Two volumes are mounted:
+ * - `androidSdkVolume(apiLevel)` → `ANDROID_SDK_ROOT` read-only: the shared,
+ *   pre-provisioned Android SDK installation (cmdline-tools, platform-tools,
+ *   emulator binary, and system image). Shared across all Rooms of the same
+ *   Android version; provisioned once by a one-shot container before this call.
+ * - `androidAvdVolume(roomId)` → `ANDROID_AVD_HOME` read-write: the per-Room
+ *   AVD directory. Persists across container recreations so quickboot snapshots
+ *   survive sleep/wake cycles (#78).
  */
 export function buildManagedEmulatorContainerArgs(
   roomId: string,
   plan: AndroidAvdPlan,
   launch: AndroidEmulatorLaunch,
-  lifecycle: ManagedEmulatorContainerLifecycle,
-  imageRef: string
+  lifecycle: ManagedEmulatorContainerLifecycle
 ): string[] {
-  const { networkNamespace, networkAuthoritySandboxId, networkAuthorityStartedAt, abortToken, limits, openbox } = lifecycle
+  const { networkNamespace, networkAuthoritySandboxId, networkAuthorityStartedAt, abortToken, limits, openbox, apiLevel } = lifecycle
 
   // Shell-escape a string for embedding inside POSIX single quotes.
   const sq = (s: string): string => s.replace(/'/g, "'\\''")
@@ -256,9 +276,10 @@ export function buildManagedEmulatorContainerArgs(
   /**
    * The managed emulator entrypoint.
    *
-   * Runs inside the container image (which ships Xvfb, openbox, x11vnc,
-   * websockify, python3, ffmpeg, base64, libX11 — all from docker-android).
-   * Does NOT rely on the image's supervisord or any docker-android env vars.
+   * Runs inside the DevHotel-owned preview image (which ships Xvfb, openbox,
+   * x11vnc, websockify/novnc, python3/xlib, ffmpeg, curl, unzip, JRE17).
+   * The Android SDK is NOT in the image — it is mounted read-only from the
+   * pre-provisioned shared SDK volume.
    *
    * Sequence:
    *   1. Write DevHotel openbox rc.xml + fit-emulator.py from embedded base64.
@@ -337,16 +358,22 @@ export function buildManagedEmulatorContainerArgs(
     // KVM access for hardware-accelerated emulation.
     '--device',
     '/dev/kvm',
+    // Shared Android SDK volume: pre-provisioned, read-only.
+    // All emulator containers of the same API level share this volume;
+    // no Room can corrupt the SDK installation.
+    '-v',
+    `${androidSdkVolume(apiLevel)}:${ANDROID_SDK_ROOT}:ro`,
     // Per-Room persistent AVD volume: the booted snapshot survives restarts.
     '-v',
     `${androidAvdVolume(roomId)}:${ANDROID_AVD_HOME}`,
     // Emulator guest memory + overhead for Xvfb/x11vnc/openbox/adb server.
     '--memory',
     `${budget.memoryMB + 1024}m`,
-    // The entrypoint is replaced: no supervisord, no docker-android env vars.
+    // The entrypoint is replaced; the DevHotel-owned preview image's CMD is a
+    // safety-net only and should never run in production.
     '--entrypoint',
     'sh',
-    imageRef,
+    MANAGED_EMULATOR_PREVIEW_IMAGE,
     '-c',
     script
   ]

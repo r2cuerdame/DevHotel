@@ -136,6 +136,21 @@ export function androidAvdVolume(roomId: string): string {
   return `dh-${roomId}-android-avd`
 }
 
+/**
+ * Shared Android SDK volume for a given API level.
+ *
+ * All Rooms of the same Android version share one SDK installation — the same
+ * cmdline-tools, platform-tools, emulator binary and system image — so the ~2 GB
+ * download happens once per API level rather than once per Room. The volume is
+ * named after the level (not the Room) and is mounted read-only in the emulator
+ * container so no Room can corrupt another Room's SDK.
+ *
+ * Named `dh-android-sdk-<apiLevel>` (e.g. `dh-android-sdk-34`).
+ */
+export function androidSdkVolume(apiLevel: number): string {
+  return `dh-android-sdk-${apiLevel}`
+}
+
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 export type EmulatorOrientation = 'portrait' | 'landscape'
 
