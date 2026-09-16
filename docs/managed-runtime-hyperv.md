@@ -75,6 +75,17 @@ only:
 The archive is written to a small FAT disk attached to the VM. Nothing outside
 those DevHotel-owned paths is ever written into the guest.
 
+The agent must survive losing the line. `NamedPipeHyperVGuestTransport` opens a
+fresh connection for every probe and destroys the socket the moment it has the
+reply, so the guest sees the port drop after *each* health check. The agent
+therefore reopens the serial line in a loop rather than running one read pass:
+a single-pass agent answers exactly one probe and leaves the runtime
+permanently unhealthy afterwards. The reopen happens in a subshell because
+`exec` is a POSIX special built-in — under busybox `ash` a failed redirection
+exits the shell outright, and neither `if` nor `||` intercepts it — and `stty`
+sets `clocal` so the open cannot block waiting for a carrier the emulated UART
+need not assert.
+
 ## Ownership and boot
 
 The provider creates one Generation 2 Hyper-V VM with no boot VHD: the pinned
@@ -133,15 +144,41 @@ redirect refusal, oversize and digest failure cleanup, manager phase recovery,
 the Windows feature/elevation/reboot-resume gate, and the overlay's exact
 contents, permissions, determinism and extraction by a real `tar`.
 
-The following are **not** proven by unit tests and remain release blockers:
+### Guest bootstrap, proven on a real boot
+
+The guest half has been exercised against the real pinned bytes, off Hyper-V,
+by booting the ISO under QEMU/TCG with the overlay on a FAT SCSI disk and the
+two serial ports wired to sockets. What that run established:
+
+- the pinned ISO downloads at exactly `68,157,440` bytes with the pinned
+  SHA-256, and boots through UEFI/OVMF;
+- Alpine's initramfs finds `devhotel.apkovl.tar.gz` on the attached FAT disk
+  and extracts it, with `modloop` mounted — confirming `.default_boot_services`
+  does its job;
+- OpenRC reaches `Starting DevHotel private runtime agent ... [ ok ]` from the
+  runlevel symlink alone;
+- COM2 answers `health:<nonce>` with the exact install/runtime/daemon identity
+  and the echoed nonce;
+- **five consecutive probes, each on its own connection that is fully closed
+  afterwards, all answer** — the disconnect-per-probe case that a single-pass
+  agent fails on its second probe.
+
+That run is guest-bootstrap evidence only. It deliberately does **not** stand in
+for Hyper-V: QEMU enumerates the disks over `virtio-scsi` and the serial ports
+as ISA 16550As, where Hyper-V Gen 2 presents storage through `hv_storvsc` and
+COM2 through a named pipe. Those paths are still unproven.
+
+### Still unproven — release blockers
 
 - a clean Windows 11 VM run of installer-led Hyper-V enable, elevation and
   reboot resume;
-- a real boot of the pinned ISO in which Alpine's initramfs discovers the
-  apkovl, OpenRC starts the agent, and COM2 health answers with the exact
-  identity — no VM has ever been booted from this provider;
-- two managed Web Rooms, persistent reboot state and the dependent #107 path;
-- update/rollback/complete-uninstall and the dependent #110 safety matrix.
+- the same guest boot **under Hyper-V**: Gen 2 UEFI boot from a SCSI DVD,
+  `hv_storvsc` enumerating the seed and state disks so the initramfs can find
+  the apkovl, and COM2 reaching the Host named pipe;
+- reboot/repair and state-disk preservation against a real VM;
+- ownership-safe uninstall;
+- two managed Web Rooms and the dependent #107 path;
+- update/rollback and the dependent #110 safety matrix.
 
 Relevant upstream references:
 
