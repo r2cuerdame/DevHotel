@@ -365,7 +365,9 @@ export interface IsolationBackend {
   startExistingEmulatorForRecovery(roomId: string): Promise<void>
   createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    /** The Room's own CPU/memory selection, which bounds the emulator guest budget. */
+    limits?: { cpus?: number; memoryMB?: number }
   ): Promise<void>
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
   captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>

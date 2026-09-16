@@ -3340,7 +3340,7 @@ export class RoomOrchestrator {
         if (providerKind === 'android') {
           this.olog(id, 'start emulator')
           try {
-            await this.backend.createEmulator(id, this.mustGet(id).android)
+            await this.backend.createEmulator(id, this.mustGet(id).android, this.mustGet(id).os)
           } catch (err) {
             // No KVM or a failed image pull must not brick the room — it can
             // still build APKs; checks surface the missing emulator screen.
@@ -3905,7 +3905,7 @@ export class RoomOrchestrator {
         try {
           this.clearAndroidEmulatorInstalls(roomId)
           await this.backend.removeEmulator(roomId)
-          await this.backend.createEmulator(roomId, room.android)
+          await this.backend.createEmulator(roomId, room.android, room.os)
           emulatorStarted = true
           report.detail('emulator container started')
         } catch (err) {

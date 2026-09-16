@@ -597,11 +597,15 @@ export class FakeBackend implements IsolationBackend {
     if (this.emulatorStateValue === 'missing') throw new Error('exact retained emulator is missing')
     this.emulatorStateValue = 'running'
   }
+  /** Room limits each `createEmulator` was given, in call order — #104's budget must follow them. */
+  readonly emulatorLimits: ({ cpus?: number; memoryMB?: number } | undefined)[] = []
   async createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    limits?: { cpus?: number; memoryMB?: number }
   ) {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)
+    this.emulatorLimits.push(limits)
     this.emulatorStateValue = 'running'
   }
   async captureEmulatorScreen(roomId: string) {
