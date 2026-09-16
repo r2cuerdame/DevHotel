@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -34,8 +34,39 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
-  await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+  // Windows keeps a directory locked until every handle under it is gone, and
+  // a just-killed process releases them a moment later, so removal needs to be
+  // retried rather than assumed.
+  await Promise.all(
+    temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }))
+  )
 })
+
+/**
+ * Ends a spawned shell *and everything it started*.
+ *
+ * `child.kill()` signals only the shell. On Windows that leaves the agent's
+ * subshell and its `sleep` running with the working directory open, and the
+ * temp-dir cleanup then fails with `EBUSY`, so the whole tree has to go and the
+ * exit has to be awaited before the directory can be removed.
+ */
+async function terminate(child: ChildProcess): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) {
+    if (process.platform === 'win32' && child.pid !== undefined) {
+      await run('taskkill', ['/pid', String(child.pid), '/T', '/F']).catch(() => undefined)
+    } else {
+      child.kill('SIGKILL')
+    }
+  }
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve) => {
+    const done = setTimeout(resolve, 10_000)
+    child.once('close', () => {
+      clearTimeout(done)
+      resolve()
+    })
+  })
+}
 
 const identity: ManagedRuntimeGuestIdentity = {
   installId: 'install-abcdef01',
@@ -220,7 +251,7 @@ describe('managed runtime guest overlay', () => {
       // agent, or the runtime answers exactly one probe and is dead after it.
       expect(exited, 'the agent exited instead of reopening the serial line').toBe('running')
     } finally {
-      agent.kill()
+      await terminate(agent)
     }
   })
 

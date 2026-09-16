@@ -35,6 +35,15 @@ async function releaseImage() {
   return { file, sha256: imageDigest, sizeBytes: imageBytes.byteLength }
 }
 
+function readPowerShellArray(script: string, variable: string): string[] {
+  const start = script.indexOf(`$${variable}=@(`)
+  if (start < 0) throw new Error(`Missing ${variable}`)
+  const open = script.indexOf('(', start)
+  const close = script.indexOf(')', open)
+  const body = script.slice(open + 1, close)
+  return [...body.matchAll(/'((?:''|[^'])*)'/g)].map((entry) => entry[1]!.replaceAll("''", "'"))
+}
+
 interface FakeVm {
   id: string
   state: string
@@ -187,6 +196,37 @@ describe('ManagedHyperVRuntime', () => {
     expect(createScript).not.toContain('-VHDPath')
     expect(path.extname(readPowerShellLiteral(createScript, 'isoPath'))).toBe('.iso')
     expect(path.extname(marker.isoPath)).toBe('.iso')
+  })
+
+  it('lets the Hyper-V VM account traverse to its attachments, and no more', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+
+    const marker = await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+
+    // A VM worker runs as a per-VM virtual account that is in no ordinary
+    // group, so it cannot traverse a user profile path. Hyper-V grants it the
+    // attachment files themselves, but a file it cannot reach still fails the
+    // start with "failed to open attachment ... Access is denied".
+    expect(createScript).toContain("/grant '*S-1-5-83-0:(X)'")
+
+    // (X) is traverse only, and carries no (OI)/(CI), so nothing below these
+    // directories is listed, read or inherited.
+    expect(createScript).not.toMatch(/S-1-5-83-0:\((OI|CI|F|M|R)/)
+
+    // Every ancestor has to be granted: one unreachable link breaks the whole
+    // path, so granting only the leaf would still fail the start.
+    const granted = readPowerShellArray(createScript, 'traverse')
+    expect(granted[0]).toBe(path.parse(marker.vmPath).root)
+    expect(granted.at(-1)).toBe(marker.vmPath)
+    for (const [index, dir] of granted.slice(1).entries()) {
+      expect(path.dirname(dir)).toBe(granted[index])
+    }
+    // The attachments all live at or under the deepest granted directory.
+    for (const attachment of [marker.seedPath, marker.statePath, marker.isoPath]) {
+      expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
+    }
   })
 
   it('keeps the runtime state disk out of the disposable seed rebuild', async () => {
