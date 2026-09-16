@@ -1,5 +1,6 @@
 import type { AnchorSpec, WebSpec } from './types'
 import { RELAY_PREAMBLE_PREFIX } from '../relayProtocol'
+import { NODE_PACKAGE_SHARED_CACHE, sharedCacheVolume } from '../lifecycle/sharedCache'
 
 export const ANCHOR_IMAGE = 'alpine/socat'
 export const RELAY_PORT = 3999
@@ -487,6 +488,9 @@ function mountArgs(spec: WebSpec): string[] {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   if (!spec.noCacheVolume) args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
+  for (const shared of spec.sharedCaches ?? []) {
+    args.push('-v', `${shared.volume}:${shared.path}`)
+  }
   for (const extra of spec.extraVolumes ?? []) {
     args.push('-v', `${extra.volume}:${extra.path}`)
   }
@@ -494,21 +498,41 @@ function mountArgs(spec: WebSpec): string[] {
 }
 
 /**
- * Caches that have to survive container recreation. Every one of these tools
- * defaults to a path in the container's writable layer, which a recreate throws
- * away; `/cache` is the Room-owned cache volume. A Room-scoped XDG cache also
- * keeps a browser download or a tool cache out of the image layer, where it
- * would otherwise be re-fetched on every wake that recreates the container.
+ * Where a Room's package manager keeps its store.
+ *
+ * `/cache` is the Room's own and always exists. When a Hotel-scoped package
+ * cache is mounted as well, the store moves into it: the contents are
+ * content-addressed, so they are identical between Rooms by construction and
+ * the per-Room copy bought nothing but a second download. Everything else a
+ * Room dirties stays under `/cache`, where one Room cannot reach another's.
  */
-export const ROOM_CACHE_ENV: ReadonlyArray<readonly [string, string]> = [
-  ['npm_config_cache', '/cache/npm'],
-  ['PNPM_HOME', '/cache/pnpm'],
+function packageStorePaths(spec: WebSpec): { npm: string; pnpm: string } {
+  const shared = (spec.sharedCaches ?? []).find((mount) => mount.volume === sharedCacheVolume(NODE_PACKAGE_SHARED_CACHE))
+  if (!shared) return { npm: '/cache/npm', pnpm: '/cache/pnpm' }
+  return { npm: `${shared.path}/npm`, pnpm: `${shared.path}/pnpm` }
+}
+
+/**
+ * Caches that have to survive a container recreate but stay Room-scoped. Each
+ * of these tools otherwise defaults to a path in the container's writable
+ * layer, which a recreate throws away, so a browser download is re-fetched on
+ * every wake that recreates the container. They do not join the Hotel-scoped
+ * package cache: unlike a package store they are not content-addressed, so one
+ * Room must not be able to reach another's.
+ */
+export const ROOM_SCOPED_CACHE_ENV: ReadonlyArray<readonly [string, string]> = [
   ['PLAYWRIGHT_BROWSERS_PATH', '/cache/playwright'],
   ['XDG_CACHE_HOME', '/cache/xdg']
 ]
 
+/** Every managed cache variable a Room's web container is created with. */
+export function roomCacheEnv(spec: WebSpec): Array<readonly [string, string]> {
+  const store = packageStorePaths(spec)
+  return [['npm_config_cache', store.npm], ['PNPM_HOME', store.pnpm], ...ROOM_SCOPED_CACHE_ENV]
+}
+
 function envArgs(spec: WebSpec): string[] {
-  const args = ROOM_CACHE_ENV.flatMap(([key, value]) => ['-e', `${key}=${value}`])
+  const args = roomCacheEnv(spec).flatMap(([key, value]) => ['-e', `${key}=${value}`])
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }

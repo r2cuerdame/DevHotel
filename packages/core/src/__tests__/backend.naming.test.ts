@@ -33,6 +33,7 @@ import {
   workspaceSnapshotVolume,
   wrapStartCommand,
 } from '../backend/naming'
+import { nodeSharedCacheMounts, SHARED_CACHE_MOUNT } from '../lifecycle/sharedCache'
 import type { WebSpec } from '../backend/types'
 
 function spec(overrides: Partial<WebSpec> = {}): WebSpec {
@@ -442,6 +443,18 @@ describe('buildWebCreateArgs', () => {
       'FOO=bar'
     ])
     expect(envs(args).some((e) => e.startsWith('CI='))).toBe(false)
+  })
+
+  it('keeps browser and XDG caches Room-scoped even with the shared package cache', () => {
+    const args = buildWebCreateArgs(spec({ sharedCaches: nodeSharedCacheMounts() }))
+    const env = envs(args)
+    // The package store is content-addressed, so it may live in the Hotel-scoped
+    // volume...
+    expect(env).toContain(`npm_config_cache=${SHARED_CACHE_MOUNT}/npm`)
+    expect(env).toContain(`PNPM_HOME=${SHARED_CACHE_MOUNT}/pnpm`)
+    // ...but these are not, so one Room must never reach another's.
+    expect(env).toContain('PLAYWRIGHT_BROWSERS_PATH=/cache/playwright')
+    expect(env).toContain('XDG_CACHE_HOME=/cache/xdg')
   })
 
   it('wraps the start command with a tolerant corepack enable and exec', () => {

@@ -398,7 +398,10 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`removeManagedContainer:${name}`)
     this.managedContainers = this.managedContainers.filter((container) => container.name !== name)
   }
+  /** Set to make the engine's network listing fail, the way a restarting engine does. */
+  listManagedNetworksError: Error | null = null
   async listManagedNetworks() {
+    if (this.listManagedNetworksError) throw this.listManagedNetworksError
     return this.managedNetworks
   }
   async removeManagedNetwork(name: string) {
@@ -484,6 +487,11 @@ export class FakeBackend implements IsolationBackend {
   }
   async removeManagedVolume(name: string): Promise<void> {
     this.calls.push(`removeManagedVolume:${name}`)
+    this.removedManagedVolumes.push(name)
+    this.managedVolumes = this.managedVolumes.filter((v) => v.name !== name)
+  }
+  async removeSharedCache(name: string): Promise<void> {
+    this.calls.push(`removeSharedCache:${name}`)
     this.removedManagedVolumes.push(name)
     this.managedVolumes = this.managedVolumes.filter((v) => v.name !== name)
   }

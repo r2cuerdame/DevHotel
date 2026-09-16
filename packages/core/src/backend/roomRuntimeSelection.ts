@@ -5,6 +5,7 @@ import { ManagedRuntimeEngine, type ManagedRuntimeChannel } from './managedRunti
 import { ManagedRuntimeIngress } from './managedRuntimeIngress'
 import { GuestFrameType, encodeGuestFrame, encodeGuestJsonFrame, GuestFrameDecoder } from './managedRuntimeGuestProtocol'
 import type { IsolationBackend } from './types'
+import type { IngressLedger } from '../lifecycle/ingressLedger'
 import type { ManagedHyperVGuestChannel } from './managedHyperVRuntime'
 
 /**
@@ -26,6 +27,15 @@ export interface RoomRuntimeSelection {
   detail: string
   /** Released on shutdown; only the managed mode holds Host ports. */
   dispose: () => Promise<void>
+  /**
+   * Closes one Room's Host ingress port and forgets its durable record.
+   *
+   * Present in both modes, and that is deliberate. The compatibility backend
+   * opens no Host forwarder of its own, but this install may have run in
+   * managed mode last time and left records behind; a machine that switched
+   * modes must still be able to settle what the other mode wrote down.
+   */
+  revokeIngress: (roomId: string) => Promise<void>
 }
 
 export interface SelectRoomRuntimeOptions {
@@ -37,6 +47,8 @@ export interface SelectRoomRuntimeOptions {
   /** Test seam for the guest socket. */
   connect?: (channel: ManagedHyperVGuestChannel) => Promise<ManagedRuntimeChannel>
   onIngressError?: (error: Error) => void
+  /** Durable record of the Host ingress ports this install opened. */
+  ingressLedger?: IngressLedger
 }
 
 /**
@@ -154,7 +166,11 @@ export async function selectRoomRuntime(opts: SelectRoomRuntimeOptions): Promise
     mode: 'compatibility',
     backend: new OciCliBackend(opts.compatibility),
     detail,
-    dispose: async () => {}
+    dispose: async () => {},
+    // Nothing is listening in this mode, so revoking is exactly forgetting.
+    revokeIngress: async (roomId: string) => {
+      opts.ingressLedger?.forget(roomId)
+    }
   })
 
   if (!opts.channel || !opts.runtimeId) {
@@ -162,7 +178,9 @@ export async function selectRoomRuntime(opts: SelectRoomRuntimeOptions): Promise
   }
 
   const ingress = new ManagedRuntimeIngress({
-    ...(opts.onIngressError ? { onError: opts.onIngressError } : {})
+    ...(opts.onIngressError ? { onError: opts.onIngressError } : {}),
+    ...(opts.ingressLedger ? { ledger: opts.ingressLedger } : {}),
+    runtimeId: opts.runtimeId
   })
   const connect = opts.connect ?? connectGuestChannel
   const channel = opts.channel
@@ -198,6 +216,9 @@ export async function selectRoomRuntime(opts: SelectRoomRuntimeOptions): Promise
     detail: 'Rooms are running on the DevHotel-managed Linux runtime.',
     dispose: async () => {
       await ingress.revokeAll()
+    },
+    revokeIngress: async (roomId: string) => {
+      await ingress.revoke(roomId)
     }
   }
 }

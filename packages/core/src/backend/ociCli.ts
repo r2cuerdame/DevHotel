@@ -16,7 +16,7 @@ import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
-  ROOM_CACHE_ENV,
+  roomCacheEnv,
   anchorName,
   androidControlNetworkName,
   androidRuntimeAnchorName,
@@ -50,6 +50,12 @@ import {
   type NetworkNamespaceAuthority,
 } from './naming'
 import type { ResumeRoomPodOpts, ResumeServiceSpec, RoomResumeResult } from './types'
+import {
+  isSharedCacheVolumeName,
+  provesSharedCacheOwnership,
+  sharedCacheLabels,
+  sharedCachePurpose
+} from '../lifecycle/sharedCache'
 import { SubnetAllocator, classifyNetworkCreateError } from './ipam'
 import { CLONE_IMAGE, gitCloneRun } from './gitClone'
 import type {
@@ -1389,6 +1395,7 @@ export class OciCliBackend implements IsolationBackend {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -1871,6 +1878,7 @@ export class OciCliBackend implements IsolationBackend {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -2097,7 +2105,7 @@ export class OciCliBackend implements IsolationBackend {
       return 'the retained Room web container is not in its exact owned network namespace'
     }
     const env = containerEnvMap(web)
-    for (const [key, value] of [...ROOM_CACHE_ENV, ...Object.entries(spec.env ?? {})]) {
+    for (const [key, value] of [...roomCacheEnv(spec), ...Object.entries(spec.env ?? {})]) {
       if (env.get(key) !== value) return 'the Room environment changed while it slept'
     }
     const expectedMounts = this.expectedRoomArtifactWebMounts(spec)
@@ -2239,6 +2247,7 @@ export class OciCliBackend implements IsolationBackend {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -5614,6 +5623,60 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(created, roomId, name)
   }
 
+  /**
+   * Makes sure a Hotel-scoped shared cache exists, and carries proof it is ours.
+   *
+   * This has to happen before any container mounts it. Docker creates a missing
+   * named volume implicitly on first mount, and the volume it creates that way
+   * carries no labels at all — so the cache would exist, hold real bytes, and be
+   * unattributable forever after. Creating it explicitly is what keeps the
+   * ownership proof in the artifact rather than in a convention.
+   */
+  private async ensureSharedCacheVolume(name: string): Promise<void> {
+    const purpose = sharedCachePurpose(name)
+    if (!purpose) throw new Error(`invalid shared cache volume name: ${name}`)
+    const existing = await this.inspectVolume(name)
+    if (existing) {
+      if (!provesSharedCacheOwnership(name, existing.Labels ?? {})) {
+        throw new Error(`shared cache name collision or invalid ownership metadata: ${name}`)
+      }
+      return
+    }
+    const labels = sharedCacheLabels(purpose)
+    const labelArgs = Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`])
+    must(await this.engine.run(['volume', 'create', ...labelArgs, name]), `create shared cache ${name}`)
+    const created = await this.inspectVolume(name)
+    if (!created || !provesSharedCacheOwnership(name, created.Labels ?? {})) {
+      throw new Error(`created shared cache is missing or unprovable: ${name}`)
+    }
+  }
+
+  private async ensureSpecSharedCaches(spec: WebSpec): Promise<void> {
+    for (const mount of spec.sharedCaches ?? []) await this.ensureSharedCacheVolume(mount.volume)
+  }
+
+  /**
+   * Removes a shared cache, and only ever a shared cache.
+   *
+   * Deliberately separate from `removeManagedVolume`, which proves Room
+   * ownership and would reject this, and which no Room-scoped caller should be
+   * able to talk into removing something every other Room is still using. The
+   * reachability proof lives above, in the Host footprint; what is enforced here
+   * is that the thing being removed is a Hotel-scoped cache and nothing else.
+   */
+  async removeSharedCache(name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    if (!isSharedCacheVolumeName(name)) throw new Error(`not a DevHotel shared cache: ${name}`)
+    const existing = await this.inspectVolume(name)
+    if (!existing) return
+    if (!provesSharedCacheOwnership(name, existing.Labels ?? {})) {
+      throw new Error(`refusing to remove a shared cache DevHotel cannot prove it owns: ${name}`)
+    }
+    // No --force: the engine must still refuse a cache that gained an
+    // attachment after the footprint was taken.
+    must(await this.engine.run(['volume', 'rm', name]), `remove shared cache ${name}`)
+  }
+
   private async removeRoomVolume(roomId: string, name: string): Promise<void> {
     assertExpectedRoomVolumeName(roomId, name)
     const existing = await this.inspectVolume(name)
@@ -6844,7 +6907,7 @@ export class OciCliBackend implements IsolationBackend {
     }
 
     const expectedEnv = new Map<string, string>([
-      ...ROOM_CACHE_ENV,
+      ...roomCacheEnv(spec),
       ...Object.entries(spec.env ?? {})
     ])
     const actualEnv = new Map<string, string>()

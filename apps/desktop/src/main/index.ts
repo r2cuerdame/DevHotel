@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, net, protocol, safeStorage, session, shell } from 'electron'
 import {
   Gateway,
+  IngressLedger,
   ManagedRuntimeManager,
   RoomOrchestrator,
   WindowsVmBackend,
@@ -127,15 +128,20 @@ async function bootstrap(): Promise<void> {
     initialConnectionState: 'disconnected'
   })
   const gateway = new Gateway({ caDir: join(userData, 'ca') })
+  // Host ingress ports are the one owned artifact no engine can enumerate, so
+  // DevHotel writes them down itself. The ledger outlives the process, which is
+  // the whole point: a crash must not be able to leave a port listening for a
+  // container that no longer exists.
+  const ingressLedger = new IngressLedger({ userData })
   const ownershipRooms = roomsRepo(db)
   // The managed runtime is preferred; a Host whose Hyper-V gate has not been
   // passed, or whose runtime is still preparing, keeps working on the external
   // compatibility engine and is told which one it got.
+  const managedRuntimeReady = await managedRuntime.roomChannel().catch(() => null)
+  const managedRuntimeId = managedRuntimeReady?.runtimeId ?? null
   const runtime = await selectRoomRuntime({
-    ...(await managedRuntime.roomChannel().catch(() => null).then((ready) => ({
-      channel: ready?.channel ?? null,
-      runtimeId: ready?.runtimeId ?? null
-    }))),
+    channel: managedRuntimeReady?.channel ?? null,
+    runtimeId: managedRuntimeId,
     compatibility: {
       identityFile: join(userData, 'runtime', 'docker-engine.json'),
       legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
@@ -144,7 +150,8 @@ async function bootstrap(): Promise<void> {
         ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
       isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
     },
-    onIngressError: (error) => console.error('managed runtime ingress failed:', error)
+    onIngressError: (error) => console.error('managed runtime ingress failed:', error),
+    ingressLedger
   })
   console.log(`DevHotel Room runtime: ${runtime.mode} — ${runtime.detail}`)
   const backend = runtime.backend
@@ -169,6 +176,9 @@ async function bootstrap(): Promise<void> {
     // Reported, never assumed: this is the executor Rooms actually got, which is
     // the only thing that explains why a Room behaves the way it does.
     runtimeMode: runtime.mode,
+    ingressLedger,
+    revokeIngress: runtime.revokeIngress,
+    runtimeId: managedRuntimeId,
     // The Room's browser profile is an Electron session partition, so only the
     // desktop app can clear it; core asks through this hook.
     clearBrowserData: async (roomId) => {

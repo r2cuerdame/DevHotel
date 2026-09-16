@@ -28,6 +28,12 @@ export interface WebSpec {
   noCacheVolume?: boolean
   /** additional named-volume mounts (docker seeds them from image content on first use) */
   extraVolumes?: { volume: string; path: string }[]
+  /**
+   * Hotel-scoped caches this Room mounts, shared with every other Room that
+   * mounts them. Distinct from `extraVolumes` because these carry no Room
+   * identity: nothing Room-scoped may create, validate or delete one.
+   */
+  sharedCaches?: { volume: string; path: string }[]
   /** docker --cpus limit */
   cpus?: number
   /** docker --memory limit in MB */
@@ -343,6 +349,12 @@ export interface IsolationBackend {
   volumeSizes(roomId: string): Promise<Record<string, number>>
   listVolumesWithUsage(): Promise<DockerVolumeUsage[]>
   removeManagedVolume(name: string): Promise<void>
+  /**
+   * Remove one Hotel-scoped shared cache. Separate from `removeManagedVolume`
+   * on purpose: that path proves Room ownership, which a shared cache by
+   * definition cannot show, and no Room-scoped caller may reach this one.
+   */
+  removeSharedCache(name: string): Promise<void>
   imageExists(image: string): Promise<boolean>
   pullImage(image: string, log?: (line: string) => void): Promise<void>
   /** force-remove and recreate a volume, guaranteeing it is empty */
