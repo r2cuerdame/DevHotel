@@ -248,7 +248,7 @@ export class ManagedHyperVRuntime {
     const suffix = createHash('sha256').update(`${opts.installId}\0${opts.runtimeId}`).digest('hex').slice(0, 16)
     this.vmName = `DevHotel-${suffix}`
     this.vmPath = path.join(this.root, 'machine')
-    this.diskPath = path.join(this.vmPath, 'runtime.vhd')
+    this.diskPath = path.join(this.vmPath, 'runtime.vhdx')
     this.seedPath = path.join(this.vmPath, 'seed.vhdx')
     this.pipePath = `\\\\.\\pipe\\devhotel-runtime-${suffix}`
   }
@@ -499,7 +499,42 @@ export class ManagedHyperVRuntime {
     if (measured.digest !== image.sha256 || measured.sizeBytes !== image.sizeBytes) {
       throw new Error('Managed Hyper-V owned image no longer matches its release digest')
     }
-    return canonical
+    return await this.installParentDisk(canonical, image)
+  }
+
+  /**
+   * A Generation 2 VM boots from a SCSI `.vhdx`; `.vhd` is an IDE-only,
+   * Generation 1 boot device, so the verified upstream VHD cannot be attached
+   * directly. The pinned bytes are converted once into an owned VHDX parent
+   * named after the digest they were produced from, which keeps the
+   * provenance of the differencing chain checkable without re-hashing an
+   * image Hyper-V is free to rewrite in place.
+   */
+  private async installParentDisk(verifiedVhd: string, image: ManagedHyperVReleaseImage): Promise<string> {
+    const parent = path.join(path.dirname(verifiedVhd), `${image.sha256}.vhdx`)
+    if (!existsSync(parent)) {
+      const temporary = path.join(path.dirname(verifiedVhd), `.${image.sha256}-${randomUUID()}.vhdx`)
+      try {
+        await this.runPowerShell(
+          [
+            `$source=${psLiteral(verifiedVhd)}`,
+            `$temporary=${psLiteral(temporary)}`,
+            `$parent=${psLiteral(parent)}`,
+            'if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }',
+            'Convert-VHD -Path $source -DestinationPath $temporary -VHDType Dynamic -ErrorAction Stop',
+            'Set-ItemProperty -LiteralPath $temporary -Name IsReadOnly -Value $true',
+            'Move-Item -LiteralPath $temporary -Destination $parent -ErrorAction Stop'
+          ].join(';')
+        )
+      } finally {
+        // The staged parent is marked read-only before it is moved into place,
+        // so a cleanup after a failed move must not mask the real error.
+        await rm(temporary, { force: true }).catch(() => undefined)
+      }
+    }
+    const parentInfo = await lstat(parent)
+    if (!parentInfo.isFile() || parentInfo.isSymbolicLink()) throw new Error('Managed Hyper-V owned parent disk is unsafe')
+    return await realpath(parent)
   }
 
   private async inspectVm(): Promise<HyperVInspection> {
