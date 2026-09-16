@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### The managed runtime updates, rolls back and uninstalls on its own terms
+
+- The runtime is now a versioned product component. Every release this build can
+  stand up is listed with its pinned artifacts and digests, and older releases
+  stay listed so an update that fails can re-fetch and re-verify exactly the one
+  the install came from.
+- An install on an older runtime is updated once per launch, journal first: the
+  update record lands on disk before the download, the manifest adopts the new
+  version only once an apply is in flight, and the runtime has to produce an
+  exact healthy identity proof before anything commits. No crash or reboot can
+  leave a runtime whose version nobody can name.
+- Room data survives an update and a rollback. The VM is proved owned at the old
+  version, de-registered and rebuilt at the new one, while the state disk the
+  Rooms live on is never named by the teardown, detached or recreated.
+- A target that cannot be made healthy is rolled back to the version that worked,
+  by the same migration run backwards. The rolled-back update stays on disk as a
+  barrier, so the next launch keeps the working runtime instead of walking back
+  into the update that just broke — and says which runtime the user is on and
+  why.
+- An update interrupted by a crash or a reboot is recovered by rule rather than
+  guess: nothing applied is retried, a migration that already landed is finished
+  forward, and an update that has burned two attempts is put back.
+- Uninstall now asks which promise you meant. **Uninstall app only** removes the
+  application, DevHotel CA trust and autostart, leaving Rooms, their disks and
+  the runtime in place for a reinstall to pick up. **Delete everything** also
+  deletes Rooms, app data and the runtime virtual machine with its disks. Cancel
+  stays the default.
+- Neither scope touches WSL distributions, virtual machines, switches or images
+  DevHotel did not create, and superseded boot images are pruned only by the
+  digest names this provider itself wrote.
+  ([#110](https://github.com/r2cuerdame/DevHotel/issues/110))
+
 ### Web Rooms can run without an external Docker Engine
 
 - Web Rooms now run inside the DevHotel-managed Linux runtime when it is

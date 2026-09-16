@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { constants as fsConstants, existsSync } from 'node:fs'
-import { copyFile, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
@@ -350,6 +350,18 @@ export class ManagedHyperVRuntime {
   }
 
   async readMarker(): Promise<ManagedHyperVRuntimeMarker | null> {
+    return await this.readMarkerAs(this.runtimeVersion)
+  }
+
+  /**
+   * The marker, read as if this install were at `runtimeVersion`.
+   *
+   * Only a migration has any business asking: every other caller wants the
+   * marker to match the version it was constructed for, and a mismatch there
+   * is exactly the "a build silently re-stamped a live runtime" case the
+   * validation exists to catch.
+   */
+  private async readMarkerAs(runtimeVersion: string): Promise<ManagedHyperVRuntimeMarker | null> {
     if (!existsSync(this.markerPath)) return null
     const root = await realpath(this.root)
     const info = await lstat(this.markerPath)
@@ -362,7 +374,7 @@ export class ManagedHyperVRuntime {
       userData: path.dirname(path.dirname(path.dirname(this.root))),
       installId: this.installId,
       runtimeId: this.runtimeId,
-      runtimeVersion: this.runtimeVersion
+      runtimeVersion
     })
     if (
       !assertExactPath(marker.vmPath, this.vmPath) ||
@@ -514,6 +526,130 @@ export class ManagedHyperVRuntime {
       status: 'stopped',
       failure: undefined
     })
+  }
+
+  /**
+   * Moves an owned runtime from `fromVersion` onto this provider's version,
+   * keeping the disk the Room data is on.
+   *
+   * The VM object cannot be edited into the new version: its boot media, its
+   * seeded guest identity and its ownership Notes all change together, and a
+   * saved state taken against the old guest cannot be resumed against the new
+   * one. So the object is proved owned at the old version, destroyed, and
+   * rebuilt at the new one — while `state.vhdx`, which is where Rooms actually
+   * live, is neither detached nor recreated. The rebuild path is the ordinary
+   * provisioning path, which already reuses an existing state disk and treats
+   * the seed as disposable; that reuse is the guarantee, not a coincidence.
+   *
+   * Every step is idempotent, because the interesting failures are the ones
+   * that happen between steps. A crash after the VM is gone but before the new
+   * marker lands re-runs from the old marker; a crash after the marker lands
+   * re-runs from the new one. Both converge on the same runtime.
+   *
+   * The same call runs a rollback: a rollback is a migration whose target is
+   * the version the install came from.
+   */
+  async migrateFrom(fromVersion: string, image: ManagedHyperVReleaseImage): Promise<ManagedHyperVRuntimeMarker> {
+    if (!/^[0-9A-Za-z._-]{1,64}$/.test(fromVersion)) throw new Error('Managed Hyper-V migration source version is invalid')
+    if (fromVersion === this.runtimeVersion) throw new Error('Managed Hyper-V migration has nothing to change')
+
+    // Already carrying this provider's version: a previous attempt got past the
+    // marker swap, so finishing is the recovery.
+    if (await this.readMarkerAs(this.runtimeVersion).catch(() => null)) return await this.provision(image)
+
+    const previous = await this.readMarkerAs(fromVersion).catch(() => null)
+    // Nothing owned at either version is not a migration failure — there is no
+    // runtime to move — so it provisions the target version outright.
+    if (!previous) return await this.provision(image)
+
+    // Both versions derive these from the same fenced identity, so a mismatch
+    // means the marker is not describing this install's runtime, and a
+    // migration that "preserves" the wrong disk preserves nothing.
+    if (!assertExactPath(previous.statePath, this.statePath) || !assertExactPath(previous.vmPath, this.vmPath)) {
+      throw new Error('Managed Hyper-V migration would not preserve the Room state disk')
+    }
+
+    const sourceInfo = await lstat(image.file)
+    if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new Error('Managed Hyper-V release image is not a regular file')
+    await this.ensureRoot()
+    const ownedImage = await this.installImage(await realpath(image.file), image)
+
+    const inspection = await this.inspectVm()
+    if (inspection.exists) {
+      this.assertOwnedVm(inspection, previous)
+      await this.runPowerShell(
+        [
+          `$vmName=${psLiteral(previous.vmName)}`,
+          `$vmId=${psLiteral(previous.vmId ?? '')}`,
+          `$notes=${psLiteral(markerNotes(previous))}`,
+          `$seedPath=${psLiteral(previous.seedPath)}`,
+          '$vm=Get-VM -Name $vmName -ErrorAction SilentlyContinue',
+          'if ($null -ne $vm) {',
+          // Re-proved inside the pass that destroys it, exactly as removal
+          // does: between the inspection above and this command the object
+          // could have been renamed onto or away from this name.
+          "  if ($vm.Notes -ne $notes) { throw 'Managed Hyper-V VM ownership proof is invalid' }",
+          "  if ($vmId -ne '' -and $vm.Id.Guid -ne $vmId) { throw 'Managed Hyper-V VM identity changed' }",
+          // Turned off rather than saved: a saved state belongs to the guest
+          // that is being replaced, and resuming it against new boot media is
+          // what would actually corrupt the state disk.
+          "  if ([string]$vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }",
+          // -Force only removes the registration. The VHDX files stay, which is
+          // the point: state.vhdx is never named here at all.
+          '  Remove-VM -VM $vm -Force -ErrorAction Stop',
+          '}',
+          // The seed is regenerated from the new identity, so the old one is
+          // removed with the VM that held it open. It carries no Room data.
+          'if (Test-Path -LiteralPath $seedPath) { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop }',
+          '[pscustomobject]@{Migrated=$true}|ConvertTo-Json -Compress'
+        ].join(';')
+      )
+    }
+
+    await this.writeMarker({
+      ...previous,
+      runtimeVersion: this.runtimeVersion,
+      isoPath: ownedImage,
+      baseImageDigest: image.sha256,
+      overlayDigest: this.overlay.sha256,
+      // The object that carried the old identity is gone; the new one has not
+      // been created yet, and claiming its predecessor's ID would defeat the
+      // identity check that authorises every later mutation.
+      vmId: null,
+      status: 'provisioning',
+      failure: undefined
+    })
+    return await this.provision(image)
+  }
+
+  /**
+   * Deletes owned boot images no marker points at any more.
+   *
+   * Only files this provider itself wrote: they live in one directory it
+   * created, and it names them by the digest it verified, so an entry that is
+   * neither the live image nor a `<sha256>.iso` name is left alone rather than
+   * guessed about. Called after an update commits, because until then the
+   * previous image is what a rollback would need.
+   */
+  async pruneUnreferencedImages(): Promise<number> {
+    const marker = await this.readMarker().catch(() => null)
+    if (!marker) return 0
+    const imageRoot = path.join(this.root, 'images')
+    if (!existsSync(imageRoot)) return 0
+    const info = await lstat(imageRoot)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Managed Hyper-V image root is unsafe')
+    const live = path.basename(marker.isoPath).toLocaleLowerCase('en-US')
+    let removed = 0
+    for (const entry of await readdir(imageRoot)) {
+      const name = entry.toLocaleLowerCase('en-US')
+      if (name === live || !/^[a-f0-9]{64}\.iso$/.test(name)) continue
+      const candidate = path.join(imageRoot, entry)
+      const candidateInfo = await lstat(candidate)
+      if (!candidateInfo.isFile() || candidateInfo.isSymbolicLink()) continue
+      await rm(candidate, { force: true })
+      removed += 1
+    }
+    return removed
   }
 
   async start(): Promise<ManagedHyperVRuntimeObservation> {

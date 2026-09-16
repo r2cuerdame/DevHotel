@@ -65,6 +65,7 @@ function readPowerShellLiteral(script: string, variable: string): string {
 class FakeHyperV {
   vm: FakeVm | null = null
   readonly scripts: string[] = []
+  readonly migrations: string[] = []
   /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
   grantsNested = true
 
@@ -72,6 +73,16 @@ class FakeHyperV {
     expect(executable).toBe('powershell.exe')
     const script = decodeScript(args)
     this.scripts.push(script)
+    if (script.includes('Migrated=$true')) {
+      if (this.vm) {
+        if (this.vm.notes !== readPowerShellLiteral(script, 'notes')) {
+          return { code: 1, stdout: '', stderr: 'Managed Hyper-V VM ownership proof is invalid' }
+        }
+        this.vm = null
+      }
+      this.migrations.push(script)
+      return { code: 0, stdout: JSON.stringify({ Migrated: true }), stderr: '' }
+    }
     if (script.includes('Remove-VM -VM $vm -Force')) {
       if (this.vm) {
         // The provider's own fences, enforced the way Hyper-V would.
@@ -134,11 +145,16 @@ function health(overrides: Partial<ManagedHyperVGuestStatus> = {}): ManagedHyper
 }
 
 async function runtime(fake: FakeHyperV, guest = health()) {
+  return runtimeAt(fake, await tempDir(), '0.1.0', guest)
+}
+
+/** A provider pinned to one version over a chosen data root, as the real factory builds one. */
+function runtimeAt(fake: FakeHyperV, userData: string, runtimeVersion: string, guest = health({ runtimeVersion, daemonVersion: runtimeVersion })) {
   return new ManagedHyperVRuntime({
-    userData: await tempDir(),
+    userData,
     installId: 'install-owned',
     runtimeId: 'runtime-owned',
-    runtimeVersion: '0.1.0',
+    runtimeVersion,
     runner: fake.runner,
     guest,
     now: () => new Date('2026-09-16T00:00:00Z')
@@ -515,5 +531,123 @@ describe('ManagedHyperVRuntime', () => {
     const observation = await managed.observe()
     expect(observation).toMatchObject({ state: 'broken', runtimeId: null, runtimeVersion: null })
     expect(JSON.stringify(observation)).not.toContain('private')
+  })
+  it('moves an owned runtime to another version without recreating the Room state disk', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    const before = await runtimeAt(fake, userData, '0.1.0').provision(image)
+
+    const migrated = await runtimeAt(fake, userData, '0.2.0').migrateFrom('0.1.0', image)
+
+    expect(migrated).toMatchObject({
+      runtimeVersion: '0.2.0',
+      installId: before.installId,
+      runtimeId: before.runtimeId,
+      // Same VM name, same paths: this is the same runtime moved, not a new one
+      // standing beside it.
+      vmName: before.vmName,
+      statePath: before.statePath,
+      vmPath: before.vmPath,
+      status: 'stopped'
+    })
+    // The guest bootstrap is what the version change is for, so its digest has
+    // to move with it.
+    expect(migrated.overlayDigest).not.toBe(before.overlayDigest)
+
+    const teardown = fake.migrations.at(0)!
+    expect(teardown).toContain('Remove-VM -VM $vm -Force')
+    // The whole promise of an update: the disk the Rooms are on is never
+    // named by the teardown, so it cannot be detached, deleted or rebuilt.
+    expect(teardown).not.toContain(before.statePath)
+    expect(teardown).not.toContain('New-VHD')
+    expect(teardown).toContain(before.seedPath)
+
+    // And the rebuild reuses the state disk it found rather than making one.
+    const rebuild = fake.scripts.filter((script) => script.includes('New-VM -Name')).at(-1)!
+    expect(rebuild).toContain('if (-not (Test-Path -LiteralPath $statePath)) { New-VHD -Path $statePath')
+    expect(readPowerShellLiteral(rebuild, 'statePath')).toBe(before.statePath)
+  })
+
+  it('refuses to migrate a VM it cannot prove it created', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    await runtimeAt(fake, userData, '0.1.0').provision(image)
+    // Something else now answers to this name — a restored VM, a collision, a
+    // user's own machine renamed onto it.
+    fake.vm = { ...fake.vm!, notes: JSON.stringify({ owner: 'somebody-else' }) }
+
+    await expect(runtimeAt(fake, userData, '0.2.0').migrateFrom('0.1.0', image)).rejects.toThrow(
+      'Managed Hyper-V VM ownership proof is invalid'
+    )
+    // Refused means nothing happened, not "deleted anyway and reported".
+    expect(fake.vm).not.toBeNull()
+    expect(fake.migrations).toEqual([])
+  })
+
+  it('finishes a migration that was interrupted after the marker was written', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    await runtimeAt(fake, userData, '0.1.0').provision(image)
+    const target = runtimeAt(fake, userData, '0.2.0')
+    await target.migrateFrom('0.1.0', image)
+    // What a crash between the VM rebuild and the next launch leaves: a marker
+    // already on the target version.
+    fake.vm = null
+
+    const finished = await target.migrateFrom('0.1.0', image)
+
+    expect(finished).toMatchObject({ runtimeVersion: '0.2.0', status: 'stopped' })
+    expect(fake.vm).not.toBeNull()
+    // The VM was rebuilt, not torn down a second time.
+    expect(fake.migrations).toHaveLength(1)
+  })
+
+  it('rolls back by migrating in the other direction, still keeping the state disk', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    const original = await runtimeAt(fake, userData, '0.1.0').provision(image)
+    await runtimeAt(fake, userData, '0.2.0').migrateFrom('0.1.0', image)
+
+    const restored = await runtimeAt(fake, userData, '0.1.0').migrateFrom('0.2.0', image)
+
+    expect(restored).toMatchObject({ runtimeVersion: '0.1.0', statePath: original.statePath })
+    expect(restored.overlayDigest).toBe(original.overlayDigest)
+    expect(fake.migrations).toHaveLength(2)
+    for (const teardown of fake.migrations) expect(teardown).not.toContain(original.statePath)
+  })
+
+  it('refuses a migration that would change nothing', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    await runtimeAt(fake, userData, '0.1.0').provision(image)
+
+    await expect(runtimeAt(fake, userData, '0.1.0').migrateFrom('0.1.0', image)).rejects.toThrow(
+      'Managed Hyper-V migration has nothing to change'
+    )
+  })
+
+  it('prunes only the owned boot images no marker points at any more', async () => {
+    const userData = await tempDir()
+    const fake = new FakeHyperV()
+    const image = await releaseImage()
+    const managed = runtimeAt(fake, userData, '0.1.0')
+    const marker = await managed.provision(image)
+    const imageRoot = path.join(path.dirname(marker.vmPath), 'images')
+    // One superseded image, and one file that is not this provider's to judge.
+    await writeFile(path.join(imageRoot, `${'b'.repeat(64)}.iso`), 'superseded')
+    await writeFile(path.join(imageRoot, 'notes.txt'), 'not ours')
+
+    await expect(managed.pruneUnreferencedImages()).resolves.toBe(1)
+
+    expect(existsSync(path.join(imageRoot, `${imageDigest}.iso`))).toBe(true)
+    expect(existsSync(path.join(imageRoot, `${'b'.repeat(64)}.iso`))).toBe(false)
+    // Named by nothing this provider wrote, so it is left alone rather than
+    // guessed about.
+    expect(existsSync(path.join(imageRoot, 'notes.txt'))).toBe(true)
   })
 })

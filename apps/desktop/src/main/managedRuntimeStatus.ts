@@ -13,10 +13,14 @@ import type { ManagedRuntimeObservation } from '@devhotel/core'
  * What must not reach it is the Windows feature harness's `failure`: it carries
  * a raw DISM or elevation error, which is Host text of exactly the kind the
  * provider keeps private everywhere else. The gate's own `stage`/`detail` say
- * what the user can do about it without quoting Windows.
+ * what the user can do about it without quoting Windows. An update's `failure`
+ * is dropped for the same reason: it can carry the provider's own message about
+ * a Hyper-V object, and the summary's `detail` already says what happened and
+ * which runtime the user is now on.
  */
 export function managedRuntimeStatusInfo(observation: ManagedRuntimeObservation): ManagedRuntimeStatusInfo {
   const gate = observation.windowsFeature
+  const update = observation.update
   return {
     state: observation.state,
     phase: observation.phase,
@@ -25,6 +29,15 @@ export function managedRuntimeStatusInfo(observation: ManagedRuntimeObservation)
     runtimeVersion: observation.runtimeVersion,
     artifactDigests: { ...observation.artifactDigests },
     nestedVirtualization: observation.nestedVirtualization ?? null,
+    update: update
+      ? {
+          stage: update.stage,
+          fromVersion: update.fromVersion,
+          toVersion: update.toVersion,
+          attempts: update.attempts,
+          detail: update.detail
+        }
+      : null,
     windowsFeature: gate
       ? { stage: gate.stage, restartRequired: gate.restartRequired, edition: gate.edition, detail: gate.detail }
       : null

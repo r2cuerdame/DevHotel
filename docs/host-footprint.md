@@ -143,6 +143,25 @@ Gateway. A damaged ledger reports damage and returns empty rather than throwing 
 losing the inventory is not a reason to refuse to start — and the damage becomes
 a footprint gap, which is where it matters.
 
+## Uninstall removes only what DevHotel made
+
+Uninstall has two scopes, and the difference is what survives it.
+
+App-only removes the application, DevHotel CA trust and the autostart login
+item. Complete additionally removes Rooms and their volumes, app data — which is
+where the runtime downloads cache, the ingress ledger and the databases live —
+and the managed runtime VM with its disks.
+
+Neither scope touches a WSL distribution, virtual machine, switch, network or
+image DevHotel did not create. That is enforced, not intended: the Hyper-V object
+is removed only when the Host marker and the VM's exact Notes payload both prove
+it, re-checked inside the same PowerShell pass that removes it, and the app-data
+delete happens only against the exact canonical `%APPDATA%\DevHotel` path, with
+a matching process-bound ownership manifest and no reparse point anywhere
+beneath it. The Hyper-V Default Switch is used and never owned, so it is never
+removed. Anything DevHotel cannot prove it made is reported and left standing —
+an orphan the user can see beats deleting something that might be theirs.
+
 ## Shared caches
 
 A Room's `/cache` stays per-Room; it holds things a Room can dirty. The Node

@@ -225,6 +225,12 @@ export interface ManagedRuntimeStatusInfo {
   artifactDigests: Record<string, string>
   /** `null` means unrecorded, not refused. */
   nestedVirtualization: boolean | null
+  /**
+   * The runtime version change in flight, or the last one that did not end on
+   * the version it aimed for. `null` means there is nothing to report — which
+   * includes an update that simply worked.
+   */
+  update: { stage: string; fromVersion: string; toVersion: string; attempts: number; detail: string } | null
   windowsFeature: { stage: string; restartRequired: boolean; edition: string | null; detail: string } | null
 }
 
