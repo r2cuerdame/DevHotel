@@ -1,0 +1,194 @@
+# Release-gate readiness — GitHub #111
+
+**Status: the gate was not run. It cannot be run today, and the reason is not only the missing VM.**
+
+This document records what was measured on 2026-09-17 against `main@a84a97e`, so
+the next attempt starts from facts instead of re-deriving them. It is a
+readiness assessment, not gate evidence, and nothing in it should be read as a
+passing row in `issue-106-clean-windows-acceptance.md` or
+`issue-107-managed-web-rooms.md` — every row in both of those is still blank.
+
+## The short version
+
+#111's eleven claims split into two groups, and they need different work:
+
+- **Seven are blocked only by the environment.** The code exists and is
+  host-side tested; it has simply never been exercised against a real Hyper-V
+  guest, because no machine here can host one.
+- **Four are blocked by missing implementation.** No environment produces
+  evidence for them, because the code path does not exist yet. Building the
+  clean VM first would spend hours to arrive at four rows that still cannot
+  pass.
+
+## Group A — blocked only by the environment
+
+| # | #111 claim | Where the implementation is |
+|---|---|---|
+| 1 | Fresh install | `managedRuntimeManager.ts`, `managedHyperVRuntime.ts` |
+| 2 | Upgrade | `managedRuntimeUpdate.ts` — `ManagedRuntimeUpdateLedger`, `fromVersion`/`toVersion` |
+| 3 | Rollback | same ledger; "what the install had verified before the update, for an exact rollback" (`managedRuntimeUpdate.ts:33`) |
+| 4 | Reboot | `managedRuntimeWindowsFeature.ts` boot-identity resume; `managedRuntimeManager.ts:347` |
+| 5 | Runtime crash / recovery | `managedRuntimeManager.ts` `repair()` paths (`:399`, `:406`, `:576`, `:590`) |
+| 6 | Complete uninstall | `managedRuntimeManager.ts:284` removes everything this install provisioned; `:102` app-only is the honest half |
+| 7 | North Star Web without external Docker/Node/DB | `managedRoomBackend.ts`, `roomRuntimeSelection.ts`, `managedRuntimeGuestAgent.ts` |
+
+Claim 7 is the one with the largest gap between "implemented" and "proven".
+#107's own closing comment is explicit that the guest half has never been
+booted, and the host-side tests exercise an in-process implementation of the
+frame protocol rather than a guest.
+
+The host-side baseline was re-run here rather than taken on trust:
+
+```
+pnpm --filter @devhotel/core test
+Test Files  92 passed | 5 skipped (97)
+     Tests  1666 passed | 12 skipped (1678)
+```
+
+Green — and that is exactly the point. A green suite is what #108's comment
+warned against closing a gate from. The suite's own probe test prints the
+host's real capability, and it agrees with everything below:
+
+```
+MANAGED_RUNTIME_PROBE {"support":{"supported":true,"code":"virtualization-ready",
+  "hypervisorPresent":true,"virtualizationFirmwareEnabled":true,"slat":false,
+  "hyperVPowerShellAvailable":false,"hyperVManagementAccessible":false}}
+```
+
+Room-data persistence and one-Room-cannot-affect-another isolation also sit in
+this group: the per-Room network, subnet allocation and owned-volume-generation
+rules were deliberately reused rather than reimplemented (#107, `350675d`), so
+they are as implemented as the compatibility backend — and equally unproven on
+a managed guest.
+
+## Group B — blocked by missing implementation
+
+### B1. Android build / install / launch / preview without Host adb, Android Studio or Docker
+
+**Not implemented.** The Android execution path is still entirely
+`budtmo/docker-android`:
+
+- `packages/core/src/backend/naming.ts:119` returns
+  `budtmo/docker-android:emulator_${version}` as the emulator image.
+- `packages/core/src/backend/ociCli.ts` still carries the docker-android
+  workarounds — the KVM `chown` through `sudo` (`:4998`), the
+  cannot-be-restarted emulator (`:1992`), the wallpaper-aware fit daemon
+  (`:947`).
+- `androidEmulatorLaunch()` and `androidSdkPin` (#128, #129) have **zero call
+  sites** outside their own modules and `packages/core/src/index.ts`. They are
+  a pinned-artifact table and a launch *plan*; nothing invokes them. Their
+  tests (`backend.androidEmulatorLaunch.test.ts`, 7 tests;
+  `backend.androidSdkPin.test.ts`, 6 tests) assert the shape of the plan, not
+  an emulator that started.
+- `managedRoomBackend.ts` contains no Android, emulator or KVM handling at all.
+
+So a clean Windows 11 VM with Docker absent cannot run an Android Room by any
+path. This is #108's remaining work, and #108 is open.
+
+### B2. Low disk
+
+**Not implemented.** No free-space probe, no `ENOSPC` handling and no
+disk-budget refusal exists anywhere in `packages/core/src/backend/managed*.ts`.
+Provisioning stages a ~150 MB artifact and creates a state disk with no
+precondition on available space; there is no behaviour to assert.
+
+### B3. Offline / retry
+
+**Not implemented.** `downloadManagedRuntimeArtifact()`
+(`managedRuntimeArtifact.ts:114`) issues a single `fetch` with
+`redirect: 'manual'` against a host allowlist. There is no retry, no resumed
+`Range` request, no backoff and no offline classification — a dropped
+connection mid-download fails the provision outright.
+
+The guest-side package cache #107 describes is a different claim: it makes the
+*second* guest boot offline-capable, which is row 4 of the #107 matrix, and it
+does nothing for the Host's artifact fetch.
+
+### B4. Enterprise virtualization-policy failure
+
+**Partial.** Nested-virtualization refusal is handled honestly —
+`managedHyperVRuntime.ts:493` wraps `Set-VMProcessor
+-ExposeVirtualizationExtensions` in a `try` and records `nestedVirtualization`
+as `true | false | null` rather than assuming. `managedRuntimeWindowsFeature.ts`
+distinguishes `enabled` / `pending` / `disabled` / `absent` and refuses Home
+editions.
+
+What is absent is the enterprise case the gate names: a policy-managed host
+where `Enable-WindowsOptionalFeature` is denied by policy rather than by
+elevation, or where Hyper-V is present but administratively blocked. Those
+surface today as a generic `failed` stage carrying a DISM error string.
+
+## Why this host cannot supply the environment
+
+Measured, not assumed:
+
+```
+Edition                : Microsoft Windows 11 Pro (26200)
+CPU                    : AMD Ryzen 7 9800X3D          -> nested virt capable
+Elevated               : False
+HypervisorPresent      : True                          (VBS / WSL2)
+hvax64.exe             : present
+vmms.exe               : ABSENT                        <- VM Management Service
+Hyper-V PS module dir  : ABSENT
+New-VM / Get-VM        : not recognised
+Free space on C:       : 462 GB
+```
+
+`Microsoft-Hyper-V-All` is **not installed**. Enabling it needs elevation *and*
+a Host restart, and `scripts/acceptance/issue-106/New-CleanWindowsAcceptanceVm.ps1`
+refuses to run without it by design.
+
+The host is also disqualified as the gate target regardless of Hyper-V, because
+the gate's premise is a machine with none of this on it:
+
+```
+docker      29.2.1   C:\Program Files\Docker\Docker\resources\bin\docker.exe
+wsl         Ubuntu-24.04 (Running, v2), docker-desktop (Running, v2)
+node        v24.13.1        pnpm 10.33.0        npm 11.8.0
+java        openjdk 17.0.20
+Android SDK C:\Users\recue\AppData\Local\Android  (present)
+```
+
+No managed runtime has ever been provisioned here: `%APPDATA%\DevHotel\runtime`
+holds only `docker-engine.json`, `legacy-volume-adoptions.json`,
+`network-recovery-attestations/` and a stale August `vmware/` directory. There
+is no `managed-linux` root and no `windows-feature.json`.
+
+## The reboot question, answered with the host's actual state
+
+Enabling Hyper-V here would require restarting a machine that is mid-flight:
+
+- 8 `DevHotel` processes running, the oldest since 2026-09-16 18:59.
+- 27 `node` / `claude` / `orca` processes — a live multi-agent session.
+- `csx-451-test-pg` **Up 10 hours** — another agent's running Postgres.
+- 246 Docker volumes, including Room workspace and service state.
+
+The dispatch authorised the milestone reboot *only when it will not corrupt
+active work*. That precondition is not met, so the reboot was not taken.
+
+It would also not be sufficient. The full path from here to a gate result is:
+
+1. elevation + `Enable-WindowsOptionalFeature Microsoft-Hyper-V-All` + Host restart;
+2. fetch the ~6 GB Windows 11 Enterprise Evaluation ISO and pin its SHA-256 (no
+   Windows install media exists on this machine);
+3. build the nested Gen 2 VM and run the unattended install;
+4. install DevHotel in the guest and boot the Alpine runtime under Hyper-V —
+   which has never been done, on any machine;
+5. run #106 rows 1–15, then #107's 17-row matrix.
+
+Steps 1–5 land on seven of eleven claims. The other four (B1–B4) stay red.
+
+## Recommended order
+
+1. **Finish B2 and B3 first.** They are small, host-side and unit-testable — a
+   free-space precondition and a resumable download with retry.
+2. **Close B4's enterprise case**, or narrow #111's wording to the
+   nested-virtualization refusal that is actually implemented.
+3. **Then take the reboot**, on a host with no active agent work, and run #106
+   + #107 in the clean VM. That settles Group A and claim 7.
+4. **B1 (Android) is #108's remaining implementation**, not a gate run. It
+   needs `androidEmulatorLaunch()` wired to the managed backend and
+   `naming.ts` stopped from naming a Docker Hub image. Until then no
+   environment can produce that row.
+
+Nothing above was mocked, and nothing above is a pass.
