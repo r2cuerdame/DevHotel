@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import type { ManagedRuntimeFeatureObservation } from './managedRuntimeWindowsFeature'
 
 export type ManagedRuntimeSupportCode =
   | 'ready'
@@ -89,6 +90,12 @@ export interface ManagedRuntimeObservation {
   runtimeId: string | null
   runtimeVersion: string | null
   artifactDigests: Record<string, string>
+  /**
+   * The Windows optional-feature gate, when one stands between this Host and a
+   * provisionable runtime. Populated by the manager, which owns the harness;
+   * the bootstrap alone never inspects or mutates Windows features.
+   */
+  windowsFeature?: ManagedRuntimeFeatureObservation
 }
 
 const MANIFEST_FILE = 'ownership.json'

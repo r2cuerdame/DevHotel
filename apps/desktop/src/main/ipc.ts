@@ -79,6 +79,12 @@ export function registerIpc(opts: {
   requestRelaunch: () => void
   runCleanRemoval: (operation: CleanRemovalOperation) => Promise<boolean>
   finishCleanRemoval: () => void
+  enableManagedRuntimeFeatures: () => Promise<{
+    stage: string
+    restartRequired: boolean
+    edition: string | null
+    detail: string
+  }>
 }): void {
   const {
     win,
@@ -92,7 +98,8 @@ export function registerIpc(opts: {
     github,
     requestRelaunch,
     runCleanRemoval,
-    finishCleanRemoval
+    finishCleanRemoval,
+    enableManagedRuntimeFeatures
   } = opts
   const caDir = join(userData, 'ca')
   const installDir = dirname(process.execPath)
@@ -343,6 +350,9 @@ export function registerIpc(opts: {
     installDir,
     autostart: app.getLoginItemSettings().openAtLogin
   }))
+  // The only Host-level Windows mutation DevHotel performs, and only when the
+  // human asks for it here. Never invoked during launch or provisioning.
+  handle(IPC.enableManagedRuntimeFeatures, () => enableManagedRuntimeFeatures())
   handle(IPC.autostartSet, (_event, enabled) => {
     app.setLoginItemSettings({ openAtLogin: zAutostartEnabled.parse(enabled), args: ['--hidden'] })
   })
