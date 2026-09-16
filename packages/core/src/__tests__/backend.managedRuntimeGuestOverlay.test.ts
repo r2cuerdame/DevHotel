@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -42,6 +42,43 @@ const identity: ManagedRuntimeGuestIdentity = {
   runtimeId: 'runtime-0123456789',
   runtimeVersion: '0.1.0',
   daemonVersion: '0.1.0'
+}
+
+/**
+ * The guest agent runs under busybox ash. Any POSIX shell is close enough to
+ * catch the mistakes that matter here; where none exists the two tests that
+ * need one skip rather than fail, because a missing shell is an environment
+ * gap and not a defect in the archive.
+ */
+let shellProbe: Promise<string | null> | null = null
+function posixShell(): Promise<string | null> {
+  shellProbe ??= (async () => {
+    for (const shell of ['sh', 'bash']) {
+      const ok = await run(shell, ['-c', 'exit 0'], { timeout: 30_000 }).then(
+        () => true,
+        () => false
+      )
+      if (ok) return shell
+    }
+    return null
+  })()
+  return shellProbe
+}
+
+/** The agent script exactly as it is written into the overlay. */
+function agentSource(overlay: { bytes: Buffer }): string {
+  const tar = gunzipSync(overlay.bytes)
+  for (let offset = 0; offset + 512 <= tar.byteLength; ) {
+    const block = tar.subarray(offset, offset + 512)
+    const name = block.subarray(0, 100).toString('ascii').replace(/\0.*$/, '')
+    if (name === '') break
+    const size = parseInt(block.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim() || '0', 8)
+    if (name === 'usr/local/sbin/devhotel-runtime-agent') {
+      return tar.subarray(offset + 512, offset + 512 + size).toString('utf8')
+    }
+    offset += 512 + Math.ceil(size / 512) * 512
+  }
+  throw new Error('the overlay carries no agent script')
 }
 
 /** Reads the ustar member table straight out of the archive. */
@@ -121,6 +158,70 @@ describe('managed runtime guest overlay', () => {
     // No Host-reachable network listener is ever installed in the guest.
     expect(tar).not.toMatch(/\b(nc|socat|sshd|iptables)\b.*-l/)
     expect(tar).not.toContain('0.0.0.0')
+  })
+
+  it('generates an agent script a POSIX shell accepts', async (ctx) => {
+    const shell = await posixShell()
+    if (!shell) return ctx.skip()
+
+    // The guest runs this under busybox ash. A syntax error here would only
+    // ever surface as a runtime that boots and never answers health, so it is
+    // worth catching on the Host where the archive is built.
+    const dir = await tempDir()
+    const script = path.join(dir, 'agent.sh')
+    await writeFile(script, agentSource(buildManagedRuntimeGuestOverlay(identity)))
+
+    const failure = await run(shell, ['-n', 'agent.sh'], { cwd: dir, timeout: 30_000 }).catch(
+      (error: unknown) => error as { stderr?: string }
+    )
+    expect((failure as { stderr?: string } | undefined)?.stderr ?? '').toBe('')
+  })
+
+  it('keeps answering health after the Host drops the serial line', async (ctx) => {
+    const shell = await posixShell()
+    if (!shell) return ctx.skip()
+
+    // Hyper-V backs COM2 with a named pipe the Host opens and closes once per
+    // probe, so the guest sees a disconnect after every single health check.
+    // A regular file stands in here: it hands the agent one request and then
+    // EOFs, which is exactly the shape of that disconnect.
+    const dir = await tempDir()
+    const overlay = buildManagedRuntimeGuestOverlay(identity)
+    const source = agentSource(overlay).replace(
+      `serial=${MANAGED_RUNTIME_GUEST_SERIAL}`,
+      'serial=serial.txt'
+    )
+    expect(source).toContain('serial=serial.txt')
+    await writeFile(path.join(dir, 'agent.sh'), source)
+    await writeFile(path.join(dir, 'serial.txt'), 'health:0a1b2c3d\n')
+
+    const agent = spawn(shell, ['agent.sh'], { cwd: dir, stdio: 'ignore' })
+    let exited: number | null | 'running' = 'running'
+    agent.on('exit', (code) => {
+      exited = code
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+
+      const transcript = await readFile(path.join(dir, 'serial.txt'), 'utf8')
+      const reply = transcript.split('\n').find((line) => line.startsWith('{'))
+      expect(reply, `agent wrote no reply: ${JSON.stringify(transcript)}`).toBeTruthy()
+      expect(JSON.parse(reply ?? '{}')).toEqual({
+        owner: 'devhotel',
+        installId: identity.installId,
+        runtimeId: identity.runtimeId,
+        runtimeVersion: identity.runtimeVersion,
+        daemonVersion: identity.daemonVersion,
+        state: 'ready',
+        requestId: '0a1b2c3d'
+      })
+
+      // The point of the reconnect loop: EOF on the line must not end the
+      // agent, or the runtime answers exactly one probe and is dead after it.
+      expect(exited, 'the agent exited instead of reopening the serial line').toBe('running')
+    } finally {
+      agent.kill()
+    }
   })
 
   it('records the ownership the Host will demand back over the wire', () => {
