@@ -18,6 +18,7 @@ import {
   cacheVolume,
   depsVolume,
   emulatorAvdOverride,
+  EMULATOR_ADDITIONAL_ARGS,
   parsePortOutput,
   roomNetworkName,
   srcVolume,
@@ -323,6 +324,24 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth')
   })
 
+  it('passes no CPU/RAM budget and never asks for a GPU', () => {
+    // Measured and rejected (#104, docs/android-runtime-performance.md): the
+    // image's AVD already sets hw.cpu.ncore = 4, so -cores restates the default,
+    // and -memory only desynchronizes hw.ramSize from the AVD's vm.heapSize
+    // without measuring faster. Guest LCD size is the lever that works.
+    expect(EMULATOR_ADDITIONAL_ARGS).toBe('-no-boot-anim -skip-adb-auth')
+    const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })
+    const joined = args.join(' ')
+    expect(joined).not.toContain('-cores')
+    expect(joined).not.toContain('-memory')
+    // --gpus all + -gpu host selects llvmpipe and Vulkan then fails with
+    // VK_ERROR_INCOMPATIBLE_DRIVER, so software rendering must stay implicit.
+    expect(args).not.toContain('--gpus')
+    expect(joined).not.toContain('-gpu')
+    // ...while KVM has to survive every change to these arguments
+    expect(args[args.indexOf('--device') + 1]).toBe('/dev/kvm')
+  })
+
   it('rotates the X screen and AVD orientation for landscape emulators', () => {
     const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0', orientation: 'landscape' })
     expect(args).toContain('SCREEN_WIDTH=1140')
@@ -361,7 +380,13 @@ describe('buildWebCreateArgs', () => {
 
   it('sets cache env, passes extra env, and never sets CI', () => {
     const args = buildWebCreateArgs(spec({ env: { FOO: 'bar' } }))
-    expect(envs(args)).toEqual(['npm_config_cache=/cache/npm', 'PNPM_HOME=/cache/pnpm', 'FOO=bar'])
+    expect(envs(args)).toEqual([
+      'npm_config_cache=/cache/npm',
+      'PNPM_HOME=/cache/pnpm',
+      'PLAYWRIGHT_BROWSERS_PATH=/cache/playwright',
+      'XDG_CACHE_HOME=/cache/xdg',
+      'FOO=bar'
+    ])
     expect(envs(args).some((e) => e.startsWith('CI='))).toBe(false)
   })
 

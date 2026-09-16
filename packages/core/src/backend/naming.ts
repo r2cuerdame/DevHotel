@@ -114,6 +114,21 @@ export const EMULATOR_SCREEN_HEIGHT = 1140
 /** Where createEmulator stages the AVD override; docker-android appends it to config.ini at AVD creation. */
 export const EMULATOR_AVD_OVERRIDE_PATH = '/home/androidusr/devhotel-avd-override.ini'
 
+/**
+ * Flags handed to the `emulator` binary. Deliberately no CPU/RAM budget: the
+ * image's AVD already sets hw.cpu.ncore = 4, and an explicit -memory only
+ * desynchronizes it from the AVD's matched vm.heapSize without ever measuring
+ * faster. `-skip-adb-auth` is safe only because this ADB transport has no Host
+ * port and no Room-network path.
+ *
+ * Hardware GPU acceleration is deliberately not claimed and not requested: -gpu
+ * stays at the image's swiftshader_indirect, because `--gpus all` + `-gpu host`
+ * makes the emulator select llvmpipe and Vulkan then fails with
+ * VK_ERROR_INCOMPATIBLE_DRIVER. Guest LCD size, not the CPU/RAM budget, is the
+ * lever that works — see docs/android-runtime-performance.md.
+ */
+export const EMULATOR_ADDITIONAL_ARGS = '-no-boot-anim -skip-adb-auth'
+
 export function emulatorImage(version: string): string {
   return `budtmo/docker-android:emulator_${version}`
 }
@@ -238,7 +253,7 @@ export function buildEmulatorArgs(
     // ADB authentication is disabled only for this managed emulator: its ADB
     // transport has no Host port or Room-network path, and immutable-ID
     // helpers can reach it only through the proved private control netns.
-    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth',
+    `EMULATOR_ADDITIONAL_ARGS=${EMULATOR_ADDITIONAL_ARGS}`,
     '-e',
     `SCREEN_WIDTH=${screen.width}`,
     '-e',
@@ -434,8 +449,22 @@ function mountArgs(spec: WebSpec): string[] {
   return args
 }
 
+/**
+ * Caches that have to survive container recreation. Every one of these tools
+ * defaults to a path in the container's writable layer, which a recreate throws
+ * away; `/cache` is the Room-owned cache volume. A Room-scoped XDG cache also
+ * keeps a browser download or a tool cache out of the image layer, where it
+ * would otherwise be re-fetched on every wake that recreates the container.
+ */
+export const ROOM_CACHE_ENV: ReadonlyArray<readonly [string, string]> = [
+  ['npm_config_cache', '/cache/npm'],
+  ['PNPM_HOME', '/cache/pnpm'],
+  ['PLAYWRIGHT_BROWSERS_PATH', '/cache/playwright'],
+  ['XDG_CACHE_HOME', '/cache/xdg']
+]
+
 function envArgs(spec: WebSpec): string[] {
-  const args = ['-e', 'npm_config_cache=/cache/npm', '-e', 'PNPM_HOME=/cache/pnpm']
+  const args = ROOM_CACHE_ENV.flatMap(([key, value]) => ['-e', `${key}=${value}`])
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }

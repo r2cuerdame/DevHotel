@@ -16,6 +16,8 @@ import type {
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
   RoomArtifactWebRuntimeFence,
+  ResumeRoomPodOpts,
+  RoomResumeResult,
   WebSpec
 } from '../backend/types'
 import { workspaceSnapshotVolume } from '../backend/naming'
@@ -272,6 +274,26 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`recreateAnchor:${spec.roomId}:${spec.internalPort}`)
     this.lastAnchorSpec = spec
     return { hostPort: this.hostPort }
+  }
+  /** What `resumeRoomPod` answers; the default is a Room that cannot be proved warm. */
+  resumeResult: RoomResumeResult = { reused: false, reason: 'the Room relay credential was not retained' }
+  async resumeRoomPod(spec: WebSpec, _opts?: ResumeRoomPodOpts): Promise<RoomResumeResult> {
+    const kind = spec.androidRuntimeIsolation ? 'android' : 'web'
+    this.calls.push(`resumeRoomPod:${spec.roomId}:${kind}`)
+    // Mirrors the real backend: a retained docker-android emulator cannot be
+    // restarted, so no test can assert a warm Android wake by setting
+    // `resumeResult` — see OciCliBackend.resumeRoomPod.
+    if (spec.androidRuntimeIsolation) {
+      return { reused: false, reason: 'a retained Android emulator container cannot be restarted' }
+    }
+    if (this.resumeResult.reused) {
+      this.lastWebSpec = spec
+      this.webPausedValue = false
+      this.webRunningUnpausedValue = true
+      if (spec.androidRuntimeIsolation) this.emulatorStateValue = 'running'
+      return { reused: true, hostPort: this.hostPort }
+    }
+    return this.resumeResult
   }
   async deleteRoomPod(roomId: string) {
     this.calls.push(`deleteRoomPod:${roomId}`)

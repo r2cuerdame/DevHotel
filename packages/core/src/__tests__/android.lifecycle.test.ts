@@ -121,6 +121,32 @@ describe('Android room lifecycle', () => {
     expect(orch.rooms.get(room.id)!.status).toBe('ready')
   })
 
+  it('recreates an Android Room on wake because a retained emulator cannot restart', async () => {
+    const { backend, orch } = setup()
+    const room = await orch.createRoom({
+      provider: 'android',
+      sourceType: 'empty',
+      sourceRef: '',
+      project: 'android-warm',
+      nickname: 'dev',
+      actor: 'user'
+    })
+
+    await orch.sleepRoom(room.id, 'user')
+    // Even told to reuse, an Android Room must not: stopping the container
+    // SIGKILLs it, and the emulator never reacquires its X display after that.
+    backend.resumeResult = { reused: true, hostPort: backend.hostPort }
+    backend.calls.length = 0
+    await orch.startRoom(room.id, 'user')
+
+    expect(orch.rooms.get(room.id)!.status).toBe('ready')
+    expect(backend.calls).toContain(`resumeRoomPod:${room.id}:android`)
+    // The refusal has to take the explicit recreation path, fence and all.
+    expect(backend.calls.some((call) => call.startsWith('recreateAnchor:'))).toBe(true)
+    expect(backend.calls.some((call) => call.startsWith('removeEmulator:'))).toBe(true)
+    expect(backend.calls.some((call) => call.startsWith('createEmulator:'))).toBe(true)
+  })
+
   it('records an immutable APK build without marking the live working state as changed', async () => {
     const { backend, orch } = setup()
     const room = makeRoom({
