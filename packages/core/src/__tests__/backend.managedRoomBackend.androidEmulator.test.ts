@@ -6,30 +6,31 @@ import {
   androidAvdPlan,
   androidEmulatorLaunch,
   buildManagedEmulatorContainerArgs,
+  MANAGED_EMULATOR_PREVIEW_IMAGE,
   type ManagedEmulatorContainerLifecycle
 } from '../backend/androidEmulatorLaunch'
-import { androidAvdVolume, emulatorName, EMULATOR_DEFAULT_VERSION, emulatorImage } from '../backend/naming'
-import { pinnedAndroidVersions, UnpinnedAndroidSystemImageError } from '../backend/androidSdkPin'
+import { androidAvdVolume, androidSdkVolume, emulatorName } from '../backend/naming'
+import { androidApiLevel, pinnedAndroidVersions, UnpinnedAndroidSystemImageError } from '../backend/androidSdkPin'
 
 const FAKE_SANDBOX = 'a'.repeat(64)
 const FAKE_STARTED_AT = '2026-09-17T00:00:00Z'
 const FAKE_ANCHOR_ID = 'b'.repeat(64)
 const FAKE_ABORT_TOKEN = 'c'.repeat(36)
+const API_LEVEL_14 = androidApiLevel('14.0') // 34
 
 const baseLifecycle: ManagedEmulatorContainerLifecycle = {
   networkNamespace: FAKE_ANCHOR_ID,
   networkAuthoritySandboxId: FAKE_SANDBOX,
   networkAuthorityStartedAt: FAKE_STARTED_AT,
-  abortToken: FAKE_ABORT_TOKEN
+  abortToken: FAKE_ABORT_TOKEN,
+  apiLevel: API_LEVEL_14
 }
-
-const IMAGE_REF = emulatorImage(EMULATOR_DEFAULT_VERSION)
 
 describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('starts with docker create and names the container correctly', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     expect(args[0]).toBe('create')
     expect(args).toContain('--name')
     const nameIdx = args.indexOf('--name')
@@ -39,7 +40,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('joins the control anchor network namespace', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const netIdx = args.indexOf('--network')
     expect(args[netIdx + 1]).toBe(`container:${FAKE_ANCHOR_ID}`)
   })
@@ -47,23 +48,40 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('adds /dev/kvm device access', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const devIdx = args.indexOf('--device')
     expect(args[devIdx + 1]).toBe('/dev/kvm')
   })
 
-  it('mounts the per-Room AVD volume at ANDROID_AVD_HOME', () => {
+  it('mounts the shared SDK volume read-only at ANDROID_SDK_ROOT', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
+    // The SDK volume is the first -v in the args
     const vIdx = args.indexOf('-v')
-    expect(args[vIdx + 1]).toBe(`${androidAvdVolume('r1')}:${ANDROID_AVD_HOME}`)
+    expect(args[vIdx + 1]).toBe(`${androidSdkVolume(API_LEVEL_14)}:${ANDROID_SDK_ROOT}:ro`)
+  })
+
+  it('mounts the per-Room AVD volume read-write at ANDROID_AVD_HOME', () => {
+    const plan = androidAvdPlan('r1')
+    const launch = androidEmulatorLaunch('r1')
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
+    // Collect all -v values
+    const volumes: string[] = []
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '-v') volumes.push(args[i + 1]!)
+    }
+    // AVD volume must be present (read-write, no :ro suffix)
+    const avdVol = `${androidAvdVolume('r1')}:${ANDROID_AVD_HOME}`
+    expect(volumes).toContain(avdVol)
+    // AVD volume must NOT be read-only
+    expect(volumes.find((v) => v.startsWith(androidAvdVolume('r1')))).toBe(avdVol)
   })
 
   it('applies DevHotel ownership labels', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     // Collect all -l pairs
     const labels: string[] = []
     for (let i = 0; i < args.length - 1; i++) {
@@ -77,21 +95,27 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
     expect(labels).toContain(`devhotel.abort-token=${FAKE_ABORT_TOKEN}`)
   })
 
-  it('overrides the entrypoint to sh so docker-android supervisord never runs', () => {
+  it('overrides the entrypoint to sh (no supervisord)', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const epIdx = args.indexOf('--entrypoint')
     expect(args[epIdx + 1]).toBe('sh')
   })
 
-  it('uses the docker-android image as the base and passes the script as -c', () => {
+  it('uses the DevHotel-owned preview image (not docker-android)', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
-    // image ref appears immediately after --entrypoint sh
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
+    // Image ref appears immediately after --entrypoint sh
     const epIdx = args.indexOf('--entrypoint')
-    expect(args[epIdx + 2]).toBe(IMAGE_REF)
+    expect(args[epIdx + 2]).toBe(MANAGED_EMULATOR_PREVIEW_IMAGE)
+    // Must be the DevHotel GHCR image, not docker-android
+    expect(args[epIdx + 2]).toContain('ghcr.io/r2cuerdame/devhotel-android-emulator-preview')
+    expect(args[epIdx + 2]).not.toContain('budtmo')
+    expect(args[epIdx + 2]).not.toContain('docker-android')
+    // Must be digest-pinned
+    expect(args[epIdx + 2]).toMatch(/@sha256:[a-f0-9]{64}$/)
     expect(args[epIdx + 3]).toBe('-c')
     // The script is the last element
     const script = args[args.length - 1]!
@@ -101,7 +125,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('embeds ANDROID_SDK_ROOT and ANDROID_AVD_HOME env exports in the script', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const script = args[args.length - 1]!
     expect(script).toContain(`ANDROID_SDK_ROOT='${ANDROID_SDK_ROOT}'`)
     expect(script).toContain(`ANDROID_AVD_HOME='${ANDROID_AVD_HOME}'`)
@@ -111,7 +135,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('includes the emulator binary path in the exec call', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const script = args[args.length - 1]!
     expect(script).toContain(`${ANDROID_SDK_ROOT}/emulator/emulator`)
     expect(script).toContain('exec ')
@@ -120,7 +144,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('starts Xvfb, openbox, x11vnc and websockify in the script', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const script = args[args.length - 1]!
     expect(script).toContain('Xvfb')
     expect(script).toContain('openbox')
@@ -131,7 +155,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('checks for an existing AVD directory before creating (warm restart idempotence)', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     const script = args[args.length - 1]!
     // The if-guard must come before avdmanager
     const ifIdx = script.indexOf('if [ ! -d')
@@ -144,7 +168,7 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
     const openbox = { rcXml: '<openbox_config/>', fitPy: 'import os' }
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, { ...baseLifecycle, openbox }, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, { ...baseLifecycle, openbox })
     const script = args[args.length - 1]!
     const rcXmlB64 = Buffer.from('<openbox_config/>', 'utf8').toString('base64')
     expect(script).toContain(rcXmlB64)
@@ -155,7 +179,10 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('respects Room limits for the container memory ceiling', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1', undefined, { cpus: 2, memoryMB: 4096 })
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, { ...baseLifecycle, limits: { cpus: 2, memoryMB: 4096 } }, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, {
+      ...baseLifecycle,
+      limits: { cpus: 2, memoryMB: 4096 }
+    })
     const memIdx = args.indexOf('--memory')
     // Budget: min(4, 2)=2 cores, min(4096-1024,4096)=3072 MB guest; ceiling = 3072+1024=4096m
     expect(args[memIdx + 1]).toMatch(/^\d+m$/)
@@ -164,10 +191,24 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
   it('drops NET_RAW capability', () => {
     const plan = androidAvdPlan('r1')
     const launch = androidEmulatorLaunch('r1')
-    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle, IMAGE_REF)
+    const args = buildManagedEmulatorContainerArgs('r1', plan, launch, baseLifecycle)
     expect(args).toContain('--cap-drop')
     const capIdx = args.indexOf('--cap-drop')
     expect(args[capIdx + 1]).toBe('NET_RAW')
+  })
+
+  it('SDK volume is shared across rooms (same apiLevel, same volume name)', () => {
+    const plan1 = androidAvdPlan('r1')
+    const plan2 = androidAvdPlan('r2')
+    const launch1 = androidEmulatorLaunch('r1')
+    const launch2 = androidEmulatorLaunch('r2')
+    const args1 = buildManagedEmulatorContainerArgs('r1', plan1, launch1, baseLifecycle)
+    const args2 = buildManagedEmulatorContainerArgs('r2', plan2, launch2, baseLifecycle)
+    // First -v is SDK volume — must be the same for both rooms
+    const sdkVol1 = args1[args1.indexOf('-v') + 1]
+    const sdkVol2 = args2[args2.indexOf('-v') + 1]
+    expect(sdkVol1).toBe(`${androidSdkVolume(API_LEVEL_14)}:${ANDROID_SDK_ROOT}:ro`)
+    expect(sdkVol1).toBe(sdkVol2)
   })
 
   it('uses the per-Room AVD volume for different room IDs independently', () => {
@@ -175,14 +216,24 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
     const plan2 = androidAvdPlan('r2')
     const launch1 = androidEmulatorLaunch('r1')
     const launch2 = androidEmulatorLaunch('r2')
-    const args1 = buildManagedEmulatorContainerArgs('r1', plan1, launch1, baseLifecycle, IMAGE_REF)
-    const args2 = buildManagedEmulatorContainerArgs('r2', plan2, launch2, baseLifecycle, IMAGE_REF)
-    const vIdx1 = args1.indexOf('-v')
-    const vIdx2 = args2.indexOf('-v')
-    expect(args1[vIdx1 + 1]).toBe(`${androidAvdVolume('r1')}:${ANDROID_AVD_HOME}`)
-    expect(args2[vIdx2 + 1]).toBe(`${androidAvdVolume('r2')}:${ANDROID_AVD_HOME}`)
-    // Volumes must differ between rooms
-    expect(args1[vIdx1 + 1]).not.toBe(args2[vIdx2 + 1])
+    const args1 = buildManagedEmulatorContainerArgs('r1', plan1, launch1, baseLifecycle)
+    const args2 = buildManagedEmulatorContainerArgs('r2', plan2, launch2, baseLifecycle)
+    // Collect all volumes
+    const getVolumes = (args: string[]): string[] => {
+      const vols: string[] = []
+      for (let i = 0; i < args.length - 1; i++) {
+        if (args[i] === '-v') vols.push(args[i + 1]!)
+      }
+      return vols
+    }
+    const vols1 = getVolumes(args1)
+    const vols2 = getVolumes(args2)
+    const avdVol1 = `${androidAvdVolume('r1')}:${ANDROID_AVD_HOME}`
+    const avdVol2 = `${androidAvdVolume('r2')}:${ANDROID_AVD_HOME}`
+    expect(vols1).toContain(avdVol1)
+    expect(vols2).toContain(avdVol2)
+    // AVD volumes must differ between rooms
+    expect(avdVol1).not.toBe(avdVol2)
   })
 })
 

@@ -183,3 +183,162 @@ export function assertAndroidSdkArtifactPinned(artifact: AndroidSdkArtifact): vo
 export function androidSdkDownloadBytes(version: string): number {
   return androidSdkArtifacts(version).reduce((total, artifact) => total + artifact.sizeBytes, 0)
 }
+
+/**
+ * Shell script that provisions the Android SDK for a given version into
+ * `ANDROID_SDK_ROOT` inside a container.
+ *
+ * This script is the sole actor that writes into `androidSdkVolume(apiLevel)`.
+ * It runs as a one-shot container (via `docker run --rm`) before the first
+ * emulator container of this Android version starts, then exits. Subsequent
+ * Rooms of the same version skip provisioning because the volume already exists
+ * and the sentinel file `$ANDROID_SDK_ROOT/.devhotel-provisioned` is present.
+ *
+ * ## Artifact integrity
+ *
+ * Each artifact is fetched with `curl --fail --location`, written to a temp
+ * file, and then its SHA-256 is verified with `sha256sum` against the digest
+ * from `ANDROID_SDK_TOOLS` and `ANDROID_SYSTEM_IMAGES` before extraction. A
+ * checksum mismatch aborts the entire provisioning so a partial SDK is never
+ * used. Upstream SHA-1 is NOT checked at runtime (it is provenance only).
+ *
+ * ## Directory layout produced
+ *
+ * ```
+ * $ANDROID_SDK_ROOT/
+ *   cmdline-tools/latest/    ← from commandlinetools-*.zip
+ *   platform-tools/          ← from platform-tools_*.zip
+ *   emulator/                ← from emulator-*.zip
+ *   system-images/android-<N>/google_apis/x86_64/  ← from sys-img/*.zip
+ *   .devhotel-provisioned    ← sentinel (sha256 of version string)
+ * ```
+ *
+ * `sdkmanager` and `avdmanager` from cmdline-tools expect exactly this layout.
+ */
+export function buildAndroidSdkProvisionScript(version: string, sdkRoot: string): string {
+  assertAndroidSdkArtifactPinned(ANDROID_SDK_TOOLS[0]!)
+  assertAndroidSdkArtifactPinned(ANDROID_SDK_TOOLS[1]!)
+  assertAndroidSdkArtifactPinned(ANDROID_SDK_TOOLS[2]!)
+
+  const apiLevel = androidApiLevel(version)
+  const image = ANDROID_SYSTEM_IMAGES[apiLevel]
+  if (!image) throw new UnpinnedAndroidSystemImageError(version, apiLevel)
+  assertAndroidSdkArtifactPinned(image)
+
+  const [cmdlineTools, platformTools, emulatorArtifact] = ANDROID_SDK_TOOLS as [
+    AndroidSdkArtifact,
+    AndroidSdkArtifact,
+    AndroidSdkArtifact
+  ]
+  const sentinel = `${sdkRoot}/.devhotel-provisioned`
+
+  // Shell-escape a string for embedding inside single quotes.
+  const sq = (s: string): string => s.replace(/'/g, "'\\''")
+
+  /**
+   * Download one artifact, verify SHA-256, and extract it.
+   *
+   * @param artifact  Pinned artifact descriptor.
+   * @param destDir   Where the zip is extracted (the zip root lands here).
+   * @param extractOpts  Optional extra unzip args (e.g. `-j` to junk paths).
+   */
+  function downloadStep(artifact: AndroidSdkArtifact, destDir: string, rename?: string): string {
+    const tmp = `/tmp/dh-sdk-${artifact.id}.zip`
+    return [
+      `echo '[devhotel] provisioning ${artifact.id}...'`,
+      `curl --silent --show-error --fail --location --max-time 600 --retry 3 \\`,
+      `  -o '${sq(tmp)}' '${sq(artifact.url)}'`,
+      `echo '${artifact.sha256}  ${sq(tmp)}' | sha256sum --check --strict`,
+      `mkdir -p '${sq(destDir)}'`,
+      `unzip -q -o '${sq(tmp)}' -d '${sq(destDir)}'`,
+      `rm -f '${sq(tmp)}'`,
+      ...(rename
+        ? [
+            // Some zips produce a subdirectory that needs to be renamed/moved.
+            `mv '${sq(destDir)}/${sq(rename[0]!)}' '${sq(destDir)}/${sq(rename[1]!)}'`
+          ]
+        : [])
+    ].join('\n')
+  }
+
+  const cmdlineToolsDir = `${sdkRoot}/cmdline-tools`
+  const platformToolsDir = `${sdkRoot}`
+  const emulatorDir = `${sdkRoot}`
+  const systemImageDir = `${sdkRoot}/system-images/android-${apiLevel}/google_apis`
+
+  return [
+    'set -eu',
+    // Idempotent: skip if already provisioned (warm restart or second Room).
+    `if [ -f '${sq(sentinel)}' ]; then`,
+    `  echo '[devhotel] Android SDK ${version} (API ${apiLevel}) already provisioned, skipping'`,
+    '  exit 0',
+    'fi',
+
+    // cmdline-tools: zip contains `cmdline-tools/` — rename to `latest`.
+    `mkdir -p '${sq(cmdlineToolsDir)}'`,
+    downloadStep(cmdlineTools!, cmdlineToolsDir),
+    // The zip unpacks as cmdline-tools/cmdline-tools — rename to cmdline-tools/latest
+    `if [ -d '${sq(cmdlineToolsDir + '/cmdline-tools')}' ]; then`,
+    `  mv '${sq(cmdlineToolsDir + '/cmdline-tools')}' '${sq(cmdlineToolsDir + '/latest')}'`,
+    'fi',
+
+    // platform-tools: zip unpacks as platform-tools/ directly.
+    downloadStep(platformTools!, platformToolsDir),
+
+    // emulator: zip unpacks as emulator/ directly.
+    downloadStep(emulatorArtifact!, emulatorDir),
+
+    // system-image: zip unpacks as x86_64/ — place inside the google_apis dir.
+    `mkdir -p '${sq(systemImageDir)}'`,
+    downloadStep(image, systemImageDir),
+
+    // Write the sentinel so subsequent starts skip this step.
+    `echo '${version}' > '${sq(sentinel)}'`,
+    `echo '[devhotel] Android SDK ${version} (API ${apiLevel}) provisioned.'`
+  ].join('\n')
+}
+
+/**
+ * `docker run` args for the one-shot Android SDK provisioner container (#108).
+ *
+ * The provisioner runs as a one-shot container (with `--rm`) before the
+ * emulator container is created. It downloads and extracts the pinned SDK
+ * artifacts into `androidSdkVolume(apiLevel)` — mounted read-write — so that
+ * all subsequent emulator containers can mount the volume read-only.
+ *
+ * Idempotent: the provisioner script exits immediately if the SDK sentinel is
+ * already present, so calling this multiple times (e.g. on Room wake) is safe.
+ */
+export function buildAndroidSdkProvisionArgs(opts: {
+  version: string
+  sdkRoot: string
+  sdkVolumeName: string
+  imageRef: string
+  roomId: string
+}): string[] {
+  const { version, sdkRoot, sdkVolumeName, imageRef, roomId } = opts
+  const script = buildAndroidSdkProvisionScript(version, sdkRoot)
+  return [
+    'run',
+    '--rm',
+    // Never in a network: provisioner only downloads from dl.google.com.
+    // Attach to the default bridge so DNS works, but no other container access.
+    '--network',
+    'bridge',
+    // SDK volume mounted read-write so the provisioner can install into it.
+    '-v',
+    `${sdkVolumeName}:${sdkRoot}`,
+    // Labels so this container is identifiable in diagnostics.
+    '-l',
+    `devhotel.room=${roomId}`,
+    '-l',
+    'devhotel.role=sdk-provision',
+    '-l',
+    'devhotel.managed=1',
+    '--entrypoint',
+    'sh',
+    imageRef,
+    '-c',
+    script
+  ]
+}
