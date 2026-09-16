@@ -15,10 +15,14 @@ passing row in `issue-106-clean-windows-acceptance.md` or
 - **Seven are blocked only by the environment.** The code exists and is
   host-side tested; it has simply never been exercised against a real Hyper-V
   guest, because no machine here can host one.
-- **Four are blocked by missing implementation.** No environment produces
-  evidence for them, because the code path does not exist yet. Building the
-  clean VM first would spend hours to arrive at four rows that still cannot
-  pass.
+- **Four were blocked by missing implementation.** No environment produces
+  evidence for a code path that does not exist, so building the clean VM first
+  would have spent hours to arrive at four rows that still could not pass.
+
+**Two of those four were closed in this session** (`b0a6bf3`): low disk and
+offline/retry now have behaviour and unit evidence, so they are environment-
+blocked like the rest rather than unbuildable. That leaves **B1 (Android)** as
+the one row no environment can produce, and **B4 (enterprise policy)** partial.
 
 ## Group A — blocked only by the environment
 
@@ -88,24 +92,38 @@ a managed guest.
 So a clean Windows 11 VM with Docker absent cannot run an Android Room by any
 path. This is #108's remaining work, and #108 is open.
 
-### B2. Low disk
+### B2. Low disk — **closed in `b0a6bf3`**
 
-**Not implemented.** No free-space probe, no `ENOSPC` handling and no
-disk-budget refusal exists anywhere in `packages/core/src/backend/managed*.ts`.
-Provisioning stages a ~150 MB artifact and creates a state disk with no
-precondition on available space; there is no behaviour to assert.
+It was not implemented: no free-space probe, no `ENOSPC` handling and no
+disk-budget refusal existed anywhere in `packages` or `apps`. Provisioning
+staged a ~150 MB artifact and created disks beside it with no precondition on
+available space, so the first symptom of a full volume was a truncated file
+that the digest check then reported as a corrupt download.
 
-### B3. Offline / retry
+`managedRuntimeDiskSpace.ts` now asserts the size before the first byte is
+written and names what is free against what is needed. A platform that will not
+report free space is recorded as `availableBytes: null` and allowed to proceed,
+because refusing to provision on a filesystem Node cannot measure would break
+installs that would have worked.
 
-**Not implemented.** `downloadManagedRuntimeArtifact()`
-(`managedRuntimeArtifact.ts:114`) issues a single `fetch` with
-`redirect: 'manual'` against a host allowlist. There is no retry, no resumed
-`Range` request, no backoff and no offline classification — a dropped
-connection mid-download fails the provision outright.
+### B3. Offline / retry — **closed in `b0a6bf3`**
 
-The guest-side package cache #107 describes is a different claim: it makes the
-*second* guest boot offline-capable, which is row 4 of the #107 matrix, and it
-does nothing for the Host's artifact fetch.
+`downloadManagedRuntimeArtifact()` issued a single `fetch`: no retry, no
+resumed `Range` request, no backoff, no offline classification. A connection
+dropping at 90% failed the whole provision.
+
+It now resumes from the bytes it already holds, restarts rather than
+concatenating when an origin ignores `Range`, and retries only transport
+failures — an integrity failure is not retried, because a retry cannot make a
+bad pin true.
+
+The guest-side package cache #107 describes remains a different claim: it makes
+the *second* guest boot offline-capable, which is row 4 of the #107 matrix, and
+it does nothing for the Host's artifact fetch.
+
+Both still need their gate row run against a real full volume and a real
+dropped network in the clean VM. Unit evidence is what makes that row possible;
+it is not that row.
 
 ### B4. Enterprise virtualization-policy failure
 
@@ -183,15 +201,26 @@ Steps 1–5 land on seven of eleven claims. The other four (B1–B4) stay red.
 
 ## Recommended order
 
-1. **Finish B2 and B3 first.** They are small, host-side and unit-testable — a
-   free-space precondition and a resumable download with retry.
+1. ~~Finish B2 and B3 first.~~ **Done** — `b0a6bf3`.
 2. **Close B4's enterprise case**, or narrow #111's wording to the
    nested-virtualization refusal that is actually implemented.
 3. **Then take the reboot**, on a host with no active agent work, and run #106
-   + #107 in the clean VM. That settles Group A and claim 7.
+   + #107 in the clean VM. That settles Group A and claim 7, and gives B2/B3
+   their live rows.
 4. **B1 (Android) is #108's remaining implementation**, not a gate run. It
-   needs `androidEmulatorLaunch()` wired to the managed backend and
-   `naming.ts` stopped from naming a Docker Hub image. Until then no
-   environment can produce that row.
+   needs `androidEmulatorLaunch()` wired to the managed backend and `naming.ts`
+   stopped from naming a Docker Hub image. Until then no environment can
+   produce that row, and #111 cannot close.
 
-Nothing above was mocked, and nothing above is a pass.
+Nothing above was mocked, and nothing above is a gate pass.
+
+## What this session changed
+
+| Commit | What |
+|---|---|
+| `ea1627e`, `57fc3f4` | this document |
+| `b0a6bf3` | B2 + B3: free-space precondition, resumable download with bounded transport retry |
+
+Suites after the change: core 1679 passed / 12 skipped, shared 52, mcp 56,
+desktop 203 / 4 skipped. Workspace typecheck clean. Lint 0 errors, 4
+pre-existing warnings.
