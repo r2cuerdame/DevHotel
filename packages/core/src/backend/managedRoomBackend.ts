@@ -3,11 +3,19 @@ import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { OciCliBackend, type OciCliBackendOptions } from './ociCli'
+import { OciCliBackend, openboxFramelessRc, fitEmulatorPy, type OciCliBackendOptions } from './ociCli'
 import { MANAGED_RUNTIME_GUEST_STAGE_ROOT } from './managedRuntimeGuestAgent'
 import type { ManagedRuntimeEngine } from './managedRuntimeEngine'
 import type { ManagedRuntimeIngress } from './managedRuntimeIngress'
 import type { ExecResult, GitCredential } from './types'
+import {
+  androidAvdPlan,
+  androidEmulatorLaunch,
+  buildManagedEmulatorContainerArgs
+} from './androidEmulatorLaunch'
+import { pinnedAndroidVersions } from './androidSdkPin'
+import { anchorName, emulatorName, emulatorScreen, EMULATOR_IMAGE, emulatorImage } from './naming'
+
 
 /**
  * Where a Host path has to be staged before the guest engine can see it.
@@ -178,7 +186,168 @@ export class ManagedRoomBackend extends OciCliBackend {
       .run(['run', '--rm', '-v', `${MANAGED_RUNTIME_GUEST_STAGE_ROOT}:/stage`, 'alpine/git', '--', 'rm', '-rf', `/stage/${name}`])
       .catch(() => undefined)
   }
+
+  /**
+   * Create the Android emulator sidecar for a managed Room (#108).
+   *
+   * **Managed path (pinned Android version):** uses `androidAvdPlan` +
+   * `androidEmulatorLaunch` + `buildManagedEmulatorContainerArgs` to launch the
+   * emulator directly — no docker-android supervisord, no env-var interface. The
+   * per-Room AVD volume survives container recreation; quickboot saves/loads are
+   * left alone so warm-Room state persists across sleep/wake cycles (#78).
+   *
+   * **Compatibility fallback (unpinned Android version):** delegates to
+   * `super.createEmulator`, which uses `budtmo/docker-android` via the guest
+   * engine — behaviour unchanged from before #108.
+   *
+   * The openbox window rules and `fit-emulator.py` are staged into the created
+   * (not yet started) container before `docker start`, exactly as
+   * `OciCliBackend.createEmulator` does today — so the preview geometry is
+   * fixed before the WM maps the emulator window.
+   */
+  override async createEmulator(
+    roomId: string,
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    limits?: { cpus?: number; memoryMB?: number }
+  ): Promise<void> {
+    const version = opts?.version ?? '14.0'
+    const pinned = pinnedAndroidVersions()
+
+    if (!pinned.includes(version)) {
+      // Version not yet pinned for the managed path — use docker-android via the
+      // guest engine. This is the compatibility fallback the spec mandates until
+      // every offered version has a pinned system image.
+      return super.createEmulator(roomId, opts, limits)
+    }
+
+    // ── Managed path ─────────────────────────────────────────────────────────
+
+    const plan = androidAvdPlan(roomId, opts)
+    const launch = androidEmulatorLaunch(roomId, opts, limits)
+
+    // Resolve the image to use. We reuse the docker-android image as the base
+    // because it ships the complete X11/VNC/openbox stack. The entrypoint is
+    // replaced by buildManagedEmulatorContainerArgs so docker-android's
+    // supervisord never runs.
+    const imageRef = opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE
+
+    // Pull the image so the create below does not time out on first use.
+    await this.managedEngine.run(['pull', imageRef], { timeoutMs: null })
+
+    // Find the control anchor — the emulator joins its network namespace.
+    const anchorInspect = await this.managedEngine.run([
+      'inspect',
+      '--format',
+      '{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}',
+      anchorName(roomId)
+    ])
+    if (anchorInspect.code !== 0) {
+      throw new Error(`managed emulator: control anchor for Room ${roomId} not found`)
+    }
+    const anchorFields = anchorInspect.stdout.trim().split('|')
+    if (anchorFields.length < 3) {
+      throw new Error(`managed emulator: control anchor inspect returned unexpected format for Room ${roomId}`)
+    }
+    const [anchorId, anchorStatus, anchorStartedAt] = anchorFields
+    if (anchorStatus !== 'running') {
+      throw new Error(`managed emulator: control anchor for Room ${roomId} is not running (${anchorStatus})`)
+    }
+
+    // Resolve the sandbox ID for the network fencing label.
+    const sandboxInspect = await this.managedEngine.run([
+      'inspect',
+      '--format',
+      '{{.NetworkSettings.SandboxID}}',
+      anchorName(roomId)
+    ])
+    const networkAuthoritySandboxId = sandboxInspect.stdout.trim()
+    if (!/^[a-f0-9]{64}$/.test(networkAuthoritySandboxId)) {
+      throw new Error(`managed emulator: could not resolve control anchor sandbox ID for Room ${roomId}`)
+    }
+
+    // Generate the openbox WM config that makes the emulator window frameless
+    // and full-screen — identical rules to those OciCliBackend stages for
+    // docker-android, embedded as base64 in the entrypoint script.
+    const screen = emulatorScreen(opts?.orientation)
+    const openbox = {
+      rcXml: openboxFramelessRc(screen.width, screen.height),
+      fitPy: fitEmulatorPy(screen.width, screen.height)
+    }
+
+    const networkAuthorityStartedAt = anchorStartedAt!.trim()
+    const networkNamespace = anchorId!.trim()
+    const abortToken = randomUUID()
+
+    const containerArgs = buildManagedEmulatorContainerArgs(roomId, plan, launch, {
+      networkNamespace,
+      networkAuthoritySandboxId,
+      networkAuthorityStartedAt,
+      abortToken,
+      limits,
+      openbox
+    }, imageRef)
+
+    let emulatorId: string | undefined
+    try {
+      const createResult = await this.managedEngine.run(
+        // buildManagedEmulatorContainerArgs starts with 'create' and sets
+        // --name to emulatorName(roomId). The openbox config is embedded in the
+        // entrypoint script — no docker cp staging step needed.
+        containerArgs,
+        { timeoutMs: null, maxStdoutBytes: 128, maxStderrBytes: 8 * 1024 }
+      )
+      const candidateId = createResult.stdout.trim()
+      if (/^[a-f0-9]{64}$/.test(candidateId)) emulatorId = candidateId
+      if (createResult.code !== 0) {
+        throw new Error(`managed emulator create failed: ${createResult.stderr.slice(-500)}`)
+      }
+      if (!emulatorId) {
+        throw new Error('managed emulator create did not return one immutable container ID')
+      }
+
+      const startResult = await this.managedEngine.run(['start', emulatorId])
+      if (startResult.code !== 0) {
+        throw new Error(`managed emulator start failed: ${startResult.stderr.slice(-500)}`)
+      }
+    } catch (error) {
+      // Best-effort abort cleanup: remove the named container so the next
+      // createEmulator call does not collide with a stuck created-not-started one.
+      await this.managedEngine
+        .run(['rm', '-f', emulatorId ?? emulatorName(roomId)])
+        .catch(() => undefined)
+      throw error
+    }
+  }
+
+  /**
+   * Recovery restart of the managed Android emulator (#108).
+   *
+   * On the compatibility (docker-android) path, `OciCliBackend` calls
+   * `prepareDockerAndroidEmulatorRestart` before `docker start` because
+   * docker-android's bootstrap deletes the root passwd entry and Docker restores
+   * `/dev/kvm` on the next start — so `sudo` would otherwise fail before qemu.
+   * The managed emulator does not run docker-android's bootstrap, so the passwd
+   * is never mutated and the workaround is not needed; the managed restart is
+   * just a validated `docker start` of the exact retained container.
+   *
+   * Everything else in `startExistingEmulatorForRecovery` — capturing all
+   * participant IDs, verifying the full isolated topology before and after,
+   * proving namespace membership, writing the network recovery attestation —
+   * is the same on both paths and is inherited from `OciCliBackend`.
+   */
+  override async startExistingEmulatorForRecovery(roomId: string): Promise<void> {
+    // The managed emulator does not use docker-android's entrypoint and therefore
+    // never runs the bootstrap that removes the root passwd line; the KVM restart
+    // workaround that super calls prepareDockerAndroidEmulatorRestart for is not
+    // needed. All topology fencing is identical: super handles it.
+    //
+    // The distinction is tracked in the docker-android entrypoint comment in
+    // OciCliBackend.prepareDockerAndroidEmulatorRestart. If a future managed
+    // emulator image requires its own restart preparation, override here.
+    return super.startExistingEmulatorForRecovery(roomId)
+  }
 }
+
 
 /** Unpacks the archive the guest produced, using the Host's own tar. */
 async function extractTarTo(archive: string, destination: string): Promise<void> {
