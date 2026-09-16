@@ -342,6 +342,55 @@ describe('ManagedRuntimeManager', () => {
     expect(providerFactory).not.toHaveBeenCalled()
   })
 
+  it('returns the gate from enableWindowsFeatures without waiting for provisioning', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.currentSupport = support('virtualization-ready')
+    let enabled = false
+    // A download that never settles stands in for the minutes a real provision
+    // takes; the call must still return.
+    const downloadArtifact = vi.fn(async () => await new Promise<never>(() => {}))
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotelData',
+      installId: 'install-owned',
+      windowsFeature: {
+        observe: async () =>
+          enabled
+            ? {
+                stage: 'awaiting-restart' as const,
+                missing: ['Microsoft-Hyper-V-All'],
+                restartRequired: true,
+                edition: 'Microsoft Windows 11 Pro',
+                detail: 'Windows must restart to finish enabling the DevHotel runtime features.'
+              }
+            : {
+                stage: 'elevation-required' as const,
+                missing: ['Microsoft-Hyper-V-All'],
+                restartRequired: false,
+                edition: 'Microsoft Windows 11 Pro',
+                detail: 'DevHotel needs one-time Windows approval.'
+              },
+        enable: async () => {
+          enabled = true
+          return {
+            stage: 'awaiting-restart' as const,
+            missing: ['Microsoft-Hyper-V-All'],
+            restartRequired: true,
+            edition: 'Microsoft Windows 11 Pro',
+            detail: 'Windows must restart to finish enabling the DevHotel runtime features.'
+          }
+        }
+      },
+      bootstrap,
+      downloadArtifact,
+      providerFactory: vi.fn()
+    })
+
+    const observation = await manager.enableWindowsFeatures()
+    expect(observation.windowsFeature?.stage).toBe('awaiting-restart')
+    expect(observation.windowsFeature?.restartRequired).toBe(true)
+
+  })
+
   it('reports an unsupported Host when the Windows edition cannot offer Hyper-V', async () => {
     const bootstrap = new FakeBootstrap()
     bootstrap.currentSupport = support('virtualization-ready')

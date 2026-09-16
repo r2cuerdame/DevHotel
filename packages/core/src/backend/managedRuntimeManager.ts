@@ -148,7 +148,11 @@ export class ManagedRuntimeManager {
   async enableWindowsFeatures(): Promise<ManagedRuntimeObservation> {
     if (this.platform !== 'win32') return await this.observe()
     await this.windowsFeature.enable()
-    return await this.prepare()
+    // Provisioning downloads and boots a runtime and can take minutes. Start it
+    // the same way launch does — without blocking — so the caller gets the gate
+    // back immediately instead of a frozen button.
+    void this.prepare().catch(() => undefined)
+    return await this.observe()
   }
 
   async observe(): Promise<ManagedRuntimeObservation> {
