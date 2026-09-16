@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Web Rooms can run without an external Docker Engine
+
+- Web Rooms now run inside the DevHotel-managed Linux runtime when it is
+  healthy, and fall back to the clearly labelled external compatibility engine
+  when it is not. Which one a launch got is reported rather than assumed, because
+  it is the only thing that explains a Room's behaviour.
+  ([#107](https://github.com/r2cuerdame/DevHotel/issues/107))
+- The Room model itself is unchanged: the same anchor/namespace layout, per-Room
+  networks, owned volume generations, ownership labels and relay-token ingress.
+  Two Rooms still serve one internal port, and Control API and MCP responses stay
+  backend-neutral.
+- Managed runtime `0.2.0` adds a container engine, a persistent state disk and a
+  Room command channel to the guest. Guest packages are resolved once and served
+  from a cache on that disk afterwards, so only the first provision needs the
+  network.
+- Host paths never cross into the guest implicitly. A Room file transfer is
+  staged explicitly both ways, because a Host-path bind against an engine inside
+  a VM does not fail — it resolves against the wrong filesystem.
+- Not yet accepted: the guest half has not been booted, because this Host has
+  Hyper-V uninstalled and Docker Desktop present. See
+  `docs/verification/issue-107-managed-web-rooms.md` for the exact live gate.
+
 ### Rooms wake warm instead of being rebuilt
 
 - Waking a sleeping Room now restarts its retained containers in place when
@@ -21,18 +43,9 @@
   Xvfb leaves a read-only `/tmp/.X0-lock` behind and the emulator then fails with
   "no Qt platform plugin could be initialized" even after its one-shot KVM
   bootstrap identity is repaired. They refuse the warm path immediately rather
-  than spending a doomed emulator boot on every wake.
+  than spending a doomed emulator boot on every wake, and the warm Android path
+  is tracked with [#108](https://github.com/r2cuerdame/DevHotel/issues/108).
 
-### Android emulator CPU/RAM budget: measured and rejected
-
-- DevHotel still passes no explicit emulator CPU/RAM budget, now as a documented
-  decision rather than an omission. Re-measuring the proposal in
-  [#104](https://github.com/r2cuerdame/DevHotel/issues/104) over ten emulator
-  boots found no reproducible gain: the image's AVD already sets
-  `hw.cpu.ncore = 4`, so `-cores 4` is a no-op; `-noaudio` is a wash; and
-  `-memory 4096` only desynchronizes `hw.ramSize` from the AVD's matched
-  `vm.heapSize`. The win #104 was chasing had already been taken by 0.5.4's fast
-  resolution profile. See `docs/android-runtime-performance.md`.
 
 ## 0.5.4 - 2026-09-15
 

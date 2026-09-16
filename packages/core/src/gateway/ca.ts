@@ -23,10 +23,24 @@ function rootKeyPath(caDir: string): string {
   return path.join(caDir, 'rootCA.key')
 }
 
-// first hex digit forced to a low nibble so the DER integer stays positive
-function randomSerial(): string {
-  const hex = forge.util.bytesToHex(forge.random.getBytesSync(16))
-  return '0' + hex.slice(1)
+/**
+ * A certificate serial, as a DER INTEGER that OpenSSL will accept.
+ *
+ * Two rules apply at once, and satisfying only the first is the trap: the
+ * integer must be positive, so the leading byte cannot be `>= 0x80`, and it
+ * must be minimally encoded, so a leading `0x00` is legal only when the byte
+ * after it has its high bit set. Forcing just the top *nibble* to zero leaves
+ * a one-in-sixteen chance of a `0x00` leading byte, and half of those are
+ * followed by a byte below `0x80` — about 3% of serials, which OpenSSL rejects
+ * with `ERR_OSSL_ASN1_ILLEGAL_PADDING` only once the certificate is loaded.
+ *
+ * Constraining the whole leading byte to `0x01..0x7f` satisfies both rules by
+ * construction and still leaves 127 * 2^120 serials.
+ */
+export function randomSerial(): string {
+  const lead = (forge.random.getBytesSync(1).charCodeAt(0) % 0x7f) + 1
+  const rest = forge.util.bytesToHex(forge.random.getBytesSync(15))
+  return lead.toString(16).padStart(2, '0') + rest
 }
 
 function fingerprintOf(cert: forge.pki.Certificate): string {

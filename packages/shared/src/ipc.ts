@@ -60,6 +60,8 @@ export const IPC = {
   footprint: 'app:footprint',
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
+  enableManagedRuntimeFeatures: 'app:enableManagedRuntimeFeatures',
+  managedRuntimeStatus: 'app:managedRuntimeStatus',
   androidAction: 'android:action',
   androidPairingDiscover: 'android:pairing:discover',
   androidPairingBegin: 'android:pairing:begin',
@@ -208,6 +210,24 @@ export type VmwareSetupStatusInfo =
     }
 
 /** The API surface exposed to the renderer as `window.devhotel`. */
+/**
+ * What the DevHotel-managed runtime is on this Host: state, identity and the
+ * digests of the artifacts it verified. Deliberately carries no Host path --
+ * the provider keeps its Hyper-V object names and paths private.
+ */
+export interface ManagedRuntimeStatusInfo {
+  state: string
+  phase: string | null
+  detail: string
+  runtimeId: string | null
+  runtimeVersion: string | null
+  /** Logical artifact id to verified SHA-256. */
+  artifactDigests: Record<string, string>
+  /** `null` means unrecorded, not refused. */
+  nestedVirtualization: boolean | null
+  windowsFeature: { stage: string; restartRequired: boolean; edition: string | null; detail: string } | null
+}
+
 export interface IpcApi {
   rooms: {
     list(): Promise<RuntimeRoomRecord[]>
@@ -298,6 +318,27 @@ export interface IpcApi {
     /** deletes every room, removes CA trust and autostart, erases app data, launches the uninstaller */
     /** true once cleanup/uninstaller helpers are scheduled; false when native confirmation is cancelled */
     cleanUninstall(): Promise<boolean>
+    /**
+     * Asks Windows, through one consented elevation, to enable the optional
+     * features the DevHotel-managed runtime needs. Returns the resulting gate:
+     * `completed`, `awaiting-restart` when Windows still wants a reboot,
+     * `unsupported-edition`, or `failed` when approval was declined.
+     */
+    enableManagedRuntimeFeatures(): Promise<{
+      stage: string
+      restartRequired: boolean
+      edition: string | null
+      detail: string
+    }>
+    /**
+     * What the DevHotel-managed runtime actually is on this Host right now.
+     *
+     * Read-only and safe to poll. The identity, version and verified artifact
+     * digests are the only way to tell a runtime that is running the pinned
+     * image from one that merely reports itself healthy, and on a machine with
+     * nothing installed the app window is the only place they can be read.
+     */
+    managedRuntimeStatus(): Promise<ManagedRuntimeStatusInfo>
   }
   android: {
     /** drive a phone control (navigation key or screen rotation) on the room's emulator */

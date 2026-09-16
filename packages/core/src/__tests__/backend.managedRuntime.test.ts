@@ -53,10 +53,25 @@ describe('managed runtime support probe', () => {
         HypervisorPresent: true,
         VirtualizationFirmwareEnabled: false,
         SecondLevelAddressTranslationExtensions: false,
-        HyperVPowerShellAvailable: true
+        HyperVPowerShellAvailable: true,
+        HyperVManagementAccessible: true
       })
     })
     expect(result).toMatchObject({ supported: true, code: 'ready', hypervisorPresent: true })
+  })
+
+  it('requires explicit elevation when Hyper-V exists but this process cannot manage it', async () => {
+    const result = await probeManagedRuntimeSupport({
+      platform: 'win32',
+      runner: probeRunner({
+        HypervisorPresent: true,
+        VirtualizationFirmwareEnabled: true,
+        SecondLevelAddressTranslationExtensions: true,
+        HyperVPowerShellAvailable: true,
+        HyperVManagementAccessible: false
+      })
+    })
+    expect(result).toMatchObject({ supported: true, code: 'elevation-required', hyperVManagementAccessible: false })
   })
 
   it('does not report the selected Hyper-V provider ready when its management tooling is absent', async () => {

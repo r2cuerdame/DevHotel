@@ -118,6 +118,18 @@ export const fr: Translation = {
   'settings.caMissing': 'pas encore créée',
   'settings.trustCa': 'Approuver la CA',
   'settings.untrustCa': 'Retirer la confiance',
+  'settings.runtimeTitle': 'Runtime Linux géré',
+  'settings.runtimeDesc':
+    'DevHotel peut exécuter les Rooms sur son propre runtime Linux plutôt que sur Docker Desktop. Windows demande une approbation unique pour activer les fonctionnalités de virtualisation utilisées.',
+  'settings.runtimeEnable': 'Activer les fonctionnalités Windows',
+  'settings.runtimeRestart': 'Redémarrez Windows pour terminer l’activation du runtime DevHotel.',
+  'settings.runtimeRefresh': 'Actualiser',
+  'settings.runtimeIdentity': 'Identité du runtime',
+  'settings.runtimeNested': 'Virtualisation imbriquée',
+  'settings.runtimeNestedGranted': 'accordée',
+  'settings.runtimeNestedRefused': 'refusée par ce PC',
+  'settings.runtimeNestedUnknown': 'non enregistrée',
+  'settings.runtimeImage': 'Image vérifiée',
   'settings.about': 'À propos',
   'settings.aboutLine': 'DevHotel {version} — chaque projet a sa propre chambre.',
 

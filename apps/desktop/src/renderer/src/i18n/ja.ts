@@ -118,6 +118,18 @@ export const ja: Translation = {
   'settings.caMissing': '未作成',
   'settings.trustCa': 'CA を信頼',
   'settings.untrustCa': '信頼を解除',
+  'settings.runtimeTitle': 'マネージド Linux ランタイム',
+  'settings.runtimeDesc':
+    'DevHotel は Docker Desktop の代わりに独自の Linux ランタイムで Room を実行できます。使用する仮想化機能を有効にするには、Windows で一度だけ承認が必要です。',
+  'settings.runtimeEnable': 'Windows 機能を有効にする',
+  'settings.runtimeRestart': 'DevHotel ランタイムの有効化を完了するには Windows を再起動してください。',
+  'settings.runtimeRefresh': '更新',
+  'settings.runtimeIdentity': 'ランタイム ID',
+  'settings.runtimeNested': 'ネスト仮想化',
+  'settings.runtimeNestedGranted': '許可済み',
+  'settings.runtimeNestedRefused': 'この PC が拒否',
+  'settings.runtimeNestedUnknown': '未記録',
+  'settings.runtimeImage': '検証済みイメージ',
   'settings.about': 'このアプリについて',
   'settings.aboutLine': 'DevHotel {version} — すべてのプロジェクトに専用のルームを。',
 

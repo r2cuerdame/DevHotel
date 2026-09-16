@@ -118,6 +118,18 @@ export const ru: Translation = {
   'settings.caMissing': 'ещё не создан',
   'settings.trustCa': 'Доверять CA',
   'settings.untrustCa': 'Убрать доверие',
+  'settings.runtimeTitle': 'Управляемая среда выполнения Linux',
+  'settings.runtimeDesc':
+    'DevHotel может запускать Rooms в собственной среде выполнения Linux вместо Docker Desktop. Windows требуется однократное подтверждение, чтобы включить используемые функции виртуализации.',
+  'settings.runtimeEnable': 'Включить компоненты Windows',
+  'settings.runtimeRestart': 'Перезагрузите Windows, чтобы завершить включение среды выполнения DevHotel.',
+  'settings.runtimeRefresh': 'Обновить',
+  'settings.runtimeIdentity': 'Идентификатор среды',
+  'settings.runtimeNested': 'Вложенная виртуализация',
+  'settings.runtimeNestedGranted': 'предоставлена',
+  'settings.runtimeNestedRefused': 'отклонена этим ПК',
+  'settings.runtimeNestedUnknown': 'не записана',
+  'settings.runtimeImage': 'Проверенный образ',
   'settings.about': 'О приложении',
   'settings.aboutLine': 'DevHotel {version} — у каждого проекта свой номер.',
 

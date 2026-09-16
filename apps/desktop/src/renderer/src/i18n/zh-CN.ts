@@ -118,6 +118,18 @@ export const zhCN: Translation = {
   'settings.caMissing': '尚未创建',
   'settings.trustCa': '信任 CA',
   'settings.untrustCa': '移除信任',
+  'settings.runtimeTitle': '托管 Linux 运行时',
+  'settings.runtimeDesc':
+    'DevHotel 可以在自己的 Linux 运行时上运行 Room，而不依赖 Docker Desktop。启用其所需的虚拟化功能需要 Windows 一次性授权。',
+  'settings.runtimeEnable': '启用 Windows 功能',
+  'settings.runtimeRestart': '请重启 Windows 以完成启用 DevHotel 运行时。',
+  'settings.runtimeRefresh': '刷新',
+  'settings.runtimeIdentity': '运行时标识',
+  'settings.runtimeNested': '嵌套虚拟化',
+  'settings.runtimeNestedGranted': '已授予',
+  'settings.runtimeNestedRefused': '此电脑拒绝',
+  'settings.runtimeNestedUnknown': '未记录',
+  'settings.runtimeImage': '已验证镜像',
   'settings.about': '关于',
   'settings.aboutLine': 'DevHotel {version} — 每个项目都有自己的房间。',
 

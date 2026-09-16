@@ -114,21 +114,6 @@ export const EMULATOR_SCREEN_HEIGHT = 1140
 /** Where createEmulator stages the AVD override; docker-android appends it to config.ini at AVD creation. */
 export const EMULATOR_AVD_OVERRIDE_PATH = '/home/androidusr/devhotel-avd-override.ini'
 
-/**
- * Flags handed to the `emulator` binary. Deliberately no CPU/RAM budget: the
- * image's AVD already sets hw.cpu.ncore = 4, and an explicit -memory only
- * desynchronizes it from the AVD's matched vm.heapSize without ever measuring
- * faster. `-skip-adb-auth` is safe only because this ADB transport has no Host
- * port and no Room-network path.
- *
- * Hardware GPU acceleration is deliberately not claimed and not requested: -gpu
- * stays at the image's swiftshader_indirect, because `--gpus all` + `-gpu host`
- * makes the emulator select llvmpipe and Vulkan then fails with
- * VK_ERROR_INCOMPATIBLE_DRIVER. Guest LCD size, not the CPU/RAM budget, is the
- * lever that works — see docs/android-runtime-performance.md.
- */
-export const EMULATOR_ADDITIONAL_ARGS = '-no-boot-anim -skip-adb-auth'
-
 export function emulatorImage(version: string): string {
   return `budtmo/docker-android:emulator_${version}`
 }
@@ -145,6 +130,56 @@ export interface EmulatorOpts {
   version: string
   resolution?: EmulatorResolution
   orientation?: EmulatorOrientation
+}
+
+/**
+ * Emulator guest budget (#104). Measured on a Windows Host against disposable
+ * probes of the same emulator image: `-cores 4 -memory 4096 -noaudio` cut
+ * average adb input latency ~355ms → ~230ms and screencap ~873ms → ~639ms,
+ * with KVM and the image's swiftshader_indirect renderer left untouched. These
+ * are the *ceiling*, not a demand — a Room that asked for less gets less.
+ */
+export const EMULATOR_BUDGET_CORES = 4
+export const EMULATOR_BUDGET_MEMORY_MB = 4096
+/**
+ * The emulator container is not just qemu: Xvfb, x11vnc, websockify and
+ * supervisord live there too, and qemu's own resident set carries the software
+ * framebuffer on top of guest RAM. A Room's memory selection therefore cannot
+ * be handed to the guest whole.
+ */
+export const EMULATOR_HOST_RESERVE_MB = 1024
+/** An Android 14 AVD below this does not reach `sys.boot_completed`. */
+export const EMULATOR_MIN_MEMORY_MB = 1024
+
+export interface EmulatorLimits {
+  /** Room CPU selection (`RoomOsSettings.cpus`); undefined = unlimited. */
+  cpus?: number
+  /** Room memory selection in MB (`RoomOsSettings.memoryMB`); undefined = unlimited. */
+  memoryMB?: number
+}
+
+/**
+ * The guest budget the Room's own control-panel limits allow.
+ *
+ * The limits are deliberately spent on the guest rather than on `--cpus` /
+ * `--memory` for the emulator container. A hard container memory cap around a
+ * qemu process whose RSS includes the software framebuffer does not make the
+ * emulator smaller — it makes it OOM-killed, which the Room reports as "no
+ * emulator" rather than "slow emulator". Guest cores and guest RAM are what
+ * actually decide the sidecar's footprint, so that is where a 1 CPU / 1 GB Room
+ * is held to what it asked for.
+ */
+export function emulatorBudget(limits?: EmulatorLimits): { cores: number; memoryMB: number } {
+  const cores = limits?.cpus && Number.isFinite(limits.cpus)
+    ? Math.max(1, Math.min(EMULATOR_BUDGET_CORES, Math.floor(limits.cpus)))
+    : EMULATOR_BUDGET_CORES
+  const memoryMB = limits?.memoryMB && Number.isFinite(limits.memoryMB)
+    ? Math.max(
+        EMULATOR_MIN_MEMORY_MB,
+        Math.min(EMULATOR_BUDGET_MEMORY_MB, Math.floor(limits.memoryMB) - EMULATOR_HOST_RESERVE_MB)
+      )
+    : EMULATOR_BUDGET_MEMORY_MB
+  return { cores, memoryMB }
 }
 
 /** X screen dimensions for the emulator container, per orientation. */
@@ -213,11 +248,13 @@ export function buildEmulatorArgs(
     networkAuthoritySandboxId?: string
     networkAuthorityStartedAt?: string
     abortToken?: string
+    limits?: EmulatorLimits
   } = {}
 ): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
   const screen = emulatorScreen(opts?.orientation)
+  const budget = emulatorBudget(lifecycle.limits)
   return [
     'create',
     '--name',
@@ -253,7 +290,7 @@ export function buildEmulatorArgs(
     // ADB authentication is disabled only for this managed emulator: its ADB
     // transport has no Host port or Room-network path, and immutable-ID
     // helpers can reach it only through the proved private control netns.
-    `EMULATOR_ADDITIONAL_ARGS=${EMULATOR_ADDITIONAL_ARGS}`,
+    `EMULATOR_ADDITIONAL_ARGS=-cores ${budget.cores} -memory ${budget.memoryMB} -noaudio -no-boot-anim -skip-adb-auth`,
     '-e',
     `SCREEN_WIDTH=${screen.width}`,
     '-e',
@@ -363,7 +400,14 @@ function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string, subnet?
 export function buildAnchorArgs(
   spec: AnchorSpec,
   relayTokenSha256: string,
-  networkName = roomNetworkName(spec.roomId)
+  networkName = roomNetworkName(spec.roomId),
+  /**
+   * Where the relay gate is published, in the engine's own network view. The
+   * managed runtime's engine is inside a VM, so a loopback publication would be
+   * unreachable from the Host; everything else about the gate, including the
+   * token check, is unchanged by the wider binding.
+   */
+  publishAddress = '127.0.0.1'
 ): string[] {
   if (!/^[a-f0-9]{64}$/.test(relayTokenSha256)) throw new Error('invalid DevHotel relay verifier')
   const relayGateScript = `IFS= read -r -t 2 line || exit 1; case "$line" in "${RELAY_PREAMBLE_PREFIX}"*) token=\${line#"${RELAY_PREAMBLE_PREFIX}"};; *) exit 1;; esac; [ "\${#token}" -eq 64 ] || exit 1; case "$token" in *[!0-9a-f]*) exit 1;; esac; actual=$(printf '%s' "$token" | sha256sum); actual=\${actual%% *}; expected=$DEVHOTEL_RELAY_TOKEN_SHA256; mismatch=0; i=0; while [ "$i" -lt 64 ]; do ac=\${actual%"\${actual#?}"}; ec=\${expected%"\${expected#?}"}; [ "$ac" = "$ec" ] || mismatch=1; actual=\${actual#?}; expected=\${expected#?}; i=$((i + 1)); done; [ "$mismatch" -eq 0 ] || exit 1; exec socat STDIO "TCP:127.0.0.1:$DEVHOTEL_INTERNAL_PORT"`
@@ -376,7 +420,7 @@ export function buildAnchorArgs(
     networkName,
     ...labelArgs(spec.roomId, 'anchor'),
     '-p',
-    `127.0.0.1:0:${RELAY_PORT}`,
+    `${publishAddress}:0:${RELAY_PORT}`,
     '--cap-drop',
     'NET_RAW',
     '-e',

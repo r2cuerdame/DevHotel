@@ -128,8 +128,7 @@ import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
-import { runDocker } from './backend/cli'
-import { gitCloneRun, splitGitCredential } from './backend/gitClone'
+import { splitGitCredential } from './backend/gitClone'
 import type { ManagedRuntimeObservation } from './backend/managedRuntime'
 import {
   EMULATOR_ADB_SERIAL,
@@ -3340,7 +3339,7 @@ export class RoomOrchestrator {
         if (providerKind === 'android') {
           this.olog(id, 'start emulator')
           try {
-            await this.backend.createEmulator(id, this.mustGet(id).android)
+            await this.backend.createEmulator(id, this.mustGet(id).android, this.mustGet(id).os)
           } catch (err) {
             // No KVM or a failed image pull must not brick the room — it can
             // still build APKs; checks surface the missing emulator screen.
@@ -3926,7 +3925,7 @@ export class RoomOrchestrator {
           try {
             this.clearAndroidEmulatorInstalls(roomId)
             await this.backend.removeEmulator(roomId)
-            await this.backend.createEmulator(roomId, room.android)
+            await this.backend.createEmulator(roomId, room.android, room.os)
             emulatorStarted = true
             report.detail('emulator container started')
           } catch (err) {
@@ -9471,16 +9470,12 @@ export class RoomOrchestrator {
   ): Promise<{ reader: SourceReader; cleanup: () => void }> {
     if (sourceType === 'linked-folder') return { reader: fsSourceReader(sourceRef), cleanup: () => undefined }
     if (sourceType === 'empty') return { reader: EMPTY_READER, cleanup: () => undefined }
-    // managed-git: shallow clone into a temp dir through docker so the host
-    // never needs git installed
+    // managed-git: shallow clone into a temp dir through the Room backend, so
+    // the Host needs neither git nor any knowledge of where the engine runs.
     const tmp = join(this.userData, 'tmp', `plan-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
     const credential = urlCredential ?? (await this.resolveGitCredential('system', sourceRef))
-    const run = gitCloneRun(['-v', `${tmp}:/workspace`, '-w', '/workspace'], sourceRef, ['--depth', '1'], credential)
-    const result = await runDocker(run.args, {
-      timeoutMs: 180_000,
-      ...(run.input === undefined ? {} : { input: run.input })
-    })
+    const result = await this.backend.cloneToHostDirectory(sourceRef, tmp, { credential })
     if (result.code !== 0) {
       rmSync(tmp, { recursive: true, force: true })
       throw new Error(`Could not read repository ${sourceRef}: ${result.stderr.slice(-300)}`)

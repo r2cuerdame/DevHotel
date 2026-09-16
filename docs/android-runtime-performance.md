@@ -1,7 +1,8 @@
 # Android Room runtime performance
 
-What actually moves the needle for an Android Room, and what was measured and
-rejected. Numbers here are reproducible with the probe method at the bottom.
+What actually moves the needle for an Android Room, and what the numbers behind
+the current settings are. Reproduce anything here with the probe method at the
+bottom before changing a setting on the strength of a recalled figure.
 
 ## The one lever that works: guest LCD size
 
@@ -13,36 +14,41 @@ single biggest speed lever, which is why `emulatorAvdOverride` exists and why
 Shipped in 0.5.4 and re-confirmed here: guest screen capture is ~298 ms at
 540x1140 against ~919 ms at the native 1080x2280.
 
-## Measured and rejected: an explicit CPU/RAM/audio budget
+## The emulator CPU/RAM/audio budget
 
-[#104](https://github.com/r2cuerdame/DevHotel/issues/104) proposed passing
-`-cores 4 -memory 4096 -noaudio` to the emulator, on the strength of disposable
-probes that showed adb input latency ~355 ms -> ~230 ms and screencap
-~873 ms -> ~639 ms.
+`buildEmulatorArgs` passes `-cores 4 -memory 4096 -noaudio`, clamped by
+`emulatorBudget` to the Room's own System-tab CPU and memory selections
+([#104](https://github.com/r2cuerdame/DevHotel/issues/104)). The clamp is the
+part that is doing real work: before it, a Room capped at 1 CPU / 1 GB still
+asked for a 4-core, 4096MB emulator.
 
-Those figures predate 0.5.4. They were taken before the `fast` resolution
+**The 4-core / 4096MB ceiling itself is not supported by measurement on current
+`main`, and should be revisited rather than treated as a tuned value.** The
+figures it was chosen from (adb input ~355 ms -> ~230 ms, screencap
+~873 ms -> ~639 ms) predate 0.5.4. They were taken before the `fast` resolution
 profile became the default, so the improvement they captured is the one 0.5.4
-already shipped by shrinking the panel. Re-measured against current `main`,
-where the panel is already 540x1140, the budget does not reproduce as a win.
+already shipped by shrinking the panel — this document's baseline screencap of
+283-350 ms brackets the ~298 ms the 0.5.4 changelog reports.
 
-Ten emulator boots, medians per run, alternating order across rounds:
+Ten emulator boots at 540x1140, medians per run, alternating order across rounds:
 
 | flags (on top of `-no-boot-anim -skip-adb-auth`) | boot to adb-ready | adb input | screencap |
 | --- | --- | --- | --- |
-| none (current default) | 32.6 / 35.5 / 39.8 / 46.4 s | 17 / 17 / 21 / 28 ms | 283 / 297 / 331 / 350 ms |
+| none | 32.6 / 35.5 / 39.8 / 46.4 s | 17 / 17 / 21 / 28 ms | 283 / 297 / 331 / 350 ms |
 | `-noaudio` | 32.5 / 35.6 s | 17 / 21 ms | 288 / 292 ms |
 | `-memory 4096` | 33.0 / 52.5 s | 17 / 25 ms | 325 / 602 ms |
 | `-cores 4 -memory 4096 -noaudio` | 38.9 / 48.8 s | 26 / 36 ms | 308 / 448 ms |
 
-Read the spread, not the best number in each row. Run-to-run variance on the
-default configuration alone spans 32.6-46.4 s of boot and 283-350 ms of
-screencap, and no configuration here beats the default by more than that noise.
+Read the spread, not the best number in each row. Run-to-run variance with no
+flags at all spans 32.6-46.4 s of boot and 283-350 ms of screencap, and no
+configuration here beats that noise floor.
 
 Flag by flag:
 
-- **`-cores 4` is a no-op.** This is a code fact rather than a measurement: the
-  image's AVD already ships `hw.cpu.ncore = 4` in
-  `/home/androidusr/emulator/config.ini`. The flag restates the default.
+- **`-cores 4` is a no-op.** A code fact rather than a measurement: the image's
+  AVD already ships `hw.cpu.ncore = 4` in `/home/androidusr/emulator/config.ini`,
+  so the flag restates the default. It still matters as a *ceiling*, because
+  `emulatorBudget` lowers it for a Room that asked for fewer CPUs.
 - **`-noaudio` is neutral.** No measured gain and no measured harm. The AVD has
   `hw.audioInput`/`hw.audioOutput` on, but nothing in a Room ever opens them.
 - **`-memory 4096` is unpredictable rather than faster.** One run landed in the
@@ -52,12 +58,6 @@ Flag by flag:
   the guest physical memory inside the engine VM. There is no run in which it
   bought anything.
 
-So DevHotel passes no CPU/RAM budget, deliberately. That is a conclusion from
-measurement, not an omission — the win #104 was chasing had already been taken
-by the resolution profile, and the flags it proposed are respectively a no-op, a
-wash, and a source of variance. Do not add them back without re-running the
-probe below and beating the noise floor.
-
 ## Not available: hardware GPU acceleration
 
 DevHotel does not claim, and must not request, hardware GPU acceleration for the
@@ -65,6 +65,30 @@ emulator. `--gpus all` together with `-gpu host` makes the emulator select
 llvmpipe and Vulkan then fails with `VK_ERROR_INCOMPATIBLE_DRIVER`; forcing Mesa
 d3d12 fails emulator startup outright. `-gpu` stays at the image's
 `swiftshader_indirect`, and `-accel on` (KVM) is what keeps the CPU fast.
+
+## A retained emulator container cannot be restarted
+
+This is why Android Rooms refuse the warm wake path and recreate their emulator
+instead (see `docs/room-lifecycle.md`).
+
+- `docker stop -t 5` always exits **137**. The image's PID 1 does not forward
+  SIGTERM, so every stop is a SIGKILL.
+- Xvfb therefore never releases `:0` and leaves a read-only `/tmp/.X0-lock`.
+- The image also deletes the root `/etc/passwd` entry its bootstrap needs for
+  `sudo chown /dev/kvm`. DevHotel repairs that identity, and with it repaired
+  qemu does relaunch and reports `CPU Acceleration: working`. It then dies
+  anyway:
+
+```
+INFO | Warning: could not connect to display :0 (:0, )
+INFO | Fatal: This application failed to start because no Qt platform plugin
+       could be initialized.
+```
+
+No Docker CLI operation can delete a file inside a stopped container, so the
+stale lock cannot be cleared from outside, and the image offers no way to shut
+the emulator down cleanly first. Owning the emulator process directly
+([#108](https://github.com/r2cuerdame/DevHotel/issues/108)) is what removes this.
 
 ## Reproducing
 

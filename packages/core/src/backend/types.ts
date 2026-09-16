@@ -290,6 +290,22 @@ export interface IsolationBackend {
     log?: (line: string) => void,
     credential?: GitCredential | null
   ): Promise<void>
+  /**
+   * Shallow-clone a repository into an existing Host directory, for project
+   * detection before a Room exists.
+   *
+   * This is the backend's job rather than the orchestrator's because only the
+   * backend knows how its engine reaches the Host filesystem. A Host-local
+   * engine can bind-mount the directory straight into the clone container; an
+   * engine inside the DevHotel-managed runtime cannot see that path at all and
+   * has to clone guest-side and copy the tree out. Core must not have to know
+   * which of those it is talking to.
+   */
+  cloneToHostDirectory(
+    gitUrl: string,
+    hostPath: string,
+    opts?: { credential?: GitCredential | null; timeoutMs?: number }
+  ): Promise<ExecResult>
   /** Import a canonical Host folder through a short-lived read-only mount into a new owned workspace generation. */
   importHostFolder(
     roomId: string,
@@ -384,7 +400,9 @@ export interface IsolationBackend {
   startExistingEmulatorForRecovery(roomId: string): Promise<void>
   createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    /** The Room's own CPU/memory selection, which bounds the emulator guest budget. */
+    limits?: { cpus?: number; memoryMB?: number }
   ): Promise<void>
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
   captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>
