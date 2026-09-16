@@ -104,6 +104,21 @@ the exact installation ID, runtime ID, runtime version and daemon version. Host
 readiness therefore requires all three proofs: Host marker, Hyper-V object
 Notes/ID and guest daemon identity.
 
+Two Host permissions the VM needs are asked for explicitly rather than assumed.
+Provisioning grants `NT VIRTUAL MACHINE\Virtual Machines` **traverse** on every
+ancestor of the machine directory: a VM worker account is in no ordinary group,
+so it cannot otherwise walk a user profile path to reach its own attachments,
+and the start fails with "failed to open attachment … Access is denied" even
+though Hyper-V granted it those files. `(X)` carries no `(OI)`/`(CI)`, so
+nothing in those directories is listed, read or inherited.
+
+Nested virtualization is requested but **optional**. It matters only for KVM in
+the guest later; the runtime boots and serves Web Rooms without it, and Hyper-V
+refuses it on hosts that cannot nest — including inside a VM at all, since it
+does not stack three levels deep. Provisioning asks with `-ErrorAction Stop`,
+falls back to setting the processor count alone, and reports which it got, so a
+refusal is a recorded outcome rather than a lost VM or a silent downgrade.
+
 Hyper-V state is saved on DevHotel shutdown and configured for
 `StartIfRunning`/`Save` across Host shutdown. Startup repair rechecks the pinned
 image and all ownership proofs, recreates only a missing VM already described
