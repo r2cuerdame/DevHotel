@@ -61,6 +61,17 @@ export interface ManagedHyperVRuntimeMarker {
   baseImageDigest: string
   /** SHA-256 of the generated overlay, binding the guest identity payload. */
   overlayDigest: string
+  /**
+   * Whether this Host actually granted nested virtualization to the VM.
+   *
+   * Hyper-V refuses it on hosts that cannot nest, and the refusal is
+   * survivable -- the runtime boots and serves Web Rooms without it. What is
+   * not survivable is losing the answer: only a guest that was granted it can
+   * run KVM-backed Android emulators, so a later feature has to read what this
+   * Host decided rather than re-derive it. `null` is a marker written before
+   * this was recorded, and means unknown rather than refused.
+   */
+  nestedVirtualization?: boolean | null
   status: 'provisioning' | 'stopped' | 'starting' | 'ready' | 'broken'
   createdAt: string
   updatedAt: string
@@ -73,8 +84,17 @@ export interface ManagedHyperVRuntimeObservation {
   runtimeVersion: string | null
   daemonVersion: string | null
   baseImageDigest: string | null
+  /** What this Host granted at creation. `null` means unrecorded, not refused. */
+  nestedVirtualization: boolean | null
   detail: string
 }
+
+/**
+ * What a removal request actually did. Uninstall has to tell "there was
+ * nothing of ours here" apart from "something is here that DevHotel cannot
+ * prove it owns", because only the second leaves a Hyper-V object behind.
+ */
+export type ManagedHyperVRemovalOutcome = 'nothing-owned' | 'removed' | 'refused'
 
 interface HyperVInspection {
   exists: boolean
@@ -248,6 +268,9 @@ function validateMarker(value: unknown, expected: Omit<ManagedHyperVRuntimeOptio
     !isDigest(marker.baseImageDigest) ||
     typeof marker.overlayDigest !== 'string' ||
     !isDigest(marker.overlayDigest) ||
+    (marker.nestedVirtualization !== undefined &&
+      marker.nestedVirtualization !== null &&
+      typeof marker.nestedVirtualization !== 'boolean') ||
     !['provisioning', 'stopped', 'starting', 'ready', 'broken'].includes(marker.status ?? '') ||
     typeof marker.createdAt !== 'string' ||
     typeof marker.updatedAt !== 'string'
@@ -446,7 +469,16 @@ export class ManagedHyperVRuntime {
     if (typeof created['Id'] !== 'string') throw new Error('Managed Hyper-V provider did not return a VM identity')
     const after = await this.inspectVm()
     this.assertOwnedVm(after, marker)
-    return await this.writeMarker({ ...marker, vmId: after.id, status: 'stopped', failure: undefined })
+    return await this.writeMarker({
+      ...marker,
+      vmId: after.id,
+      // Recorded, not asserted. A Host that refused is still a valid runtime;
+      // what would be wrong is finishing provisioning with no record of which
+      // of the two happened.
+      nestedVirtualization: typeof created['Nested'] === 'boolean' ? created['Nested'] : null,
+      status: 'stopped',
+      failure: undefined
+    })
   }
 
   async start(): Promise<ManagedHyperVRuntimeObservation> {
@@ -485,8 +517,81 @@ export class ManagedHyperVRuntime {
       runtimeVersion: marker.runtimeVersion,
       daemonVersion: null,
       baseImageDigest: marker.baseImageDigest,
+      nestedVirtualization: marker.nestedVirtualization ?? null,
       detail: 'The DevHotel-managed runtime is stopped with its state preserved.'
     }
+  }
+
+  /**
+   * Tears down the runtime this install owns, and refuses to touch anything
+   * else.
+   *
+   * Deleting DevHotel's app data is not enough on Windows: a registered VM
+   * keeps its configuration and its VHDX attachments open, so a recursive
+   * delete of `%APPDATA%\DevHotel` either fails on the lock or succeeds and
+   * leaves Hyper-V holding a VM whose disks no longer exist. The Hyper-V
+   * object has to go first, and it can only go if DevHotel can still prove it
+   * is the one that made it.
+   *
+   * Proof is the Host marker plus the exact Notes payload, re-checked inside
+   * the same PowerShell pass that removes the VM so nothing can be swapped in
+   * between. Without that proof this reports `refused` and removes nothing --
+   * an orphan the user can see beats silently deleting a VM that might be
+   * theirs.
+   */
+  async remove(): Promise<ManagedHyperVRemovalOutcome> {
+    let marker: ManagedHyperVRuntimeMarker | null
+    try {
+      marker = await this.readMarker()
+    } catch {
+      // The marker is the only thing that could authorize removing a VM, so an
+      // unreadable one is a refusal rather than a reason to guess.
+      return 'refused'
+    }
+    if (!marker) {
+      const inspection = await this.inspectVm().catch(() => null)
+      // A VM under DevHotel's derived name with no marker is either a
+      // collision or a half-removed install; either way nothing authorizes
+      // deleting it.
+      return inspection?.exists ? 'refused' : 'nothing-owned'
+    }
+
+    const inspection = await this.inspectVm().catch(() => null)
+    if (inspection?.exists && !validateNotes(inspection.notes, marker)) return 'refused'
+    if (inspection?.exists && inspection.id && marker.vmId && inspection.id.toLocaleLowerCase('en-US') !== marker.vmId.toLocaleLowerCase('en-US')) {
+      return 'refused'
+    }
+
+    await this.runPowerShell(
+      [
+        `$vmName=${psLiteral(marker.vmName)}`,
+        `$vmId=${psLiteral(marker.vmId ?? '')}`,
+        `$notes=${psLiteral(markerNotes(marker))}`,
+        `$vmPath=${psLiteral(marker.vmPath)}`,
+        '$vm=Get-VM -Name $vmName -ErrorAction SilentlyContinue',
+        'if ($null -ne $vm) {',
+        // Re-proved here, not just in the caller: between the inspection above
+        // and this command the object could have been renamed onto or away
+        // from this name.
+        "  if ($vm.Notes -ne $notes) { throw 'Managed Hyper-V VM ownership proof is invalid' }",
+        "  if ($vmId -ne '' -and $vm.Id.Guid -ne $vmId) { throw 'Managed Hyper-V VM identity changed' }",
+        // The user asked to delete everything, so a running guest is turned
+        // off rather than saved -- a saved state would only hold the disks
+        // open for the removal that follows it.
+        "  if ([string]$vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }",
+        '  Remove-VM -VM $vm -Force -ErrorAction Stop',
+        '}',
+        // Only the directory this provider created, and only after the VM that
+        // held it open is gone.
+        'if (Test-Path -LiteralPath $vmPath) { Remove-Item -LiteralPath $vmPath -Recurse -Force -ErrorAction Stop }',
+        '[pscustomobject]@{Removed=$true}|ConvertTo-Json -Compress'
+      ].join(';')
+    )
+
+    // The owned ISO copy and the marker live under this provider's own root and
+    // nowhere else, so removing the root is exactly the owned footprint.
+    await rm(this.root, { recursive: true, force: true })
+    return 'removed'
   }
 
   async observe(): Promise<ManagedHyperVRuntimeObservation> {
@@ -499,6 +604,7 @@ export class ManagedHyperVRuntime {
           runtimeVersion: null,
           daemonVersion: null,
           baseImageDigest: null,
+          nestedVirtualization: null,
           detail: 'The DevHotel-managed Hyper-V runtime is not installed.'
         }
       }
@@ -511,6 +617,7 @@ export class ManagedHyperVRuntime {
           runtimeVersion: marker.runtimeVersion,
           daemonVersion: null,
           baseImageDigest: marker.baseImageDigest,
+          nestedVirtualization: marker.nestedVirtualization ?? null,
           detail: marker.status === 'broken' ? 'The DevHotel-managed runtime needs repair.' : 'The DevHotel-managed runtime is stopped.'
         }
       }
@@ -524,6 +631,7 @@ export class ManagedHyperVRuntime {
         runtimeVersion: null,
         daemonVersion: null,
         baseImageDigest: null,
+        nestedVirtualization: null,
         detail: 'The DevHotel-managed runtime ownership or health proof is invalid.'
       }
     }
@@ -536,6 +644,7 @@ export class ManagedHyperVRuntime {
       runtimeVersion: marker.runtimeVersion,
       daemonVersion: health.daemonVersion,
       baseImageDigest: marker.baseImageDigest,
+      nestedVirtualization: marker.nestedVirtualization ?? null,
       detail: 'The DevHotel-managed separate-kernel runtime is ready.'
     }
   }

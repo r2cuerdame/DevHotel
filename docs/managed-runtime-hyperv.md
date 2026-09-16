@@ -117,7 +117,12 @@ the guest later; the runtime boots and serves Web Rooms without it, and Hyper-V
 refuses it on hosts that cannot nest — including inside a VM at all, since it
 does not stack three levels deep. Provisioning asks with `-ErrorAction Stop`,
 falls back to setting the processor count alone, and reports which it got, so a
-refusal is a recorded outcome rather than a lost VM or a silent downgrade.
+refusal is a recorded outcome rather than a lost VM or a silent downgrade. The
+answer is written into the provider marker and surfaced in the runtime
+observation, because nothing else on the Host distinguishes "this Host refused"
+from "nobody ever asked", and only a guest that was granted it can run
+KVM-backed Android emulators later. A marker written before this was recorded
+reports `null` — unknown, not refused.
 
 Hyper-V state is saved on DevHotel shutdown and configured for
 `StartIfRunning`/`Save` across Host shutdown. Startup repair rechecks the pinned
@@ -125,6 +130,30 @@ image and all ownership proofs, recreates only a missing VM already described
 by the exact retained marker, starts it, and re-proves guest health. A repair
 regenerates the seed from the marker identity but **never** destroys the state
 disk: a power loss during provisioning must not cost the user Room data.
+
+## Uninstall
+
+Deleting DevHotel's app data is not sufficient on Windows. A registered Hyper-V
+VM keeps its configuration and its VHDX attachments open, so a recursive delete
+of `%APPDATA%DevHotel` either fails on the lock or succeeds and leaves Hyper-V
+holding a VM whose disks no longer exist. The Hyper-V object therefore has to go
+first, and only a running DevHotel still holds the proof that it may.
+
+Clean removal runs `ManagedRuntimeManager.remove()` in-process, after the Rooms
+are deleted and **before** the detached coordinator that runs the uninstaller
+and deletes app data is launched. The provider re-proves the Host marker and
+the exact Notes payload inside the same PowerShell pass that removes the VM, so
+nothing can be swapped onto the name in between; a running guest is turned off
+rather than saved, since a saved state would only hold the attachments open
+against the delete that follows. It then removes its own machine directory and
+runtime root, and nothing outside them.
+
+Without that proof the removal reports `refused` and touches nothing, and clean
+removal stops and says so. An orphaned VM the user can see and delete is a
+better outcome than DevHotel deleting a virtual machine that might be theirs —
+a name collision or a restored backup looks exactly like an install DevHotel
+made. A Host that was never provisioned reports `nothing-owned` and no
+PowerShell runs at all.
 
 ## Windows gates
 
@@ -156,8 +185,10 @@ the pinned ISO in a temporary directory.
 Unit coverage exercises collision refusal, identity drift, interrupted
 provisioning, app/Host restart, saved shutdown, nonce-bound named-pipe health,
 redirect refusal, oversize and digest failure cleanup, manager phase recovery,
-the Windows feature/elevation/reboot-resume gate, and the overlay's exact
-contents, permissions, determinism and extraction by a real `tar`.
+the Windows feature/elevation/reboot-resume gate, the recorded nested-
+virtualization outcome, ownership-fenced removal (removed / refused /
+nothing-owned), and the overlay's exact contents, permissions, determinism and
+extraction by a real `tar`.
 
 ### Guest bootstrap, proven on a real boot
 

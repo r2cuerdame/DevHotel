@@ -292,6 +292,7 @@ async function bootstrap(): Promise<void> {
     github,
     requestRelaunch: () => requestShutdown('relaunch'),
     runCleanRemoval: (operation) => cleanRemoval.run(operation),
+    removeManagedRuntime: () => managedRuntime.remove(),
     enableManagedRuntimeFeatures: async () => {
       const observation = await managedRuntime.enableWindowsFeatures()
       const gate = observation.windowsFeature

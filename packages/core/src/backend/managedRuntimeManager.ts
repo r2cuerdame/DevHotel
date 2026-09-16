@@ -2,6 +2,7 @@ import path from 'node:path'
 import {
   ManagedHyperVRuntime,
   NamedPipeHyperVGuestTransport,
+  type ManagedHyperVRemovalOutcome,
   type ManagedHyperVRuntimeObservation
 } from './managedHyperVRuntime'
 import {
@@ -68,6 +69,7 @@ export interface ManagedRuntimeProviderController {
   provision(...args: Parameters<ManagedHyperVRuntime['provision']>): ReturnType<ManagedHyperVRuntime['provision']>
   repair(...args: Parameters<ManagedHyperVRuntime['repair']>): ReturnType<ManagedHyperVRuntime['repair']>
   stop(): ReturnType<ManagedHyperVRuntime['stop']>
+  remove(): ReturnType<ManagedHyperVRuntime['remove']>
 }
 
 export interface ManagedRuntimeWindowsFeatureController {
@@ -177,7 +179,7 @@ export class ManagedRuntimeManager {
         provider.runtimeVersion === manifest.runtimeVersion &&
         provider.baseImageDigest === MANAGED_HYPERV_BOOT_ISO.sha256
       ) {
-        return bootstrap
+        return { ...bootstrap, nestedVirtualization: provider.nestedVirtualization }
       }
       return {
         ...bootstrap,
@@ -199,6 +201,21 @@ export class ManagedRuntimeManager {
         artifactDigests: {}
       }
     }
+  }
+
+  /**
+   * Removes everything this install provisioned on the Host, for uninstall.
+   *
+   * It runs while DevHotel is still alive and before app data is deleted,
+   * because only a live process holds the ownership proof, and a registered VM
+   * holds its disks open against the deletion that follows. Ownership is
+   * enforced by the provider: an object DevHotel cannot prove it created is
+   * reported back rather than deleted.
+   */
+  async remove(): Promise<ManagedHyperVRemovalOutcome> {
+    const manifest = await this.bootstrap.readManifest().catch(() => null)
+    if (!manifest) return 'nothing-owned'
+    return await this.providerFactory(manifest).remove()
   }
 
   async stop(): Promise<void> {

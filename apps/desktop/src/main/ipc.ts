@@ -79,6 +79,8 @@ export function registerIpc(opts: {
   requestRelaunch: () => void
   runCleanRemoval: (operation: CleanRemovalOperation) => Promise<boolean>
   finishCleanRemoval: () => void
+  /** Removes the DevHotel-owned managed runtime VM, or reports why it could not. */
+  removeManagedRuntime: () => Promise<'nothing-owned' | 'removed' | 'refused'>
   enableManagedRuntimeFeatures: () => Promise<{
     stage: string
     restartRequired: boolean
@@ -99,6 +101,7 @@ export function registerIpc(opts: {
     requestRelaunch,
     runCleanRemoval,
     finishCleanRemoval,
+    removeManagedRuntime,
     enableManagedRuntimeFeatures
   } = opts
   const caDir = join(userData, 'ca')
@@ -378,6 +381,25 @@ export function registerIpc(opts: {
       // This closes the orchestrator mutation gate, drains admitted work, and
       // deletes one stable inventory. Failed Room ownership stays retryable.
       await orch.deleteAllRooms('user')
+      // The managed runtime VM has to go while DevHotel is still running. The
+      // coordinator that deletes app data runs after this process exits, and a
+      // registered Hyper-V VM holds its VHDX attachments open against that
+      // delete -- and would survive it as a VM pointing at disks that no longer
+      // exist. Ownership is proved by the provider, so an object DevHotel
+      // cannot prove it created is reported here instead of removed.
+      let managedRuntimeRemoval: 'nothing-owned' | 'removed' | 'refused'
+      try {
+        managedRuntimeRemoval = await removeManagedRuntime()
+      } catch (err) {
+        throw new Error(
+          `Rooms were removed, but the DevHotel managed runtime could not be removed: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      if (managedRuntimeRemoval === 'refused') {
+        throw new Error(
+          'Rooms were removed, but DevHotel could not prove it owns the managed runtime virtual machine, so it was left in place. Remove it in Hyper-V Manager and try again.'
+        )
+      }
       try {
         if ((await caTrustStatus(caDir)) === 'trusted') await untrustCaInWindows(caDir)
       } catch (err) {

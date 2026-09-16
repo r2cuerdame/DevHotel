@@ -91,6 +91,12 @@ export interface ManagedRuntimeObservation {
   runtimeVersion: string | null
   artifactDigests: Record<string, string>
   /**
+   * Whether the Host granted the runtime nested virtualization. Reported, not
+   * required: the runtime is healthy either way, but only a guest that has it
+   * can later run KVM-backed Android emulators. `null` means not recorded.
+   */
+  nestedVirtualization?: boolean | null
+  /**
    * The Windows optional-feature gate, when one stands between this Host and a
    * provisionable runtime. Populated by the manager, which owns the harness;
    * the bootstrap alone never inspects or mutates Windows features.
