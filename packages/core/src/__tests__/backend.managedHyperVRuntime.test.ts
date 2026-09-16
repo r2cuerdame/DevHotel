@@ -204,6 +204,25 @@ describe('ManagedHyperVRuntime', () => {
     expect(path.extname(marker.statePath)).toBe('.vhdx')
   })
 
+  it('demands a deliberate migration when the generated guest overlay changes', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    const image = await releaseImage()
+    const marker = await managed.provision(image)
+
+    // Simulate a DevHotel build whose overlay bytes differ from the recorded
+    // ones. Re-seeding underneath a running install would silently change the
+    // guest's identity payload, so this must be refused by name.
+    await writeFile(
+      path.join(path.dirname(marker.vmPath), 'provider.json'),
+      JSON.stringify({ ...marker, overlayDigest: 'b'.repeat(64) }),
+      'utf8'
+    )
+    fake.vm = null
+
+    await expect(managed.provision(image)).rejects.toThrow(/overlay changed.*version bump/i)
+  })
+
   it('reuses the owned ISO instead of copying it again', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)

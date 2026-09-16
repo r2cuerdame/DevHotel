@@ -298,8 +298,7 @@ export class ManagedHyperVRuntime {
       !assertExactPath(marker.vmPath, this.vmPath) ||
       !assertExactPath(marker.seedPath, this.seedPath) ||
       !assertExactPath(marker.statePath, this.statePath) ||
-      marker.pipePath !== this.pipePath ||
-      marker.overlayDigest !== this.overlay.sha256
+      marker.pipePath !== this.pipePath
     ) {
       throw new Error('Managed Hyper-V ownership marker paths are invalid')
     }
@@ -348,6 +347,12 @@ export class ManagedHyperVRuntime {
       })
     } else if (marker.baseImageDigest !== image.sha256) {
       throw new Error('Managed Hyper-V runtime update requires an explicit migration')
+    } else if (marker.overlayDigest !== this.overlay.sha256) {
+      // The overlay is derived from the fenced identity, so a digest change can
+      // only mean this build generates a different guest bootstrap. That is a
+      // runtime change, and it has to be migrated deliberately rather than
+      // silently re-seeded underneath a running install.
+      throw new Error('Managed Hyper-V guest overlay changed; a runtime version bump is required')
     }
 
     if (inspection.exists) {
