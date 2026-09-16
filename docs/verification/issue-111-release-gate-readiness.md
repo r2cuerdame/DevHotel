@@ -40,9 +40,12 @@ frame protocol rather than a guest.
 The host-side baseline was re-run here rather than taken on trust:
 
 ```
-pnpm --filter @devhotel/core test
-Test Files  92 passed | 5 skipped (97)
-     Tests  1666 passed | 12 skipped (1678)
+@devhotel/core      92 files passed,  5 skipped   1666 passed, 12 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   1977 passed, 16 skipped
 ```
 
 Green — and that is exactly the point. A green suite is what #108's comment
