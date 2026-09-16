@@ -8,6 +8,10 @@ readiness assessment, not gate evidence, and nothing in it should be read as a
 passing row in `issue-106-clean-windows-acceptance.md` or
 `issue-107-managed-web-rooms.md` — every row in both of those is still blank.
 
+**Revised against `main@06fbb46`**, which lands #135. That PR changed B1's
+facts, so the B1 section below has been corrected rather than left to age; the
+rest of the measurements are unchanged and still carry their original date.
+
 ## The short version
 
 #111's eleven claims split into two groups, and they need different work:
@@ -19,10 +23,17 @@ passing row in `issue-106-clean-windows-acceptance.md` or
   evidence for a code path that does not exist, so building the clean VM first
   would have spent hours to arrive at four rows that still could not pass.
 
-**Two of those four were closed in this session** (`b0a6bf3`): low disk and
+**Two of those four were closed in this session** (`bf6ce55`): low disk and
 offline/retry now have behaviour and unit evidence, so they are environment-
-blocked like the rest rather than unbuildable. That leaves **B1 (Android)** as
-the one row no environment can produce, and **B4 (enterprise policy)** partial.
+blocked like the rest rather than unbuildable.
+
+**B1 (Android) was partially closed on `main` by #135**, which wired the managed
+emulator path. It is no longer the empty code path this document first recorded
+— but it still pulls a `budtmo/docker-android` base image, still covers only one
+of the four Android versions the product offers, and has never been booted. So
+it is not an environment-blocked row either: it is a third state, *implemented
+but not yet independent of docker-android*. **B4 (enterprise policy)** stays
+partial.
 
 ## Group A — blocked only by the environment
 
@@ -68,31 +79,59 @@ rules were deliberately reused rather than reimplemented (#107, `350675d`), so
 they are as implemented as the compatibility backend — and equally unproven on
 a managed guest.
 
-## Group B — blocked by missing implementation
+## Group B — blocked by implementation, not only by the environment
 
 ### B1. Android build / install / launch / preview without Host adb, Android Studio or Docker
 
-**Not implemented.** The Android execution path is still entirely
-`budtmo/docker-android`:
+**Corrected on 2026-09-17 against `main@06fbb46`.** An earlier revision of this
+document recorded that `androidEmulatorLaunch()` and `androidSdkPin` had **zero
+call sites**, that `managedRoomBackend.ts` had no emulator handling at all, and
+that therefore no Android Room could run by any path. **#135 made all three of
+those statements false**, and they are corrected here rather than left to age.
 
-- `packages/core/src/backend/naming.ts:119` returns
-  `budtmo/docker-android:emulator_${version}` as the emulator image.
-- `packages/core/src/backend/ociCli.ts` still carries the docker-android
-  workarounds — the KVM `chown` through `sudo` (`:4998`), the
-  cannot-be-restarted emulator (`:1992`), the wallpaper-aware fit daemon
-  (`:947`).
-- `androidEmulatorLaunch()` and `androidSdkPin` (#128, #129) have **zero call
-  sites** outside their own modules and `packages/core/src/index.ts`. They are
-  a pinned-artifact table and a launch *plan*; nothing invokes them. Their
-  tests (`backend.androidEmulatorLaunch.test.ts`, 7 tests;
-  `backend.androidSdkPin.test.ts`, 6 tests) assert the shape of the plan, not
-  an emulator that started.
-- `managedRoomBackend.ts` contains no Android, emulator or KVM handling at all.
+What #135 wired:
 
-So a clean Windows 11 VM with Docker absent cannot run an Android Room by any
-path. This is #108's remaining work, and #108 is open.
+- `ManagedRoomBackend.createEmulator()` (`managedRoomBackend.ts:208`) routes a
+  pinned Android version through `androidAvdPlan()`, `androidEmulatorLaunch()`
+  and `buildManagedEmulatorContainerArgs()`, replacing the container's
+  entrypoint so the emulator binary is exec'd directly and docker-android's
+  `supervisord` never runs.
+- `androidAvdVolume()` (`naming.ts:135`) names the per-Room persistent AVD
+  volume, and `startExistingEmulatorForRecovery()` is overridden to document
+  that the docker-android `passwd` repair does not apply on the managed path.
+- `backend.managedRoomBackend.androidEmulator.test.ts` — 18 tests over the
+  generated `docker create` argv and entrypoint script.
 
-### B2. Low disk — **closed in `b0a6bf3`**
+**This does not make the row claimable, and #135 does not claim it either.** Its
+own description records that end-to-end acceptance is tracked in #111 and that
+the image dependency is deliberate for now. What still blocks the row:
+
+- **The base image is still `budtmo/docker-android`.** `createEmulator()`
+  resolves `imageRef` via `emulatorImage(version)` and pulls it, because the
+  managed path reuses docker-android's X11 / VNC / openbox stack;
+  `naming.ts:119` still returns `budtmo/docker-android:emulator_${version}`. A
+  DevHotel-owned managed emulator base image is the **active #108 follow-up**,
+  and until it lands, a managed Android Room still depends on an unpinned
+  third-party Docker Hub image — which is the opposite of what this claim
+  asserts.
+- **Only Android 14.0 is pinned.** `ANDROID_SYSTEM_IMAGES` holds API 34 alone,
+  so `pinnedAndroidVersions()` returns a single version. The other three the
+  Stack tab offers — 13.0, 12.0, 11.0 — fall through to `super.createEmulator`,
+  i.e. the unmodified docker-android compatibility path.
+- **The compatibility path's workarounds are untouched.** `ociCli.ts` still
+  carries the KVM `chown` through `sudo` (`:4998`), the emulator that cannot be
+  restarted (`:1992`) and the wallpaper-aware fit daemon (`:926`, `:960`).
+- **Nothing has been booted.** The 18 new tests assert argv and script text. No
+  emulator has started under the managed runtime on any machine, and the managed
+  guest itself has never booted under Hyper-V at all (Group A, claim 7).
+
+So B1 moved from *no code path exists* to *a code path exists, has never run,
+and is not yet free of docker-android*. **#108's live acceptance and #111's
+Android row are both still unsatisfied.** #108 was auto-closed by `Fixes: #108`
+in #135; the base-image removal is the follow-up that has to land before any
+clean Windows VM can produce this row.
+
+### B2. Low disk — **closed in `bf6ce55`**
 
 It was not implemented: no free-space probe, no `ENOSPC` handling and no
 disk-budget refusal existed anywhere in `packages` or `apps`. Provisioning
@@ -106,7 +145,7 @@ report free space is recorded as `availableBytes: null` and allowed to proceed,
 because refusing to provision on a filesystem Node cannot measure would break
 installs that would have worked.
 
-### B3. Offline / retry — **closed in `b0a6bf3`**
+### B3. Offline / retry — **closed in `bf6ce55`**
 
 `downloadManagedRuntimeArtifact()` issued a single `fetch`: no retry, no
 resumed `Range` request, no backoff, no offline classification. A connection
@@ -197,20 +236,27 @@ It would also not be sufficient. The full path from here to a gate result is:
    which has never been done, on any machine;
 5. run #106 rows 1–15, then #107's 17-row matrix.
 
-Steps 1–5 land on seven of eleven claims. The other four (B1–B4) stay red.
+Those steps land on seven of eleven claims, and give B2 and B3 the live rows
+their unit evidence cannot supply. B1 and B4 stay red regardless of the
+environment — B1 until the #108 base-image follow-up lands, B4 until the
+policy-denied case is handled.
 
 ## Recommended order
 
-1. ~~Finish B2 and B3 first.~~ **Done** — `b0a6bf3`.
-2. **Close B4's enterprise case**, or narrow #111's wording to the
+1. ~~Finish B2 and B3 first.~~ **Done** — `bf6ce55`.
+2. ~~Wire `androidEmulatorLaunch()` to the managed backend.~~ **Done on `main`**
+   — #135.
+3. **Close B4's enterprise case**, or narrow #111's wording to the
    nested-virtualization refusal that is actually implemented.
-3. **Then take the reboot**, on a host with no active agent work, and run #106
+4. **Then take the reboot**, on a host with no active agent work, and run #106
    + #107 in the clean VM. That settles Group A and claim 7, and gives B2/B3
    their live rows.
-4. **B1 (Android) is #108's remaining implementation**, not a gate run. It
-   needs `androidEmulatorLaunch()` wired to the managed backend and `naming.ts`
-   stopped from naming a Docker Hub image. Until then no environment can
-   produce that row, and #111 cannot close.
+5. **B1 (Android) still needs the #108 follow-up before it needs a gate run.**
+   `naming.ts` must stop naming a Docker Hub image — that means a DevHotel-owned
+   managed emulator base image carrying the X11/VNC stack, and system-image pins
+   for the remaining offered versions. Until that lands the managed path pulls
+   docker-android, no clean Windows VM can produce this row, and #108 acceptance
+   and #111 both stay open.
 
 Nothing above was mocked, and nothing above is a gate pass.
 
@@ -218,9 +264,31 @@ Nothing above was mocked, and nothing above is a gate pass.
 
 | Commit | What |
 |---|---|
-| `ea1627e`, `57fc3f4` | this document |
-| `b0a6bf3` | B2 + B3: free-space precondition, resumable download with bounded transport retry |
+| `024d372`, `a3efb1c`, `b6577b3` | this document |
+| `bf6ce55` | B2 + B3: free-space precondition, resumable download with bounded transport retry |
+| *(this commit)* | rebased onto `main@06fbb46`; B1 corrected for #135 |
 
-Suites after the change: core 1679 passed / 12 skipped, shared 52, mcp 56,
-desktop 203 / 4 skipped. Workspace typecheck clean. Lint 0 errors, 4
-pre-existing warnings.
+Commit hashes are post-rebase onto `main@06fbb46`. The pre-rebase equivalents
+were `ea1627e`, `57fc3f4`, `92c32c5` and `b0a6bf3`.
+
+Re-run after the rebase onto `main@06fbb46`, on this host, today:
+
+```
+@devhotel/core      94 files passed,  5 skipped   1697 passed, 12 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   2008 passed, 16 skipped
+```
+
+Core is 1697 rather than the 1679 this branch measured before the rebase: the
+extra 18 are #135's `backend.managedRoomBackend.androidEmulator.test.ts`, which
+is the evidence that the wiring described in B1 is present on this branch.
+
+`pnpm -r typecheck` clean across all four packages. `pnpm lint` 0 errors, 4
+warnings — all pre-existing unused-import warnings in
+`backend.network-lifecycle.test.ts`, none introduced here.
+
+None of this is gate evidence. It is a host-side suite, which is exactly what
+B1 says must not be mistaken for an Android row.
