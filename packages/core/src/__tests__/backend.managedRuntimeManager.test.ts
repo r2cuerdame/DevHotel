@@ -13,6 +13,28 @@ import {
   type ManagedRuntimeProviderController
 } from '../backend/managedRuntimeManager'
 
+/**
+ * The Windows optional-feature gate is exercised by its own suite; here it is
+ * stubbed so these tests never spawn PowerShell against the developer's Host.
+ */
+const completedWindowsFeature = {
+  observe: async () => ({
+    stage: 'completed' as const,
+    missing: [],
+    restartRequired: false,
+    edition: 'Microsoft Windows 11 Pro',
+    detail: 'Windows virtualization features required by the DevHotel runtime are enabled.'
+  }),
+  enable: async () => ({
+    stage: 'completed' as const,
+    missing: [],
+    restartRequired: false,
+    edition: 'Microsoft Windows 11 Pro',
+    detail: 'Windows virtualization features required by the DevHotel runtime are enabled.'
+  })
+}
+
+
 function support(code: ManagedRuntimeSupport['code'] = 'ready'): ManagedRuntimeSupport {
   return {
     supported: code === 'ready' || code === 'virtualization-ready' || code === 'elevation-required',
@@ -163,6 +185,7 @@ describe('ManagedRuntimeManager', () => {
     const manager = new ManagedRuntimeManager({
       userData: 'C:\\DevHotelData',
       installId: 'install-owned',
+      windowsFeature: completedWindowsFeature,
       bootstrap,
       downloadArtifact,
       providerFactory
@@ -179,6 +202,7 @@ describe('ManagedRuntimeManager', () => {
     const manager = new ManagedRuntimeManager({
       userData: 'C:\\DevHotelData',
       installId: 'install-owned',
+      windowsFeature: completedWindowsFeature,
       bootstrap,
       downloadArtifact: vi.fn(async () => downloaded),
       providerFactory: () => hyperv
@@ -206,6 +230,7 @@ describe('ManagedRuntimeManager', () => {
     const manager = new ManagedRuntimeManager({
       userData: 'C:\\DevHotelData',
       installId: 'install-owned',
+      windowsFeature: completedWindowsFeature,
       bootstrap,
       downloadArtifact: vi.fn(async () => downloaded),
       providerFactory: () => hyperv
@@ -221,6 +246,7 @@ describe('ManagedRuntimeManager', () => {
     const manager = new ManagedRuntimeManager({
       userData: 'C:\\DevHotelData',
       installId: 'install-owned',
+      windowsFeature: completedWindowsFeature,
       bootstrap,
       downloadArtifact: vi.fn(async () => downloaded),
       providerFactory: () => hyperv
@@ -244,6 +270,7 @@ describe('ManagedRuntimeManager', () => {
     const manager = new ManagedRuntimeManager({
       userData: 'C:\\DevHotel',
       installId: 'install-1234',
+      windowsFeature: completedWindowsFeature,
       bootstrap,
       providerFactory: () => hyperv
     })
@@ -251,5 +278,93 @@ describe('ManagedRuntimeManager', () => {
     await manager.stop()
 
     expect(stop).toHaveBeenCalledOnce()
+  })
+  it('reports the Windows approval gate instead of provisioning on a Host without Hyper-V', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.currentSupport = support('virtualization-ready')
+    const downloadArtifact = vi.fn()
+    const providerFactory = vi.fn()
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotelData',
+      installId: 'install-owned',
+      windowsFeature: {
+        observe: async () => ({
+          stage: 'elevation-required' as const,
+          missing: ['Microsoft-Hyper-V-All'],
+          restartRequired: false,
+          edition: 'Microsoft Windows 11 Pro',
+          detail: 'DevHotel needs one-time Windows approval to enable the virtualization features its runtime requires.'
+        }),
+        enable: async () => {
+          throw new Error('enable must not run without the caller asking')
+        }
+      },
+      bootstrap,
+      downloadArtifact,
+      providerFactory
+    })
+
+    const observation = await manager.prepare()
+    expect(observation.windowsFeature?.stage).toBe('elevation-required')
+    expect(observation.detail).toContain('approval')
+    expect(downloadArtifact).not.toHaveBeenCalled()
+    expect(providerFactory).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a pending restart without touching the provider', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.currentSupport = support('virtualization-ready')
+    const providerFactory = vi.fn()
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotelData',
+      installId: 'install-owned',
+      windowsFeature: {
+        observe: async () => ({
+          stage: 'awaiting-restart' as const,
+          missing: ['Microsoft-Hyper-V-All'],
+          restartRequired: true,
+          edition: 'Microsoft Windows 11 Pro',
+          detail: 'Windows must restart to finish enabling the DevHotel runtime features.'
+        }),
+        enable: async () => {
+          throw new Error('enable must not run while a restart is pending')
+        }
+      },
+      bootstrap,
+      downloadArtifact: vi.fn(),
+      providerFactory
+    })
+
+    const observation = await manager.prepare()
+    expect(observation.windowsFeature?.restartRequired).toBe(true)
+    expect(providerFactory).not.toHaveBeenCalled()
+  })
+
+  it('reports an unsupported Host when the Windows edition cannot offer Hyper-V', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.currentSupport = support('virtualization-ready')
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotelData',
+      installId: 'install-owned',
+      windowsFeature: {
+        observe: async () => ({
+          stage: 'unsupported-edition' as const,
+          missing: ['Microsoft-Hyper-V-All'],
+          restartRequired: false,
+          edition: 'Microsoft Windows 11 Home',
+          detail: 'This Windows edition does not offer Hyper-V, so the managed DevHotel runtime cannot be provisioned here.'
+        }),
+        enable: async () => {
+          throw new Error('enable must not run on an unsupported edition')
+        }
+      },
+      bootstrap,
+      downloadArtifact: vi.fn(),
+      providerFactory: vi.fn()
+    })
+
+    const observation = await manager.prepare()
+    expect(observation.state).toBe('unsupported')
+    expect(observation.windowsFeature?.edition).toBe('Microsoft Windows 11 Home')
   })
 })

@@ -60,6 +60,7 @@ export const IPC = {
   footprint: 'app:footprint',
   autostartSet: 'app:autostartSet',
   cleanUninstall: 'app:cleanUninstall',
+  enableManagedRuntimeFeatures: 'app:enableManagedRuntimeFeatures',
   androidAction: 'android:action',
   androidPairingDiscover: 'android:pairing:discover',
   androidPairingBegin: 'android:pairing:begin',
@@ -298,6 +299,18 @@ export interface IpcApi {
     /** deletes every room, removes CA trust and autostart, erases app data, launches the uninstaller */
     /** true once cleanup/uninstaller helpers are scheduled; false when native confirmation is cancelled */
     cleanUninstall(): Promise<boolean>
+    /**
+     * Asks Windows, through one consented elevation, to enable the optional
+     * features the DevHotel-managed runtime needs. Returns the resulting gate:
+     * `completed`, `awaiting-restart` when Windows still wants a reboot,
+     * `unsupported-edition`, or `failed` when approval was declined.
+     */
+    enableManagedRuntimeFeatures(): Promise<{
+      stage: string
+      restartRequired: boolean
+      edition: string | null
+      detail: string
+    }>
   }
   android: {
     /** drive a phone control (navigation key or screen rotation) on the room's emulator */

@@ -11,6 +11,10 @@ import {
   type ManagedRuntimeObservation
 } from './managedRuntime'
 import {
+  ManagedRuntimeWindowsFeatureHarness,
+  type ManagedRuntimeFeatureObservation
+} from './managedRuntimeWindowsFeature'
+import {
   downloadManagedRuntimeArtifact,
   type ManagedRuntimeDownloadedArtifact,
   type ManagedRuntimeFetch,
@@ -59,6 +63,11 @@ export interface ManagedRuntimeProviderController {
   stop(): ReturnType<ManagedHyperVRuntime['stop']>
 }
 
+export interface ManagedRuntimeWindowsFeatureController {
+  observe(): Promise<ManagedRuntimeFeatureObservation>
+  enable(): Promise<ManagedRuntimeFeatureObservation>
+}
+
 export interface ManagedRuntimeManagerOptions {
   userData: string
   installId: string
@@ -68,6 +77,7 @@ export interface ManagedRuntimeManagerOptions {
   bootstrap?: ManagedRuntimeBootstrapController
   downloadArtifact?: DownloadArtifact
   providerFactory?: (manifest: ManagedRuntimeManifest) => ManagedRuntimeProviderController
+  windowsFeature?: ManagedRuntimeWindowsFeatureController
 }
 
 /** Coordinates resumable bootstrap state with the concrete Hyper-V provider. */
@@ -77,6 +87,8 @@ export class ManagedRuntimeManager {
   private readonly fetch?: ManagedRuntimeFetch
   private readonly downloadArtifact: DownloadArtifact
   private readonly providerFactory: (manifest: ManagedRuntimeManifest) => ManagedRuntimeProviderController
+  private readonly windowsFeature: ManagedRuntimeWindowsFeatureController
+  private readonly platform: NodeJS.Platform
   private preparation: Promise<ManagedRuntimeObservation> | null = null
 
   constructor(opts: ManagedRuntimeManagerOptions) {
@@ -84,6 +96,15 @@ export class ManagedRuntimeManager {
     this.bootstrap =
       opts.bootstrap ??
       new ManagedRuntimeBootstrap({
+        userData: this.userData,
+        installId: opts.installId,
+        platform: opts.platform,
+        runner: opts.runner
+      })
+    this.platform = opts.platform ?? process.platform
+    this.windowsFeature =
+      opts.windowsFeature ??
+      new ManagedRuntimeWindowsFeatureHarness({
         userData: this.userData,
         installId: opts.installId,
         platform: opts.platform,
@@ -112,9 +133,29 @@ export class ManagedRuntimeManager {
     return await this.preparation
   }
 
+  /**
+   * Turns on the Windows features the provider needs, through one consented
+   * elevation. This is deliberately caller-driven: DevHotel never opens a UAC
+   * prompt on its own during launch.
+   */
+  async enableWindowsFeatures(): Promise<ManagedRuntimeObservation> {
+    if (this.platform !== 'win32') return await this.observe()
+    await this.windowsFeature.enable()
+    return await this.prepare()
+  }
+
   async observe(): Promise<ManagedRuntimeObservation> {
     const bootstrap = await this.bootstrap.observe()
-    if (bootstrap.state !== 'ready') return bootstrap
+    const gate = await this.windowsGate()
+    if (gate && bootstrap.state !== 'ready') {
+      return {
+        ...bootstrap,
+        state: gate.stage === 'unsupported-edition' ? 'unsupported' : bootstrap.state,
+        detail: gate.detail,
+        windowsFeature: gate
+      }
+    }
+    if (bootstrap.state !== 'ready') return gate ? { ...bootstrap, windowsFeature: gate } : bootstrap
     try {
       const manifest = await this.bootstrap.readManifest()
       if (!manifest) return bootstrap
@@ -163,7 +204,12 @@ export class ManagedRuntimeManager {
 
   private async prepareOnce(): Promise<ManagedRuntimeObservation> {
     const support = await this.bootstrap.support()
-    if (support.code !== 'ready') return await this.bootstrap.observe()
+    if (support.code !== 'ready') {
+      // The provider cannot be provisioned until Windows itself offers Hyper-V.
+      // Report the exact gate — approval needed, restart pending, or an edition
+      // that will never offer it — instead of a bare capability failure.
+      return await this.observe()
+    }
 
     let manifest = await this.bootstrap.beginProvision(MANAGED_HYPERV_RUNTIME_VERSION)
     try {
@@ -214,6 +260,13 @@ export class ManagedRuntimeManager {
       await this.bootstrap.markBroken(manifest.runtimeId, failure).catch(() => undefined)
       throw error
     }
+  }
+
+  /** The Windows feature gate, or `null` when nothing stands in the way. */
+  private async windowsGate(): Promise<ManagedRuntimeFeatureObservation | null> {
+    if (this.platform !== 'win32') return null
+    const gate = await this.windowsFeature.observe().catch(() => null)
+    return gate && gate.stage !== 'completed' ? gate : null
   }
 
   private assertReady(observation: ManagedHyperVRuntimeObservation, manifest: ManagedRuntimeManifest): void {

@@ -292,6 +292,16 @@ async function bootstrap(): Promise<void> {
     github,
     requestRelaunch: () => requestShutdown('relaunch'),
     runCleanRemoval: (operation) => cleanRemoval.run(operation),
+    enableManagedRuntimeFeatures: async () => {
+      const observation = await managedRuntime.enableWindowsFeatures()
+      const gate = observation.windowsFeature
+      return {
+        stage: gate?.stage ?? 'completed',
+        restartRequired: gate?.restartRequired ?? false,
+        edition: gate?.edition ?? null,
+        detail: gate?.detail ?? observation.detail
+      }
+    },
     // Bypass the removal gate only after the detached coordinator exists. The
     // normal shutdown path still disposes streams/gateway before app.exit.
     finishCleanRemoval: () => setTimeout(() => shutdown('quit'), 500)
