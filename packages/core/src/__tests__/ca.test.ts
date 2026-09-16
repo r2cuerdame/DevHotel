@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import forge from 'node-forge'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { caTrustStatus, ensureCa, issueLeafCert } from '../gateway/ca'
+import { caTrustStatus, ensureCa, issueLeafCert, randomSerial } from '../gateway/ca'
 
 let caDir: string
 
@@ -13,6 +13,37 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await rm(caDir, { recursive: true, force: true })
+})
+
+describe('randomSerial', () => {
+  // A serial that breaks these rules does not fail where it is generated. It
+  // fails later, when OpenSSL loads the finished certificate, as
+  // ERR_OSSL_ASN1_ILLEGAL_PADDING -- so the only cheap place to catch it is
+  // here. The previous implementation forced just the top nibble to zero and
+  // produced a rejected serial about 3% of the time, which read as a flaky
+  // gateway suite rather than as a certificate bug.
+  it('always encodes as a positive, minimally encoded DER INTEGER', () => {
+    const offenders: string[] = []
+    for (let i = 0; i < 20_000; i += 1) {
+      const serial = randomSerial()
+      const lead = parseInt(serial.slice(0, 2), 16)
+      const next = parseInt(serial.slice(2, 4), 16)
+      // Negative: a leading byte >= 0x80 makes the INTEGER negative.
+      // Illegal padding: a leading 0x00 is only legal before a byte >= 0x80.
+      if (lead >= 0x80 || (lead === 0x00 && next < 0x80)) offenders.push(serial)
+    }
+    expect(offenders.slice(0, 5)).toEqual([])
+  })
+
+  it('stays a full-width, varied 16-byte serial', () => {
+    const serials = new Set<string>()
+    for (let i = 0; i < 1_000; i += 1) {
+      const serial = randomSerial()
+      expect(serial).toMatch(/^[0-9a-f]{32}$/)
+      serials.add(serial)
+    }
+    expect(serials.size).toBe(1_000)
+  })
 })
 
 describe('ensureCa', () => {
