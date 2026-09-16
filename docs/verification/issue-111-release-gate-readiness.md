@@ -12,6 +12,14 @@ passing row in `issue-106-clean-windows-acceptance.md` or
 facts, so the B1 section below has been corrected rather than left to age; the
 rest of the measurements are unchanged and still carry their original date.
 
+**Revised again on 2026-09-17 against `main@1181428`**, which lands #136. Two
+things changed that the earlier revisions could not have known, and both are
+recorded in *What the second attempt found* at the end of this document: the
+managed Android image is published but **not publicly pullable**, and the
+Windows feature gate was **never actually reading the feature state**. The
+second is a defect no clean VM would have fixed, and it would have failed the
+fresh-install and reboot rows on the first try.
+
 ## The short version
 
 #111's eleven claims split into two groups, and they need different work:
@@ -292,3 +300,195 @@ warnings — all pre-existing unused-import warnings in
 
 None of this is gate evidence. It is a host-side suite, which is exactly what
 B1 says must not be mistaken for an Android row.
+
+---
+
+# What the second attempt found — 2026-09-17, `main@1181428`
+
+The gate was dispatched a second time. It still did not run, and the
+environment is still the reason it could not — but the environment was no
+longer the *only* reason, and the two new blockers below are both ones that
+building the VM first would have discovered the expensive way.
+
+## The environment, re-measured rather than assumed
+
+Nothing moved:
+
+```
+Edition               : Microsoft Windows 11 Pro (26200)
+Elevated              : False
+Microsoft-Hyper-V-All : InstallState 2 (Disabled) — vmms.exe absent, New-VM not recognised
+Free space on C:      : 460.7 GB
+Windows 11 ISO        : none on this machine
+```
+
+Two things were checked that the first attempt had not been explicit about:
+
+- **`recue` *is* in `Administrators`.** So the block is not "this account
+  cannot elevate". It is that `EnableLUA=1` with `PromptOnSecureDesktop=1`
+  puts the consent prompt on the secure desktop, which an automated session
+  cannot answer. Enabling Hyper-V needs a human to click it.
+- **The host is still mid-flight**: 7 `DevHotel`, 14 `node`, 11
+  `claude`/`orca` processes, and another agent's containers. The dispatch
+  authorised the milestone reboot *only when it will not corrupt active work*.
+  That precondition is still not met, so the reboot was again not taken.
+
+## New blocker 1 — the managed Android image is published but not pullable
+
+#136 removed `budtmo/docker-android` from the managed execution path and pinned
+a DevHotel-owned image instead:
+
+```
+MANAGED_EMULATOR_PREVIEW_IMAGE =
+  ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe38…
+```
+
+`ManagedRoomBackend.createEmulator()` pulls that digest before it creates
+anything. Measured against GHCR today:
+
+| Check | Result |
+|---|---|
+| Manifest by digest, **authenticated** | `HTTP 200` — the image exists |
+| Manifest by digest, **anonymous** | `HTTP 403`; the anonymous token request returns no token |
+| Package visibility | `visibility: private`, `repository: null` |
+| Publish workflow on `main` (run `35154759623`) | **failure** — `denied: permission_denied: read_package` |
+| Package version created | `2026-09-16T21:25:46Z` — *before* both workflow runs |
+
+Read together these say one thing: the image was pushed **by hand**, not by CI.
+The package was therefore created outside the repository, is not linked to it,
+and the repo's `GITHUB_TOKEN` consequently has no access — which is exactly the
+`read_package` denial the `main` run failed with. The
+`org.opencontainers.image.source` label is already in the Dockerfile; it links
+packages *created by* a workflow, and cannot retroactively adopt one that was
+not.
+
+**Why this fails the gate.** #111's Android claim is that a clean Windows 11 VM
+builds, installs, launches and previews Android with no Host prerequisites. That
+VM has no GitHub credentials. A pull of a private GHCR digest from it fails
+before an emulator is ever created — so the row fails at its first step, for a
+reason that has nothing to do with Hyper-V, Android or the code #136 wrote. The
+managed path is no longer *dependent* on docker-android; it is currently
+dependent on something worse, a registry only this account can read.
+
+**This was not fixed here.** Making the package public is an outward-facing
+publish on the user's GitHub account, and the fix also needs the package granted
+to the repository so CI can republish it. Both were escalated rather than taken
+unilaterally.
+
+## New blocker 2 — the Windows feature gate was never reading the feature state
+
+This one was found by running the harness's own PowerShell against this real
+Host instead of against its test double, and it is the more serious of the two.
+
+`inspect()` asked `Get-WindowsOptionalFeature -Online`. That is a DISM *online*
+operation and **requires elevation**. DevHotel runs unelevated, so on this
+machine the call fails with a COMException meaning "the requested operation
+requires elevation", and `-ErrorAction SilentlyContinue` turned that refusal
+into `Absent`. Measured, before the fix:
+
+```
+LIVE_INSPECT  features: { "Microsoft-Hyper-V-All": "absent" }
+              ^ Windows itself reports InstallState 2 = Disabled
+```
+
+Two gate rows follow from that, and both would have failed on the first try in
+the clean VM:
+
+- **Reboot (claim 4) fails.** With a record saying `awaiting-restart` from an
+  earlier boot, `observe()` on this real Host returned **`elevation-required`** —
+  it asked for the approval again for work already done. The module's own
+  contract says a user who defers the reboot is never asked to elevate twice for
+  the same work. It was.
+- **Fresh install (claim 1) fails.** An enabled feature also reads as `absent`,
+  so `observe()` could never reach `completed` from the app at all. The gate
+  would have sat at `elevation-required` on a machine where Hyper-V was already
+  on.
+
+No host-side test caught this, because the test double answers the DISM query
+successfully — it models a Windows that always replies. That is the specific way
+a green suite can be green about nothing, which is the warning this document
+opened with.
+
+**Fixed in `3aa08bf`.** `Win32_OptionalFeature` answers the same question
+without elevation and is now the fallback; DISM is kept because it is the only
+source that reports `EnablePending`. Verified unelevated against real Windows:
+
+```
+Microsoft-Hyper-V-All              Disabled     (was reported "absent")
+Microsoft-Windows-Subsystem-Linux  Enabled
+VirtualMachinePlatform             Enabled
+Containers                         Disabled
+```
+
+Because the unelevated read cannot express `EnablePending`, it reports a feature
+as enabled while the restart is still outstanding. The recorded boot identity
+proves the restart instead, so that check now runs *before* the
+features-are-enabled branch — otherwise the provider would be started against a
+hypervisor that is not running yet, which is the failure the original code
+commented on and then made possible by another route.
+
+## B4 (enterprise virtualization-policy failure) — closed in `3aa08bf`
+
+The gap this document recorded was that a policy-denied enablement surfaced as a
+generic `failed` stage carrying a DISM string — with a retry button beside it
+that could not change the outcome.
+
+- The elevated child now returns the **HRESULT**, which is what separates an
+  administrator forbidding the change from a download that failed; the message
+  alone is localized and cannot carry that distinction.
+- `0x800F0906`, `0x800F0954`, `0x800F081F` and `0x80070005`, plus the wording
+  Windows uses for a policy refusal, classify it as a new **`blocked-by-policy`**
+  stage.
+- `inspect()` reads the servicing policy surface unelevated — `UseWUServer`,
+  `RepairContentServerSource`, `LocalSourcePath` — so the refusal can say *why*.
+  An unreadable policy surface is recorded as **no finding**, not as a managed
+  Host: the same choice B2 made when a filesystem will not report free space.
+- The manager reports a policy-blocked Host as `unsupported`, and Settings stops
+  offering an approval that leads back to the same refusal.
+- The raw Windows text stays in `failure`, which the renderer boundary already
+  drops; the sentence the user reads is DevHotel's own.
+
+It is worth being exact about what this is: **the enterprise policy row still
+has to be run on a policy-managed Host.** What changed is that there is now a
+behaviour to run it against, and a wrong answer would now be wrong in a way the
+gate can see.
+
+## Suites, re-measured on this branch
+
+```
+@devhotel/core      95 files passed,  5 skipped   1730 passed, 12 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   2041 passed, 16 skipped
+```
+
+`pnpm -r typecheck` clean across all four packages. `pnpm lint` 0 errors, 4
+warnings — the same pre-existing unused-import warnings in
+`backend.network-lifecycle.test.ts`.
+
+## Where #111 actually stands
+
+| Group | Claims | State |
+|---|---|---|
+| A | fresh install, upgrade, rollback, reboot, crash/recovery, uninstall, North Star Web | Environment-blocked. Two of them (fresh install, reboot) were **also** code-blocked until `3aa08bf`. |
+| B1 | Android without Host adb / Android Studio / Docker | **Blocked on a private registry**, and still only Android 14.0 is pinned; 13.0/12.0/11.0 fall through to docker-android. |
+| B2 | Low disk | Behaviour landed (`bf6ce55`); needs its live row. |
+| B3 | Offline / retry | Behaviour landed (`bf6ce55`); needs its live row. |
+| B4 | Enterprise virtualization policy | Behaviour landed (`3aa08bf`); needs a policy-managed Host. |
+
+The order has not changed, but one step has been added ahead of the reboot:
+
+1. **Make the GHCR package publicly pullable and grant it to the repository**,
+   then confirm the `main` workflow publishes. Until that is true, the Android
+   row cannot pass from any machine that is not signed in to this account — and
+   a machine that is signed in is not the clean VM the gate is about.
+2. Pin the remaining three Android system images, or narrow the claim to the
+   version that is pinned.
+3. **Then take the reboot**, on a host with no active agent work, and run #106
+   rows 1–15 and #107 17-row matrix in the clean VM.
+
+Nothing above is a gate pass. Two of the reasons it is not are now smaller than
+they were this morning, and one of them — the feature read — was a defect the
+VM would have found for us at much greater cost.

@@ -213,7 +213,10 @@ export class ManagedRuntimeManager {
     if (gate && bootstrap.state !== 'ready') {
       return {
         ...bootstrap,
-        state: gate.stage === 'unsupported-edition' ? 'unsupported' : bootstrap.state,
+        // A Home edition and a policy-managed Host are the same answer to the
+        // user: this machine will not run the managed runtime, and nothing they
+        // can do here changes that.
+        state: gate.stage === 'unsupported-edition' || gate.stage === 'blocked-by-policy' ? 'unsupported' : bootstrap.state,
         detail: gate.detail,
         update,
         windowsFeature: gate
