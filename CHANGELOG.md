@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Web Rooms can run without an external Docker Engine
+
+- Web Rooms now run inside the DevHotel-managed Linux runtime when it is
+  healthy, and fall back to the clearly labelled external compatibility engine
+  when it is not. Which one a launch got is reported rather than assumed, because
+  it is the only thing that explains a Room's behaviour.
+  ([#107](https://github.com/r2cuerdame/DevHotel/issues/107))
+- The Room model itself is unchanged: the same anchor/namespace layout, per-Room
+  networks, owned volume generations, ownership labels and relay-token ingress.
+  Two Rooms still serve one internal port, and Control API and MCP responses stay
+  backend-neutral.
+- Managed runtime `0.2.0` adds a container engine, a persistent state disk and a
+  Room command channel to the guest. Guest packages are resolved once and served
+  from a cache on that disk afterwards, so only the first provision needs the
+  network.
+- Host paths never cross into the guest implicitly. A Room file transfer is
+  staged explicitly both ways, because a Host-path bind against an engine inside
+  a VM does not fail — it resolves against the wrong filesystem.
+- Not yet accepted: the guest half has not been booted, because this Host has
+  Hyper-V uninstalled and Docker Desktop present. See
+  `docs/verification/issue-107-managed-web-rooms.md` for the exact live gate.
+
 ## 0.5.4 - 2026-09-15
 
 ### Android Rooms are materially faster in use

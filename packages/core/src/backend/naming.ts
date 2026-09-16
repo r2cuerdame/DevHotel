@@ -400,7 +400,14 @@ function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string, subnet?
 export function buildAnchorArgs(
   spec: AnchorSpec,
   relayTokenSha256: string,
-  networkName = roomNetworkName(spec.roomId)
+  networkName = roomNetworkName(spec.roomId),
+  /**
+   * Where the relay gate is published, in the engine's own network view. The
+   * managed runtime's engine is inside a VM, so a loopback publication would be
+   * unreachable from the Host; everything else about the gate, including the
+   * token check, is unchanged by the wider binding.
+   */
+  publishAddress = '127.0.0.1'
 ): string[] {
   if (!/^[a-f0-9]{64}$/.test(relayTokenSha256)) throw new Error('invalid DevHotel relay verifier')
   const relayGateScript = `IFS= read -r -t 2 line || exit 1; case "$line" in "${RELAY_PREAMBLE_PREFIX}"*) token=\${line#"${RELAY_PREAMBLE_PREFIX}"};; *) exit 1;; esac; [ "\${#token}" -eq 64 ] || exit 1; case "$token" in *[!0-9a-f]*) exit 1;; esac; actual=$(printf '%s' "$token" | sha256sum); actual=\${actual%% *}; expected=$DEVHOTEL_RELAY_TOKEN_SHA256; mismatch=0; i=0; while [ "$i" -lt 64 ]; do ac=\${actual%"\${actual#?}"}; ec=\${expected%"\${expected#?}"}; [ "$ac" = "$ec" ] || mismatch=1; actual=\${actual#?}; expected=\${expected#?}; i=$((i + 1)); done; [ "$mismatch" -eq 0 ] || exit 1; exec socat STDIO "TCP:127.0.0.1:$DEVHOTEL_INTERNAL_PORT"`
@@ -413,7 +420,7 @@ export function buildAnchorArgs(
     networkName,
     ...labelArgs(spec.roomId, 'anchor'),
     '-p',
-    `127.0.0.1:0:${RELAY_PORT}`,
+    `${publishAddress}:0:${RELAY_PORT}`,
     '--cap-drop',
     'NET_RAW',
     '-e',

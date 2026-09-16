@@ -1,9 +1,17 @@
 # Managed Hyper-V runtime
 
-This is the first concrete provider behind the managed-runtime bootstrap. It is
-not yet the selected Room executor: Web and Android Rooms remain on the clearly
-labelled external compatibility backend until their provider migrations and
-live acceptance gates pass.
+This is the concrete provider behind the managed-runtime bootstrap.
+
+Since #107 it is also the **preferred** Room executor for Web Rooms: when the
+runtime is healthy, Web Rooms run inside it and need no external Docker Engine.
+A Host whose Hyper-V gate has not been passed, or whose runtime is still
+preparing, falls back to the clearly labelled external compatibility backend and
+is told which one it got. Android Rooms stay on the compatibility backend until
+#108, because they need KVM in the guest.
+
+The live acceptance gate has **not** been run. See
+[issue-107-managed-web-rooms.md](./verification/issue-107-managed-web-rooms.md)
+for what is proven, what is not, and the matrix #107 closes on.
 
 ## Why the substrate is an ISO and not a cloud disk image
 
@@ -36,7 +44,7 @@ no datasource and no extra bundled binaries.
 
 ## Pinned Linux substrate
 
-Runtime version `0.1.0` uses the official Alpine Linux `3.22.5` x86-64 `virt`
+Runtime version `0.2.0` uses the official Alpine Linux `3.22.5` x86-64 `virt`
 ISO as immutable, read-only boot media:
 
 - URL: `https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-virt-3.22.5-x86_64.iso`
@@ -72,6 +80,29 @@ only:
   with no `devfs`, `mdev`, `hwdrivers` or `modloop`, and therefore no kernel
   modules.
 
+Since runtime `0.2.0` — the version that can actually run a Room — it also
+contains, as ordered OpenRC services:
+
+- `usr/local/sbin/devhotel-runtime-state` — claims the persistent state disk.
+  This is the one destructive act in the guest bootstrap, so it is fenced twice:
+  a disk is formatted only when it carries no filesystem and no partition at
+  all, and it is only ever *found* again by DevHotel's own `DHSTATE` label. A
+  disk holding something DevHotel cannot recognise is left alone and the service
+  fails, because guessing would cost the user Room data.
+- `usr/local/sbin/devhotel-engine` — installs the pinned guest packages and
+  starts the container engine with its data root on the state disk. The guest
+  boots diskless, so a package installed at boot is gone by the next one; the
+  packages are resolved once from the pinned branch into a cache on the
+  persistent disk, and every later boot installs from that cache with no network
+  at all. That is what makes the first provision the only one that needs
+  connectivity.
+- `usr/local/sbin/devhotel-room-agent` — serves the Room command channel.
+- `etc/apk/repositories`, pinned to the same branch as the boot image, and
+  `etc/network/interfaces`, bringing up the runtime's private NIC.
+
+The services depend in that order, so a Room command can never be served before
+the engine answers, and the engine can never start before its data root exists.
+
 The archive is written to a small FAT disk attached to the VM. Nothing outside
 those DevHotel-owned paths is ever written into the guest.
 
@@ -98,11 +129,28 @@ the VM's Hyper-V Notes must agree on installation ID, runtime ID, version,
 paths, pipe, base-image digest and overlay digest before any start, save or
 repair mutation occurs. A colliding VM is refused.
 
-The agent listens only on Hyper-V COM2 through a private named pipe; it has no
-Host TCP or management socket. Every health response carries a fresh nonce plus
-the exact installation ID, runtime ID, runtime version and daemon version. Host
-readiness therefore requires all three proofs: Host marker, Hyper-V object
-Notes/ID and guest daemon identity.
+The serial agent listens only on Hyper-V COM2 through a private named pipe.
+Every health response carries a fresh nonce plus the exact installation ID,
+runtime ID, runtime version and daemon version. Host readiness therefore
+requires all three proofs: Host marker, Hyper-V object Notes/ID and guest daemon
+identity.
+
+Rooms need far more bandwidth than an emulated UART can carry, so since `0.2.0`
+the guest also has one network adapter on the Hyper-V **Default Switch**, and the
+Room command agent listens on it. The serial line bootstraps that channel rather
+than being replaced by it: `channel:<nonce>` reports the guest's address, the
+agent port and this boot's token. Both are per-boot facts — a DHCP address and a
+regenerated token — so nothing is cached, and the token reaches the Host only over
+the channel that is private to it by construction. The agent answers nothing
+before that token is presented, compares it in constant time, runs one pinned
+engine executable rather than any shell string, and writes only beneath its own
+staging root.
+
+The Default Switch is required rather than created. It is the only switch
+Hyper-V maintains itself, and it makes that adapter a NAT'd private network
+rather than a bridge onto the user's LAN; creating a switch would mean DevHotel
+owning a Host network object with its own uninstall and collision problems. A
+Host without it is reported rather than worked around.
 
 Two Host permissions the VM needs are asked for explicitly rather than assumed.
 Provisioning grants `NT VIRTUAL MACHINE\Virtual Machines` **traverse** on every
@@ -113,7 +161,8 @@ though Hyper-V granted it those files. `(X)` carries no `(OI)`/`(CI)`, so
 nothing in those directories is listed, read or inherited.
 
 Nested virtualization is requested but **optional**. It matters only for KVM in
-the guest later; the runtime boots and serves Web Rooms without it, and Hyper-V
+the guest, which is what Android Rooms will need (#108); the runtime boots and
+serves Web Rooms without it, and Hyper-V
 refuses it on hosts that cannot nest — including inside a VM at all, since it
 does not stack three levels deep. Provisioning asks with `-ErrorAction Stop`,
 falls back to setting the processor count alone, and reports which it got, so a
@@ -256,7 +305,12 @@ That is static evidence about the pinned bytes, not a boot. It says the missing
   the apkovl, and COM2 reaching the Host named pipe;
 - reboot/repair and state-disk preservation against a real VM;
 - ownership-safe uninstall;
-- two managed Web Rooms and the dependent #107 path;
+- the guest half of the #107 Room path on a real boot: the container engine
+  reaching ready, the state disk being claimed and mounted, the Room command
+  agent answering on the private NIC, and two managed Web Rooms both serving
+  internal port 3000;
+- the second-boot offline case: guest packages installed from the persistent
+  cache with no network;
 - update/rollback and the dependent #110 safety matrix.
 
 Relevant upstream references:

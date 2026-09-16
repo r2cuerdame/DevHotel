@@ -2,6 +2,7 @@ import path from 'node:path'
 import {
   ManagedHyperVRuntime,
   NamedPipeHyperVGuestTransport,
+  type ManagedHyperVGuestChannel,
   type ManagedHyperVRemovalOutcome,
   type ManagedHyperVRuntimeObservation
 } from './managedHyperVRuntime'
@@ -22,7 +23,18 @@ import {
   type ManagedRuntimeRemoteArtifact
 } from './managedRuntimeArtifact'
 
-export const MANAGED_HYPERV_RUNTIME_VERSION = '0.1.0'
+/**
+ * `0.2.0` is the first runtime that can actually run a Room.
+ *
+ * The bump is mandatory rather than cosmetic: the guest bootstrap now carries a
+ * container engine, a persistent state disk and the Room command agent, so the
+ * apkovl's bytes and therefore its digest changed. The provider refuses to
+ * re-seed a different overlay under a runtime it already provisioned — that is
+ * what stops a build from silently replacing a live runtime's guest — so the
+ * version is what authorises the new bootstrap. Migrating an install that is
+ * already on `0.1.0` is #110's explicit update path, not a side effect here.
+ */
+export const MANAGED_HYPERV_RUNTIME_VERSION = '0.2.0'
 
 /**
  * Official Alpine `virt` ISO, used read-only as the immutable Linux substrate.
@@ -70,6 +82,7 @@ export interface ManagedRuntimeProviderController {
   repair(...args: Parameters<ManagedHyperVRuntime['repair']>): ReturnType<ManagedHyperVRuntime['repair']>
   stop(): ReturnType<ManagedHyperVRuntime['stop']>
   remove(): ReturnType<ManagedHyperVRuntime['remove']>
+  roomChannel?(): ReturnType<ManagedHyperVRuntime['roomChannel']>
 }
 
 export interface ManagedRuntimeWindowsFeatureController {
@@ -216,6 +229,23 @@ export class ManagedRuntimeManager {
     const manifest = await this.bootstrap.readManifest().catch(() => null)
     if (!manifest) return 'nothing-owned'
     return await this.providerFactory(manifest).remove()
+  }
+
+  /**
+   * Where Rooms are driven, or `null` when this Host has no usable runtime.
+   *
+   * `null` is an ordinary answer: an unprovisioned Host, a Hyper-V gate not yet
+   * passed, a runtime still preparing. The caller falls back to the external
+   * compatibility engine and says so, rather than failing a launch on a
+   * capability the user has not been given yet.
+   */
+  async roomChannel(): Promise<{ channel: ManagedHyperVGuestChannel; runtimeId: string } | null> {
+    const manifest = await this.bootstrap.readManifest().catch(() => null)
+    if (!manifest || manifest.status !== 'ready') return null
+    const provider = this.providerFactory(manifest)
+    if (!provider.roomChannel) return null
+    const channel = await provider.roomChannel().catch(() => null)
+    return channel ? { channel, runtimeId: manifest.runtimeId } : null
   }
 
   async stop(): Promise<void> {

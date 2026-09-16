@@ -271,6 +271,22 @@ export interface IsolationBackend {
     log?: (line: string) => void,
     credential?: GitCredential | null
   ): Promise<void>
+  /**
+   * Shallow-clone a repository into an existing Host directory, for project
+   * detection before a Room exists.
+   *
+   * This is the backend's job rather than the orchestrator's because only the
+   * backend knows how its engine reaches the Host filesystem. A Host-local
+   * engine can bind-mount the directory straight into the clone container; an
+   * engine inside the DevHotel-managed runtime cannot see that path at all and
+   * has to clone guest-side and copy the tree out. Core must not have to know
+   * which of those it is talking to.
+   */
+  cloneToHostDirectory(
+    gitUrl: string,
+    hostPath: string,
+    opts?: { credential?: GitCredential | null; timeoutMs?: number }
+  ): Promise<ExecResult>
   /** Import a canonical Host folder through a short-lived read-only mount into a new owned workspace generation. */
   importHostFolder(
     roomId: string,

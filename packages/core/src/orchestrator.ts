@@ -128,8 +128,7 @@ import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
-import { runDocker } from './backend/cli'
-import { gitCloneRun, splitGitCredential } from './backend/gitClone'
+import { splitGitCredential } from './backend/gitClone'
 import type { ManagedRuntimeObservation } from './backend/managedRuntime'
 import {
   EMULATOR_ADB_SERIAL,
@@ -9450,16 +9449,12 @@ export class RoomOrchestrator {
   ): Promise<{ reader: SourceReader; cleanup: () => void }> {
     if (sourceType === 'linked-folder') return { reader: fsSourceReader(sourceRef), cleanup: () => undefined }
     if (sourceType === 'empty') return { reader: EMPTY_READER, cleanup: () => undefined }
-    // managed-git: shallow clone into a temp dir through docker so the host
-    // never needs git installed
+    // managed-git: shallow clone into a temp dir through the Room backend, so
+    // the Host needs neither git nor any knowledge of where the engine runs.
     const tmp = join(this.userData, 'tmp', `plan-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
     const credential = urlCredential ?? (await this.resolveGitCredential('system', sourceRef))
-    const run = gitCloneRun(['-v', `${tmp}:/workspace`, '-w', '/workspace'], sourceRef, ['--depth', '1'], credential)
-    const result = await runDocker(run.args, {
-      timeoutMs: 180_000,
-      ...(run.input === undefined ? {} : { input: run.input })
-    })
+    const result = await this.backend.cloneToHostDirectory(sourceRef, tmp, { credential })
     if (result.code !== 0) {
       rmSync(tmp, { recursive: true, force: true })
       throw new Error(`Could not read repository ${sourceRef}: ${result.stderr.slice(-300)}`)
