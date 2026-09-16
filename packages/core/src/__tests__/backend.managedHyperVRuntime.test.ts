@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
@@ -189,10 +189,13 @@ describe('ManagedHyperVRuntime', () => {
     expect(path.extname(marker.diskPath)).toBe('.vhdx')
 
     // The converted parent is named after the digest that was actually
-    // verified, so the differencing chain's provenance stays checkable.
+    // verified, so the differencing chain's provenance stays checkable. The
+    // provider reports canonical paths, which differ from the constructed ones
+    // wherever the temp root is an 8.3 short path.
     expect(fake.converted).toHaveLength(1)
-    expect(fake.converted[0]!.source).toBe(path.join(path.dirname(marker.vmPath), 'images', `${imageDigest}.vhd`))
-    expect(fake.converted[0]!.parent).toBe(path.join(path.dirname(marker.vmPath), 'images', `${imageDigest}.vhdx`))
+    const images = await realpath(path.join(path.dirname(marker.vmPath), 'images'))
+    expect(fake.converted[0]!.source).toBe(path.join(images, `${imageDigest}.vhd`))
+    expect(fake.converted[0]!.parent).toBe(path.join(images, `${imageDigest}.vhdx`))
   })
 
   it('converts the pinned image once and reuses the owned parent disk', async () => {
