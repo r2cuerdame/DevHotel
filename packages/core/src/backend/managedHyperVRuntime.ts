@@ -425,11 +425,21 @@ export class ManagedHyperVRuntime {
         '$dvd=Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru',
         'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $statePath',
         'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $seedPath',
-        'Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true',
+        // Nested virtualization is what would later let the guest run KVM for
+        // Android emulators. It is not needed to boot the runtime or to serve
+        // Web Rooms, and Hyper-V refuses it on hosts that cannot nest -- which
+        // includes running inside a VM at all, since it does not stack three
+        // levels deep. Left bare, the refusal is a non-terminating error this
+        // provider neither sees nor acts on, so the VM quietly loses a
+        // capability nobody recorded. Asking for it explicitly, and falling
+        // back, makes both outcomes deliberate and observable.
+        '$nested=$false',
+        'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true }',
+        'catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }',
         'Set-VMFirmware -VM $vm -EnableSecureBoot Off -FirstBootDevice $dvd',
         'Set-VMComPort -VM $vm -Number 2 -Path $pipePath',
         'Set-VM -VM $vm -Notes $notes -AutomaticStartAction StartIfRunning -AutomaticStopAction Save',
-        '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State}|ConvertTo-Json -Compress'
+        '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State;Nested=$nested}|ConvertTo-Json -Compress'
       ].join(';')
     )
     const created = parseJsonRecord(create, 'Managed Hyper-V provider returned invalid creation evidence')

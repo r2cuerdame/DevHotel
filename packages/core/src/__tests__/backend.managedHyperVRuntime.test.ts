@@ -160,7 +160,7 @@ describe('ManagedHyperVRuntime', () => {
     })
     expect(marker.vmName).toMatch(/^DevHotel-[a-f0-9]{16}$/)
     expect(fake.scripts.join('\n')).toContain('Set-VMFirmware -VM $vm -EnableSecureBoot Off')
-    expect(fake.scripts.join('\n')).toContain('Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true')
+    expect(fake.scripts.join('\n')).toContain('Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop')
     expect(fake.scripts.join('\n')).toContain('Set-VMComPort -VM $vm -Number 2 -Path $pipePath')
     expect(fake.scripts.join('\n')).toContain('Format-Volume -FileSystem FAT -NewFileSystemLabel')
 
@@ -196,6 +196,33 @@ describe('ManagedHyperVRuntime', () => {
     expect(createScript).not.toContain('-VHDPath')
     expect(path.extname(readPowerShellLiteral(createScript, 'isoPath'))).toBe('.iso')
     expect(path.extname(marker.isoPath)).toBe('.iso')
+  })
+
+  it('still provisions on a Host that refuses nested virtualization', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+
+    await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+
+    // Nested virtualization only matters later, for KVM in the guest. Hyper-V
+    // refuses it on hosts that cannot nest -- including inside a VM, since it
+    // does not stack three levels deep -- and the runtime boots and serves Web
+    // Rooms without it, so a refusal must not cost the user the whole VM.
+    expect(createScript).toContain(
+      'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true }'
+    )
+    // The fallback still has to set the processor count, or the VM keeps one.
+    expect(createScript).toContain('catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }')
+
+    // -ErrorAction Stop is load-bearing: a bare cmdlet failure is a
+    // non-terminating error that `catch` never sees, which is how this came to
+    // be silently ignored rather than handled.
+    expect(createScript).not.toMatch(/ExposeVirtualizationExtensions \$true(?! -ErrorAction Stop)/)
+
+    // Whether the VM got it is reported back, so it is a recorded outcome
+    // rather than something nobody can tell apart from success.
+    expect(createScript).toContain('Nested=$nested')
   })
 
   it('lets the Hyper-V VM account traverse to its attachments, and no more', async () => {
