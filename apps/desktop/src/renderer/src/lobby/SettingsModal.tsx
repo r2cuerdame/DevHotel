@@ -21,7 +21,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
   const [runtime, setRuntime] = useState<ManagedRuntimeStatusInfo | null>(null)
 
   useEffect(() => {
-    void api.app.managedRuntimeStatus().then(setRuntime)
+    // A Host where the capability probe itself fails is the interesting case,
+    // not a reason to leave an unhandled rejection in the renderer.
+    void api.app.managedRuntimeStatus().then(setRuntime).catch(() => undefined)
     void api.app.mcpInfo().then(setMcp)
     void api.app.version().then(setVersion)
     void api.app.footprint().then((f) => {
