@@ -156,6 +156,25 @@ emulator -avd <room-avd> -no-window -gpu swiftshader_indirect \
   -no-boot-anim -skip-adb-auth -no-snapshot-save ...
 ```
 
+**Implemented**: `packages/core/src/backend/androidEmulatorLaunch.ts` produces
+the argv, the environment, and the `avdmanager create avd` plan with its
+`config.ini` content. Every option was verified against the pinned emulator
+build's own option table rather than recalled — including that `-accel` takes
+`on|off|auto` and that `-ports` is `<consoleport>,<adbport>`.
+
+Three absences are deliberate and tested:
+
+- **no `-no-window`** — the emulator must map a real window into Xvfb or the
+  Room preview is permanently black;
+- **no snapshot flags** — the default quickboot save/load is what lets a warm
+  Room keep its AVD state, which is the half of #78 this unblocks;
+- **no `-gpu host` / `--gpus`** — #104 measured llvmpipe selection and
+  `VK_ERROR_INCOMPATIBLE_DRIVER`; software rendering is the supported setup.
+
+`-accel on` rather than `auto` is what turns a Host that refused nested
+virtualization into a loud failure instead of a Room that looks alive and never
+finishes booting (§6).
+
 `emulatorBudget()` (landed for #104) already produces `cores`/`memoryMB` from
 the Room's own limits and is backend-neutral — it moves across unchanged, and is
 the reason this spec does not re-derive a budget.
