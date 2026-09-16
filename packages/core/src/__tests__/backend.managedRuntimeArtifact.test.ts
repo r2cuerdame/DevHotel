@@ -57,6 +57,32 @@ describe('downloadManagedRuntimeArtifact', () => {
     expect(fetcher).toHaveBeenCalledOnce()
   })
 
+  it('downloads a .zip but still refuses a format it cannot own', async () => {
+    // `.zip` was added for the pinned Android SDK components (#108). It must
+    // widen the allowed set by exactly one entry, not turn the guard off.
+    const destinationRoot = await tempDir()
+    const fetcher = vi.fn(async () => new Response(bytes))
+
+    const zip = await downloadManagedRuntimeArtifact({
+      artifact: artifact({ id: 'android-platform-tools', extension: '.zip' }),
+      destinationRoot,
+      allowedHosts,
+      fetch: fetcher
+    })
+    expect(path.extname(zip.file)).toBe('.zip')
+
+    for (const extension of ['.exe', '.tar.gz', '.msi', '']) {
+      await expect(
+        downloadManagedRuntimeArtifact({
+          artifact: artifact({ extension: extension as '.iso' }),
+          destinationRoot,
+          allowedHosts,
+          fetch: fetcher
+        })
+      ).rejects.toThrow(/format is invalid/)
+    }
+  })
+
   it('reuses only an existing file whose full evidence still matches', async () => {
     const destinationRoot = await tempDir()
     const expected = artifact()

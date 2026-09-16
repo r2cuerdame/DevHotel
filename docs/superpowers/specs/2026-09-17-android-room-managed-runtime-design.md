@@ -97,6 +97,11 @@ Pin four artifacts, each by an immutable build-numbered URL from
 
 `repository2-3.xml` and the `sys-img` manifests are the index that names them.
 
+**Implemented**: `packages/core/src/backend/androidSdkPin.ts` carries the pinned
+set, its verifier, and the known-version/unpinned-image distinction.
+`pnpm --filter @devhotel/core pin:android-sdk` is the maintainer task that
+captures the digests.
+
 ### Google publishes SHA-1 only
 
 Verified against the live manifest on 2026-09-17: every entry carries
@@ -123,6 +128,16 @@ DevHotel's to obtain and record, and the release-level SBOM/NOTICE gate from the
 managed-runtime design applies to all four artifacts. Provisioning also needs
 network on first use; a fully offline first Android Room is out of scope and
 must say so rather than hang.
+
+### Only one Android version is pinned
+
+The Stack tab offers Android 14.0, 13.0, 12.0 and 11.0, and docker-android has
+a system image for each. DevHotel pins **API 34 (Android 14.0)** only — the
+Room default. `ANDROID_API_LEVELS` maps all four, so a managed Android Room on
+13.0 fails with `UnpinnedAndroidSystemImageError` (a DevHotel migration gap the
+Room can be told about) rather than `UnknownAndroidVersionError`. That
+distinction is why docker-android stays the default until the two tables agree:
+removing it earlier would silently drop three offered versions.
 
 ### Where they live
 
