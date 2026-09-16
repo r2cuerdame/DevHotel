@@ -24,6 +24,29 @@
   Hyper-V uninstalled and Docker Desktop present. See
   `docs/verification/issue-107-managed-web-rooms.md` for the exact live gate.
 
+### Rooms wake warm instead of being rebuilt
+
+- Waking a sleeping Room now restarts its retained containers in place when
+  every one of them is still the exact owned container the Room slept with and
+  its configuration still matches the Room record. A warm Web Room answers again
+  in about 4 seconds and keeps its Room Services' data and cache volume, because
+  nothing is removed and recreated. Reuse is fail-closed: anything unprovable —
+  a missing or unclean container, a changed image, start command, environment,
+  relayed port, volume set or service version, or a relay credential lost to an
+  app restart — falls back to the existing recreation path and records why on
+  the wake's `container-start` stage. ([#78](https://github.com/r2cuerdame/DevHotel/issues/78))
+- Playwright browser downloads and XDG caches now live on the Room cache volume
+  instead of the container's writable layer, so they survive a Room recreate
+  rather than being re-fetched. ([#78](https://github.com/r2cuerdame/DevHotel/issues/78))
+- Android Rooms deliberately keep recreating their emulator on wake. A retained
+  docker-android container cannot be restarted: the stop is always a SIGKILL, so
+  Xvfb leaves a read-only `/tmp/.X0-lock` behind and the emulator then fails with
+  "no Qt platform plugin could be initialized" even after its one-shot KVM
+  bootstrap identity is repaired. They refuse the warm path immediately rather
+  than spending a doomed emulator boot on every wake, and the warm Android path
+  is tracked with [#108](https://github.com/r2cuerdame/DevHotel/issues/108).
+
+
 ## 0.5.4 - 2026-09-15
 
 ### Android Rooms are materially faster in use

@@ -512,9 +512,27 @@ function packageStorePaths(spec: WebSpec): { npm: string; pnpm: string } {
   return { npm: `${shared.path}/npm`, pnpm: `${shared.path}/pnpm` }
 }
 
-function envArgs(spec: WebSpec): string[] {
+/**
+ * Caches that have to survive a container recreate but stay Room-scoped. Each
+ * of these tools otherwise defaults to a path in the container's writable
+ * layer, which a recreate throws away, so a browser download is re-fetched on
+ * every wake that recreates the container. They do not join the Hotel-scoped
+ * package cache: unlike a package store they are not content-addressed, so one
+ * Room must not be able to reach another's.
+ */
+export const ROOM_SCOPED_CACHE_ENV: ReadonlyArray<readonly [string, string]> = [
+  ['PLAYWRIGHT_BROWSERS_PATH', '/cache/playwright'],
+  ['XDG_CACHE_HOME', '/cache/xdg']
+]
+
+/** Every managed cache variable a Room's web container is created with. */
+export function roomCacheEnv(spec: WebSpec): Array<readonly [string, string]> {
   const store = packageStorePaths(spec)
-  const args = ['-e', `npm_config_cache=${store.npm}`, '-e', `PNPM_HOME=${store.pnpm}`]
+  return [['npm_config_cache', store.npm], ['PNPM_HOME', store.pnpm], ...ROOM_SCOPED_CACHE_ENV]
+}
+
+function envArgs(spec: WebSpec): string[] {
+  const args = roomCacheEnv(spec).flatMap(([key, value]) => ['-e', `${key}=${value}`])
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }

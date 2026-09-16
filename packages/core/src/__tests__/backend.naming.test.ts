@@ -33,6 +33,7 @@ import {
   workspaceSnapshotVolume,
   wrapStartCommand,
 } from '../backend/naming'
+import { nodeSharedCacheMounts, SHARED_CACHE_MOUNT } from '../lifecycle/sharedCache'
 import type { WebSpec } from '../backend/types'
 
 function spec(overrides: Partial<WebSpec> = {}): WebSpec {
@@ -384,6 +385,18 @@ describe('buildWebCreateArgs', () => {
     expect(emulatorBudget({ memoryMB: Number.POSITIVE_INFINITY }).memoryMB).toBe(EMULATOR_BUDGET_MEMORY_MB)
   })
 
+  it('never asks for a GPU and never gives up KVM', () => {
+    const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })
+    const joined = args.join(' ')
+    // --gpus all + -gpu host makes the emulator select llvmpipe and Vulkan then
+    // fails with VK_ERROR_INCOMPATIBLE_DRIVER, so software rendering has to stay
+    // implicit: the image's swiftshader_indirect is never overridden from here.
+    expect(args).not.toContain('--gpus')
+    expect(joined).not.toContain('-gpu')
+    // ...while KVM has to survive every change to these arguments.
+    expect(args[args.indexOf('--device') + 1]).toBe('/dev/kvm')
+  })
+
   it('rotates the X screen and AVD orientation for landscape emulators', () => {
     const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0', orientation: 'landscape' })
     expect(args).toContain('SCREEN_WIDTH=1140')
@@ -422,8 +435,26 @@ describe('buildWebCreateArgs', () => {
 
   it('sets cache env, passes extra env, and never sets CI', () => {
     const args = buildWebCreateArgs(spec({ env: { FOO: 'bar' } }))
-    expect(envs(args)).toEqual(['npm_config_cache=/cache/npm', 'PNPM_HOME=/cache/pnpm', 'FOO=bar'])
+    expect(envs(args)).toEqual([
+      'npm_config_cache=/cache/npm',
+      'PNPM_HOME=/cache/pnpm',
+      'PLAYWRIGHT_BROWSERS_PATH=/cache/playwright',
+      'XDG_CACHE_HOME=/cache/xdg',
+      'FOO=bar'
+    ])
     expect(envs(args).some((e) => e.startsWith('CI='))).toBe(false)
+  })
+
+  it('keeps browser and XDG caches Room-scoped even with the shared package cache', () => {
+    const args = buildWebCreateArgs(spec({ sharedCaches: nodeSharedCacheMounts() }))
+    const env = envs(args)
+    // The package store is content-addressed, so it may live in the Hotel-scoped
+    // volume...
+    expect(env).toContain(`npm_config_cache=${SHARED_CACHE_MOUNT}/npm`)
+    expect(env).toContain(`PNPM_HOME=${SHARED_CACHE_MOUNT}/pnpm`)
+    // ...but these are not, so one Room must never reach another's.
+    expect(env).toContain('PLAYWRIGHT_BROWSERS_PATH=/cache/playwright')
+    expect(env).toContain('XDG_CACHE_HOME=/cache/xdg')
   })
 
   it('wraps the start command with a tolerant corepack enable and exec', () => {

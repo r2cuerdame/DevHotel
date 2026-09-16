@@ -185,6 +185,23 @@ export interface GitCredential {
 /** Answers "which credential clones this URL", or null when the clone should stay anonymous. */
 export type GitCredentialResolver = (gitUrl: string) => Promise<GitCredential | null>
 
+export interface ResumeServiceSpec {
+  kind: 'postgres' | 'redis'
+  version: string
+}
+
+export interface ResumeRoomPodOpts {
+  services?: readonly ResumeServiceSpec[]
+}
+
+/**
+ * A refusal is an ordinary answer, not a failure: it carries why the retained
+ * runtime could not be proved reusable so the caller can log it and recreate.
+ */
+export type RoomResumeResult =
+  | { reused: true; hostPort: number }
+  | { reused: false; reason: string }
+
 export interface IsolationBackend {
   health(): Promise<{ ok: boolean; detail: string }>
   createRoomPod(
@@ -215,6 +232,8 @@ export interface IsolationBackend {
   restartWeb(roomId: string, spec?: WebSpec): Promise<void>
   recreateWeb(spec: WebSpec, expectedWebId?: string): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
+  /** Warm wake: start the retained, proved-unchanged Room containers in place. */
+  resumeRoomPod(spec: WebSpec, opts?: ResumeRoomPodOpts): Promise<RoomResumeResult>
   deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }>
   execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult>
   /** Spawn an interactive command only after engine and exact web-container ownership validation. */

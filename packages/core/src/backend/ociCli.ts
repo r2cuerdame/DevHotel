@@ -16,6 +16,7 @@ import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
+  roomCacheEnv,
   anchorName,
   androidControlNetworkName,
   androidRuntimeAnchorName,
@@ -48,6 +49,7 @@ import {
   workspaceSnapshotVolume,
   type NetworkNamespaceAuthority,
 } from './naming'
+import type { ResumeRoomPodOpts, ResumeServiceSpec, RoomResumeResult } from './types'
 import {
   isSharedCacheVolumeName,
   provesSharedCacheOwnership,
@@ -1955,6 +1957,168 @@ export class OciCliBackend implements IsolationBackend {
       }
       throw error
     }
+  }
+
+  /**
+   * Warm wake. Start the Room's retained containers in place instead of
+   * recreating them, so a sleeping Room keeps the state it went to sleep with —
+   * for an Android Room that is the booted AVD and everything installed on it,
+   * which the recreate path throws away along with the container.
+   *
+   * Reuse is fail-closed and returns a refusal rather than throwing, so the
+   * caller can fall back to the ordinary recreation path: every participant
+   * must still be the exact owned, cleanly stopped container this Room created,
+   * and its configuration must still match what the Room record asks for now.
+   * Ownership violations are the exception and still throw — a foreign
+   * container wearing a Room's name is not something to fall back around.
+   *
+   * On any failure after the first start it stops what it started, so a refused
+   * resume always leaves the caller the same stopped pod it was given.
+   */
+  async resumeRoomPod(spec: WebSpec, opts: ResumeRoomPodOpts = {}): Promise<RoomResumeResult> {
+    await this.assertPinnedEngineIdentity()
+    const roomId = spec.roomId
+    if (spec.standalone) return { reused: false, reason: 'standalone Rooms have no relay anchor to reuse' }
+
+    // The anchor's relay verifier is fixed at create and the raw capability is
+    // only ever held in memory. Without it the gateway cannot cross this
+    // anchor's gate, so a retained anchor from an earlier app run is unusable.
+    const relayToken = this.relayTokens.get(roomId)
+    if (!relayToken) return { reused: false, reason: 'the Room relay credential was not retained' }
+
+    const android = spec.androidRuntimeIsolation === true
+    if (android) {
+      // Measured, not assumed (docs/android-runtime-performance.md): a retained
+      // docker-android emulator cannot be restarted. Stopping the container is
+      // always a SIGKILL — its PID 1 does not forward SIGTERM — so Xvfb leaves a
+      // read-only /tmp/.X0-lock behind, never reacquires :0 on the next start,
+      // and the emulator dies with "no Qt platform plugin could be initialized"
+      // even once its one-shot KVM bootstrap identity has been repaired. No
+      // Docker CLI operation can delete a file inside a stopped container, so
+      // there is nothing to repair from out here. Refuse before starting
+      // anything rather than spend a doomed boot on every Android wake; the
+      // warm Android path belongs to the managed runtime (#108), which owns the
+      // emulator process directly and can shut it down cleanly.
+      return { reused: false, reason: 'a retained Android emulator container cannot be restarted' }
+    }
+    const services = opts.services ?? []
+    // Start order is dependency order: a container joining another container's
+    // network namespace can only start once that leader is running again.
+    const startPlan: Array<{ name: string; role: string }> = [
+      { name: anchorName(roomId), role: 'anchor' },
+      ...services.map((svc) => ({ name: svcName(roomId, svc.kind), role: `svc-${svc.kind}` })),
+      { name: webName(roomId), role: 'web' }
+    ]
+
+    const retained: Array<{ name: string; role: string; id: string }> = []
+    for (const participant of startPlan) {
+      const inspected = await this.inspectContainer(participant.name)
+      if (!inspected) {
+        return { reused: false, reason: `a retained Room container is missing: ${participant.role}` }
+      }
+      // Ownership is not a fallback condition; it is a refusal to touch it.
+      const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, inspected)
+      if (owned.State?.Status !== 'exited') {
+        return { reused: false, reason: `a retained Room container is not cleanly stopped: ${participant.role}` }
+      }
+      retained.push({ name: participant.name, role: participant.role, id: exactFullContainerId(owned, roomId) })
+    }
+
+    const drift = await this.retainedRoomPodDrift(spec, relayToken, { services })
+    if (drift) return { reused: false, reason: drift }
+
+    let startedAny = false
+    try {
+      for (const participant of retained) {
+        must(await runDocker(['start', participant.id]), `start retained Room ${participant.role}`)
+        startedAny = true
+        const current = await this.inspectContainer(participant.id)
+        const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, current ?? undefined)
+        if (exactFullContainerId(owned, roomId) !== participant.id) {
+          throw new Error(`retained Room ${participant.role} changed immutable ID while starting`)
+        }
+        if (owned.State?.Status !== 'running') {
+          throw new Error(`retained Room ${participant.role} did not enter the running state`)
+        }
+      }
+      return { reused: true, hostPort: await this.readHostPort(roomId) }
+    } catch (error) {
+      // Hand the caller back the stopped pod it gave us, never a half-warm one.
+      try {
+        if (startedAny) await this.stopRoomPod(roomId)
+      } catch (stopError) {
+        throw new AggregateError([error, stopError], 'Room resume and its rollback both failed')
+      }
+      return {
+        reused: false,
+        reason: `the retained Room runtime did not restart: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+  }
+
+  /**
+   * Everything that would make the retained pod the wrong pod to wake into.
+   * Returns the reason, or null when the retained containers still match what
+   * the Room record asks for now. Changes made while a Room sleeps are
+   * materialized by recreating its containers, so any mismatch must refuse.
+   */
+  private async retainedRoomPodDrift(
+    spec: WebSpec,
+    relayToken: string,
+    context: { services: readonly ResumeServiceSpec[] }
+  ): Promise<string | null> {
+    const roomId = spec.roomId
+    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+    const anchorEnv = containerEnvMap(anchor)
+    // Proves both that the retained anchor is the exact one our cached
+    // capability opens, and that the port it relays is still the Room's port.
+    if (anchorEnv.get('DEVHOTEL_RELAY_TOKEN_SHA256') !== createHash('sha256').update(relayToken).digest('hex')) {
+      return 'the retained relay anchor does not match the retained relay credential'
+    }
+    if (anchorEnv.get('DEVHOTEL_INTERNAL_PORT') !== String(spec.internalPort)) {
+      return 'the Room relayed port changed while it slept'
+    }
+    if (anchor.HostConfig?.NetworkMode !== roomNetworkName(roomId)) {
+      return 'the retained relay anchor is not on its exact owned network'
+    }
+
+    const web = await this.assertRoomContainer(roomId, webName(roomId), 'web')
+    const webDrift = this.retainedWebDrift(spec, web, anchorName(roomId))
+    if (webDrift) return webDrift
+
+    for (const svc of context.services) {
+      const container = await this.assertRoomContainer(roomId, svcName(roomId, svc.kind), `svc-${svc.kind}`)
+      if (container.Config?.Image !== svcImage(svc.kind, svc.version)) {
+        return `a retained Room Service image changed while it slept: ${svc.kind}`
+      }
+    }
+    return null
+  }
+
+  private retainedWebDrift(spec: WebSpec, web: DockerContainerInspect, namespaceLeader: string): string | null {
+    if (web.Config?.Image !== imageFor(spec)) return 'the Room image changed while it slept'
+    const expectedCmd = ['sh', '-lc', wrapStartCommand(spec.startCommand)]
+    if (JSON.stringify(web.Config?.Cmd ?? []) !== JSON.stringify(expectedCmd)) {
+      return 'the Room start command changed while it slept'
+    }
+    if (web.HostConfig?.NetworkMode !== `container:${namespaceLeader}`) {
+      return 'the retained Room web container is not in its exact owned network namespace'
+    }
+    const env = containerEnvMap(web)
+    for (const [key, value] of [...roomCacheEnv(spec), ...Object.entries(spec.env ?? {})]) {
+      if (env.get(key) !== value) return 'the Room environment changed while it slept'
+    }
+    const expectedMounts = this.expectedRoomArtifactWebMounts(spec)
+      .map((mount) => `${mount.destination}=${mount.volume}`)
+      .sort()
+    const actualMounts = (web.Mounts ?? [])
+      .filter((mount) => mount.Type === 'volume')
+      .map((mount) => `${mount.Destination ?? ''}=${mount.Name ?? ''}`)
+      .sort()
+    if (JSON.stringify(expectedMounts) !== JSON.stringify(actualMounts)) {
+      return 'the Room workspace, dependency, or cache volumes changed while it slept'
+    }
+    return null
   }
 
   async deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }> {
@@ -6743,8 +6907,7 @@ export class OciCliBackend implements IsolationBackend {
     }
 
     const expectedEnv = new Map<string, string>([
-      ['npm_config_cache', '/cache/npm'],
-      ['PNPM_HOME', '/cache/pnpm'],
+      ...roomCacheEnv(spec),
       ...Object.entries(spec.env ?? {})
     ])
     const actualEnv = new Map<string, string>()
@@ -8035,6 +8198,16 @@ function isExpectedRoomContainer(roomId: string, name: string, role: string): bo
     default:
       return false
   }
+}
+
+/** `KEY=value` inspect entries as a map; a container env is a list, not an object. */
+function containerEnvMap(container: DockerContainerInspect): Map<string, string> {
+  const env = new Map<string, string>()
+  for (const entry of container.Config?.Env ?? []) {
+    const separator = entry.indexOf('=')
+    if (separator > 0) env.set(entry.slice(0, separator), entry.slice(separator + 1))
+  }
+  return env
 }
 
 function isStoppedContainerState(state: string): boolean {

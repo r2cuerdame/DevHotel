@@ -3929,43 +3929,64 @@ export class RoomOrchestrator {
         this.rooms.update(roomId, { internalPort: 6080 })
       }
       report.begin('container-start', 'Start the Room containers')
-      const { hostPort } = await this.backend.recreateAnchor({
-        roomId,
-        internalPort: this.mustGet(roomId).internalPort,
-        androidRuntimeIsolation: room.provider === 'android'
-      })
-      this.rooms.update(roomId, { hostPort, status: 'running' })
-      let emulatorStarted = false
-      if (room.provider === 'android') {
-        // the emulator joins the fresh anchor's netns, so it is recreated with it
-        this.olog(roomId, 'start emulator')
-        report.begin('emulator-boot', 'Start the Room emulator')
-        try {
-          this.clearAndroidEmulatorInstalls(roomId)
-          await this.backend.removeEmulator(roomId)
-          await this.backend.createEmulator(roomId, room.android, room.os)
-          emulatorStarted = true
-          report.detail('emulator container started')
-        } catch (err) {
-          // No KVM or a failed image pull must not brick the room — it can
-          // still build APKs; checks surface the missing emulator screen.
-          const detail = `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`
-          this.olog(roomId, detail)
-          report.skip(detail)
-        }
-      }
-      report.begin('services-start', 'Start the Room services')
-      // Services use the fresh runtime anchor (separate from Android's control
-      // bridge), so every provider recreates them after anchor replacement.
       const services = Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]
-      if (services.length === 0) report.skip('this Room has no Room Services')
-      for (const [svc, cfg] of services) {
-        this.olog(roomId, `start service ${svc} ${cfg.version}`)
-        await this.backend.removeService(roomId, svc, { volume: false })
-        await this.backend.createService(roomId, svc, cfg.version)
+      // Warm wake first: a Room whose retained containers are still exactly the
+      // ones it went to sleep with keeps its running state, which for an Android
+      // Room is the booted AVD and everything installed on it. The backend
+      // refuses rather than throws whenever that cannot be proved, and the
+      // ordinary recreation path below is what materializes any change made
+      // while the Room slept.
+      const resume = await this.backend.resumeRoomPod(this.webSpecFor(this.mustGet(roomId)), {
+        services: services.map(([kind, cfg]) => ({ kind, version: cfg.version }))
+      })
+      let emulatorStarted = false
+      if (resume.reused) {
+        this.rooms.update(roomId, { hostPort: resume.hostPort, status: 'running' })
+        this.olog(roomId, 'wake reused the retained Room runtime')
+        report.detail('reused the retained Room runtime')
+        // The tracked installs deliberately survive: nothing was recreated, and
+        // every one of them is re-proved against package, user and incarnation
+        // before it is used again.
+        emulatorStarted = room.provider === 'android'
+      } else {
+        this.olog(roomId, `wake recreated the Room runtime: ${resume.reason}`)
+        report.detail(`recreated the Room runtime: ${resume.reason}`)
+        const { hostPort } = await this.backend.recreateAnchor({
+          roomId,
+          internalPort: this.mustGet(roomId).internalPort,
+          androidRuntimeIsolation: room.provider === 'android'
+        })
+        this.rooms.update(roomId, { hostPort, status: 'running' })
+        if (room.provider === 'android') {
+          // the emulator joins the fresh anchor's netns, so it is recreated with it
+          this.olog(roomId, 'start emulator')
+          report.begin('emulator-boot', 'Start the Room emulator')
+          try {
+            this.clearAndroidEmulatorInstalls(roomId)
+            await this.backend.removeEmulator(roomId)
+            await this.backend.createEmulator(roomId, room.android, room.os)
+            emulatorStarted = true
+            report.detail('emulator container started')
+          } catch (err) {
+            // No KVM or a failed image pull must not brick the room — it can
+            // still build APKs; checks surface the missing emulator screen.
+            const detail = `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`
+            this.olog(roomId, detail)
+            report.skip(detail)
+          }
+        }
+        report.begin('services-start', 'Start the Room services')
+        // Services use the fresh runtime anchor (separate from Android's control
+        // bridge), so every provider recreates them after anchor replacement.
+        if (services.length === 0) report.skip('this Room has no Room Services')
+        for (const [svc, cfg] of services) {
+          this.olog(roomId, `start service ${svc} ${cfg.version}`)
+          await this.backend.removeService(roomId, svc, { volume: false })
+          await this.backend.createService(roomId, svc, cfg.version)
+        }
+        report.begin('web-start', 'Start the Room web process')
+        await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       }
-      report.begin('web-start', 'Start the Room web process')
-      await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
       report.begin('verify', 'Verify the Room answers')
