@@ -21,6 +21,7 @@ import { startControlApi } from './controlApi'
 import { startDeviceSweeper } from './deviceSweeper'
 import { startRoomLifecycleSweeper } from './roomLifecycleSweeper'
 import { ensureDataOwnership } from './cleanRemoval'
+import { managedRuntimeStatusInfo } from './managedRuntimeStatus'
 import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGate'
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
 import { GITHUB_SERVICE_DEFAULT_ENABLED, GITHUB_SERVICE_MANIFEST, GitHubService, PINNED_GH } from './githubService'
@@ -293,6 +294,8 @@ async function bootstrap(): Promise<void> {
     requestRelaunch: () => requestShutdown('relaunch'),
     runCleanRemoval: (operation) => cleanRemoval.run(operation),
     removeManagedRuntime: () => managedRuntime.remove(),
+    // Read-only: reports what the runtime is, and never provisions or elevates.
+    managedRuntimeStatus: async () => managedRuntimeStatusInfo(await managedRuntime.observe()),
     enableManagedRuntimeFeatures: async () => {
       const observation = await managedRuntime.enableWindowsFeatures()
       const gate = observation.windowsFeature

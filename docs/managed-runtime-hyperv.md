@@ -131,6 +131,22 @@ by the exact retained marker, starts it, and re-proves guest health. A repair
 regenerates the seed from the marker identity but **never** destroys the state
 disk: a power loss during provisioning must not cost the user Room data.
 
+## What the app shows
+
+Settings → **Managed Linux runtime** reports the live runtime state and phase,
+the runtime identity and version, the verified digest of each pinned artifact,
+and whether this Host granted nested virtualization. That is deliberate rather
+than decorative: the clean Windows machine this is proven on has no Node, no
+adb and no shell tooling, so the app window is the only place those values can
+be read, and the digest is what separates a runtime actually running the pinned
+image from one that merely reports itself healthy.
+
+The renderer gets an observation narrowed by `managedRuntimeStatusInfo`. The
+Windows feature harness's `failure` is dropped there: it carries raw DISM or
+elevation text, which is Host detail of exactly the kind the provider keeps
+private everywhere else. The gate's `stage` and `detail` say what the user can
+do without quoting Windows back at them.
+
 ## Uninstall
 
 Deleting DevHotel's app data is not sufficient on Windows. A registered Hyper-V

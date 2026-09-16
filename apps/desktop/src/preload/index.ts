@@ -74,7 +74,8 @@ const api: IpcApi = {
     footprint: () => ipcRenderer.invoke(IPC.footprint),
     setAutostart: (enabled) => ipcRenderer.invoke(IPC.autostartSet, enabled),
     cleanUninstall: () => ipcRenderer.invoke(IPC.cleanUninstall),
-    enableManagedRuntimeFeatures: () => ipcRenderer.invoke(IPC.enableManagedRuntimeFeatures)
+    enableManagedRuntimeFeatures: () => ipcRenderer.invoke(IPC.enableManagedRuntimeFeatures),
+    managedRuntimeStatus: () => ipcRenderer.invoke(IPC.managedRuntimeStatus)
   },
   android: {
     action: (roomId, action) => ipcRenderer.invoke(IPC.androidAction, roomId, action),

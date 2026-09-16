@@ -32,6 +32,7 @@ import {
   zTermId,
   zTermInput,
   zTermResize,
+  type ManagedRuntimeStatusInfo,
   type McpSetupInfo
 } from '@devhotel/shared'
 import {
@@ -87,6 +88,7 @@ export function registerIpc(opts: {
     edition: string | null
     detail: string
   }>
+  managedRuntimeStatus: () => Promise<ManagedRuntimeStatusInfo>
 }): void {
   const {
     win,
@@ -102,7 +104,8 @@ export function registerIpc(opts: {
     runCleanRemoval,
     finishCleanRemoval,
     removeManagedRuntime,
-    enableManagedRuntimeFeatures
+    enableManagedRuntimeFeatures,
+    managedRuntimeStatus
   } = opts
   const caDir = join(userData, 'ca')
   const installDir = dirname(process.execPath)
@@ -356,6 +359,7 @@ export function registerIpc(opts: {
   // The only Host-level Windows mutation DevHotel performs, and only when the
   // human asks for it here. Never invoked during launch or provisioning.
   handle(IPC.enableManagedRuntimeFeatures, () => enableManagedRuntimeFeatures())
+  handle(IPC.managedRuntimeStatus, () => managedRuntimeStatus())
   handle(IPC.autostartSet, (_event, enabled) => {
     app.setLoginItemSettings({ openAtLogin: zAutostartEnabled.parse(enabled), args: ['--hidden'] })
   })

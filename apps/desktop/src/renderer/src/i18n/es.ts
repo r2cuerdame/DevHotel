@@ -123,6 +123,13 @@ export const es: Translation = {
     'DevHotel puede ejecutar las Rooms en su propio runtime de Linux en lugar de Docker Desktop. Windows necesita una aprobación única para activar las funciones de virtualización que utiliza.',
   'settings.runtimeEnable': 'Activar funciones de Windows',
   'settings.runtimeRestart': 'Reinicia Windows para terminar de activar el runtime de DevHotel.',
+  'settings.runtimeRefresh': 'Actualizar',
+  'settings.runtimeIdentity': 'Identidad del runtime',
+  'settings.runtimeNested': 'Virtualización anidada',
+  'settings.runtimeNestedGranted': 'concedida',
+  'settings.runtimeNestedRefused': 'rechazada por este PC',
+  'settings.runtimeNestedUnknown': 'sin registrar',
+  'settings.runtimeImage': 'Imagen verificada',
   'settings.about': 'Acerca de',
   'settings.aboutLine': 'DevHotel {version} — cada proyecto tiene su propia habitación.',
 

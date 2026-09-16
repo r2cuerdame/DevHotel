@@ -129,6 +129,13 @@ export const en = {
     'DevHotel can run Rooms on its own Linux runtime instead of Docker Desktop. Windows needs one-time approval to turn on the virtualization features it uses.',
   'settings.runtimeEnable': 'Enable Windows features',
   'settings.runtimeRestart': 'Restart Windows to finish enabling the DevHotel runtime.',
+  'settings.runtimeRefresh': 'Refresh',
+  'settings.runtimeIdentity': 'Runtime identity',
+  'settings.runtimeNested': 'Nested virtualization',
+  'settings.runtimeNestedGranted': 'granted',
+  'settings.runtimeNestedRefused': 'refused by this PC',
+  'settings.runtimeNestedUnknown': 'not recorded',
+  'settings.runtimeImage': 'Verified image',
   'settings.about': 'About',
   'settings.aboutLine': 'DevHotel {version} — every project gets its own room.',
 
