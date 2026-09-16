@@ -97,9 +97,9 @@ SHA-256 and the version it reports. Nothing else is copied into the guest.
 | 6 | Reboot resume works | Restart guest; DevHotel resumes from boot-identity change, no second prompt | | |
 | 7 | Provisioning completes | ISO fetched and digest-verified; VM, seed and state disks created | | |
 | 8 | VM account reaches its attachments | VM starts; no `0x80070005` on any attachment | | |
-| 9 | Nested virt is optional, not silent | Provisioning survives refusal, and the runtime observation reports which it got | | |
+| 9 | Nested virt is optional, not silent | Provisioning survives refusal, and Settings reports granted / refused rather than silence | | |
 | 10 | **Runtime reaches healthy** | COM2 health returns the exact install/runtime/daemon identity and nonce | | |
-| 11 | Identity is observable | Runtime identity, version and digests visible in DevHotel | | |
+| 11 | Identity is observable | Settings → Managed Linux runtime shows state, runtime identity/version, verified image digest, and the nested-virtualization outcome | | |
 | 12 | Guest reboot recovers | Restart guest; runtime returns to healthy without human repair | | |
 | 13 | Partial provision repairs | Kill mid-provision; restart; repair completes | | |
 | 14 | **State disk survives repair** | Write a marker into runtime state, force repair, marker still there | | |
@@ -117,6 +117,10 @@ state disk costs the user Room data, and it only shows up in a run that
 deliberately puts something in there first.
 
 ## 5. Recording the result
+
+The guest has no Node, no adb and no shell tooling by design, so the Settings →
+Managed Linux runtime card is the readable surface for rows 9, 10, 11 and 12;
+screenshot it rather than trying to query the app from outside.
 
 Add a dated verification document beside this one with the filled matrix, the
 media digest, the installer digest and version, and the guest's own output for

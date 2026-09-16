@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { McpSetupInfo } from '@devhotel/shared'
+import type { ManagedRuntimeStatusInfo, McpSetupInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import { LOCALES } from '../i18n'
@@ -18,8 +18,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
   const [cleaning, setCleaning] = useState(false)
   const [runtimeGate, setRuntimeGate] = useState<{ stage: string; restartRequired: boolean; detail: string } | null>(null)
   const [enablingRuntime, setEnablingRuntime] = useState(false)
+  const [runtime, setRuntime] = useState<ManagedRuntimeStatusInfo | null>(null)
 
   useEffect(() => {
+    void api.app.managedRuntimeStatus().then(setRuntime)
     void api.app.mcpInfo().then(setMcp)
     void api.app.version().then(setVersion)
     void api.app.footprint().then((f) => {
@@ -101,11 +103,23 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                 void api.app
                   .enableManagedRuntimeFeatures()
                   .then((gate) => setRuntimeGate(gate))
+                  .then(() => api.app.managedRuntimeStatus().then(setRuntime))
                   .catch((err: unknown) => toast('error', String(err)))
                   .finally(() => setEnablingRuntime(false))
               }}
             >
               {t('settings.runtimeEnable')}
+            </button>
+            <button
+              className="btn"
+              onClick={() => {
+                void api.app
+                  .managedRuntimeStatus()
+                  .then(setRuntime)
+                  .catch((err: unknown) => toast('error', String(err)))
+              }}
+            >
+              {t('settings.runtimeRefresh')}
             </button>
           </div>
           {runtimeGate && (
@@ -113,6 +127,35 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
               {runtimeGate.detail}
               {runtimeGate.restartRequired ? ` ${t('settings.runtimeRestart')}` : ''}
             </p>
+          )}
+          {runtime && (
+            <div className="field">
+              <p className="small" style={{ color: runtime.state === 'broken' ? 'var(--warn)' : undefined }}>
+                <b>{runtime.state}</b>
+                {runtime.phase ? ` — ${runtime.phase}` : ''} — {runtime.detail}
+              </p>
+              <p className="small muted">
+                {t('settings.runtimeIdentity')}:{' '}
+                <span className="mono">
+                  {runtime.runtimeId ?? '—'}
+                  {runtime.runtimeVersion ? ` @ ${runtime.runtimeVersion}` : ''}
+                </span>
+              </p>
+              <p className="small muted">
+                {t('settings.runtimeNested')}:{' '}
+                {runtime.nestedVirtualization === null
+                  ? t('settings.runtimeNestedUnknown')
+                  : runtime.nestedVirtualization
+                    ? t('settings.runtimeNestedGranted')
+                    : t('settings.runtimeNestedRefused')}
+              </p>
+              {Object.entries(runtime.artifactDigests).map(([id, digest]) => (
+                <p className="small muted" key={id}>
+                  {t('settings.runtimeImage')}: <span className="mono">{id}</span>{' '}
+                  <span className="mono">{digest}</span>
+                </p>
+              ))}
+            </div>
           )}
         </div>
 

@@ -155,6 +155,13 @@ export const ko: Translation = {
     'DevHotel은 Docker Desktop 대신 자체 Linux 런타임에서 Room을 실행할 수 있습니다. 사용하는 가상화 기능을 켜려면 Windows에서 한 번의 승인이 필요합니다.',
   'settings.runtimeEnable': 'Windows 기능 켜기',
   'settings.runtimeRestart': 'DevHotel 런타임 활성화를 완료하려면 Windows를 다시 시작하세요.',
+  'settings.runtimeRefresh': '새로고침',
+  'settings.runtimeIdentity': '런타임 ID',
+  'settings.runtimeNested': '중첩 가상화',
+  'settings.runtimeNestedGranted': '허용됨',
+  'settings.runtimeNestedRefused': '이 PC가 거부함',
+  'settings.runtimeNestedUnknown': '기록되지 않음',
+  'settings.runtimeImage': '검증된 이미지',
   'settings.about': '정보',
   'settings.aboutLine': 'DevHotel {version} — 모든 프로젝트에 저마다의 Room을.',
 
