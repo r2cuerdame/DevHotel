@@ -4677,7 +4677,8 @@ export class OciCliBackend implements IsolationBackend {
 
   async createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    limits?: { cpus?: number; memoryMB?: number }
   ): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
@@ -4698,7 +4699,8 @@ export class OciCliBackend implements IsolationBackend {
           networkNamespace: anchorId,
           networkAuthoritySandboxId: anchorSandboxId,
           networkAuthorityStartedAt: anchorStartedAt,
-          abortToken
+          abortToken,
+          limits
         }),
         {
           timeoutMs: null,

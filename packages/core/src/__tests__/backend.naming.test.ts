@@ -18,6 +18,11 @@ import {
   cacheVolume,
   depsVolume,
   emulatorAvdOverride,
+  emulatorBudget,
+  EMULATOR_BUDGET_CORES,
+  EMULATOR_BUDGET_MEMORY_MB,
+  EMULATOR_HOST_RESERVE_MB,
+  EMULATOR_MIN_MEMORY_MB,
   parsePortOutput,
   roomNetworkName,
   srcVolume,
@@ -320,7 +325,63 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('SCREEN_HEIGHT=1140')
     expect(args).toContain('EMULATOR_DEVICE=Samsung Galaxy S10')
     expect(args).toContain('EMULATOR_CONFIG_PATH=/home/androidusr/devhotel-avd-override.ini')
-    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth')
+    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth')
+  })
+
+  it('budgets emulator CPU and RAM while preserving KVM and the image software renderer', () => {
+    for (const args of [
+      buildEmulatorArgs('r1'),
+      buildEmulatorArgs('r1', { device: 'Nexus 5', version: '13.0', resolution: 'fast', orientation: 'landscape' })
+    ]) {
+      expect(envs(args).filter((env) => env.startsWith('EMULATOR_ADDITIONAL_ARGS='))).toEqual([
+        'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth'
+      ])
+      expect(args.flatMap((arg, index) => (arg === '--device' ? [args[index + 1]] : []))).toEqual(['/dev/kvm'])
+      expect(args).not.toContain('--gpus')
+      // Leave the image's swiftshader_indirect renderer in place.
+      expect(args.join(' ')).not.toContain('-gpu')
+    }
+  })
+
+  it('holds the emulator guest budget to the Room CPU and memory the user selected', () => {
+    // The whole point of #104's budget is that it is a ceiling. A Room capped
+    // at 1 CPU / 1 GB in the System tab must not get a 4-core, 4 GB emulator.
+    const small = buildEmulatorArgs('r1', undefined, { limits: { cpus: 1, memoryMB: 1024 } })
+    expect(envs(small)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 1 -memory 1024 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    const mid = buildEmulatorArgs('r1', undefined, { limits: { cpus: 2, memoryMB: 4096 } })
+    expect(envs(mid)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 2 -memory 3072 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    // A Room with headroom above the measured profile still stops at it.
+    const large = buildEmulatorArgs('r1', undefined, { limits: { cpus: 8, memoryMB: 8192 } })
+    expect(envs(large)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    // Bounding the guest must not be traded for a container cap that turns a
+    // slow emulator into an OOM-killed one.
+    for (const args of [small, mid, large]) {
+      expect(args).not.toContain('--memory')
+      expect(args).not.toContain('--cpus')
+      expect(args.flatMap((arg, index) => (arg === '--device' ? [args[index + 1]] : []))).toEqual(['/dev/kvm'])
+    }
+  })
+
+  it('clamps the emulator budget rather than trusting the Room limit arithmetic', () => {
+    expect(emulatorBudget()).toEqual({ cores: EMULATOR_BUDGET_CORES, memoryMB: EMULATOR_BUDGET_MEMORY_MB })
+    expect(emulatorBudget({})).toEqual({ cores: EMULATOR_BUDGET_CORES, memoryMB: EMULATOR_BUDGET_MEMORY_MB })
+    // An unlimited Room keeps the measured profile.
+    expect(emulatorBudget({ cpus: undefined, memoryMB: undefined }).cores).toBe(EMULATOR_BUDGET_CORES)
+    // memoryMB - reserve can go to zero or negative; the floor is what an
+    // Android 14 AVD needs to reach boot_completed at all.
+    expect(emulatorBudget({ memoryMB: EMULATOR_HOST_RESERVE_MB }).memoryMB).toBe(EMULATOR_MIN_MEMORY_MB)
+    expect(emulatorBudget({ memoryMB: 1 }).memoryMB).toBe(EMULATOR_MIN_MEMORY_MB)
+    // Never zero or fractional cores.
+    expect(emulatorBudget({ cpus: 0 }).cores).toBe(EMULATOR_BUDGET_CORES)
+    expect(emulatorBudget({ cpus: 1.5 }).cores).toBe(1)
+    expect(emulatorBudget({ cpus: Number.NaN }).cores).toBe(EMULATOR_BUDGET_CORES)
+    expect(emulatorBudget({ memoryMB: Number.POSITIVE_INFINITY }).memoryMB).toBe(EMULATOR_BUDGET_MEMORY_MB)
   })
 
   it('rotates the X screen and AVD orientation for landscape emulators', () => {
