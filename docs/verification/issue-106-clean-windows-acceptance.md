@@ -97,7 +97,7 @@ SHA-256 and the version it reports. Nothing else is copied into the guest.
 | 6 | Reboot resume works | Restart guest; DevHotel resumes from boot-identity change, no second prompt | | |
 | 7 | Provisioning completes | ISO fetched and digest-verified; VM, seed and state disks created | | |
 | 8 | VM account reaches its attachments | VM starts; no `0x80070005` on any attachment | | |
-| 9 | Nested virt is optional, not silent | Records whether it was obtained; provisioning survives refusal | | |
+| 9 | Nested virt is optional, not silent | Provisioning survives refusal, and the runtime observation reports which it got | | |
 | 10 | **Runtime reaches healthy** | COM2 health returns the exact install/runtime/daemon identity and nonce | | |
 | 11 | Identity is observable | Runtime identity, version and digests visible in DevHotel | | |
 | 12 | Guest reboot recovers | Restart guest; runtime returns to healthy without human repair | | |
@@ -105,7 +105,11 @@ SHA-256 and the version it reports. Nothing else is copied into the guest.
 | 14 | **State disk survives repair** | Write a marker into runtime state, force repair, marker still there | | |
 | 15 | Ownership is fenced | Tamper with marker/Notes; DevHotel refuses and does not adopt | | |
 | 16 | Two managed Web Rooms | Two Rooms reachable on the managed runtime (gates #107) | | |
-| 17 | Uninstall is ownership-safe | Removes only DevHotel-owned VM and disks; unrelated VMs untouched | | |
+| 17 | Uninstall is ownership-safe | VM removed before app data; only DevHotel-owned VM and disks; a VM whose Notes were tampered with is refused, not deleted | | |
+
+Row 17 has two halves and both have to be seen: that an owned VM is gone from
+`Get-VM` afterwards, and that a VM whose Notes were edited first is still there.
+The second half is what stops the first from being a plain `Remove-VM`.
 
 Rows 10 and 14 are the ones #106 turns on. Row 14 is the one most likely to be
 skipped and most expensive to get wrong: a repair that silently discards the

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -64,11 +65,23 @@ function readPowerShellLiteral(script: string, variable: string): string {
 class FakeHyperV {
   vm: FakeVm | null = null
   readonly scripts: string[] = []
+  /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
+  grantsNested = true
 
   readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
     expect(executable).toBe('powershell.exe')
     const script = decodeScript(args)
     this.scripts.push(script)
+    if (script.includes('Remove-VM -VM $vm -Force')) {
+      if (this.vm) {
+        // The provider's own fences, enforced the way Hyper-V would.
+        if (this.vm.notes !== readPowerShellLiteral(script, 'notes')) {
+          return { code: 1, stdout: '', stderr: 'Managed Hyper-V VM ownership proof is invalid' }
+        }
+        this.vm = null
+      }
+      return { code: 0, stdout: JSON.stringify({ Removed: true }), stderr: '' }
+    }
     if (script.includes('$vm=Get-VM')) {
       return {
         code: 0,
@@ -86,7 +99,11 @@ class FakeHyperV {
         state: 'Off',
         notes: readPowerShellLiteral(script, 'notes')
       }
-      return { code: 0, stdout: JSON.stringify({ Id: this.vm.id, State: this.vm.state }), stderr: '' }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ Id: this.vm.id, State: this.vm.state, Nested: this.grantsNested }),
+        stderr: ''
+      }
     }
     if (script.includes('Start-VM -Name')) {
       if (!this.vm) return { code: 1, stdout: '', stderr: 'missing VM' }
@@ -423,6 +440,67 @@ describe('ManagedHyperVRuntime', () => {
     await expect(managed.stop()).resolves.toMatchObject({ state: 'stopped' })
     expect(fake.vm?.state).toBe('Saved')
     await expect(managed.start()).resolves.toMatchObject({ state: 'ready' })
+  })
+
+  it('records whether this Host granted nested virtualization', async () => {
+    const granted = new FakeHyperV()
+    const refused = new FakeHyperV()
+    refused.grantsNested = false
+
+    const withNested = await runtime(granted)
+    const withoutNested = await runtime(refused)
+    await withNested.provision(await releaseImage())
+    await withoutNested.provision(await releaseImage())
+
+    // Both provision. The difference is that the answer survives, because only
+    // a guest that was granted it can later run KVM-backed Android emulators,
+    // and nothing else on the Host records which of the two happened.
+    await expect(withNested.observe()).resolves.toMatchObject({ nestedVirtualization: true })
+    await expect(withoutNested.observe()).resolves.toMatchObject({ nestedVirtualization: false })
+  })
+
+  it('removes the owned VM before the disks it holds open', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    const marker = await managed.provision(await releaseImage())
+    await managed.start()
+
+    await expect(managed.remove()).resolves.toBe('removed')
+    expect(fake.vm).toBeNull()
+
+    const removeScript = fake.scripts.find((script) => script.includes('Remove-VM -VM $vm -Force'))!
+    // A running guest is turned off rather than saved: a saved state only keeps
+    // the VHDX attachments open against the delete that follows it.
+    expect(removeScript).toContain("if ([string]$vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }")
+    // Order is the whole point. While the VM is registered, Hyper-V holds its
+    // attachments, so deleting the directory first either fails on the lock or
+    // leaves a VM pointing at disks that no longer exist.
+    expect(removeScript.indexOf('Remove-VM -VM $vm -Force')).toBeLessThan(
+      removeScript.indexOf('Remove-Item -LiteralPath $vmPath')
+    )
+    expect(existsSync(marker.vmPath.replace(/machine$/, 'provider.json'))).toBe(false)
+  })
+
+  it('refuses to remove a VM it cannot prove it created', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    await managed.provision(await releaseImage())
+
+    // Someone else's VM now answers to this name -- a collision, or a restored
+    // backup. Deleting it would destroy data DevHotel never owned.
+    fake.vm = { ...fake.vm!, notes: JSON.stringify({ owner: 'someone-else' }) }
+
+    await expect(managed.remove()).resolves.toBe('refused')
+    expect(fake.vm).not.toBeNull()
+    expect(fake.scripts.some((script) => script.includes('Remove-VM'))).toBe(false)
+  })
+
+  it('reports nothing to remove on a Host that was never provisioned', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+
+    await expect(managed.remove()).resolves.toBe('nothing-owned')
+    expect(fake.scripts.some((script) => script.includes('Remove-VM'))).toBe(false)
   })
 
   it('fails closed and sanitizes observation when ownership metadata is forged', async () => {

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { ManagedHyperVRuntimeMarker, ManagedHyperVRuntimeObservation } from '../backend/managedHyperVRuntime'
+import type {
+  ManagedHyperVRemovalOutcome,
+  ManagedHyperVRuntimeMarker,
+  ManagedHyperVRuntimeObservation
+} from '../backend/managedHyperVRuntime'
 import type {
   ManagedRuntimeManifest,
   ManagedRuntimeObservation,
@@ -79,6 +83,8 @@ function observation(current: ManagedRuntimeManifest, currentSupport = support()
 class FakeBootstrap implements ManagedRuntimeBootstrapController {
   current = manifest()
   currentSupport = support()
+  /** A Host this install never provisioned: no ownership manifest exists. */
+  manifestMissing = false
   readonly calls: string[] = []
 
   async support(): Promise<ManagedRuntimeSupport> {
@@ -93,7 +99,7 @@ class FakeBootstrap implements ManagedRuntimeBootstrapController {
 
   async readManifest(): Promise<ManagedRuntimeManifest | null> {
     this.calls.push('readManifest')
-    return this.current
+    return this.manifestMissing ? null : this.current
   }
 
   async beginProvision(): Promise<ManagedRuntimeManifest> {
@@ -134,6 +140,7 @@ function readyProviderObservation(): ManagedHyperVRuntimeObservation {
     runtimeVersion: MANAGED_HYPERV_RUNTIME_VERSION,
     daemonVersion: MANAGED_HYPERV_RUNTIME_VERSION,
     baseImageDigest: MANAGED_HYPERV_BOOT_ISO.sha256,
+    nestedVirtualization: true,
     detail: 'ready'
   }
 }
@@ -166,6 +173,7 @@ function provider(overrides: Partial<ManagedRuntimeProviderController> = {}): Ma
     stop: vi.fn(
       async (): Promise<ManagedHyperVRuntimeObservation> => ({ ...readyProviderObservation(), state: 'stopped' })
     ),
+    remove: vi.fn(async (): Promise<ManagedHyperVRemovalOutcome> => 'removed'),
     ...overrides
   }
 }
@@ -281,6 +289,49 @@ describe('ManagedRuntimeManager', () => {
 
     expect(stop).toHaveBeenCalledOnce()
   })
+  it('removes the owned runtime for uninstall, and reports a refusal instead of guessing', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.current = manifest('ready')
+    const remove = vi.fn(async (): Promise<ManagedHyperVRemovalOutcome> => 'removed')
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotel',
+      installId: 'install-1234',
+      windowsFeature: completedWindowsFeature,
+      bootstrap,
+      providerFactory: () => provider({ remove })
+    })
+
+    await expect(manager.remove()).resolves.toBe('removed')
+    expect(remove).toHaveBeenCalledOnce()
+
+    // A refusal is passed through rather than smoothed into success: uninstall
+    // has to be able to stop and tell the user a VM was left behind.
+    const refusing = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotel',
+      installId: 'install-1234',
+      windowsFeature: completedWindowsFeature,
+      bootstrap,
+      providerFactory: () => provider({ remove: vi.fn(async (): Promise<ManagedHyperVRemovalOutcome> => 'refused') })
+    })
+    await expect(refusing.remove()).resolves.toBe('refused')
+  })
+
+  it('never reaches the provider to remove a runtime that was never provisioned', async () => {
+    const bootstrap = new FakeBootstrap()
+    bootstrap.manifestMissing = true
+    const remove = vi.fn(async (): Promise<ManagedHyperVRemovalOutcome> => 'removed')
+    const manager = new ManagedRuntimeManager({
+      userData: 'C:\\DevHotel',
+      installId: 'install-1234',
+      windowsFeature: completedWindowsFeature,
+      bootstrap,
+      providerFactory: () => provider({ remove })
+    })
+
+    await expect(manager.remove()).resolves.toBe('nothing-owned')
+    expect(remove).not.toHaveBeenCalled()
+  })
+
   it('reports the Windows approval gate instead of provisioning on a Host without Hyper-V', async () => {
     const bootstrap = new FakeBootstrap()
     bootstrap.currentSupport = support('virtualization-ready')
