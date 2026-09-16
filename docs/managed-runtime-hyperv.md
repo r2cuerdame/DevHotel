@@ -166,7 +166,24 @@ two serial ports wired to sockets. What that run established:
 That run is guest-bootstrap evidence only. It deliberately does **not** stand in
 for Hyper-V: QEMU enumerates the disks over `virtio-scsi` and the serial ports
 as ISA 16550As, where Hyper-V Gen 2 presents storage through `hv_storvsc` and
-COM2 through a named pipe. Those paths are still unproven.
+COM2 through a named pipe. Those paths are still unproven on a live VM.
+
+What *can* be checked without a Hyper-V Host is whether the pinned image carries
+the drivers that path needs at all, since the ISO fixes its own boot cmdline to
+`modules=loop,squashfs,sd-mod,usb-storage` and names no Hyper-V module. Reading
+the pinned `initramfs-virt` and `config-6.12.94-0-virt` directly:
+
+- `CONFIG_HYPERV=y` — the VMBus core is built into the kernel, so it needs no
+  entry in `modules=`;
+- `hv_storvsc.ko` ships **inside the initramfs**, and `modules.alias` carries
+  its three `vmbus:` aliases, so `nlplug-findfs` autoloads it by modalias when
+  VMBus enumerates the controller;
+- `sr_mod.ko` is present for the Generation 2 SCSI DVD, and `vfat.ko` with the
+  `nls_*` tables for the FAT seed the apkovl lives on;
+- `CONFIG_SERIAL_8250=y`, so COM2 needs no module either.
+
+That is static evidence about the pinned bytes, not a boot. It says the missing
+`modules=` entry is not a blocker; it does not prove the Hyper-V boot works.
 
 ### Still unproven — release blockers
 
