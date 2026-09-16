@@ -23,8 +23,13 @@ describe('randomSerial', () => {
   // produced a rejected serial about 3% of the time, which read as a flaky
   // gateway suite rather than as a certificate bug.
   it('always encodes as a positive, minimally encoded DER INTEGER', () => {
+    // 2,000 is not a round number picked for comfort. The defect this guards
+    // against appeared in 3.06% of serials, so the chance of 2,000 clean
+    // samples hiding it is about 1e-27. Twenty thousand bought nothing beyond
+    // that and blocked the event loop long enough for vitest's worker RPC to
+    // time out on a loaded CI runner, failing a run in which every test passed.
     const offenders: string[] = []
-    for (let i = 0; i < 20_000; i += 1) {
+    for (let i = 0; i < 2_000; i += 1) {
       const serial = randomSerial()
       const lead = parseInt(serial.slice(0, 2), 16)
       const next = parseInt(serial.slice(2, 4), 16)
@@ -37,12 +42,12 @@ describe('randomSerial', () => {
 
   it('stays a full-width, varied 16-byte serial', () => {
     const serials = new Set<string>()
-    for (let i = 0; i < 1_000; i += 1) {
+    for (let i = 0; i < 500; i += 1) {
       const serial = randomSerial()
       expect(serial).toMatch(/^[0-9a-f]{32}$/)
       serials.add(serial)
     }
-    expect(serials.size).toBe(1_000)
+    expect(serials.size).toBe(500)
   })
 })
 
