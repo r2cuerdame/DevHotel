@@ -35,7 +35,6 @@ visible rather than merely slow. A Room is not reused when:
   relayed port, workspace/deps/cache volumes, or a Room Service version. Changes
   made to a sleeping Room are materialized by recreating its containers, so
   drift has to refuse.
-- **it is an Android Room.** See below.
 
 Ownership is the one thing that is not a fallback condition: a foreign container
 wearing a Room's name still fails the wake rather than being quietly worked
@@ -43,31 +42,5 @@ around. A warm start that fails partway stops whatever it started, so the caller
 always gets back the same stopped pod it had.
 
 Because nothing is recreated on the warm path, an Android Room's tracked installs
-would survive it. They are not trusted on that basis: every tracked install is
+survive it. They are not trusted on that basis: every tracked install is
 re-proved against package, user and incarnation before it is used again.
-
-### Why Android Rooms always recreate
-
-A retained `budtmo/docker-android` emulator container cannot be restarted, so
-Android Rooms refuse the warm path before starting anything rather than spend a
-doomed emulator boot on every wake.
-
-Stopping the container is always a SIGKILL — its PID 1 does not forward SIGTERM,
-so `docker stop` times out and the container exits 137. Xvfb therefore never
-releases `:0` and leaves a read-only `/tmp/.X0-lock` behind. On the next start
-the image's one-shot KVM bootstrap also fails, because it deletes the root
-`/etc/passwd` entry it needs for `sudo chown /dev/kvm`; DevHotel repairs that
-identity, and with it repaired qemu does relaunch and reports
-`CPU Acceleration: working`. It then dies anyway:
-
-```
-INFO | Warning: could not connect to display :0 (:0, )
-INFO | Fatal: This application failed to start because no Qt platform plugin
-       could be initialized.
-```
-
-No Docker CLI operation can delete a file inside a stopped container, so the
-stale lock cannot be cleared from outside, and the image offers no way to shut
-the emulator down cleanly first. The warm Android path belongs to the managed
-runtime (#108), which owns the emulator process directly and can stop it
-gracefully.

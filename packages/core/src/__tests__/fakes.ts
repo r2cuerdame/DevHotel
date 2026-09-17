@@ -280,12 +280,7 @@ export class FakeBackend implements IsolationBackend {
   async resumeRoomPod(spec: WebSpec, _opts?: ResumeRoomPodOpts): Promise<RoomResumeResult> {
     const kind = spec.androidRuntimeIsolation ? 'android' : 'web'
     this.calls.push(`resumeRoomPod:${spec.roomId}:${kind}`)
-    // Mirrors the real backend: a retained docker-android emulator cannot be
-    // restarted, so no test can assert a warm Android wake by setting
-    // `resumeResult` — see OciCliBackend.resumeRoomPod.
-    if (spec.androidRuntimeIsolation) {
-      return { reused: false, reason: 'a retained Android emulator container cannot be restarted' }
-    }
+    // The real backend can now safely restart the managed emulator.
     if (this.resumeResult.reused) {
       this.lastWebSpec = spec
       this.webPausedValue = false
