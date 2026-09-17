@@ -33,11 +33,62 @@ function formatIpv4(int: number): string {
   ].join('.')
 }
 
+interface CidrRange {
+  /** First address of the block as an unsigned 32-bit integer. */
+  start: number
+  /** Last address of the block (inclusive) as an unsigned 32-bit integer. */
+  end: number
+}
+
+/**
+ * Parse an IPv4 CIDR into its inclusive address range. Host bits below the
+ * prefix are masked off. Returns null for anything that is not a valid IPv4
+ * CIDR (IPv6 blocks reported by Docker, malformed strings, prefix > 32) so
+ * callers can skip unusable entries instead of aborting an allocation.
+ */
+function parseCidrRange(cidr: string): CidrRange | null {
+  const [ip, prefixStr, ...rest] = cidr.trim().split('/')
+  if (!ip || rest.length > 0) return null
+  const prefix = prefixStr === undefined ? 32 : Number.parseInt(prefixStr, 10)
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32 || (prefixStr !== undefined && String(prefix) !== prefixStr)) {
+    return null
+  }
+  let base: number
+  try {
+    base = parseIpv4(ip)
+  } catch {
+    return null
+  }
+  // `x >>> 32` is a no-op in JS, so /0 needs an explicit all-zero mask.
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+  const start = (base & mask) >>> 0
+  const end = (start | (~mask >>> 0)) >>> 0
+  return { start, end }
+}
+
+function rangesOverlap(a: CidrRange, b: CidrRange): boolean {
+  return a.start <= b.end && b.start <= a.end
+}
+
+/**
+ * True when two IPv4 CIDR blocks share at least one address, regardless of
+ * prefix length (a /20 supernet overlaps every /24 inside it; a /25 overlaps
+ * the /24 that contains it). Unparsable input never overlaps and never throws.
+ */
+export function cidrsOverlap(a: string, b: string): boolean {
+  const ra = parseCidrRange(a)
+  const rb = parseCidrRange(b)
+  if (!ra || !rb) return false
+  return rangesOverlap(ra, rb)
+}
+
 export class SubnetAllocator {
   readonly pool: string
   readonly subnetPrefix: number
   private readonly poolBaseInt: number
   private readonly poolPrefix: number
+  private readonly poolRange: CidrRange
+  private readonly subnetStep: number
   private readonly totalCapacity: number
   private readonly allocatedByNetwork = new Map<string, string>()
   private readonly claimedSubnets = new Set<string>()
@@ -58,49 +109,72 @@ export class SubnetAllocator {
       throw new Error(`Subnet prefix length (/${this.subnetPrefix}) must be greater than pool prefix (/${this.poolPrefix})`)
     }
     this.pool = `${formatIpv4(this.poolBaseInt)}/${this.poolPrefix}`
+    this.poolRange = parseCidrRange(this.pool)!
+    this.subnetStep = 2 ** (32 - this.subnetPrefix)
     this.totalCapacity = 2 ** (this.subnetPrefix - this.poolPrefix)
   }
 
+  /**
+   * True when the CIDR shares address space with the pool, whatever its prefix
+   * length. Docker rejects any new subnet that overlaps an existing one, so a
+   * /20 supernet or a /25 sub-network inside the pool consumes pool capacity
+   * exactly like a managed /24 does.
+   */
   isSubnetInPool(subnet: string): boolean {
-    const [ip, prefix] = subnet.split('/')
-    if (!ip || Number.parseInt(prefix ?? '', 10) !== this.subnetPrefix) return false
-    try {
-      const parsed = parseIpv4(ip)
-      const shift = 32 - this.poolPrefix
-      return (parsed >>> shift) === (this.poolBaseInt >>> shift)
-    } catch {
-      return false
-    }
+    const range = parseCidrRange(subnet)
+    return range !== null && rangesOverlap(range, this.poolRange)
   }
 
   subnetForIndex(index: number): string {
     if (index < 0 || index >= this.totalCapacity) {
       throw new Error(`Subnet index ${index} out of bounds for capacity ${this.totalCapacity}`)
     }
-    const step = 2 ** (32 - this.subnetPrefix)
-    const subnetInt = (this.poolBaseInt + index * step) >>> 0
+    const subnetInt = (this.poolBaseInt + index * this.subnetStep) >>> 0
     return `${formatIpv4(subnetInt)}/${this.subnetPrefix}`
+  }
+
+  /**
+   * Indices of every managed subnet slot that overlaps any of the given CIDRs.
+   * Unparsable entries (IPv6, garbage) and CIDRs outside the pool contribute
+   * nothing; nested or duplicate CIDRs are naturally deduplicated by the Set.
+   */
+  private occupiedIndices(cidrs: Iterable<string>): Set<number> {
+    const occupied = new Set<number>()
+    for (const cidr of cidrs) {
+      const range = parseCidrRange(cidr)
+      if (!range || !rangesOverlap(range, this.poolRange)) continue
+      const first = Math.max(range.start, this.poolRange.start)
+      const last = Math.min(range.end, this.poolRange.end)
+      const firstIndex = Math.floor((first - this.poolBaseInt) / this.subnetStep)
+      const lastIndex = Math.floor((last - this.poolBaseInt) / this.subnetStep)
+      for (let i = firstIndex; i <= lastIndex; i++) occupied.add(i)
+    }
+    return occupied
+  }
+
+  private usedIndices(externalUsedSubnets?: ReadonlySet<string>): Set<number> {
+    const occupied = this.occupiedIndices(this.claimedSubnets)
+    if (externalUsedSubnets) {
+      for (const i of this.occupiedIndices(externalUsedSubnets)) occupied.add(i)
+    }
+    return occupied
   }
 
   allocate(networkName: string, externalUsedSubnets?: ReadonlySet<string>): string {
     const existing = this.allocatedByNetwork.get(networkName)
     if (existing) return existing
 
+    const used = this.usedIndices(externalUsedSubnets)
     for (let i = 0; i < this.totalCapacity; i++) {
-      const candidate = this.subnetForIndex(i)
-      if (this.claimedSubnets.has(candidate)) continue
-      if (externalUsedSubnets?.has(candidate)) continue
+      if (used.has(i)) continue
 
+      const candidate = this.subnetForIndex(i)
       this.allocatedByNetwork.set(networkName, candidate)
       this.claimedSubnets.add(candidate)
       return candidate
     }
 
-    const usedCount = this.claimedSubnets.size + (
-      externalUsedSubnets
-        ? [...externalUsedSubnets].filter((s) => this.isSubnetInPool(s) && !this.claimedSubnets.has(s)).length
-        : 0
-    )
+    const usedCount = Math.min(this.totalCapacity, used.size)
 
     throw new DevHotelError(
       'NETWORK_POOL_EXHAUSTED',
@@ -136,10 +210,7 @@ export class SubnetAllocator {
   }
 
   getCapacity(externalUsedSubnets?: ReadonlySet<string>): PoolCapacity {
-    const externalInPool = externalUsedSubnets
-      ? [...externalUsedSubnets].filter((s) => this.isSubnetInPool(s) && !this.claimedSubnets.has(s)).length
-      : 0
-    const usedCount = Math.min(this.totalCapacity, this.claimedSubnets.size + externalInPool)
+    const usedCount = Math.min(this.totalCapacity, this.usedIndices(externalUsedSubnets).size)
     return {
       pool: this.pool,
       subnetSize: this.subnetPrefix,

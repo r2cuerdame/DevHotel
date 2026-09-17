@@ -6,6 +6,7 @@ import {
   DEFAULT_SUBNET_POOL,
   DEFAULT_SUBNET_PREFIX,
   SubnetAllocator,
+  cidrsOverlap,
   classifyNetworkCreateError
 } from '../backend/ipam'
 import {
@@ -425,6 +426,112 @@ describe('SubnetAllocator unit tests', () => {
         usedCount: 2,
         availableCount: 0
       })
+    }
+  })
+
+  it('detects CIDR overlap across arbitrary prefix lengths and tolerates unparsable input', () => {
+    expect(cidrsOverlap('10.214.0.0/24', '10.214.0.0/20')).toBe(true)
+    expect(cidrsOverlap('10.214.0.0/20', '10.214.0.0/24')).toBe(true)
+    expect(cidrsOverlap('10.214.0.0/24', '10.214.0.0/25')).toBe(true)
+    expect(cidrsOverlap('10.214.0.0/24', '10.214.0.128/25')).toBe(true)
+    expect(cidrsOverlap('10.214.3.0/24', '10.0.0.0/8')).toBe(true)
+    expect(cidrsOverlap('10.214.3.0/24', '10.214.3.4/30')).toBe(true)
+    expect(cidrsOverlap('10.214.0.0/24', '10.214.1.0/24')).toBe(false)
+    expect(cidrsOverlap('10.214.16.0/24', '10.214.0.0/20')).toBe(false)
+    expect(cidrsOverlap('10.214.0.0/16', '10.215.0.0/16')).toBe(false)
+    // Non-aligned host bits are masked before comparison
+    expect(cidrsOverlap('10.214.0.77/24', '10.214.0.0/24')).toBe(true)
+    // IPv6 and malformed entries reported by Docker never match and never throw
+    expect(cidrsOverlap('10.214.0.0/24', 'fd00::/64')).toBe(false)
+    expect(cidrsOverlap('10.214.0.0/24', 'not-a-cidr')).toBe(false)
+    expect(cidrsOverlap('10.214.0.0/24', '10.214.0.0/33')).toBe(false)
+  })
+
+  it('skips every /24 candidate covered by an external supernet', () => {
+    const allocator = new SubnetAllocator()
+    const external = new Set(['10.214.0.0/20'])
+
+    expect(allocator.allocate('dh-r0-net', external)).toBe('10.214.16.0/24')
+    expect(allocator.allocate('dh-r1-net', external)).toBe('10.214.17.0/24')
+  })
+
+  it('skips the /24 candidate that contains an external sub-network', () => {
+    const allocator = new SubnetAllocator()
+    const external = new Set(['10.214.0.0/25'])
+
+    expect(allocator.allocate('dh-r0-net', external)).toBe('10.214.1.0/24')
+  })
+
+  it('avoids external overlaps at varied prefix lengths from /8 to /30', () => {
+    // /30 inside the pool blocks exactly one candidate
+    const narrow = new SubnetAllocator()
+    expect(narrow.allocate('dh-r0-net', new Set(['10.214.5.4/30']))).toBe('10.214.0.0/24')
+    expect(narrow.allocate('dh-r5-net', new Set(['10.214.5.4/30', '10.214.0.0/21']))).toBe('10.214.8.0/24')
+    // Different prefix lengths in the same set are all honoured
+    const mixed = new SubnetAllocator()
+    const external = new Set(['10.214.0.0/22', '10.214.4.128/25', '10.214.5.0/26', '10.214.6.0/24'])
+    expect(mixed.allocate('dh-r0-net', external)).toBe('10.214.7.0/24')
+    // /8 covering the whole pool exhausts it instead of colliding with Docker
+    const covered = new SubnetAllocator()
+    expect(() => covered.allocate('dh-r0-net', new Set(['10.0.0.0/8']))).toThrowError(DevHotelError)
+    try {
+      covered.allocate('dh-r0-net', new Set(['10.0.0.0/8']))
+    } catch (err) {
+      const dhe = err as DevHotelError
+      expect(dhe.code).toBe('NETWORK_POOL_EXHAUSTED')
+      expect(dhe.evidence).toMatchObject({ usedCount: 256, availableCount: 0, totalCapacity: 256 })
+    }
+  })
+
+  it('ignores IPv6 and malformed external subnets while still honouring IPv4 overlaps', () => {
+    const allocator = new SubnetAllocator()
+    const external = new Set(['fd00:dead:beef::/48', 'garbage', '10.214.0.0/23'])
+    expect(allocator.allocate('dh-r0-net', external)).toBe('10.214.2.0/24')
+  })
+
+  it('reports pool membership for any prefix length that overlaps the pool', () => {
+    const allocator = new SubnetAllocator()
+    expect(allocator.isSubnetInPool('10.214.0.0/24')).toBe(true)
+    expect(allocator.isSubnetInPool('10.214.0.0/20')).toBe(true)
+    expect(allocator.isSubnetInPool('10.214.0.0/25')).toBe(true)
+    expect(allocator.isSubnetInPool('10.214.255.252/30')).toBe(true)
+    expect(allocator.isSubnetInPool('10.0.0.0/8')).toBe(true)
+    expect(allocator.isSubnetInPool('10.213.0.0/24')).toBe(false)
+    expect(allocator.isSubnetInPool('10.215.0.0/16')).toBe(false)
+    expect(allocator.isSubnetInPool('172.17.0.0/16')).toBe(false)
+    expect(allocator.isSubnetInPool('fd00::/64')).toBe(false)
+    expect(allocator.isSubnetInPool('nonsense')).toBe(false)
+  })
+
+  it('counts /24 equivalents consumed by overlapping external subnets in capacity', () => {
+    const allocator = new SubnetAllocator()
+
+    expect(allocator.getCapacity(new Set(['10.214.0.0/20']))).toMatchObject({ usedCount: 16, availableCount: 240 })
+    expect(allocator.getCapacity(new Set(['10.214.0.0/25']))).toMatchObject({ usedCount: 1, availableCount: 255 })
+    expect(allocator.getCapacity(new Set(['10.214.0.0/25', '10.214.0.128/25']))).toMatchObject({ usedCount: 1 })
+    // A subnet nested inside a supernet is not double counted
+    expect(allocator.getCapacity(new Set(['10.214.0.0/20', '10.214.3.0/24']))).toMatchObject({ usedCount: 16 })
+    // Networks outside the pool do not count
+    expect(allocator.getCapacity(new Set(['172.17.0.0/16', '10.213.0.0/20']))).toMatchObject({ usedCount: 0, availableCount: 256 })
+    // Supernet larger than the pool saturates it
+    expect(allocator.getCapacity(new Set(['10.0.0.0/8']))).toMatchObject({ usedCount: 256, availableCount: 0 })
+
+    // In-memory claims overlapping an external subnet are not double counted either
+    allocator.allocate('dh-r0-net', new Set(['10.214.0.0/20']))
+    expect(allocator.getCapacity(new Set(['10.214.0.0/20']))).toMatchObject({ usedCount: 17, availableCount: 239 })
+  })
+
+  it('reports accurate usedCount in the exhaustion error when an external supernet fills the pool', () => {
+    const allocator = new SubnetAllocator({ pool: '10.214.0.0/29', subnetPrefix: 30 })
+    const external = new Set(['10.214.0.0/28'])
+    try {
+      allocator.allocate('dh-r0-net', external)
+      expect.unreachable('allocate should have thrown')
+    } catch (err) {
+      expect(err).toBeInstanceOf(DevHotelError)
+      const dhe = err as DevHotelError
+      expect(dhe.code).toBe('NETWORK_POOL_EXHAUSTED')
+      expect(dhe.evidence).toMatchObject({ totalCapacity: 2, usedCount: 2, availableCount: 0 })
     }
   })
 
