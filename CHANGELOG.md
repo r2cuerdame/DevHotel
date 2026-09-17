@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Isolated Client Browsers for agent web automation (#114)
+
+- Agents can borrow a DevHotel-owned Chromium per Room with
+  `allocate_client_browser` (`POST /v1/rooms/:id/browsers`). Every session is
+  its own process and profile — cookies, localStorage, sessionStorage, tabs —
+  and is reachable only through a token-gated loopback endpoint
+  (`/cdp/<sessionId>/<token>`) that Playwright's `connectOverCDP`, puppeteer
+  and raw CDP clients consume unchanged. Two Rooms, or two agents, never share
+  login state and cannot attach to each other's browser without the token.
+- `attach_client_browser`, `inspect_client_browser` (owner, liveness,
+  tunnelled client count, page targets), `navigate_client_browser`,
+  `screenshot_client_browser` and `release_client_browser` complete the
+  surface; fifty-nine MCP tools are now available.
+- A Room's browsers are released when the Room sleeps or is deleted and on
+  DevHotel shutdown; startup stops and cleans browsers and profiles a previous
+  process left behind, only after proving the process owns that profile.
+- Only the token's SHA-256 digest is stored. Tokens never appear in listings,
+  inspection or logs.
+- `docs/client-browser.md` explains how the Client Browser capability differs
+  from the Web Server Room capability.
+
 ### Agents can tear down sleeping, fully-synced Host-linked Rooms (#90)
 
 - `DELETE /v1/rooms/:id` (and the `delete_room` MCP tool) no longer answers

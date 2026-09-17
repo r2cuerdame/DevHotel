@@ -27,6 +27,11 @@ import {
   zArtifactExportBody,
   zRoomArtifact,
   zAttachDeviceBody,
+  zAllocateClientBrowserBody,
+  zClientBrowserAuthBody,
+  zClientBrowserSessionId,
+  zNavigateClientBrowserBody,
+  zScreenshotClientBrowserBody,
   zCancelRequestBody,
   zCaptureScreenshotArtifactBody,
   zExecBody,
@@ -111,6 +116,14 @@ function parseAndroidBody<T>(schema: InputSchema<T>, input: unknown): T {
     code: 'INVALID_ANDROID_REQUEST',
     message: 'Android automation request fields are invalid.',
     recoveryHint: 'Use only the documented bounded Android operation fields and value formats.'
+  })
+}
+
+function parseClientBrowserInput<T>(schema: InputSchema<T>, input: unknown): T {
+  return parseRequestInput(schema, input, {
+    code: 'INVALID_CLIENT_BROWSER_REQUEST',
+    message: 'Client Browser request fields are invalid.',
+    recoveryHint: 'Send the session ID and token exactly as allocate_client_browser returned them, plus only the documented fields.'
   })
 }
 
@@ -275,6 +288,46 @@ export async function startControlApi(
         const body = zVolumeGcBody.parse(await readBody(req))
         sendJson(res, 200, await orch.gcVolumes(body))
         return
+      }
+    }
+
+    // Client Browsers are addressed by session, not Room: the token, not the
+    // caller's Room, is what proves ownership, so two agents in one Room are
+    // as separate as two agents in different Rooms.
+    if (parts[1] === 'browsers') {
+      if (!parts[2] && req.method === 'GET') {
+        sendJson(res, 200, { runtime: orch.clientBrowsers.runtimeKind, sessions: orch.clientBrowsers.listAll() })
+        return
+      }
+      const sessionId = parseClientBrowserInput(zClientBrowserSessionId, parts[2])
+      const action = parts[3]
+      if (req.method === 'POST' && action) {
+        const rawBody = await readBody(req)
+        if (action === 'attach') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, orch.clientBrowsers.attach(sessionId, body.token))
+          return
+        }
+        if (action === 'inspect') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.inspect(sessionId, body.token))
+          return
+        }
+        if (action === 'navigate') {
+          const body = parseClientBrowserInput(zNavigateClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.navigate(sessionId, body.token, body.url, body.timeoutMs))
+          return
+        }
+        if (action === 'screenshot') {
+          const body = parseClientBrowserInput(zScreenshotClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.screenshot(sessionId, body.token, { format: body.format, fullPage: body.fullPage }))
+          return
+        }
+        if (action === 'release') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.release(sessionId, body.token))
+          return
+        }
       }
     }
 
@@ -467,6 +520,20 @@ export async function startControlApi(
         if (action === 'adb') {
           const body = zAgentAdbBody.parse(await readBody(req))
           sendJson(res, 200, await orch.adbOnDevice(safeRoomId, body.args, { timeoutMs: body.timeoutMs }))
+          return
+        }
+      }
+
+      // /v1/rooms/:id/browsers — allocate an isolated automation browser for
+      // this Room, or see which ones it holds. The secret is returned once.
+      if (safeRoomId && op === 'browsers' && !parts[4]) {
+        if (req.method === 'GET') {
+          sendJson(res, 200, orch.clientBrowsers.listForRoom(safeRoomId))
+          return
+        }
+        if (req.method === 'POST') {
+          const body = parseClientBrowserInput(zAllocateClientBrowserBody, (await readBody(req)) ?? {})
+          sendJson(res, 200, await orch.clientBrowsers.allocate(safeRoomId, body))
           return
         }
       }

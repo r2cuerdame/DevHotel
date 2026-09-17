@@ -75,6 +75,7 @@ export class ClientBrowserEndpointServer {
         server.once('error', onError)
         server.once('listening', onListening)
         server.listen(port, '127.0.0.1')
+        server.unref()
       })
     let port: number
     try {
