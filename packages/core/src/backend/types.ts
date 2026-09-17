@@ -28,6 +28,12 @@ export interface WebSpec {
   noCacheVolume?: boolean
   /** additional named-volume mounts (docker seeds them from image content on first use) */
   extraVolumes?: { volume: string; path: string }[]
+  /**
+   * Hotel-scoped caches this Room mounts, shared with every other Room that
+   * mounts them. Distinct from `extraVolumes` because these carry no Room
+   * identity: nothing Room-scoped may create, validate or delete one.
+   */
+  sharedCaches?: { volume: string; path: string }[]
   /** docker --cpus limit */
   cpus?: number
   /** docker --memory limit in MB */
@@ -148,6 +154,9 @@ export interface DockerVolumeUsage {
   createdAt?: string
 }
 
+/** One volume as seen right now, minus the size only a full `df` pass can measure. */
+export type DockerVolumeObservation = Omit<DockerVolumeUsage, 'sizeBytes' | 'sizeKnown'>
+
 export type RoomArtifactRecoveryOutcome =
   | 'committed'
   | 'absent'
@@ -179,6 +188,23 @@ export interface GitCredential {
 /** Answers "which credential clones this URL", or null when the clone should stay anonymous. */
 export type GitCredentialResolver = (gitUrl: string) => Promise<GitCredential | null>
 
+export interface ResumeServiceSpec {
+  kind: 'postgres' | 'redis'
+  version: string
+}
+
+export interface ResumeRoomPodOpts {
+  services?: readonly ResumeServiceSpec[]
+}
+
+/**
+ * A refusal is an ordinary answer, not a failure: it carries why the retained
+ * runtime could not be proved reusable so the caller can log it and recreate.
+ */
+export type RoomResumeResult =
+  | { reused: true; hostPort: number }
+  | { reused: false; reason: string }
+
 export interface IsolationBackend {
   health(): Promise<{ ok: boolean; detail: string }>
   createRoomPod(
@@ -209,6 +235,8 @@ export interface IsolationBackend {
   restartWeb(roomId: string, spec?: WebSpec): Promise<void>
   recreateWeb(spec: WebSpec, expectedWebId?: string): Promise<void>
   recreateAnchor(spec: AnchorSpec): Promise<{ hostPort: number }>
+  /** Warm wake: start the retained, proved-unchanged Room containers in place. */
+  resumeRoomPod(spec: WebSpec, opts?: ResumeRoomPodOpts): Promise<RoomResumeResult>
   deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }>
   execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult>
   /** Spawn an interactive command only after engine and exact web-container ownership validation. */
@@ -262,6 +290,8 @@ export interface IsolationBackend {
   listManagedNetworks(): Promise<ManagedNetwork[]>
   /** Remove a network already verified as DevHotel-managed. */
   removeManagedNetwork(name: string): Promise<void>
+  /** Adopt a surviving DevHotel-managed network and its subnet into internal allocator tracking. */
+  adoptManagedNetwork?(name: string): Promise<void>
   cloneIntoVolume(
     roomId: string,
     gitUrl: string,
@@ -269,6 +299,22 @@ export interface IsolationBackend {
     log?: (line: string) => void,
     credential?: GitCredential | null
   ): Promise<void>
+  /**
+   * Shallow-clone a repository into an existing Host directory, for project
+   * detection before a Room exists.
+   *
+   * This is the backend's job rather than the orchestrator's because only the
+   * backend knows how its engine reaches the Host filesystem. A Host-local
+   * engine can bind-mount the directory straight into the clone container; an
+   * engine inside the DevHotel-managed runtime cannot see that path at all and
+   * has to clone guest-side and copy the tree out. Core must not have to know
+   * which of those it is talking to.
+   */
+  cloneToHostDirectory(
+    gitUrl: string,
+    hostPath: string,
+    opts?: { credential?: GitCredential | null; timeoutMs?: number }
+  ): Promise<ExecResult>
   /** Import a canonical Host folder through a short-lived read-only mount into a new owned workspace generation. */
   importHostFolder(
     roomId: string,
@@ -305,7 +351,20 @@ export interface IsolationBackend {
   ): Promise<void>
   volumeSizes(roomId: string): Promise<Record<string, number>>
   listVolumesWithUsage(): Promise<DockerVolumeUsage[]>
+  /**
+   * Re-observe one volume's existence, labels, ownership and container
+   * attachments without a full inventory pass. Sizes are not re-measured:
+   * `docker system df` is the only source for them and one pass per GC run is
+   * the contract. Null when the volume no longer exists.
+   */
+  inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null>
   removeManagedVolume(name: string): Promise<void>
+  /**
+   * Remove one Hotel-scoped shared cache. Separate from `removeManagedVolume`
+   * on purpose: that path proves Room ownership, which a shared cache by
+   * definition cannot show, and no Room-scoped caller may reach this one.
+   */
+  removeSharedCache(name: string): Promise<void>
   imageExists(image: string): Promise<boolean>
   pullImage(image: string, log?: (line: string) => void): Promise<void>
   /** force-remove and recreate a volume, guaranteeing it is empty */
@@ -352,6 +411,15 @@ export interface IsolationBackend {
   ): Promise<FencedEmulatorBootResult>
   /** Recovery-only ADB through the retained control anchor; never starts the Room web workload. */
   execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /**
+   * Recovery-only boot witness under the retained control-anchor topology. It
+   * proves the emulator *workload* (ADB `device` + sys.boot_completed), not
+   * merely a running container, while the Room web workload may be exited.
+   */
+  waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult>
   /** Install one Host-private staged APK without reopening the Room workspace. */
   installFencedEmulatorApk(roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult>
   /* --- android emulator sidecar (KVM) --- */
@@ -363,7 +431,9 @@ export interface IsolationBackend {
   startExistingEmulatorForRecovery(roomId: string): Promise<void>
   createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    /** The Room's own CPU/memory selection, which bounds the emulator guest budget. */
+    limits?: { cpus?: number; memoryMB?: number }
   ): Promise<void>
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
   captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>

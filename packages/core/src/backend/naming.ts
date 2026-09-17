@@ -1,5 +1,6 @@
 import type { AnchorSpec, WebSpec } from './types'
 import { RELAY_PREAMBLE_PREFIX } from '../relayProtocol'
+import { NODE_PACKAGE_SHARED_CACHE, sharedCacheVolume } from '../lifecycle/sharedCache'
 
 export const ANCHOR_IMAGE = 'alpine/socat'
 export const RELAY_PORT = 3999
@@ -122,6 +123,34 @@ export function emulatorName(roomId: string): string {
   return `dh-${roomId}-svc-emulator`
 }
 
+/**
+ * Per-Room persistent AVD storage volume for the managed emulator path (#108).
+ *
+ * Keeping the AVD outside the container image is the precondition for warm-Room
+ * AVD reuse (#78): the emulator container can be recreated or updated without
+ * losing the booted snapshot that makes a warm Room reach ADB-ready in under 60s.
+ * On the compatibility (docker-android) path the AVD is baked into the image and
+ * there is no equivalent — this volume is managed-runtime-only.
+ */
+export function androidAvdVolume(roomId: string): string {
+  return `dh-${roomId}-android-avd`
+}
+
+/**
+ * Shared Android SDK volume for a given API level.
+ *
+ * All Rooms of the same Android version share one SDK installation — the same
+ * cmdline-tools, platform-tools, emulator binary and system image — so the ~2 GB
+ * download happens once per API level rather than once per Room. The volume is
+ * named after the level (not the Room) and is mounted read-only in the emulator
+ * container so no Room can corrupt another Room's SDK.
+ *
+ * Named `dh-android-sdk-<apiLevel>` (e.g. `dh-android-sdk-34`).
+ */
+export function androidSdkVolume(apiLevel: number): string {
+  return `dh-android-sdk-${apiLevel}`
+}
+
 export type EmulatorResolution = 'native' | 'balanced' | 'fast'
 export type EmulatorOrientation = 'portrait' | 'landscape'
 
@@ -130,6 +159,56 @@ export interface EmulatorOpts {
   version: string
   resolution?: EmulatorResolution
   orientation?: EmulatorOrientation
+}
+
+/**
+ * Emulator guest budget (#104). Measured on a Windows Host against disposable
+ * probes of the same emulator image: `-cores 4 -memory 4096 -noaudio` cut
+ * average adb input latency ~355ms → ~230ms and screencap ~873ms → ~639ms,
+ * with KVM and the image's swiftshader_indirect renderer left untouched. These
+ * are the *ceiling*, not a demand — a Room that asked for less gets less.
+ */
+export const EMULATOR_BUDGET_CORES = 4
+export const EMULATOR_BUDGET_MEMORY_MB = 4096
+/**
+ * The emulator container is not just qemu: Xvfb, x11vnc, websockify and
+ * supervisord live there too, and qemu's own resident set carries the software
+ * framebuffer on top of guest RAM. A Room's memory selection therefore cannot
+ * be handed to the guest whole.
+ */
+export const EMULATOR_HOST_RESERVE_MB = 1024
+/** An Android 14 AVD below this does not reach `sys.boot_completed`. */
+export const EMULATOR_MIN_MEMORY_MB = 1024
+
+export interface EmulatorLimits {
+  /** Room CPU selection (`RoomOsSettings.cpus`); undefined = unlimited. */
+  cpus?: number
+  /** Room memory selection in MB (`RoomOsSettings.memoryMB`); undefined = unlimited. */
+  memoryMB?: number
+}
+
+/**
+ * The guest budget the Room's own control-panel limits allow.
+ *
+ * The limits are deliberately spent on the guest rather than on `--cpus` /
+ * `--memory` for the emulator container. A hard container memory cap around a
+ * qemu process whose RSS includes the software framebuffer does not make the
+ * emulator smaller — it makes it OOM-killed, which the Room reports as "no
+ * emulator" rather than "slow emulator". Guest cores and guest RAM are what
+ * actually decide the sidecar's footprint, so that is where a 1 CPU / 1 GB Room
+ * is held to what it asked for.
+ */
+export function emulatorBudget(limits?: EmulatorLimits): { cores: number; memoryMB: number } {
+  const cores = limits?.cpus && Number.isFinite(limits.cpus)
+    ? Math.max(1, Math.min(EMULATOR_BUDGET_CORES, Math.floor(limits.cpus)))
+    : EMULATOR_BUDGET_CORES
+  const memoryMB = limits?.memoryMB && Number.isFinite(limits.memoryMB)
+    ? Math.max(
+        EMULATOR_MIN_MEMORY_MB,
+        Math.min(EMULATOR_BUDGET_MEMORY_MB, Math.floor(limits.memoryMB) - EMULATOR_HOST_RESERVE_MB)
+      )
+    : EMULATOR_BUDGET_MEMORY_MB
+  return { cores, memoryMB }
 }
 
 /** X screen dimensions for the emulator container, per orientation. */
@@ -150,18 +229,19 @@ const EMULATOR_DEVICE_LCD: Record<string, { width: number; height: number; densi
 
 const EMULATOR_RESOLUTION_SCALE: Record<EmulatorResolution, number> = {
   native: 1,
-  balanced: 0.75,
-  fast: 0.5
+  balanced: 0.5,
+  fast: 0.375
 }
 
 /**
  * AVD config.ini override. The emulator has no GPU passthrough in the room
  * (swiftshader renders in software), so shrinking the guest LCD is the single
- * biggest speed lever; 'balanced' is the default for a usable phone.
+ * biggest speed lever. 'fast' matches the 540px preview width for the default phone,
+ * avoiding a second software-render/downscale pass in the normal Room view.
  */
 export function emulatorAvdOverride(
   device?: string,
-  resolution: EmulatorResolution = 'balanced',
+  resolution: EmulatorResolution = 'fast',
   orientation: EmulatorOrientation = 'portrait'
 ): string {
   const lcd = EMULATOR_DEVICE_LCD[device ?? EMULATOR_DEFAULT_DEVICE] ?? EMULATOR_DEVICE_LCD[EMULATOR_DEFAULT_DEVICE]!
@@ -197,11 +277,13 @@ export function buildEmulatorArgs(
     networkAuthoritySandboxId?: string
     networkAuthorityStartedAt?: string
     abortToken?: string
+    limits?: EmulatorLimits
   } = {}
 ): string[] {
   const device = opts?.device ?? EMULATOR_DEFAULT_DEVICE
   const version = opts?.version ?? EMULATOR_DEFAULT_VERSION
   const screen = emulatorScreen(opts?.orientation)
+  const budget = emulatorBudget(lifecycle.limits)
   return [
     'create',
     '--name',
@@ -237,7 +319,7 @@ export function buildEmulatorArgs(
     // ADB authentication is disabled only for this managed emulator: its ADB
     // transport has no Host port or Room-network path, and immutable-ID
     // helpers can reach it only through the proved private control netns.
-    'EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth',
+    `EMULATOR_ADDITIONAL_ARGS=-cores ${budget.cores} -memory ${budget.memoryMB} -noaudio -no-boot-anim -skip-adb-auth`,
     '-e',
     `SCREEN_WIDTH=${screen.width}`,
     '-e',
@@ -314,16 +396,16 @@ function labelArgs(roomId: string, role: 'anchor' | 'web' | 'job'): string[] {
   return ['-l', `devhotel.room=${roomId}`, '-l', `devhotel.role=${role}`, '-l', 'devhotel.managed=1']
 }
 
-export function buildRoomNetworkCreateArgs(roomId: string): string[] {
-  return buildOwnedBridgeNetworkCreateArgs(roomId, roomNetworkName(roomId))
+export function buildRoomNetworkCreateArgs(roomId: string, subnet?: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, roomNetworkName(roomId), subnet)
 }
 
-export function buildAndroidControlNetworkCreateArgs(roomId: string): string[] {
-  return buildOwnedBridgeNetworkCreateArgs(roomId, androidControlNetworkName(roomId))
+export function buildAndroidControlNetworkCreateArgs(roomId: string, subnet?: string): string[] {
+  return buildOwnedBridgeNetworkCreateArgs(roomId, androidControlNetworkName(roomId), subnet)
 }
 
-function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string): string[] {
-  return [
+function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string, subnet?: string): string[] {
+  const args = [
     'network',
     'create',
     '--driver',
@@ -336,14 +418,25 @@ function buildOwnedBridgeNetworkCreateArgs(roomId: string, name: string): string
     'devhotel.role=network',
     '--label',
     'devhotel.managed=1',
-    name,
   ]
+  if (subnet) {
+    args.push('--subnet', subnet)
+  }
+  args.push(name)
+  return args
 }
 
 export function buildAnchorArgs(
   spec: AnchorSpec,
   relayTokenSha256: string,
-  networkName = roomNetworkName(spec.roomId)
+  networkName = roomNetworkName(spec.roomId),
+  /**
+   * Where the relay gate is published, in the engine's own network view. The
+   * managed runtime's engine is inside a VM, so a loopback publication would be
+   * unreachable from the Host; everything else about the gate, including the
+   * token check, is unchanged by the wider binding.
+   */
+  publishAddress = '127.0.0.1'
 ): string[] {
   if (!/^[a-f0-9]{64}$/.test(relayTokenSha256)) throw new Error('invalid DevHotel relay verifier')
   const relayGateScript = `IFS= read -r -t 2 line || exit 1; case "$line" in "${RELAY_PREAMBLE_PREFIX}"*) token=\${line#"${RELAY_PREAMBLE_PREFIX}"};; *) exit 1;; esac; [ "\${#token}" -eq 64 ] || exit 1; case "$token" in *[!0-9a-f]*) exit 1;; esac; actual=$(printf '%s' "$token" | sha256sum); actual=\${actual%% *}; expected=$DEVHOTEL_RELAY_TOKEN_SHA256; mismatch=0; i=0; while [ "$i" -lt 64 ]; do ac=\${actual%"\${actual#?}"}; ec=\${expected%"\${expected#?}"}; [ "$ac" = "$ec" ] || mismatch=1; actual=\${actual#?}; expected=\${expected#?}; i=$((i + 1)); done; [ "$mismatch" -eq 0 ] || exit 1; exec socat STDIO "TCP:127.0.0.1:$DEVHOTEL_INTERNAL_PORT"`
@@ -356,7 +449,7 @@ export function buildAnchorArgs(
     networkName,
     ...labelArgs(spec.roomId, 'anchor'),
     '-p',
-    `127.0.0.1:0:${RELAY_PORT}`,
+    `${publishAddress}:0:${RELAY_PORT}`,
     '--cap-drop',
     'NET_RAW',
     '-e',
@@ -423,14 +516,51 @@ function mountArgs(spec: WebSpec): string[] {
     args.push('-v', `${effectiveDepsVolume(spec)}:/workspace/node_modules`)
   }
   if (!spec.noCacheVolume) args.push('-v', `${cacheVolume(spec.roomId)}:/cache`)
+  for (const shared of spec.sharedCaches ?? []) {
+    args.push('-v', `${shared.volume}:${shared.path}`)
+  }
   for (const extra of spec.extraVolumes ?? []) {
     args.push('-v', `${extra.volume}:${extra.path}`)
   }
   return args
 }
 
+/**
+ * Where a Room's package manager keeps its store.
+ *
+ * `/cache` is the Room's own and always exists. When a Hotel-scoped package
+ * cache is mounted as well, the store moves into it: the contents are
+ * content-addressed, so they are identical between Rooms by construction and
+ * the per-Room copy bought nothing but a second download. Everything else a
+ * Room dirties stays under `/cache`, where one Room cannot reach another's.
+ */
+function packageStorePaths(spec: WebSpec): { npm: string; pnpm: string } {
+  const shared = (spec.sharedCaches ?? []).find((mount) => mount.volume === sharedCacheVolume(NODE_PACKAGE_SHARED_CACHE))
+  if (!shared) return { npm: '/cache/npm', pnpm: '/cache/pnpm' }
+  return { npm: `${shared.path}/npm`, pnpm: `${shared.path}/pnpm` }
+}
+
+/**
+ * Caches that have to survive a container recreate but stay Room-scoped. Each
+ * of these tools otherwise defaults to a path in the container's writable
+ * layer, which a recreate throws away, so a browser download is re-fetched on
+ * every wake that recreates the container. They do not join the Hotel-scoped
+ * package cache: unlike a package store they are not content-addressed, so one
+ * Room must not be able to reach another's.
+ */
+export const ROOM_SCOPED_CACHE_ENV: ReadonlyArray<readonly [string, string]> = [
+  ['PLAYWRIGHT_BROWSERS_PATH', '/cache/playwright'],
+  ['XDG_CACHE_HOME', '/cache/xdg']
+]
+
+/** Every managed cache variable a Room's web container is created with. */
+export function roomCacheEnv(spec: WebSpec): Array<readonly [string, string]> {
+  const store = packageStorePaths(spec)
+  return [['npm_config_cache', store.npm], ['PNPM_HOME', store.pnpm], ...ROOM_SCOPED_CACHE_ENV]
+}
+
 function envArgs(spec: WebSpec): string[] {
-  const args = ['-e', 'npm_config_cache=/cache/npm', '-e', 'PNPM_HOME=/cache/pnpm']
+  const args = roomCacheEnv(spec).flatMap(([key, value]) => ['-e', `${key}=${value}`])
   for (const [key, value] of Object.entries(spec.env ?? {})) {
     args.push('-e', `${key}=${value}`)
   }
@@ -448,12 +578,40 @@ function quoteShellWord(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
+/**
+ * Seconds `docker stop` gives a Room web container between TERM and KILL. Set
+ * on the container itself so engine-initiated stops honour it too, and reused
+ * by the explicit Room stop so both paths agree.
+ */
+export const WEB_STOP_TIMEOUT_SECONDS = 8
+
 export function wrapStartCommand(startCommand: string): string {
-  // `exec <text>` only works when <text> begins with a simple command. Room
-  // commands are shell programs and may begin with `if`, `for`, assignments,
-  // or pipelines. Execute an inner shell so those programs remain valid while
-  // it still replaces the container's PID 1 for correct signal handling.
-  return `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec sh -lc ${quoteShellWord(startCommand)}`
+  // Room commands are shell programs and may begin with `if`, `for`,
+  // assignments, or pipelines, so they run in an inner shell rather than an
+  // `exec`. A shell does not forward TERM to its children: left as the
+  // container's leading process it would swallow `docker stop` until the
+  // engine's KILL fell on the whole tree (exit 137) with no graceful boundary
+  // for the user's server. Instead the outer shell traps TERM and hands it to
+  // its own process group, which is every process in the Room command tree,
+  // then keeps waiting until the inner program has really gone so the
+  // container's exit code is the program's own (0 or 143), never 137.
+  //
+  // The inner shell installs a no-op trap: `docker stop` semantics reach its
+  // child directly through the group signal, and a handler (unlike SIG_IGN)
+  // resets on exec, so the user's program still receives TERM. The outer
+  // shell re-arms itself the same way before signalling so the copy it
+  // receives cannot re-enter the handler. `wait` returns early when the trap
+  // fires, so it is repeated while the child still exists.
+  const program = `trap : TERM; ${startCommand}`
+  return [
+    'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+    'command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1',
+    `sh -lc ${quoteShellWord(program)} & child=$!`,
+    `trap 'trap : TERM; kill -TERM -$$ 2>/dev/null' TERM`,
+    'wait "$child"; status=$?',
+    'while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done',
+    'exit "$status"'
+  ].join('; ')
 }
 
 export function buildWebCreateArgs(spec: WebSpec, networkAuthority?: NetworkNamespaceAuthority): string[] {
@@ -469,6 +627,11 @@ export function buildWebCreateArgs(spec: WebSpec, networkAuthority?: NetworkName
       )}`,
     '--cap-drop',
     'NET_RAW',
+    // An init at PID 1 reaps orphans and forwards TERM to the command shell
+    // below; the shell in turn forwards it to the Room process tree.
+    '--init',
+    '--stop-timeout',
+    String(WEB_STOP_TIMEOUT_SECONDS),
     ...labelArgs(spec.roomId, 'web'),
     ...networkAuthorityLabelArgs(networkAuthority?.sandboxId, networkAuthority?.startedAt),
     ...mountArgs(spec),

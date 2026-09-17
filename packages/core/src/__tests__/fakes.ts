@@ -8,6 +8,7 @@ import type {
   AnchorSpec,
   ExecOpts,
   ExecResult,
+  DockerVolumeObservation,
   DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
@@ -16,6 +17,8 @@ import type {
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
   RoomArtifactWebRuntimeFence,
+  ResumeRoomPodOpts,
+  RoomResumeResult,
   WebSpec
 } from '../backend/types'
 import { workspaceSnapshotVolume } from '../backend/naming'
@@ -273,6 +276,21 @@ export class FakeBackend implements IsolationBackend {
     this.lastAnchorSpec = spec
     return { hostPort: this.hostPort }
   }
+  /** What `resumeRoomPod` answers; the default is a Room that cannot be proved warm. */
+  resumeResult: RoomResumeResult = { reused: false, reason: 'the Room relay credential was not retained' }
+  async resumeRoomPod(spec: WebSpec, _opts?: ResumeRoomPodOpts): Promise<RoomResumeResult> {
+    const kind = spec.androidRuntimeIsolation ? 'android' : 'web'
+    this.calls.push(`resumeRoomPod:${spec.roomId}:${kind}`)
+    // The real backend can now safely restart the managed emulator.
+    if (this.resumeResult.reused) {
+      this.lastWebSpec = spec
+      this.webPausedValue = false
+      this.webRunningUnpausedValue = true
+      if (spec.androidRuntimeIsolation) this.emulatorStateValue = 'running'
+      return { reused: true, hostPort: this.hostPort }
+    }
+    return this.resumeResult
+  }
   async deleteRoomPod(roomId: string) {
     this.calls.push(`deleteRoomPod:${roomId}`)
     return { reclaimedBytes: 1024 }
@@ -376,14 +394,34 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push(`removeManagedContainer:${name}`)
     this.managedContainers = this.managedContainers.filter((container) => container.name !== name)
   }
+  /** Set to make the engine's network listing fail, the way a restarting engine does. */
+  listManagedNetworksError: Error | null = null
   async listManagedNetworks() {
+    if (this.listManagedNetworksError) throw this.listManagedNetworksError
     return this.managedNetworks
   }
   async removeManagedNetwork(name: string) {
     this.calls.push(`removeManagedNetwork:${name}`)
     this.managedNetworks = this.managedNetworks.filter((network) => network.name !== name)
   }
+  async adoptManagedNetwork(name: string) {
+    this.calls.push(`adoptManagedNetwork:${name}`)
+  }
   async cloneIntoVolume() {}
+  /** Stands in for the engine-side clone; a test that needs file content writes it here. */
+  cloneToHostDirectoryHandler: ((gitUrl: string, hostPath: string) => void) | null = null
+  /** What detection asked the backend to clone, and with which credential. */
+  readonly planClones: { gitUrl: string; credential: GitCredential | null | undefined }[] = []
+  async cloneToHostDirectory(
+    gitUrl: string,
+    hostPath: string,
+    opts: { credential?: GitCredential | null; timeoutMs?: number } = {}
+  ): Promise<ExecResult> {
+    this.calls.push(`cloneToHostDirectory:${gitUrl}:${opts.credential ? 'credentialed' : 'anonymous'}`)
+    this.planClones.push({ gitUrl, credential: opts.credential })
+    this.cloneToHostDirectoryHandler?.(gitUrl, hostPath)
+    return { code: 0, stdout: '', stderr: '' }
+  }
   async importHostFolder(_roomId: string, hostPath: string, revision: number) {
     this.calls.push(`importHostFolder:${hostPath}:r${revision}`)
   }
@@ -443,8 +481,20 @@ export class FakeBackend implements IsolationBackend {
     this.calls.push('listVolumesWithUsage')
     return this.managedVolumes
   }
+  async inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null> {
+    this.calls.push(`inspectVolumeUsage:${name}`)
+    const found = this.managedVolumes.find((v) => v.name === name)
+    if (!found) return null
+    const { sizeBytes: _size, sizeKnown: _known, ...observation } = found
+    return observation
+  }
   async removeManagedVolume(name: string): Promise<void> {
     this.calls.push(`removeManagedVolume:${name}`)
+    this.removedManagedVolumes.push(name)
+    this.managedVolumes = this.managedVolumes.filter((v) => v.name !== name)
+  }
+  async removeSharedCache(name: string): Promise<void> {
+    this.calls.push(`removeSharedCache:${name}`)
     this.removedManagedVolumes.push(name)
     this.managedVolumes = this.managedVolumes.filter((v) => v.name !== name)
   }
@@ -558,6 +608,22 @@ export class FakeBackend implements IsolationBackend {
       helperCode: 0
     }
   }
+  async waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult> {
+    this.calls.push(`waitForFencedEmulatorRecoveryBoot:${roomId}`)
+    this.fencedEmulatorBootCalls.push({ opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (this.fencedEmulatorBootHandler) return await this.fencedEmulatorBootHandler(opts)
+    return {
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
+    }
+  }
   async execFencedEmulatorRecoveryAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {
     this.calls.push(`execFencedEmulatorRecoveryAdb:${args.join(' ')}`)
     this.fencedEmulatorExecCalls.push({ args, opts })
@@ -594,11 +660,15 @@ export class FakeBackend implements IsolationBackend {
     if (this.emulatorStateValue === 'missing') throw new Error('exact retained emulator is missing')
     this.emulatorStateValue = 'running'
   }
+  /** Room limits each `createEmulator` was given, in call order — #104's budget must follow them. */
+  readonly emulatorLimits: ({ cpus?: number; memoryMB?: number } | undefined)[] = []
   async createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    limits?: { cpus?: number; memoryMB?: number }
   ) {
     this.calls.push(`createEmulator:${roomId}:${opts?.device ?? 'default'}:${opts?.version ?? 'default'}`)
+    this.emulatorLimits.push(limits)
     this.emulatorStateValue = 'running'
   }
   async captureEmulatorScreen(roomId: string) {

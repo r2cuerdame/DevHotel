@@ -162,14 +162,56 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: wrap(async () => (await getClient()).listRooms())
     },
     {
-      name: 'create_room',
+      name: 'acquire_room',
       description:
-        'Create a new isolated room from a git URL or as an empty Room. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the created room.',
+        'Default agent entry point: reuse a compatible Room by canonical source, project, provider, runtime profile and task identity, waking sleeping Rooms. Existing modified state is preserved and reported. Nicknames do not affect matching. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the selected room, disposition, reuse reason and modified flag.',
       schema: {
         sourceType: z.enum(['managed-git', 'empty']),
         sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
         project: z.string().describe('project name, e.g. the repo name'),
         nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
+        taskId: z.string().trim().min(1).max(200).optional().describe('stable distinct task identity for parallel work'),
+        issueRef: z.string().trim().min(1).max(500).optional().describe('stable distinct issue identity for parallel work'),
+        provider: z
+          .enum(['web', 'android'])
+          .optional()
+          .describe("'web' (default) serves the site; 'android' builds APKs and previews the room-owned emulator screen"),
+        runtimeVersion: z.string().regex(/^\d+$/).optional().describe('Node major version override, e.g. "22"'),
+        pmKind: zPmKind.optional(),
+        startCommand: z.string().optional(),
+        internalPort: z.number().int().optional(),
+        https: z.boolean().optional()
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).acquireRoom({
+          sourceType: a.sourceType,
+          sourceRef: a.sourceRef,
+          project: a.project,
+          nickname: a.nickname,
+          provider: a.provider,
+          taskId: a.taskId,
+          issueRef: a.issueRef,
+          planOverrides: {
+            runtimeVersion: a.runtimeVersion,
+            pmKind: a.pmKind,
+            startCommand: a.startCommand,
+            internalPort: a.internalPort,
+            https: a.https
+          }
+        })
+      )
+    },
+    {
+      name: 'create_room',
+      description:
+        'Exceptional low-level creation. Prefer acquire_room. A compatible duplicate is rejected with ROOM_REUSE_REQUIRED and candidate roomId unless a distinct taskId or issueRef is supplied. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the created room.',
+      schema: {
+        sourceType: z.enum(['managed-git', 'empty']),
+        sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
+        project: z.string().describe('project name, e.g. the repo name'),
+        nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
+        taskId: z.string().trim().min(1).max(200).optional().describe('stable distinct task identity for parallel work'),
+        issueRef: z.string().trim().min(1).max(500).optional().describe('stable distinct issue identity for parallel work'),
         provider: z
           .enum(['web', 'android'])
           .optional()
@@ -187,6 +229,8 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           project: a.project,
           nickname: a.nickname,
           provider: a.provider,
+          taskId: a.taskId,
+          issueRef: a.issueRef,
           planOverrides: {
             runtimeVersion: a.runtimeVersion,
             pmKind: a.pmKind,
@@ -396,7 +440,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'hotel_status',
       description:
-        'One read-only call answering "is DevHotel ready and what is actually running": exact app build identity, pending/ready update target version, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
+        'One read-only call answering "is DevHotel ready and what is actually running": exact app build identity, pending/ready update target version, selected runtime mode, managed-runtime provisioning/identity/digests, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
       schema: {},
       handler: wrap(async () => (await getClient()).hotelStatus())
     },

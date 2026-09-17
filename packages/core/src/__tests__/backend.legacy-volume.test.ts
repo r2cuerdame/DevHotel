@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker } from '../backend/cli'
 import { OciCliBackend } from '../backend/ociCli'
+import type { WebSpec } from '../backend/types'
 
 vi.mock('../backend/cli', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backend/cli')>()
@@ -233,5 +234,48 @@ describe('legacy Room volume adoption', () => {
         ownership: 'managed-labels'
       })
     ])
+  })
+
+  it('refuses to silently create an empty volume when workspaceVolumeRevision > 0 is missing, throwing a DATA_LOSS error', async () => {
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
+      if (args[0] === 'image' && args[1] === 'inspect') return { code: 0, stdout: '[]', stderr: '' }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return {
+          code: 0,
+          stdout: JSON.stringify([
+            {
+              Name: `dh-${ROOM_ID}-net`,
+              Driver: 'bridge',
+              Labels: { 'devhotel.managed': '1', 'devhotel.room': ROOM_ID, 'devhotel.role': 'network' }
+            }
+          ]),
+          stderr: ''
+        }
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return { code: 1, stdout: '', stderr: 'no such volume' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const backend = new OciCliBackend({ identityFile: join(dir, 'engine.json') })
+    const spec: WebSpec = {
+      roomId: ROOM_ID,
+      internalPort: 3000,
+      nodeMajor: '22',
+      sourceType: 'linked-folder',
+      sourceRef: 'C:\\src',
+      workspaceMode: 'hotel',
+      workspaceVolumeRevision: 1,
+      startCommand: 'npm start'
+    }
+
+    await expect(backend.recreateWeb(spec)).rejects.toThrow(
+      expect.objectContaining({
+        name: 'DevHotelError',
+        code: 'DATA_LOSS'
+      })
+    )
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'volume' && args[1] === 'create')).toBe(false)
   })
 })

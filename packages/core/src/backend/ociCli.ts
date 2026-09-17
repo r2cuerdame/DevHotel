@@ -6,6 +6,8 @@ import { SCREENSHOT_ARTIFACT_MAX_BYTES, type VolumeOwnership } from '@devhotel/s
 import { ANDROID_IMAGE } from '../providers/androidProvider'
 import { isSafeWorkspacePath, type WorkspaceSnapshot, type WorkspaceSnapshotEntry } from '../workspaceDrift'
 import { getPinnedDockerRuntime, runDocker, spawnDockerProcess } from './cli'
+import type { OciEngineExecutor, RunDockerOpts } from './cli'
+import { DevHotelError } from '../errors'
 import { RoomArtifactPublicationError } from './types'
 import {
   ANCHOR_IMAGE,
@@ -14,6 +16,7 @@ import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
+  roomCacheEnv,
   anchorName,
   androidControlNetworkName,
   androidRuntimeAnchorName,
@@ -44,14 +47,24 @@ import {
   webName,
   wrapStartCommand,
   workspaceSnapshotVolume,
+  WEB_STOP_TIMEOUT_SECONDS,
   type NetworkNamespaceAuthority,
 } from './naming'
+import type { ResumeRoomPodOpts, ResumeServiceSpec, RoomResumeResult } from './types'
+import {
+  isSharedCacheVolumeName,
+  provesSharedCacheOwnership,
+  sharedCacheLabels,
+  sharedCachePurpose
+} from '../lifecycle/sharedCache'
+import { SubnetAllocator, classifyNetworkCreateError } from './ipam'
 import { CLONE_IMAGE, gitCloneRun } from './gitClone'
 import type {
   AnchorSpec,
   ExecOpts,
   ExecOutputChunk,
   ExecResult,
+  DockerVolumeObservation,
   DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
@@ -66,6 +79,8 @@ import type {
 import { isDockerUnitSizeKnown, parseDockerUnitSize } from '../volumeGc'
 
 const DU_IMAGE = 'alpine'
+const DOCKER_ANDROID_ROOT_PASSWD = 'root:x:0:0:root:/root:/bin/bash'
+const DOCKER_ANDROID_PASSWD_MAX_BYTES = 128 * 1024
 /**
  * Opt-in phase timing for one fenced ADB command, written to a file because the
  * packaged app has no console anyone can read. Off unless DEVHOTEL_FENCE_TIMING
@@ -910,7 +925,7 @@ export function workspaceTransactionalFingerprintScript(): string {
  * itself), so FIT_EMULATOR_PY below enforces the full-screen size and the
  * force-center rule snaps the frame back to 0,0 on that resize.
  */
-function openboxFramelessRc(width: number, height: number): string {
+export function openboxFramelessRc(width: number, height: number): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <applications>
@@ -944,7 +959,7 @@ python3 "$HOME/.config/openbox/fit-emulator.py" >/dev/null 2>&1 &
  * and libX11 ship in the image) forces the "Android Emulator*" window to the
  * full X screen; Qt then rescales the device content edge to edge.
  */
-function fitEmulatorPy(width: number, height: number): string {
+export function fitEmulatorPy(width: number, height: number): string {
   return `import ctypes
 import time
 
@@ -1256,6 +1271,24 @@ function sanitizedRoomArtifactPublicationError(error: unknown): RoomArtifactPubl
   )
 }
 
+/**
+ * The Host's pinned Docker CLI, expressed as an executor.
+ *
+ * It delegates to this module's functions rather than re-deriving anything, so
+ * the endpoint pin, the blocked endpoint variables and the resolved executable
+ * behave exactly as before this seam existed.
+ */
+export const hostDockerCliExecutor: OciEngineExecutor = {
+  get endpoint() {
+    return getPinnedDockerRuntime().context
+  },
+  // Forwarded without a second argument when the caller gave none: the seam has
+  // to be invisible, and `runDocker(args, undefined)` is not the same call as
+  // `runDocker(args)` to anything observing the invocation.
+  run: (args: string[], opts?: RunDockerOpts) => (opts === undefined ? runDocker(args) : runDocker(args, opts)),
+  spawn: (args: string[]) => spawnDockerProcess(args)
+}
+
 interface DockerVersionJson {
   Client?: { Version?: string } | null
   Server?: { Version?: string } | null
@@ -1272,6 +1305,16 @@ export interface OciCliBackendOptions {
   canAdoptLegacyVolume?: (roomId: string, name: string) => boolean
   /** Test seam; production uses a fresh 256-bit random token per anchor. */
   relayTokenFactory?: () => string
+  /** Bounded network allocator for Room IPAM. */
+  subnetAllocator?: SubnetAllocator
+  /** Liveness predicate to safely distinguish live rooms from stale unattached networks. */
+  isRoomActive?: (roomId: string) => boolean
+  /**
+   * The engine this backend drives. Defaults to the Host's pinned Docker CLI;
+   * the DevHotel-managed runtime supplies its own without changing a single
+   * Room semantic above this line.
+   */
+  engine?: OciEngineExecutor
 }
 
 export class OciCliBackend implements IsolationBackend {
@@ -1279,10 +1322,13 @@ export class OciCliBackend implements IsolationBackend {
   private readonly legacyVolumeAdoptionFile: string | undefined
   private readonly networkRecoveryAttestationDir: string | undefined
   private readonly canAdoptLegacyVolume: ((roomId: string, name: string) => boolean) | undefined
+  private readonly isRoomActive: ((roomId: string) => boolean) | undefined
+  private readonly ipam: SubnetAllocator
   private expectedEngineIdentity: EngineIdentity | null | undefined
   private legacyVolumeAdoptions: LegacyVolumeAdoptionRegistry | undefined
   private readonly relayTokenFactory: () => string
   private readonly relayTokens = new Map<string, string>()
+  private readonly engine: OciEngineExecutor
 
   constructor(opts: OciCliBackendOptions = {}) {
     if (opts.networkRecoveryAttestationDir && !isAbsolute(opts.networkRecoveryAttestationDir)) {
@@ -1294,13 +1340,20 @@ export class OciCliBackend implements IsolationBackend {
       ? resolve(opts.networkRecoveryAttestationDir)
       : undefined
     this.canAdoptLegacyVolume = opts.canAdoptLegacyVolume
+    this.isRoomActive = opts.isRoomActive
+    this.ipam = opts.subnetAllocator ?? new SubnetAllocator()
     this.relayTokenFactory = opts.relayTokenFactory ?? (() => randomBytes(32).toString('hex'))
+    this.engine = opts.engine ?? hostDockerCliExecutor
+  }
+
+  get subnetAllocator(): SubnetAllocator {
+    return this.ipam
   }
 
   async health(): Promise<{ ok: boolean; detail: string }> {
     let result: ExecResult
     try {
-      result = await runDocker(['version', '--format', 'json'], { timeoutMs: 15_000 })
+      result = await this.engine.run(['version', '--format', 'json'], { timeoutMs: 15_000 })
     } catch (err) {
       return { ok: false, detail: `docker CLI not available: ${(err as Error).message}` }
     }
@@ -1334,12 +1387,17 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureImage(imageFor(spec))
     if (spec.workspaceMode === 'hotel') {
       if (initializeManagedSource && spec.sourceType === 'managed-git') await this.ensureImage(CLONE_IMAGE)
-      await this.ensureRoomVolume(spec.roomId, srcVolume(spec.roomId, spec.workspaceVolumeRevision))
+      await this.ensureRoomVolume(
+        spec.roomId,
+        srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 }
+      )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -1353,11 +1411,12 @@ export class OciCliBackend implements IsolationBackend {
       if (!spec.standalone) {
         relayToken = this.newRelayToken()
         must(
-          await runDocker(
+          await this.engine.run(
             buildAnchorArgs(
               { roomId: spec.roomId, internalPort: spec.internalPort },
               createHash('sha256').update(relayToken).digest('hex'),
-              spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId)
+              spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId),
+              this.relayPublishAddress
             )
           ),
           'run anchor container',
@@ -1365,18 +1424,17 @@ export class OciCliBackend implements IsolationBackend {
       }
       if (spec.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(spec.roomId)
       const webNetworkAuthority = await this.exactWebNetworkNamespace(spec)
-      must(await runDocker(buildWebCreateArgs(spec, webNetworkAuthority)), 'create web container')
+      must(await this.engine.run(buildWebCreateArgs(spec, webNetworkAuthority)), 'create web container')
       if (startWeb) await this.startWeb(spec.roomId, undefined, webNetworkAuthority)
       const hostPort = spec.standalone ? null : await this.readHostPort(spec.roomId)
       if (relayToken) this.relayTokens.set(spec.roomId, relayToken)
       return { hostPort }
     } catch (error) {
       this.relayTokens.delete(spec.roomId)
-      if (!spec.androidRuntimeIsolation) throw error
       try {
-        await this.rollbackPartialAndroidTopology(spec.roomId)
+        await this.rollbackPartialRoomTopology(spec)
       } catch (cleanupError) {
-        throw new AggregateError([error, cleanupError], 'Android Room creation and topology rollback both failed')
+        throw new AggregateError([error, cleanupError], 'Room creation and topology rollback both failed')
       }
       throw error
     }
@@ -1405,7 +1463,7 @@ export class OciCliBackend implements IsolationBackend {
       if (opts.androidRuntimeIsolation) {
         this.assertContainerNetworkMode(anchor, androidControlNetworkName(roomId), 'Android control anchor')
       }
-      must(await runDocker(['start', anchorName(roomId)]), 'start anchor container')
+      must(await this.engine.run(['start', anchorName(roomId)]), 'start anchor container')
     }
     if (opts.androidRuntimeIsolation) await this.ensureAndroidRuntimeAnchor(roomId)
     await this.startWeb(roomId)
@@ -1427,7 +1485,7 @@ export class OciCliBackend implements IsolationBackend {
     const mode = web.HostConfig?.NetworkMode ?? ''
     if (!mode.startsWith('container:')) {
       if (web.State?.Status === 'running') return
-      must(await runDocker(['start', id]), 'start web container')
+      must(await this.engine.run(['start', id]), 'start web container')
       return
     }
     const candidates = [
@@ -1483,50 +1541,74 @@ export class OciCliBackend implements IsolationBackend {
     await this.reapResidentFencedHelper(roomId)
     await this.assertPinnedEngineIdentity()
     const containers = await this.listRoomContainers(roomId)
+    const failures = await this.stopOwnedContainers(roomId, containers)
+    // The final inventory, not the stop transport, decides completeness: the
+    // survivors are named exactly, and a stop that failed but left nothing
+    // running has still reached the sleeping state.
+    const notStopped = (await this.listRoomContainers(roomId)).filter(
+      (container) => !isStoppedContainerState(container.state)
+    )
+    if (notStopped.length > 0) {
+      const survivors = notStopped.map((container) => container.name).join(', ')
+      const detail = failures.length > 0 ? ` (${failures.join('; ')})` : ''
+      throw new Error(`Room ${roomId} stop incomplete: ${survivors}${detail}`)
+    }
+  }
+
+  /**
+   * Gracefully stops every owned container that is still active, leaves
+   * first and network authorities last so a server shuts down while its
+   * namespace still exists. Only `docker stop` is ever issued here: the
+   * engine delivers TERM and escalates to KILL on its own timeout, and this
+   * flow never force-kills or removes anything itself. One failing group does
+   * not skip the next; the failures come back for the caller to weigh against
+   * the inventory it re-reads.
+   */
+  private async stopOwnedContainers(roomId: string, containers: ManagedRoomContainer[]): Promise<string[]> {
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
     for (const container of active) {
       if (container.state === 'paused') {
         try {
-          await runDocker(['unpause', container.id])
+          await this.engine.run(['unpause', container.id])
         } catch {
           // best-effort unpause before stop
         }
       }
     }
-    const web = active.filter((container) => container.role === 'web').map((container) => container.id)
-    const leaves = active
-      .filter((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role))
-      .map((container) => container.id)
-    const runtimeAnchors = active
-      .filter((container) => container.role === 'android-runtime-anchor')
-      .map((container) => container.id)
-    const controlAnchors = active.filter((container) => container.role === 'anchor').map((container) => container.id)
-    if (web.length > 0) must(await runDocker(['stop', '-t', '8', ...web]), `stop Room ${roomId} web container`)
-    if (leaves.length > 0) must(await runDocker(['stop', '-t', '5', ...leaves]), `stop Room ${roomId} leaf containers`)
-    if (runtimeAnchors.length > 0) {
-      must(await runDocker(['stop', '-t', '5', ...runtimeAnchors]), `stop Room ${roomId} runtime anchor`)
+    const ids = (predicate: (container: ManagedRoomContainer) => boolean): string[] =>
+      active.filter(predicate).map((container) => container.id)
+    const groups: Array<{ ids: string[]; timeout: number; what: string }> = [
+      { ids: ids((container) => container.role === 'web'), timeout: WEB_STOP_TIMEOUT_SECONDS, what: 'web container' },
+      {
+        ids: ids((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role)),
+        timeout: 5,
+        what: 'leaf containers'
+      },
+      { ids: ids((container) => container.role === 'android-runtime-anchor'), timeout: 5, what: 'runtime anchor' },
+      { ids: ids((container) => container.role === 'anchor'), timeout: 5, what: 'control anchor' }
+    ]
+    const failures: string[] = []
+    for (const group of groups) {
+      if (group.ids.length === 0) continue
+      try {
+        must(await this.engine.run(['stop', '-t', String(group.timeout), ...group.ids]), `stop Room ${roomId} ${group.what}`)
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error))
+      }
     }
-    if (controlAnchors.length > 0) {
-      must(await runDocker(['stop', '-t', '5', ...controlAnchors]), `stop Room ${roomId} control anchor`)
-    }
-    const notStopped = (await this.listRoomContainers(roomId)).filter(
-      (container) => !isStoppedContainerState(container.state)
-    )
-    if (notStopped.length > 0) {
-      throw new Error(`Room ${roomId} stop incomplete: ${notStopped.map((container) => container.name).join(', ')}`)
-    }
+    return failures
   }
 
   async pauseWeb(roomId: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['pause', webName(roomId)]), 'pause web container')
+    must(await this.engine.run(['pause', webName(roomId)]), 'pause web container')
   }
 
   async unpauseWeb(roomId: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['unpause', webName(roomId)]), 'unpause web container')
+    must(await this.engine.run(['unpause', webName(roomId)]), 'unpause web container')
   }
 
   async captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence> {
@@ -1571,7 +1653,7 @@ export class OciCliBackend implements IsolationBackend {
     if (before.State?.Paused !== true) {
       try {
         must(
-          await runDocker(['pause', fence.containerId], {
+          await this.engine.run(['pause', fence.containerId], {
             timeoutMs: 30_000,
             maxStdoutBytes: 128,
             maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -1626,7 +1708,7 @@ export class OciCliBackend implements IsolationBackend {
         for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
             must(
-              await runDocker(['unpause', fence.containerId], {
+              await this.engine.run(['unpause', fence.containerId], {
                 timeoutMs: 30_000,
                 maxStdoutBytes: 128,
                 maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -1684,7 +1766,7 @@ export class OciCliBackend implements IsolationBackend {
     let recreatedId: string | undefined
     try {
       const created = must(
-        await runDocker(createArgs, {
+        await this.engine.run(createArgs, {
           timeoutMs: 120_000,
           maxStdoutBytes: 256,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -1722,7 +1804,7 @@ export class OciCliBackend implements IsolationBackend {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           must(
-            await runDocker(['start', recreatedId], {
+            await this.engine.run(['start', recreatedId], {
               timeoutMs: 120_000,
               maxStdoutBytes: 256,
               maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -1794,7 +1876,7 @@ export class OciCliBackend implements IsolationBackend {
       return
     }
     if (!isStoppedContainerState(web.State?.Status ?? '')) {
-      must(await runDocker(['stop', '-t', '8', id]), 'stop exact web container for restart')
+      must(await this.engine.run(['stop', '-t', String(WEB_STOP_TIMEOUT_SECONDS), id]), 'stop exact web container for restart')
       const stopped = await this.inspectContainer(id)
       if (!stopped || stopped.State?.Status !== 'exited') {
         throw new Error('web container restart could not prove its exact stopped state')
@@ -1812,12 +1894,17 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureImage(imageFor(spec))
     await this.ensureRoomNetwork(spec.roomId)
     if (spec.workspaceMode === 'hotel') {
-      await this.ensureRoomVolume(spec.roomId, srcVolume(spec.roomId, spec.workspaceVolumeRevision))
+      await this.ensureRoomVolume(
+        spec.roomId,
+        srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 }
+      )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -1833,7 +1920,7 @@ export class OciCliBackend implements IsolationBackend {
     let createdId: string | undefined
     try {
       const created = must(
-        await runDocker(this.roomArtifactRestoreCreateArgs(spec, recreationToken, webNetworkAuthority)),
+        await this.engine.run(this.roomArtifactRestoreCreateArgs(spec, recreationToken, webNetworkAuthority)),
         'create token-fenced web container'
       )
       const candidateId = created.stdout.trim()
@@ -1876,10 +1963,11 @@ export class OciCliBackend implements IsolationBackend {
     const relayToken = this.newRelayToken()
     try {
       must(
-        await runDocker(buildAnchorArgs(
+        await this.engine.run(buildAnchorArgs(
           spec,
           createHash('sha256').update(relayToken).digest('hex'),
-          spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId)
+          spec.androidRuntimeIsolation ? androidControlNetworkName(spec.roomId) : roomNetworkName(spec.roomId),
+          this.relayPublishAddress
         )),
         'run anchor container'
       )
@@ -1895,6 +1983,160 @@ export class OciCliBackend implements IsolationBackend {
       }
       throw error
     }
+  }
+
+  /**
+   * Warm wake. Start the Room's retained containers in place instead of
+   * recreating them, so a sleeping Room keeps the state it went to sleep with —
+   * for an Android Room that is the booted AVD and everything installed on it,
+   * which the recreate path throws away along with the container.
+   *
+   * Reuse is fail-closed and returns a refusal rather than throwing, so the
+   * caller can fall back to the ordinary recreation path: every participant
+   * must still be the exact owned, cleanly stopped container this Room created,
+   * and its configuration must still match what the Room record asks for now.
+   * Ownership violations are the exception and still throw — a foreign
+   * container wearing a Room's name is not something to fall back around.
+   *
+   * On any failure after the first start it stops what it started, so a refused
+   * resume always leaves the caller the same stopped pod it was given.
+   */
+  async resumeRoomPod(spec: WebSpec, opts: ResumeRoomPodOpts = {}): Promise<RoomResumeResult> {
+    await this.assertPinnedEngineIdentity()
+    const roomId = spec.roomId
+    if (spec.standalone) return { reused: false, reason: 'standalone Rooms have no relay anchor to reuse' }
+
+    // The anchor's relay verifier is fixed at create and the raw capability is
+    // only ever held in memory. Without it the gateway cannot cross this
+    // anchor's gate, so a retained anchor from an earlier app run is unusable.
+    const relayToken = this.relayTokens.get(roomId)
+    if (!relayToken) return { reused: false, reason: 'the Room relay credential was not retained' }
+
+    const android = spec.androidRuntimeIsolation === true
+    const services = opts.services ?? []
+    // Start order is dependency order: a container joining another container's
+    // network namespace can only start once that leader is running again.
+    const startPlan: Array<{ name: string; role: string }> = [
+      { name: anchorName(roomId), role: 'anchor' }
+    ]
+    if (android) {
+      startPlan.push({ name: androidRuntimeAnchorName(roomId), role: 'android-runtime-anchor' })
+    }
+    startPlan.push(...services.map((svc) => ({ name: svcName(roomId, svc.kind), role: `svc-${svc.kind}` })))
+    if (android) {
+      startPlan.push({ name: emulatorName(roomId), role: 'svc-emulator' })
+    }
+    startPlan.push({ name: webName(roomId), role: 'web' })
+
+    const retained: Array<{ name: string; role: string; id: string }> = []
+    for (const participant of startPlan) {
+      const inspected = await this.inspectContainer(participant.name)
+      if (!inspected) {
+        return { reused: false, reason: `a retained Room container is missing: ${participant.role}` }
+      }
+      // Ownership is not a fallback condition; it is a refusal to touch it.
+      const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, inspected)
+      if (owned.State?.Status !== 'exited') {
+        return { reused: false, reason: `a retained Room container is not cleanly stopped: ${participant.role}` }
+      }
+      retained.push({ name: participant.name, role: participant.role, id: exactFullContainerId(owned, roomId) })
+    }
+
+    const drift = await this.retainedRoomPodDrift(spec, relayToken, { services })
+    if (drift) return { reused: false, reason: drift }
+
+    let startedAny = false
+    try {
+      for (const participant of retained) {
+        must(await runDocker(['start', participant.id]), `start retained Room ${participant.role}`)
+        startedAny = true
+        const current = await this.inspectContainer(participant.id)
+        const owned = await this.assertRoomContainer(roomId, participant.name, participant.role, current ?? undefined)
+        if (exactFullContainerId(owned, roomId) !== participant.id) {
+          throw new Error(`retained Room ${participant.role} changed immutable ID while starting`)
+        }
+        if (owned.State?.Status !== 'running') {
+          throw new Error(`retained Room ${participant.role} did not enter the running state`)
+        }
+      }
+      return { reused: true, hostPort: await this.readHostPort(roomId) }
+    } catch (error) {
+      // Hand the caller back the stopped pod it gave us, never a half-warm one.
+      try {
+        if (startedAny) await this.stopRoomPod(roomId)
+      } catch (stopError) {
+        throw new AggregateError([error, stopError], 'Room resume and its rollback both failed')
+      }
+      return {
+        reused: false,
+        reason: `the retained Room runtime did not restart: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+  }
+
+  /**
+   * Everything that would make the retained pod the wrong pod to wake into.
+   * Returns the reason, or null when the retained containers still match what
+   * the Room record asks for now. Changes made while a Room sleeps are
+   * materialized by recreating its containers, so any mismatch must refuse.
+   */
+  private async retainedRoomPodDrift(
+    spec: WebSpec,
+    relayToken: string,
+    context: { services: readonly ResumeServiceSpec[] }
+  ): Promise<string | null> {
+    const roomId = spec.roomId
+    const anchor = await this.assertRoomContainer(roomId, anchorName(roomId), 'anchor')
+    const anchorEnv = containerEnvMap(anchor)
+    // Proves both that the retained anchor is the exact one our cached
+    // capability opens, and that the port it relays is still the Room's port.
+    if (anchorEnv.get('DEVHOTEL_RELAY_TOKEN_SHA256') !== createHash('sha256').update(relayToken).digest('hex')) {
+      return 'the retained relay anchor does not match the retained relay credential'
+    }
+    if (anchorEnv.get('DEVHOTEL_INTERNAL_PORT') !== String(spec.internalPort)) {
+      return 'the Room relayed port changed while it slept'
+    }
+    if (anchor.HostConfig?.NetworkMode !== roomNetworkName(roomId)) {
+      return 'the retained relay anchor is not on its exact owned network'
+    }
+
+    const web = await this.assertRoomContainer(roomId, webName(roomId), 'web')
+    const webDrift = this.retainedWebDrift(spec, web, anchorName(roomId))
+    if (webDrift) return webDrift
+
+    for (const svc of context.services) {
+      const container = await this.assertRoomContainer(roomId, svcName(roomId, svc.kind), `svc-${svc.kind}`)
+      if (container.Config?.Image !== svcImage(svc.kind, svc.version)) {
+        return `a retained Room Service image changed while it slept: ${svc.kind}`
+      }
+    }
+    return null
+  }
+
+  private retainedWebDrift(spec: WebSpec, web: DockerContainerInspect, namespaceLeader: string): string | null {
+    if (web.Config?.Image !== imageFor(spec)) return 'the Room image changed while it slept'
+    const expectedCmd = ['sh', '-lc', wrapStartCommand(spec.startCommand)]
+    if (JSON.stringify(web.Config?.Cmd ?? []) !== JSON.stringify(expectedCmd)) {
+      return 'the Room start command changed while it slept'
+    }
+    if (web.HostConfig?.NetworkMode !== `container:${namespaceLeader}`) {
+      return 'the retained Room web container is not in its exact owned network namespace'
+    }
+    const env = containerEnvMap(web)
+    for (const [key, value] of [...roomCacheEnv(spec), ...Object.entries(spec.env ?? {})]) {
+      if (env.get(key) !== value) return 'the Room environment changed while it slept'
+    }
+    const expectedMounts = this.expectedRoomArtifactWebMounts(spec)
+      .map((mount) => `${mount.destination}=${mount.volume}`)
+      .sort()
+    const actualMounts = (web.Mounts ?? [])
+      .filter((mount) => mount.Type === 'volume')
+      .map((mount) => `${mount.Destination ?? ''}=${mount.Name ?? ''}`)
+      .sort()
+    if (JSON.stringify(expectedMounts) !== JSON.stringify(actualMounts)) {
+      return 'the Room workspace, dependency, or cache volumes changed while it slept'
+    }
+    return null
   }
 
   async deleteRoomPod(roomId: string, opts: { volumes: boolean }): Promise<{ reclaimedBytes: number }> {
@@ -1928,14 +2170,18 @@ export class OciCliBackend implements IsolationBackend {
     const leafIds = containers
       .filter((container) => !['anchor', 'android-runtime-anchor'].includes(container.role))
       .map((container) => container.id)
+    // Services own persistent data and the web may be mid-write: give every
+    // active container its graceful TERM boundary first. Removal below is the
+    // forced boundary, so a stop that fails here does not block the delete.
+    await this.stopOwnedContainers(roomId, containers)
     if (leafIds.length > 0) {
-      must(await runDocker(['rm', '-f', ...leafIds]), `remove Room ${roomId} leaf containers`)
+      must(await this.engine.run(['rm', '-f', ...leafIds]), `remove Room ${roomId} leaf containers`)
     }
     if (runtimeAnchorIds.length > 0) {
-      must(await runDocker(['rm', '-f', ...runtimeAnchorIds]), `remove Room ${roomId} runtime anchor`)
+      must(await this.engine.run(['rm', '-f', ...runtimeAnchorIds]), `remove Room ${roomId} runtime anchor`)
     }
     if (controlAnchorIds.length > 0) {
-      must(await runDocker(['rm', '-f', ...controlAnchorIds]), `remove Room ${roomId} control anchor`)
+      must(await this.engine.run(['rm', '-f', ...controlAnchorIds]), `remove Room ${roomId} control anchor`)
     }
     const remainingContainers = await this.listRoomContainers(roomId)
     if (remainingContainers.length > 0) {
@@ -1949,7 +2195,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.removeAndroidControlNetwork(roomId)
     if (opts.volumes) {
       if (ownedVolumes.length > 0) {
-        must(await runDocker(['volume', 'rm', '-f', ...ownedVolumes]), `remove Room ${roomId} volumes`)
+        must(await this.engine.run(['volume', 'rm', '-f', ...ownedVolumes]), `remove Room ${roomId} volumes`)
       }
       const remainingVolumes = await this.listRoomVolumes(roomId)
       if (remainingVolumes.length > 0) {
@@ -1963,7 +2209,7 @@ export class OciCliBackend implements IsolationBackend {
   async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return runDocker(['exec', exactContainerId(container, roomId), ...cmd], {
+    return this.engine.run(['exec', exactContainerId(container, roomId), ...cmd], {
       timeoutMs: opts?.timeoutMs,
       ...(opts?.signal ? { signal: opts.signal } : {}),
       ...(opts?.maxStdoutBytes !== undefined ? { maxStdoutBytes: opts.maxStdoutBytes } : {}),
@@ -1976,14 +2222,14 @@ export class OciCliBackend implements IsolationBackend {
   async spawnInteractiveExec(roomId: string, cmd: string[]) {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return spawnDockerProcess(['exec', '-i', exactContainerId(container, roomId), ...cmd])
+    return this.engine.spawn(['exec', '-i', exactContainerId(container, roomId), ...cmd])
   }
 
   async followRoomLogs(roomId: string, tail = 50) {
     await this.assertPinnedEngineIdentity()
     if (!Number.isInteger(tail) || tail < 0 || tail > 10_000) throw new Error('invalid Room log tail count')
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return spawnDockerProcess(['logs', '-f', '--tail', String(tail), exactContainerId(container, roomId)])
+    return this.engine.spawn(['logs', '-f', '--tail', String(tail), exactContainerId(container, roomId)])
   }
 
   async runOneShot(
@@ -2015,13 +2261,15 @@ export class OciCliBackend implements IsolationBackend {
     if (spec.workspaceMode === 'hotel') {
       await this.ensureRoomVolume(
         spec.roomId,
-        spec.workspaceVolumeOverride ?? srcVolume(spec.roomId, spec.workspaceVolumeRevision)
+        spec.workspaceVolumeOverride ?? srcVolume(spec.roomId, spec.workspaceVolumeRevision),
+        { mustExist: spec.workspaceVolumeRevision > 0 && !spec.workspaceVolumeOverride }
       )
     }
     if (spec.sourceType !== 'empty' && !spec.noDepsVolume) {
       await this.ensureRoomVolume(spec.roomId, effectiveDepsVolume(spec))
     }
     if (!spec.noCacheVolume) await this.ensureRoomVolume(spec.roomId, cacheVolume(spec.roomId))
+    await this.ensureSpecSharedCaches(spec)
     for (const extra of spec.extraVolumes ?? []) {
       await this.ensureRoomVolume(spec.roomId, extra.volume)
     }
@@ -2040,7 +2288,7 @@ export class OciCliBackend implements IsolationBackend {
       // Container creation is an ownership-critical section. Let the CLI reach
       // a definitive answer, while bounding its own diagnostics, then validate
       // the immutable ID before any user command is allowed to start.
-      const created = await runDocker(createArgs, {
+      const created = await this.engine.run(createArgs, {
         timeoutMs: null,
         maxStdoutBytes: 128,
         maxStderrBytes: 8 * 1024,
@@ -2075,7 +2323,7 @@ export class OciCliBackend implements IsolationBackend {
     let result: ExecResult | undefined
     let executionError: unknown
     try {
-      result = await runDocker(['start', '-a', containerId], {
+      result = await this.engine.run(['start', '-a', containerId], {
         timeoutMs: opts.timeoutMs ?? LONG_TIMEOUT_MS,
         signal: opts.signal,
         maxStdoutBytes,
@@ -2243,7 +2491,7 @@ export class OciCliBackend implements IsolationBackend {
         'printf "devhotel-android-export-v1\\t%s\\t%s\\t%s\\n" "$apk_count" "$aggregate_bytes" "$metadata_count"'
       ].join('\n')
       const exportJobName = jobName(roomId, randomUUID())
-      const exported = await runDocker(
+      const exported = await this.engine.run(
         [
           'run',
           '--rm',
@@ -2461,7 +2709,7 @@ export class OciCliBackend implements IsolationBackend {
       let result: ExecResult | undefined
       let operationError: unknown
       try {
-        const created = await runDocker(createArgs, {
+        const created = await this.engine.run(createArgs, {
           timeoutMs: 30_000,
           maxStdoutBytes: 128,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES,
@@ -2491,7 +2739,7 @@ export class OciCliBackend implements IsolationBackend {
         }
         await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webFence.containerId)
         await recheckPrivateRoomArtifact(hostPngPath, expected, privateInput)
-        result = await runDocker(['start', '-a', helperId], {
+        result = await this.engine.run(['start', '-a', helperId], {
           timeoutMs: ROOM_ARTIFACT_HELPER_TIMEOUT_MS,
           maxStdoutBytes: ROOM_ARTIFACT_HELPER_STDOUT_BYTES,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES,
@@ -2652,7 +2900,7 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async webState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
-    const result = await runDocker(['inspect', '--format', '{{.State.Status}}', webName(roomId)])
+    const result = await this.engine.run(['inspect', '--format', '{{.State.Status}}', webName(roomId)])
     if (result.code !== 0) return 'missing'
     return result.stdout.trim() === 'running' ? 'running' : 'exited'
   }
@@ -2660,7 +2908,7 @@ export class OciCliBackend implements IsolationBackend {
   async listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]> {
     await this.assertPinnedEngineIdentity()
     const result = must(
-      await runDocker(['ps', '-a', '--filter', 'label=devhotel.managed=1', '--format', '{{json .}}']),
+      await this.engine.run(['ps', '-a', '--filter', 'label=devhotel.managed=1', '--format', '{{json .}}']),
       'list managed containers',
     )
     const out: { roomId: string; role: string; state: string; name: string }[] = []
@@ -2721,13 +2969,13 @@ export class OciCliBackend implements IsolationBackend {
     ) {
       throw new Error(`refusing to remove container not owned by DevHotel: ${name}`)
     }
-    must(await runDocker(['rm', '-f', id]), `remove managed container ${name}`)
+    must(await this.engine.run(['rm', '-f', id]), `remove managed container ${name}`)
     if (await this.inspectContainer(id)) throw new Error(`container cleanup incomplete: ${name}`)
   }
 
   async listManagedNetworks(): Promise<ManagedNetwork[]> {
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'network',
         'ls',
         '--filter',
@@ -2772,9 +3020,34 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error(`refusing to remove network not owned by DevHotel: ${name}`)
     }
     assertRoomNetwork(network, roomId, name)
-    must(await runDocker(['network', 'rm', name]), `remove network ${name}`)
+    must(await this.engine.run(['network', 'rm', name]), `remove network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`network cleanup incomplete: ${name}`)
+    }
+    this.ipam.release(name)
+  }
+
+  async adoptManagedNetwork(name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    assertManagedNetworkName(name)
+    const network = await this.inspectNetwork(name)
+    if (!network) return
+    const labels = network.Labels ?? {}
+    const roomId = labels['devhotel.room'] ?? ''
+    if (
+      network.Name !== name ||
+      labels['devhotel.managed'] !== '1' ||
+      labels['devhotel.role'] !== 'network' ||
+      !roomId ||
+      (name !== roomNetworkName(roomId) && name !== androidControlNetworkName(roomId))
+    ) {
+      throw new Error(`refusing to adopt network not owned by DevHotel: ${name}`)
+    }
+    assertRoomNetwork(network, roomId, name)
+    for (const cfg of network.IPAM?.Config ?? []) {
+      if (cfg.Subnet) {
+        this.ipam.adopt(name, cfg.Subnet)
+      }
     }
   }
 
@@ -2791,13 +3064,31 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureRoomVolume(roomId, target)
     const run = gitCloneRun(['-v', `${target}:/workspace`, '-w', '/workspace'], gitUrl, [], credential)
     must(
-      await runDocker(run.args, {
+      await this.engine.run(run.args, {
         timeoutMs: LONG_TIMEOUT_MS,
         onLine: log,
         ...(run.input === undefined ? {} : { input: run.input })
       }),
       `clone ${gitUrl}`,
     )
+  }
+
+  /**
+   * A Host-local engine reaches the Host filesystem directly, so the clone
+   * container bind-mounts the caller's directory as `/workspace` and writes the
+   * tree there. The credential still goes in on stdin, never into argv.
+   */
+  async cloneToHostDirectory(
+    gitUrl: string,
+    hostPath: string,
+    opts: { credential?: GitCredential | null; timeoutMs?: number } = {}
+  ): Promise<ExecResult> {
+    if (!isAbsolute(hostPath)) throw new Error('clone destination must be an absolute Host path')
+    const run = gitCloneRun(['-v', `${hostPath}:/workspace`, '-w', '/workspace'], gitUrl, ['--depth', '1'], opts.credential)
+    return await this.engine.run(run.args, {
+      timeoutMs: opts.timeoutMs ?? 180_000,
+      ...(run.input === undefined ? {} : { input: run.input })
+    })
   }
 
   async importHostFolder(
@@ -2814,7 +3105,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureRoomVolume(roomId, target)
     try {
       must(
-        await runDocker(
+        await this.engine.run(
           [
             'run',
             '--rm',
@@ -2865,7 +3156,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(volume, roomId, source)
     await this.ensureImage(DU_IMAGE)
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'run',
         '--rm',
         '--network',
@@ -2901,7 +3192,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(volume, roomId, source)
     await this.ensureImage(DU_IMAGE)
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'run',
         '--rm',
         '--network',
@@ -2983,7 +3274,7 @@ export class OciCliBackend implements IsolationBackend {
     const generatedPrunes = generatedDirs.map((name) => `-name ${name}`).join(' -o ')
     const generatedFiles = currentGeneratedExclusions ? " ! -name '*.apk' ! -name '*.aab'" : ''
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'run',
         '--rm',
         '--network',
@@ -3019,7 +3310,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(volume, roomId, workspaceVolume)
     await this.ensureImage(DU_IMAGE)
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'run',
         '--rm',
         '--network',
@@ -3079,7 +3370,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.ensureRoomVolume(targetRoomId, target)
     try {
       must(
-        await runDocker(
+        await this.engine.run(
           [
             'run',
             '--rm',
@@ -3106,7 +3397,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const sizes: Record<string, number> = {}
     for (const volume of await this.listRoomVolumes(roomId)) {
-      const result = await runDocker(
+      const result = await this.engine.run(
         ['run', '--rm', '-v', `${volume}:/v`, DU_IMAGE, 'du', '-sb', '/v'],
         { timeoutMs: 300_000 },
       )
@@ -3132,7 +3423,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(volume, roomId, name)
     await this.ensureImage(DU_IMAGE)
     must(
-      await runDocker([
+      await this.engine.run([
         'run',
         '--rm',
         '--network',
@@ -3235,7 +3526,7 @@ export class OciCliBackend implements IsolationBackend {
     const creationToken = randomUUID()
     let createdId: string | undefined
     try {
-      const launched = await runDocker(
+      const launched = await this.engine.run(
         buildServiceArgs(
           roomId,
           svc,
@@ -3425,7 +3716,7 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.assertRoomContainer(roomId, name, `svc-${svc}`)
     if (existing.State?.Status === 'exited') return
     const id = exactContainerId(existing, roomId)
-    must(await runDocker(['stop', '-t', '5', id]), `stop ${svc}`)
+    must(await this.engine.run(['stop', '-t', '5', id]), `stop ${svc}`)
     const stopped = await this.inspectContainer(id)
     if (!stopped || stopped.State?.Status !== 'exited') throw new Error(`${svc} stop incomplete: ${name}`)
   }
@@ -3455,7 +3746,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
     const interactive = opts?.input !== undefined ? ['-i'] : []
-    return runDocker(['exec', ...interactive, exactContainerId(container, roomId), ...cmd], {
+    return this.engine.run(['exec', ...interactive, exactContainerId(container, roomId), ...cmd], {
       timeoutMs: opts?.timeoutMs ?? 120_000,
       input: opts?.input
     })
@@ -3470,7 +3761,7 @@ export class OciCliBackend implements IsolationBackend {
   ): Promise<ExecResult> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
-    return runDocker(['exec', exactContainerId(container, roomId), ...cmd], {
+    return this.engine.run(['exec', exactContainerId(container, roomId), ...cmd], {
       timeoutMs: opts?.timeoutMs ?? 600_000,
       outputFile: hostPath
     })
@@ -3485,7 +3776,7 @@ export class OciCliBackend implements IsolationBackend {
   ): Promise<ExecResult> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
-    return runDocker(['exec', '-i', exactContainerId(container, roomId), ...cmd], {
+    return this.engine.run(['exec', '-i', exactContainerId(container, roomId), ...cmd], {
       timeoutMs: opts?.timeoutMs ?? 600_000,
       inputFile: hostPath
     })
@@ -3494,25 +3785,25 @@ export class OciCliBackend implements IsolationBackend {
   async copyFromService(roomId: string, svc: 'postgres' | 'redis', containerPath: string, hostPath: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
-    must(await runDocker(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), `copy from ${svc}`)
+    must(await this.engine.run(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), `copy from ${svc}`)
   }
 
   async copyToService(roomId: string, svc: 'postgres' | 'redis', hostPath: string, containerPath: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, svcName(roomId, svc), `svc-${svc}`)
-    must(await runDocker(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), `copy into ${svc}`)
+    must(await this.engine.run(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), `copy into ${svc}`)
   }
 
   async copyIntoRoom(roomId: string, hostPath: string, containerPath: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), 'copy into room')
+    must(await this.engine.run(['cp', hostPath, `${exactContainerId(container, roomId)}:${containerPath}`]), 'copy into room')
   }
 
   async copyFromRoom(roomId: string, containerPath: string, hostPath: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    must(await runDocker(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), 'copy from room')
+    must(await this.engine.run(['cp', `${exactContainerId(container, roomId)}:${containerPath}`, hostPath]), 'copy from room')
   }
 
   async execFencedEmulatorAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
@@ -3544,6 +3835,29 @@ export class OciCliBackend implements IsolationBackend {
   async execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts: ExecOpts = {}): Promise<ExecResult> {
     throwIfAborted(opts.signal)
     return this.runFencedEmulatorAdb(roomId, args, opts, undefined, true)
+  }
+
+  async waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts: Pick<ExecOpts, 'timeoutMs' | 'signal'> = {}
+  ): Promise<FencedEmulatorBootResult> {
+    throwIfAborted(opts.signal)
+    // Same one-shot boot helper as the live path, proved against the recovery
+    // topology: the web/runtime workload stays exited and untouched.
+    const result = await this.runFencedEmulatorAdb(
+      roomId,
+      [],
+      {
+        ...opts,
+        timeoutMs: opts.timeoutMs ?? FENCED_EMULATOR_BOOT_TIMEOUT_MS,
+        maxStdoutBytes: FENCED_EMULATOR_BOOT_STDOUT_BYTES,
+        maxStderrBytes: FENCED_EMULATOR_BOOT_STDERR_BYTES
+      },
+      undefined,
+      true,
+      'wait-for-boot'
+    )
+    return parseFencedEmulatorBootResult(result)
   }
 
   async installFencedEmulatorApk(roomId: string, hostApkPath: string, opts: ExecOpts = {}): Promise<ExecResult> {
@@ -3655,7 +3969,7 @@ export class OciCliBackend implements IsolationBackend {
     const abortToken = randomUUID()
     let helperId: string | undefined
     try {
-      const created = await runDocker(
+      const created = await this.engine.run(
         [
           'create', '--name', name, '--user', '0:0',
           '--network', `container:${emulatorId}`,
@@ -3691,7 +4005,7 @@ export class OciCliBackend implements IsolationBackend {
         inspected.State?.Status !== 'created'
       ) throw new Error('resident fenced helper ownership could not be verified before start')
       await reproveTopology()
-      must(await runDocker(['start', helperId], { timeoutMs: 60_000 }), 'start resident fenced emulator ADB helper')
+      must(await this.engine.run(['start', helperId], { timeoutMs: 60_000 }), 'start resident fenced emulator ADB helper')
       this.residentFencedHelpers.set(roomId, { id: helperId, name, abortToken, emulatorId })
       return helperId
     } catch {
@@ -3801,7 +4115,7 @@ export class OciCliBackend implements IsolationBackend {
       if (resident) {
         const stdoutBuf = boundedCommandOutput(stdoutLimitEarly)
         const stderrBuf = boundedCommandOutput(stderrLimitEarly)
-        const execResult = await runDocker(
+        const execResult = await this.engine.run(
           [
             'exec', '--user', '0:0', resident, '/bin/sh', '-c',
             FENCED_EMULATOR_RESIDENT_COMMAND, 'devhotel-fenced-resident-command',
@@ -3913,7 +4227,7 @@ export class OciCliBackend implements IsolationBackend {
     let helperId: string | undefined
     try {
       throwIfAborted(opts.signal)
-      const createResult = await runDocker(createArgs, {
+      const createResult = await this.engine.run(createArgs, {
         timeoutMs: null,
         maxStdoutBytes: 128,
         maxStderrBytes: 8 * 1024,
@@ -3963,7 +4277,7 @@ export class OciCliBackend implements IsolationBackend {
     let result: ExecResult | undefined
     let executionError: unknown
     try {
-      result = await runDocker(['start', '-a', helperId], {
+      result = await this.engine.run(['start', '-a', helperId], {
         timeoutMs: mode === 'wait-for-boot'
           ? timeoutMs + FENCED_EMULATOR_BOOT_CLEANUP_GRACE_MS
           : timeoutMs,
@@ -4533,7 +4847,7 @@ export class OciCliBackend implements IsolationBackend {
     if (expectedId && id !== expectedId) {
       throw new Error('Refusing to clean up a fenced Android helper with a different immutable ID')
     }
-    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    const removed = await this.engine.run(['rm', '-f', id], { timeoutMs: 30_000 })
     if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
       throw new Error('Could not clean up the exact aborted fenced Android helper')
     }
@@ -4619,7 +4933,7 @@ export class OciCliBackend implements IsolationBackend {
     if (expectedId && id !== expectedId) {
       throw new Error('Refusing to clean up a replacement emulator container')
     }
-    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    const removed = await this.engine.run(['rm', '-f', id], { timeoutMs: 30_000 })
     if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
       throw new Error('Could not clean up the exact aborted emulator container')
     }
@@ -4628,7 +4942,8 @@ export class OciCliBackend implements IsolationBackend {
 
   async createEmulator(
     roomId: string,
-    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' }
+    opts?: { device: string; version: string; resolution?: 'native' | 'balanced' | 'fast'; orientation?: 'portrait' | 'landscape' },
+    limits?: { cpus?: number; memoryMB?: number }
   ): Promise<void> {
     await this.assertPinnedEngineIdentity()
     await this.ensureImage(opts?.version ? emulatorImage(opts.version) : EMULATOR_IMAGE)
@@ -4644,12 +4959,13 @@ export class OciCliBackend implements IsolationBackend {
     // container, so openbox can never win a race and map the emulator
     // decorated, and the AVD is born at the requested LCD size/orientation.
     try {
-      const createResult = await runDocker(
+      const createResult = await this.engine.run(
         buildEmulatorArgs(roomId, opts, {
           networkNamespace: anchorId,
           networkAuthoritySandboxId: anchorSandboxId,
           networkAuthorityStartedAt: anchorStartedAt,
-          abortToken
+          abortToken,
+          limits
         }),
         {
           timeoutMs: null,
@@ -4679,20 +4995,20 @@ export class OciCliBackend implements IsolationBackend {
         writeFileSync(join(staging, 'openbox', 'fit-emulator.py'), fitEmulatorPy(screen.width, screen.height))
         writeFileSync(
           join(staging, 'avd-override.ini'),
-          emulatorAvdOverride(opts?.device, opts?.resolution ?? 'balanced', opts?.orientation ?? 'portrait')
+          emulatorAvdOverride(opts?.device, opts?.resolution ?? 'fast', opts?.orientation ?? 'portrait')
         )
         must(
-          await runDocker(['cp', join(staging, 'openbox'), `${emulatorId}:/home/androidusr/.config/`]),
+          await this.engine.run(['cp', join(staging, 'openbox'), `${emulatorId}:/home/androidusr/.config/`]),
           'install emulator window rules'
         )
         must(
-          await runDocker(['cp', join(staging, 'avd-override.ini'), `${emulatorId}:${EMULATOR_AVD_OVERRIDE_PATH}`]),
+          await this.engine.run(['cp', join(staging, 'avd-override.ini'), `${emulatorId}:${EMULATOR_AVD_OVERRIDE_PATH}`]),
           'install emulator resolution override'
         )
       } finally {
         rmSync(staging, { recursive: true, force: true })
       }
-      must(await runDocker(['start', emulatorId]), 'start emulator container')
+      must(await this.engine.run(['start', emulatorId]), 'start emulator container')
       const started = await this.inspectContainer(emulatorId)
       this.assertOwnedEmulatorCreate(started, roomId, name, abortToken, emulatorId, anchorId)
       if (started?.State?.Status !== 'running') throw new Error('emulator did not enter the running state')
@@ -4720,6 +5036,45 @@ export class OciCliBackend implements IsolationBackend {
         throw new AggregateError([error, cleanupError], 'emulator creation and exact cleanup both failed')
       }
       throw error
+    }
+  }
+
+  /**
+   * docker-android's emulator bootstrap chowns /dev/kvm through sudo, then
+   * deliberately deletes the root passwd entry. Docker restores the KVM device
+   * node on a later container start, so a retained container cannot run that
+   * bootstrap again: sudo fails before qemu is launched. Restore the one
+   * canonical root line only while the exact owned container is stopped; the
+   * image removes it again immediately after it has repaired /dev/kvm.
+   */
+  private async prepareDockerAndroidEmulatorRestart(emulatorId: string): Promise<void> {
+    const staging = mkdtempSync(join(tmpdir(), 'dh-emulator-restart-'))
+    const passwdPath = join(staging, 'passwd')
+    try {
+      must(
+        await this.engine.run(['cp', `${emulatorId}:/etc/passwd`, passwdPath], { timeoutMs: 30_000 }),
+        'read retained emulator passwd'
+      )
+      const passwd = readFileSync(passwdPath, 'utf8')
+      if (!passwd || Buffer.byteLength(passwd, 'utf8') > DOCKER_ANDROID_PASSWD_MAX_BYTES || passwd.includes('\0')) {
+        throw new Error('retained emulator passwd is not a bounded text file')
+      }
+      const lines = passwd.split(/\r?\n/)
+      const rootLines = lines.filter((line) => line.startsWith('root:'))
+      if (rootLines.length > 1) throw new Error('retained emulator passwd has duplicate root identities')
+      if (rootLines.length === 1) {
+        if (lines[0] !== DOCKER_ANDROID_ROOT_PASSWD) {
+          throw new Error('retained emulator root identity is not the expected bootstrap identity')
+        }
+        return
+      }
+      writeFileSync(passwdPath, `${DOCKER_ANDROID_ROOT_PASSWD}\n${passwd}`, 'utf8')
+      must(
+        await this.engine.run(['cp', passwdPath, `${emulatorId}:/etc/passwd`], { timeoutMs: 30_000 }),
+        'restore retained emulator bootstrap identity'
+      )
+    } finally {
+      rmSync(staging, { recursive: true, force: true })
     }
   }
 
@@ -4820,7 +5175,10 @@ export class OciCliBackend implements IsolationBackend {
           startedAt: exactDockerStartedAt(authority, 'Android recovery control anchor')
         }
       }
-      must(await runDocker(['start', participant.id]), `start exact Android recovery ${participant.role}`)
+      if (participant.role === 'svc-emulator') {
+        await this.prepareDockerAndroidEmulatorRestart(participant.id)
+      }
+      must(await this.engine.run(['start', participant.id]), `start exact Android recovery ${participant.role}`)
       if (participant.role === 'svc-emulator') {
         if (!authorityBeforeJoinerStart) {
           throw new Error('Android recovery control anchor was not witnessed before emulator start')
@@ -4882,7 +5240,7 @@ export class OciCliBackend implements IsolationBackend {
     }
     const stdout = boundedCommandOutput(SCREENSHOT_MAX_BASE64_BYTES)
     const stderr = boundedCommandOutput(64 * 1024)
-    const result = await runDocker([
+    const result = await this.engine.run([
       'exec',
       topology.emulatorId,
       'sh',
@@ -4927,13 +5285,13 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   async imageExists(image: string): Promise<boolean> {
-    const result = await runDocker(['image', 'inspect', '--format', '{{.Id}}', image])
+    const result = await this.engine.run(['image', 'inspect', '--format', '{{.Id}}', image])
     return result.code === 0
   }
 
   async pullImage(image: string, log?: (line: string) => void): Promise<void> {
     await this.assertPinnedEngineIdentity()
-    must(await runDocker(['pull', image], { timeoutMs: LONG_TIMEOUT_MS, onLine: log }), `pull ${image}`)
+    must(await this.engine.run(['pull', image], { timeoutMs: LONG_TIMEOUT_MS, onLine: log }), `pull ${image}`)
   }
 
   /**
@@ -4946,7 +5304,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertPinnedEngineIdentity()
     const prefix = `dh-${roomId}-`
     const listed = must(
-      await runDocker(['volume', 'ls', '--filter', `name=${prefix}`, '--format', '{{.Name}}']),
+      await this.engine.run(['volume', 'ls', '--filter', `name=${prefix}`, '--format', '{{.Name}}']),
       `discover legacy Room ${roomId} volumes`
     )
     const adopted: string[] = []
@@ -5032,7 +5390,7 @@ export class OciCliBackend implements IsolationBackend {
 
   private async readEngineIdentity(): Promise<EngineIdentity> {
     const result = must(
-      await runDocker(['info', '--format', '{{json .}}'], { timeoutMs: 15_000 }),
+      await this.engine.run(['info', '--format', '{{json .}}'], { timeoutMs: 15_000 }),
       'read Docker engine identity'
     )
     let info: { ID?: string }
@@ -5043,7 +5401,7 @@ export class OciCliBackend implements IsolationBackend {
     }
     const engineId = info.ID?.trim()
     if (!engineId) throw new Error('Docker engine did not report a stable engine ID')
-    return { schema: 1, context: getPinnedDockerRuntime().context, engineId }
+    return { schema: 1, context: this.engine.endpoint, engineId }
   }
 
   private async loadLegacyVolumeRegistry(): Promise<LegacyVolumeAdoptionRegistry> {
@@ -5273,15 +5631,26 @@ export class OciCliBackend implements IsolationBackend {
     throw new Error(`volume name collision or invalid ownership metadata: ${name}`)
   }
 
-  private async ensureRoomVolume(roomId: string, name: string): Promise<void> {
+  private async ensureRoomVolume(
+    roomId: string,
+    name: string,
+    opts?: { mustExist?: boolean }
+  ): Promise<void> {
     assertExpectedRoomVolumeName(roomId, name)
     const existing = await this.inspectVolume(name)
     if (existing) {
       await this.assertRoomVolumeOwnership(existing, roomId, name)
       return
     }
+    if (opts?.mustExist) {
+      throw new DevHotelError(
+        'DATA_LOSS',
+        `Recorded volume ${name} for Room ${roomId} does not exist. Refusing to recreate an empty volume.`,
+        { recoveryHint: 'Restore the missing volume or reset the room.' }
+      )
+    }
     must(
-      await runDocker([
+      await this.engine.run([
         'volume',
         'create',
         '--label',
@@ -5299,19 +5668,73 @@ export class OciCliBackend implements IsolationBackend {
     await this.assertRoomVolumeOwnership(created, roomId, name)
   }
 
+  /**
+   * Makes sure a Hotel-scoped shared cache exists, and carries proof it is ours.
+   *
+   * This has to happen before any container mounts it. Docker creates a missing
+   * named volume implicitly on first mount, and the volume it creates that way
+   * carries no labels at all — so the cache would exist, hold real bytes, and be
+   * unattributable forever after. Creating it explicitly is what keeps the
+   * ownership proof in the artifact rather than in a convention.
+   */
+  private async ensureSharedCacheVolume(name: string): Promise<void> {
+    const purpose = sharedCachePurpose(name)
+    if (!purpose) throw new Error(`invalid shared cache volume name: ${name}`)
+    const existing = await this.inspectVolume(name)
+    if (existing) {
+      if (!provesSharedCacheOwnership(name, existing.Labels ?? {})) {
+        throw new Error(`shared cache name collision or invalid ownership metadata: ${name}`)
+      }
+      return
+    }
+    const labels = sharedCacheLabels(purpose)
+    const labelArgs = Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`])
+    must(await this.engine.run(['volume', 'create', ...labelArgs, name]), `create shared cache ${name}`)
+    const created = await this.inspectVolume(name)
+    if (!created || !provesSharedCacheOwnership(name, created.Labels ?? {})) {
+      throw new Error(`created shared cache is missing or unprovable: ${name}`)
+    }
+  }
+
+  private async ensureSpecSharedCaches(spec: WebSpec): Promise<void> {
+    for (const mount of spec.sharedCaches ?? []) await this.ensureSharedCacheVolume(mount.volume)
+  }
+
+  /**
+   * Removes a shared cache, and only ever a shared cache.
+   *
+   * Deliberately separate from `removeManagedVolume`, which proves Room
+   * ownership and would reject this, and which no Room-scoped caller should be
+   * able to talk into removing something every other Room is still using. The
+   * reachability proof lives above, in the Host footprint; what is enforced here
+   * is that the thing being removed is a Hotel-scoped cache and nothing else.
+   */
+  async removeSharedCache(name: string): Promise<void> {
+    await this.assertPinnedEngineIdentity()
+    if (!isSharedCacheVolumeName(name)) throw new Error(`not a DevHotel shared cache: ${name}`)
+    const existing = await this.inspectVolume(name)
+    if (!existing) return
+    if (!provesSharedCacheOwnership(name, existing.Labels ?? {})) {
+      throw new Error(`refusing to remove a shared cache DevHotel cannot prove it owns: ${name}`)
+    }
+    // No --force: the engine must still refuse a cache that gained an
+    // attachment after the footprint was taken.
+    must(await this.engine.run(['volume', 'rm', name]), `remove shared cache ${name}`)
+  }
+
   private async removeRoomVolume(roomId: string, name: string): Promise<void> {
     assertExpectedRoomVolumeName(roomId, name)
     const existing = await this.inspectVolume(name)
     if (!existing) return
     await this.assertRoomVolumeOwnership(existing, roomId, name)
-    must(await runDocker(['volume', 'rm', '-f', name]), `remove Room ${roomId} volume ${name}`)
+    must(await this.engine.run(['volume', 'rm', '-f', name]), `remove Room ${roomId} volume ${name}`)
     if (await this.inspectVolume(name)) {
       throw new Error(`Room ${roomId} volume cleanup incomplete: ${name}`)
     }
   }
 
   private async inspectVolume(name: string): Promise<DockerVolumeInspect | null> {
-    const result = await runDocker(['volume', 'inspect', name])
+    const result = await this.engine.run(['volume', 'inspect', name])
     if (result.code !== 0) {
       const detail = `${result.stderr}\n${result.stdout}`
       if (/no such volume|not found/i.test(detail)) return null
@@ -5334,9 +5757,18 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.inspectNetwork(name)
     if (existing) {
       assertRoomNetwork(existing, roomId, name)
+      const existingSubnet = existing.IPAM?.Config?.[0]?.Subnet
+      if (existingSubnet) this.ipam.adopt(name, existingSubnet)
       return
     }
-    must(await runDocker(buildRoomNetworkCreateArgs(roomId)), `create room network ${name}`)
+    const usedSubnets = await this.collectDockerSubnets()
+    const subnet = await this.allocateSubnetWithStaleReclaim(roomId, name, usedSubnets)
+    try {
+      must(await this.engine.run(buildRoomNetworkCreateArgs(roomId, subnet)), `create room network ${name}`)
+    } catch (error) {
+      this.ipam.release(name)
+      throw classifyNetworkCreateError(error, roomId, name, subnet)
+    }
   }
 
   private async ensureAndroidControlNetwork(roomId: string): Promise<void> {
@@ -5344,9 +5776,124 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.inspectNetwork(name)
     if (existing) {
       assertRoomNetwork(existing, roomId, name)
+      const existingSubnet = existing.IPAM?.Config?.[0]?.Subnet
+      if (existingSubnet) this.ipam.adopt(name, existingSubnet)
       return
     }
-    must(await runDocker(buildAndroidControlNetworkCreateArgs(roomId)), `create Android control network ${name}`)
+    const usedSubnets = await this.collectDockerSubnets()
+    const subnet = await this.allocateSubnetWithStaleReclaim(roomId, name, usedSubnets)
+    try {
+      must(await this.engine.run(buildAndroidControlNetworkCreateArgs(roomId, subnet)), `create Android control network ${name}`)
+    } catch (error) {
+      this.ipam.release(name)
+      throw classifyNetworkCreateError(error, roomId, name, subnet)
+    }
+  }
+
+  async collectDockerSubnets(): Promise<Set<string>> {
+    const used = new Set<string>()
+    try {
+      const result = await this.engine.run(['network', 'ls', '--format', '{{.Name}}'])
+      if (result.code === 0 && result.stdout.trim()) {
+        const names = result.stdout.trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+        if (names.length > 0) {
+          const inspectedNames = new Set<string>()
+          let batchSuccess = false
+          try {
+            const inspectResult = await this.engine.run(['network', 'inspect', ...names])
+            if (inspectResult.stdout.trim()) {
+              try {
+                const parsed = JSON.parse(inspectResult.stdout) as DockerNetworkInspect[]
+                for (const net of parsed) {
+                  if (net.Name) inspectedNames.add(net.Name)
+                  for (const cfg of net.IPAM?.Config ?? []) {
+                    if (cfg.Subnet) used.add(cfg.Subnet)
+                  }
+                }
+              } catch {
+                // stdout was not parseable as complete JSON
+              }
+            }
+            if (inspectResult.code === 0) {
+              batchSuccess = true
+            }
+          } catch {
+            // batch execution failed
+          }
+
+          if (!batchSuccess) {
+            const remaining = names.filter((n) => !inspectedNames.has(n))
+            for (const name of remaining) {
+              try {
+                const single = await this.engine.run(['network', 'inspect', name])
+                if (single.stdout.trim()) {
+                  try {
+                    const parsed = JSON.parse(single.stdout) as DockerNetworkInspect[]
+                    for (const net of parsed) {
+                      for (const cfg of net.IPAM?.Config ?? []) {
+                        if (cfg.Subnet) used.add(cfg.Subnet)
+                      }
+                    }
+                  } catch {
+                    // ignore malformed output for single network
+                  }
+                }
+              } catch {
+                // ignore single network inspect failure
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Best-effort inspection: test mocks or docker CLI failures fall back to in-memory allocator tracking
+    }
+    return used
+  }
+
+  private async allocateSubnetWithStaleReclaim(
+    roomId: string,
+    networkName: string,
+    usedSubnets: Set<string>
+  ): Promise<string> {
+    try {
+      return this.ipam.allocate(networkName, usedSubnets)
+    } catch (allocError) {
+      if (!(allocError instanceof DevHotelError) || allocError.code !== 'NETWORK_POOL_EXHAUSTED') {
+        throw allocError
+      }
+      if (this.isRoomActive) {
+        let reclaimedAny = false
+        try {
+          const managed = await this.listManagedNetworks()
+          for (const net of managed) {
+            if (!net.roomId || !this.isRoomActive(net.roomId)) {
+              const inspected = await this.inspectNetwork(net.name)
+              if (inspected && (!inspected.Containers || Object.keys(inspected.Containers).length === 0)) {
+                try {
+                  await this.removeManagedNetwork(net.name)
+                  reclaimedAny = true
+                  const freedSubnet = inspected.IPAM?.Config?.[0]?.Subnet
+                  if (freedSubnet) usedSubnets.delete(freedSubnet)
+                } catch {
+                  // crash-tolerant cleanup: ignore single failure and continue
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore listing failures
+        }
+        if (reclaimedAny) {
+          try {
+            return this.ipam.allocate(networkName, usedSubnets)
+          } catch {
+            // Still exhausted, fall through to rethrow original error
+          }
+        }
+      }
+      throw allocError
+    }
   }
 
   private async ensureAndroidRuntimeAnchor(roomId: string): Promise<void> {
@@ -5359,7 +5906,7 @@ export class OciCliBackend implements IsolationBackend {
       this.assertContainerNetworkMode(owned, roomNetworkName(roomId), 'Android runtime anchor')
       const id = exactContainerId(owned, roomId)
       if (owned.State?.Status !== 'running') {
-        must(await runDocker(['start', id]), 'start Android runtime anchor')
+        must(await this.engine.run(['start', id]), 'start Android runtime anchor')
         const started = await this.inspectContainer(id)
         if (!started || started.State?.Status !== 'running') {
           throw new Error('Android runtime anchor start did not produce a running namespace leader')
@@ -5369,7 +5916,7 @@ export class OciCliBackend implements IsolationBackend {
       }
       return
     }
-    must(await runDocker(buildAndroidRuntimeAnchorArgs(roomId)), 'create Android runtime anchor')
+    must(await this.engine.run(buildAndroidRuntimeAnchorArgs(roomId)), 'create Android runtime anchor')
     const created = await this.assertRoomContainer(roomId, name, 'android-runtime-anchor')
     exactContainerId(created, roomId)
     this.assertContainerNetworkMode(created, roomNetworkName(roomId), 'Android runtime anchor')
@@ -5378,26 +5925,33 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  private async rollbackPartialAndroidTopology(roomId: string): Promise<void> {
+  private async rollbackPartialRoomTopology(spec: WebSpec): Promise<void> {
     const failures: unknown[] = []
     for (const [name, role] of [
-      [webName(roomId), 'web'],
-      [androidRuntimeAnchorName(roomId), 'android-runtime-anchor'],
-      [anchorName(roomId), 'anchor']
+      [webName(spec.roomId), 'web'],
+      [androidRuntimeAnchorName(spec.roomId), 'android-runtime-anchor'],
+      [anchorName(spec.roomId), 'anchor']
     ] as const) {
       try {
-        await this.removeRoomContainer(roomId, name, role)
+        await this.removeRoomContainer(spec.roomId, name, role)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (spec.androidRuntimeIsolation) {
+      try {
+        await this.removeAndroidControlNetwork(spec.roomId)
       } catch (error) {
         failures.push(error)
       }
     }
     try {
-      await this.removeAndroidControlNetwork(roomId)
+      await this.removeRoomNetwork(spec.roomId)
     } catch (error) {
       failures.push(error)
     }
     if (failures.length > 0) {
-      throw new AggregateError(failures, 'partial Android topology cleanup was incomplete')
+      throw new AggregateError(failures, 'partial Room topology cleanup was incomplete')
     }
   }
 
@@ -5739,7 +6293,7 @@ export class OciCliBackend implements IsolationBackend {
       const previousStartedAt = initialJoiner.State?.StartedAt
       await assertAuthorityContextStable?.()
       exactStartAttempted = true
-      must(await runDocker(['start', joinerId]), `start exact ${what}`)
+      must(await this.engine.run(['start', joinerId]), `start exact ${what}`)
       const started = await validateJoiner(undefined, true)
       if (started.needsProof && started.startedAt === previousStartedAt) {
         throw new Error(`${what} did not report a fresh start identity`)
@@ -6025,27 +6579,35 @@ export class OciCliBackend implements IsolationBackend {
   private async removeRoomNetwork(roomId: string): Promise<void> {
     const name = roomNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
-    if (!existing) return
+    if (!existing) {
+      this.ipam.release(name)
+      return
+    }
     assertRoomNetwork(existing, roomId, name)
-    must(await runDocker(['network', 'rm', name]), `remove room network ${name}`)
+    must(await this.engine.run(['network', 'rm', name]), `remove room network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`Room ${roomId} network cleanup incomplete: ${name}`)
     }
+    this.ipam.release(name)
   }
 
   private async removeAndroidControlNetwork(roomId: string): Promise<void> {
     const name = androidControlNetworkName(roomId)
     const existing = await this.inspectNetwork(name)
-    if (!existing) return
+    if (!existing) {
+      this.ipam.release(name)
+      return
+    }
     assertRoomNetwork(existing, roomId, name)
-    must(await runDocker(['network', 'rm', name]), `remove Android control network ${name}`)
+    must(await this.engine.run(['network', 'rm', name]), `remove Android control network ${name}`)
     if (await this.inspectNetwork(name)) {
       throw new Error(`Room ${roomId} Android control network cleanup incomplete: ${name}`)
     }
+    this.ipam.release(name)
   }
 
   private async inspectNetwork(name: string): Promise<DockerNetworkInspect | null> {
-    const result = await runDocker(['network', 'inspect', name])
+    const result = await this.engine.run(['network', 'inspect', name])
     if (result.code !== 0) {
       const detail = `${result.stderr}\n${result.stdout}`
       if (/no such network|not found/i.test(detail)) return null
@@ -6076,7 +6638,7 @@ export class OciCliBackend implements IsolationBackend {
   private async inspectContainers(targets: readonly string[]): Promise<Map<string, DockerContainerInspect>> {
     const found = new Map<string, DockerContainerInspect>()
     if (targets.length === 0) return found
-    const result = await runDocker(['inspect', ...targets])
+    const result = await this.engine.run(['inspect', ...targets])
     if (result.code !== 0) {
       const detail = `${result.stderr}\n${result.stdout}`
       // Docker reports missing targets on stderr and still prints the rest.
@@ -6100,7 +6662,7 @@ export class OciCliBackend implements IsolationBackend {
   }
 
   private async inspectContainer(name: string): Promise<DockerContainerInspect | null> {
-    const result = await runDocker(['inspect', name])
+    const result = await this.engine.run(['inspect', name])
     if (result.code !== 0) {
       const detail = `${result.stderr}\n${result.stdout}`
       if (/no such object|no such container|not found/i.test(detail)) return null
@@ -6390,8 +6952,7 @@ export class OciCliBackend implements IsolationBackend {
     }
 
     const expectedEnv = new Map<string, string>([
-      ['npm_config_cache', '/cache/npm'],
-      ['PNPM_HOME', '/cache/pnpm'],
+      ...roomCacheEnv(spec),
       ...Object.entries(spec.env ?? {})
     ])
     const actualEnv = new Map<string, string>()
@@ -6594,7 +7155,7 @@ export class OciCliBackend implements IsolationBackend {
       await this.assertRoomArtifactNetworkAuthorityStable(spec, authority)
       try {
         must(
-          await runDocker(['rm', '-f', fence.containerId], {
+          await this.engine.run(['rm', '-f', fence.containerId], {
             timeoutMs: 30_000,
             maxStdoutBytes: 128,
             maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -6653,7 +7214,7 @@ export class OciCliBackend implements IsolationBackend {
       throw new Error('Refusing to clean up a Room web runtime outside the exact restore token fence')
     }
     try {
-      await runDocker(['rm', '-f', id], {
+      await this.engine.run(['rm', '-f', id], {
         timeoutMs: 30_000,
         maxStdoutBytes: 128,
         maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -6670,7 +7231,7 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.inspectContainer(name)
     if (!existing) return
     await this.assertRoomContainer(roomId, name, role, existing)
-    must(await runDocker(['rm', '-f', name]), `remove Room ${roomId} container ${name}`)
+    must(await this.engine.run(['rm', '-f', name]), `remove Room ${roomId} container ${name}`)
     if (await this.inspectContainer(name)) throw new Error(`Room ${roomId} container cleanup incomplete: ${name}`)
   }
 
@@ -6690,7 +7251,7 @@ export class OciCliBackend implements IsolationBackend {
     if (expectedId !== undefined && id !== expectedId) {
       throw new Error(`Room ${roomId} web immutable ID changed before recreation`)
     }
-    must(await runDocker(['rm', '-f', id]), `remove exact Room ${roomId} container ${name}`)
+    must(await this.engine.run(['rm', '-f', id]), `remove exact Room ${roomId} container ${name}`)
     if (await this.inspectContainer(id)) throw new Error(`Room ${roomId} exact container cleanup incomplete: ${name}`)
     if (await this.inspectContainer(name)) {
       throw new Error(`Room ${roomId} web was replaced concurrently during recreation`)
@@ -6839,7 +7400,7 @@ export class OciCliBackend implements IsolationBackend {
     let finalizerError: unknown
     let cleanupError: unknown
     try {
-      const created = await runDocker(createArgs, {
+      const created = await this.engine.run(createArgs, {
         timeoutMs: 30_000,
         maxStdoutBytes: 128,
         maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES,
@@ -6864,7 +7425,7 @@ export class OciCliBackend implements IsolationBackend {
       if (inert.State?.Status !== 'created') throw new Error('Room artifact finalizer was not inert before start')
       if (webId !== undefined) await this.assertPausedRoomArtifactWeb(roomId, workspaceVolume, webId)
       try {
-        await runDocker(['start', '-a', helperId], {
+        await this.engine.run(['start', '-a', helperId], {
           timeoutMs: 30_000,
           maxStdoutBytes: ROOM_ARTIFACT_HELPER_STDOUT_BYTES,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -6984,7 +7545,7 @@ export class OciCliBackend implements IsolationBackend {
       existing.State?.Status === 'paused'
     ) {
       try {
-        await runDocker(['stop', '-t', '3', id], {
+        await this.engine.run(['stop', '-t', '3', id], {
           timeoutMs: 10_000,
           maxStdoutBytes: 128,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -6996,7 +7557,7 @@ export class OciCliBackend implements IsolationBackend {
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await runDocker(['rm', '-f', id], {
+        await this.engine.run(['rm', '-f', id], {
           timeoutMs: 30_000,
           maxStdoutBytes: 128,
           maxStderrBytes: ROOM_ARTIFACT_HELPER_STDERR_BYTES
@@ -7023,7 +7584,7 @@ export class OciCliBackend implements IsolationBackend {
     if (expectedId && id !== expectedId) {
       throw new Error('Refusing to clean up a replacement one-shot container')
     }
-    const removed = await runDocker(['rm', '-f', id], { timeoutMs: 30_000 })
+    const removed = await this.engine.run(['rm', '-f', id], { timeoutMs: 30_000 })
     if (removed.code !== 0 && !/no such (?:object|container)/i.test(`${removed.stderr}\n${removed.stdout}`)) {
       throw new Error('Could not clean up the exact one-shot container')
     }
@@ -7053,7 +7614,7 @@ export class OciCliBackend implements IsolationBackend {
     if (expectedId && id !== expectedId) {
       throw new Error(`Refusing to clean up a replacement ${svc} container`)
     }
-    must(await runDocker(['rm', '-f', id]), `remove failed ${svc} container`)
+    must(await this.engine.run(['rm', '-f', id]), `remove failed ${svc} container`)
     if (await this.inspectContainer(id)) {
       throw new Error(`The exact failed ${svc} container still exists after cleanup`)
     }
@@ -7069,7 +7630,7 @@ export class OciCliBackend implements IsolationBackend {
     if (exactContainerId(existing, roomId) !== expectedId) {
       throw new Error(`Refusing to clean up a replacement ${svc} container after namespace mismatch`)
     }
-    must(await runDocker(['rm', '-f', expectedId]), `remove misbound ${svc} container`)
+    must(await this.engine.run(['rm', '-f', expectedId]), `remove misbound ${svc} container`)
     if (await this.inspectContainer(expectedId)) {
       throw new Error(`The exact misbound ${svc} container still exists after cleanup`)
     }
@@ -7088,7 +7649,7 @@ export class OciCliBackend implements IsolationBackend {
     await assertExactOwned(existing)
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await runDocker(['rm', '-f', expectedId], { timeoutMs: 30_000 })
+        await this.engine.run(['rm', '-f', expectedId], { timeoutMs: 30_000 })
       } catch {
         // Exact-ID re-inspection, not the transport response, decides cleanup.
       }
@@ -7101,7 +7662,7 @@ export class OciCliBackend implements IsolationBackend {
 
   private async listRoomContainers(roomId: string): Promise<ManagedRoomContainer[]> {
     const result = must(
-      await runDocker([
+      await this.engine.run([
         'ps',
         '-a',
         '--filter',
@@ -7142,13 +7703,41 @@ export class OciCliBackend implements IsolationBackend {
     return [...new Map(containers.map((container) => [container.id, container])).values()]
   }
 
+  /**
+   * The Host loopback port the Gateway routes this Room to.
+   *
+   * With a Host-local engine the anchor's published port already *is* a Host
+   * port, so the engine's answer is final. With the engine inside the managed
+   * runtime it is a port on the guest, and something on the Host has to stand in
+   * front of it — see `reachHostPort`. Keeping that as one override is what lets
+   * the Room record, the Gateway route and the relay-token handshake stay
+   * byte-for-byte the same on both backends.
+   */
   private async readHostPort(roomId: string): Promise<number> {
     const anchor = await this.assertRelayAnchorAuthority(roomId)
     const result = must(
-      await runDocker(['port', exactContainerId(anchor, roomId), `${RELAY_PORT}/tcp`]),
+      await this.engine.run(['port', exactContainerId(anchor, roomId), `${RELAY_PORT}/tcp`]),
       'read anchor host port',
     )
-    return parsePortOutput(result.stdout)
+    return await this.reachHostPort(roomId, parsePortOutput(result.stdout))
+  }
+
+  /**
+   * Turns the port the engine published into a port the Host can connect to.
+   * Identity for a Host-local engine, because there is nothing to cross.
+   */
+  protected async reachHostPort(_roomId: string, publishedPort: number): Promise<number> {
+    return publishedPort
+  }
+
+  /**
+   * The address the anchor publishes its relay gate on, inside the engine's own
+   * network view. Loopback is the tightest possible binding and is what a
+   * Host-local engine wants; an engine in a VM has to publish on the interface
+   * the Host can actually reach.
+   */
+  protected get relayPublishAddress(): string {
+    return '127.0.0.1'
   }
 
   private async assertRelayAnchorAuthority(roomId: string): Promise<DockerContainerInspect> {
@@ -7181,7 +7770,7 @@ export class OciCliBackend implements IsolationBackend {
   private async listRoomVolumes(roomId: string): Promise<string[]> {
     const prefix = `dh-${roomId}-`
     const result = must(
-      await runDocker(['volume', 'ls', '--filter', `name=${prefix}`, '--format', '{{.Name}}']),
+      await this.engine.run(['volume', 'ls', '--filter', `name=${prefix}`, '--format', '{{.Name}}']),
       `list Room ${roomId} volumes`
     )
     const names = result.stdout
@@ -7233,7 +7822,7 @@ export class OciCliBackend implements IsolationBackend {
   async listVolumesWithUsage(): Promise<DockerVolumeUsage[]> {
     await this.assertPinnedEngineIdentity()
     try {
-      const result = await runDocker(['system', 'df', '-v', '--format', '{{json .Volumes}}'], { timeoutMs: 60_000 })
+      const result = await this.engine.run(['system', 'df', '-v', '--format', '{{json .Volumes}}'], { timeoutMs: 60_000 })
       if (result.code === 0 && result.stdout.trim().length > 0) {
         const parsed = JSON.parse(result.stdout) as Array<{
           Name?: string
@@ -7274,7 +7863,7 @@ export class OciCliBackend implements IsolationBackend {
       // Fallback to volume enumeration
     }
 
-    const listResult = await runDocker(['volume', 'ls', '--format', '{{json .}}'], { timeoutMs: 60_000 })
+    const listResult = await this.engine.run(['volume', 'ls', '--format', '{{json .}}'], { timeoutMs: 60_000 })
     if (listResult.code !== 0) return []
     const usages: DockerVolumeUsage[] = []
     const lines = listResult.stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
@@ -7304,6 +7893,36 @@ export class OciCliBackend implements IsolationBackend {
     return usages
   }
 
+  async inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null> {
+    await this.assertPinnedEngineIdentity()
+    const inspected = await this.inspectVolume(name)
+    if (!inspected) return null
+    // Every container, in any state, that references the volume. This is what
+    // `docker system df` counts as Links, observed for one volume instead of
+    // all of them.
+    const attached = await this.engine.run(['ps', '-a', '--filter', `volume=${name}`, '--format', '{{.ID}}'], { timeoutMs: 30_000 })
+    const linksKnown = attached.code === 0
+    const links = linksKnown
+      ? attached.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).length
+      : 0
+    const labels: Record<string, string> = {}
+    for (const [key, value] of Object.entries(inspected.Labels ?? {})) labels[key] = value
+    const usage = await this.completeVolumeUsage({
+      name,
+      driver: inspected.Driver ?? 'local',
+      scope: inspected.Scope ?? 'local',
+      mountpoint: inspected.Mountpoint ?? '',
+      sizeBytes: 0,
+      sizeKnown: false,
+      links,
+      linksKnown,
+      labels,
+      ...(inspected.CreatedAt ? { createdAt: inspected.CreatedAt } : {})
+    })
+    const { sizeBytes: _size, sizeKnown: _known, ...observation } = usage
+    return observation
+  }
+
   async removeManagedVolume(name: string): Promise<void> {
     await this.assertPinnedEngineIdentity()
     const existing = await this.inspectVolume(name)
@@ -7324,7 +7943,7 @@ export class OciCliBackend implements IsolationBackend {
     }
     // Deliberately omit --force: Docker must refuse a newly attached volume at
     // the final host boundary, even if state changed after reconciliation.
-    must(await runDocker(['volume', 'rm', name]), `remove volume ${name}`)
+    must(await this.engine.run(['volume', 'rm', name]), `remove volume ${name}`)
     if (await this.inspectVolume(name)) {
       throw new Error(`volume cleanup incomplete: ${name}`)
     }
@@ -7362,6 +7981,10 @@ interface DockerNetworkInspect {
   Driver?: string
   Labels?: Record<string, string> | null
   Containers?: Record<string, { Name?: string } | null> | null
+  IPAM?: {
+    Driver?: string
+    Config?: Array<{ Subnet?: string; Gateway?: string }> | null
+  } | null
 }
 
 interface DockerContainerInspect {
@@ -7652,8 +8275,19 @@ function isExpectedRoomContainer(roomId: string, name: string, role: string): bo
   }
 }
 
+/** `KEY=value` inspect entries as a map; a container env is a list, not an object. */
+function containerEnvMap(container: DockerContainerInspect): Map<string, string> {
+  const env = new Map<string, string>()
+  for (const entry of container.Config?.Env ?? []) {
+    const separator = entry.indexOf('=')
+    if (separator > 0) env.set(entry.slice(0, separator), entry.slice(separator + 1))
+  }
+  return env
+}
+
+/** Terminal states: nothing runs in any of these, so there is nothing to stop. */
 function isStoppedContainerState(state: string): boolean {
-  return state === 'exited' || state === 'created'
+  return state === 'exited' || state === 'created' || state === 'dead'
 }
 
 function assertExpectedRoomVolumeName(roomId: string, name: string): void {

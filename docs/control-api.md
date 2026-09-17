@@ -14,7 +14,7 @@ While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
   "port": 6084,
   "token": "…48 hex chars…",
   "pid": 12345,
-  "version": "0.5.2",
+  "version": "0.5.4",
   "commit": "98a292c82209eb586409ceec1ea27b5fe21ccf0b",
   "buildTime": "2026-09-08T12:34:56.789Z",
   "sourceVerified": true
@@ -132,9 +132,11 @@ can drive the whole thing by polling.
 |---|---|
 | `GET /v1/ping` | `{ version, commit, buildTime, sourceVerified }` |
 | `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
-| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
+| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, runtime: { mode, managed }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. `runtime.mode` is the backend-neutral `managed` or `compatibility` selection. `runtime.managed` reports the managed-runtime provisioning state/phase, support result, opaque runtime ID, version and verified artifact digests without returning native VM identifiers or Host paths; support distinguishes a provider that is ready, needs Windows provisioning, or needs explicit elevation. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
+| `GET /v1/storage/volumes` | Every Docker volume reconciled against the Room registry: totals, per-class bytes, and for each volume its class, `safeToDelete` and the reason. Read-only. See [volume-gc.md](volume-gc.md). |
+| `POST /v1/storage/volumes/gc` | `{ dryRun?, maxVolumes?, maxBytes?, deadlineMs? }` — dry by default. A real pass (`dryRun: false`) must give `maxVolumes` (attempts, ≤ 500) and `maxBytes`; `deadlineMs` defaults to 5 minutes (≤ 1 h). Returns the report plus `deletedVolumes`, `errors`, `attemptedCount`, `deadlineReached` and `skipped[]`. Only positively orphaned, exactly owned, unattached, size-known volumes are ever attempted, each re-proved under its Room lock first. |
 
 ### Shared Android devices
 
@@ -451,3 +453,23 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "C:\…\DevHotel.ex
 
 `-s user` registers it once for every project. Registration only takes effect
 for agent sessions started afterwards — a running session must reconnect.
+
+### Room acquisition
+
+`POST /v1/rooms/acquire` is the default agent entry point (`acquire_room` in MCP).
+It accepts the same strict agent body as `POST /v1/rooms`, including optional
+`taskId` and `issueRef`. It returns `{ room, disposition, reason, modified }`,
+where disposition is `created`, `reused`, or `woken`. Sleeping Rooms are woken;
+existing source state is preserved, with no automatic resync or reset. A failed
+wake returns `ROOM_WAKE_FAILED` with the existing Room ID. Other Room states
+are surfaced in `room.status` for inspection/recovery.
+
+Matching uses canonical source identity, case-insensitive project, provider,
+and explicit plan overrides; nickname is only a display label. With no task
+identity supplied, compatible task-bound Rooms are also candidates. A distinct
+`taskId` or `issueRef` selects a separate parallel lane; repeating that identity
+reuses its existing Room. Direct agent creation returns HTTP 409,
+`ROOM_REUSE_REQUIRED`, and `evidence.roomId` when a candidate exists. Neither a
+nickname change nor a force flag grants an exception. User/manual creation is
+unchanged. Selection, disposition and preservation reason are journaled on the
+selected Room as `acquire-room`.

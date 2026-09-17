@@ -94,6 +94,13 @@ beforeAll(async () => {
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
       }
+      if (req.url === '/v1/rooms/acquire' && req.method === 'POST') {
+        return void res.end(JSON.stringify({ room: { id: 'abc12345' }, disposition: 'reused', reason: 'compatible Room; state preserved', modified: true }))
+      }
+      if (req.url === '/v1/rooms' && req.method === 'POST') {
+        res.writeHead(409)
+        return void res.end(JSON.stringify({ code: 'ROOM_REUSE_REQUIRED', evidence: { roomId: 'abc12345' } }))
+      }
       if (req.url === '/v1/rooms/abc12345/changes' && req.method === 'POST') {
         const body = JSON.parse(raw)
         if (body.change?.kind === 'android-run' && body.waitMs === 0) {
@@ -470,6 +477,21 @@ describe('makeTools', () => {
   const tools = makeTools(async () => client())
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
 
+  it('sends acquire/create task identities through their respective client routes', async () => {
+    for (const [name, route] of [['acquire_room', '/v1/rooms/acquire'], ['create_room', '/v1/rooms']]) {
+      const result = await byName[name!]!.handler({ sourceType: 'empty', sourceRef: '', project: 'demo', nickname: 'dev', taskId: 'task-97', issueRef: 'issue-97', runtimeVersion: '22' })
+      expect(seen.at(-1)).toMatchObject({ method: 'POST', url: route, body: { taskId: 'task-97', issueRef: 'issue-97', planOverrides: { runtimeVersion: '22' } } })
+      if (name === 'acquire_room') {
+        expect(result.isError).not.toBe(true)
+        expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({ room: { id: 'abc12345' }, disposition: 'reused', modified: true })
+      } else {
+        expect(result.isError).toBe(true)
+        expect(JSON.stringify(result.content)).toContain('ROOM_REUSE_REQUIRED')
+        expect(JSON.stringify(result.content)).toContain('abc12345')
+      }
+    }
+  })
+
   it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
@@ -494,6 +516,7 @@ describe('makeTools', () => {
         'check_room',
         'clone_room',
         'copy_diagnostic',
+        'acquire_room',
         'create_room',
         'delete_room',
         'hotel_github_install',
@@ -530,7 +553,7 @@ describe('makeTools', () => {
   })
 
   it('reports the package release metadata', () => {
-    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.2' })
+    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.4' })
   })
 
   function firstText(res: { content: ({ type: string } & Record<string, unknown>)[] }): string {

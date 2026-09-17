@@ -31,6 +31,7 @@ export type VolumeLivenessClass =
   | 'orphaned-stale-generation'
   | 'orphaned-stale-snapshot'
   | 'orphaned-stale-deps'
+  | 'orphaned-removed-service'
   | 'unowned'
 
 export const zVolumeLivenessClass = z.enum([
@@ -43,6 +44,7 @@ export const zVolumeLivenessClass = z.enum([
   'orphaned-stale-generation',
   'orphaned-stale-snapshot',
   'orphaned-stale-deps',
+  'orphaned-removed-service',
   'unowned'
 ])
 
@@ -144,6 +146,17 @@ export const zVolumeReconciliationReport = z.object({
   volumes: z.array(zVolumeRecord)
 })
 
+/** A candidate the pass proved removable but did not attempt, and the bound that stopped it. */
+export interface VolumeGcSkip {
+  name: string
+  reason: string
+}
+
+export const zVolumeGcSkip = z.object({
+  name: z.string(),
+  reason: z.string()
+})
+
 export interface VolumeGcResult {
   dryRun: boolean
   report: VolumeReconciliationReport
@@ -151,6 +164,11 @@ export interface VolumeGcResult {
   reclaimedBytes: number
   deletedVolumes: string[]
   errors: string[]
+  /** Removal attempts made, successful or not; this is what `maxVolumes` bounds. */
+  attemptedCount: number
+  /** True when the wall-clock deadline ended the pass before every candidate was attempted. */
+  deadlineReached: boolean
+  skipped: VolumeGcSkip[]
 }
 
 export const zVolumeGcResult = z.object({
@@ -159,13 +177,20 @@ export const zVolumeGcResult = z.object({
   deletedCount: z.number().int().nonnegative(),
   reclaimedBytes: z.number().int().nonnegative(),
   deletedVolumes: z.array(z.string()),
-  errors: z.array(z.string())
+  errors: z.array(z.string()),
+  attemptedCount: z.number().int().nonnegative(),
+  deadlineReached: z.boolean(),
+  skipped: z.array(zVolumeGcSkip)
 })
+
+/** A real pass that brings no deadline gets this one; a pass can never run open-ended. */
+export const VOLUME_GC_DEFAULT_DEADLINE_MS = 5 * 60 * 1000
 
 export const zVolumeGcBody = z.object({
   dryRun: z.boolean().optional(),
   maxVolumes: z.number().int().positive().max(500).optional(),
-  maxBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()
+  maxBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  deadlineMs: z.number().int().positive().max(60 * 60 * 1000).optional()
 }).superRefine((value, ctx) => {
   if (value.dryRun !== false) return
   if (value.maxVolumes === undefined) {
@@ -177,5 +202,6 @@ export const zVolumeGcBody = z.object({
 }).transform((value) => ({
   dryRun: value.dryRun ?? true,
   maxVolumes: value.maxVolumes ?? 50,
-  maxBytes: value.maxBytes
+  maxBytes: value.maxBytes,
+  deadlineMs: value.deadlineMs ?? VOLUME_GC_DEFAULT_DEADLINE_MS
 }))

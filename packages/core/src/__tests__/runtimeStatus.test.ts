@@ -29,6 +29,54 @@ describe('Room runtime status', () => {
     return { backend, orch }
   }
 
+  it('reports managed-runtime readiness separately from the selected backend mode', async () => {
+    const userData = tempDir()
+    dirs.push(userData)
+    const db = testDb()
+    dbs.push(db)
+    const managedRuntimeStatus = vi.fn(async () => ({
+      state: 'preparing' as const,
+      phase: 'provisioning-runtime-provider' as const,
+      detail: 'The DevHotel-managed runtime is preparing.',
+      support: {
+        supported: true,
+        code: 'ready' as const,
+        detail: 'Windows hypervisor is active.',
+        hypervisorPresent: true,
+        virtualizationFirmwareEnabled: true,
+        slat: true,
+        hyperVPowerShellAvailable: true,
+        hyperVManagementAccessible: true
+      },
+      runtimeId: 'runtime-observed',
+      runtimeVersion: '0.1.0',
+      artifactDigests: { 'linux-runtime': 'a'.repeat(64) }
+    }))
+    const orch = new RoomOrchestrator({
+      userData,
+      backend: new FakeBackend(),
+      gateway: new FakeGateway().asGateway(),
+      db,
+      appVersion: 'test',
+      managedRuntimeStatus,
+      runtimeMode: 'compatibility'
+    })
+
+    expect(await orch.hotelStatus()).toMatchObject({
+      runtime: {
+        mode: 'compatibility',
+        managed: {
+          state: 'preparing',
+          phase: 'provisioning-runtime-provider',
+          runtimeId: 'runtime-observed',
+          runtimeVersion: '0.1.0',
+          artifactDigests: { 'linux-runtime': 'a'.repeat(64) }
+        }
+      }
+    })
+    expect(managedRuntimeStatus).toHaveBeenCalledOnce()
+  })
+
   it('does not report a recorded-ready Room as ready when its runtime stopped', async () => {
     const { backend, orch } = setup()
     const room = makeRoom({

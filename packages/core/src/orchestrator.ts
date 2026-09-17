@@ -59,6 +59,7 @@ import type {
   CheckResult,
   CheckStatus,
   CloneRoomInput,
+  AcquireRoomResult,
   CreateRoomInput,
   OperationRecord,
   HostResyncDriftFacts,
@@ -101,6 +102,7 @@ import {
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
+import type { HostFootprint, HostGcResult, LifecycleQuotas, QuotaVerdict } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
@@ -128,8 +130,8 @@ import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
-import { runDocker } from './backend/cli'
-import { gitCloneRun, splitGitCredential } from './backend/gitClone'
+import { splitGitCredential } from './backend/gitClone'
+import type { ManagedRuntimeObservation } from './backend/managedRuntime'
 import {
   EMULATOR_ADB_SERIAL,
   EMULATOR_DEFAULT_DEVICE,
@@ -140,6 +142,7 @@ import {
 } from './backend/naming'
 import {
   RoomArtifactPublicationError,
+  type DockerVolumeUsage,
   type ExecResult,
   type GitCredential,
   type GitCredentialResolver,
@@ -188,6 +191,12 @@ import { writeManifest } from './manifest'
 import { OperationTracker, type OperationReporter } from './operations'
 import { operationsRepo, type OperationsRepo } from './store/operationsRepo'
 import { reconcile, type ReconcileResult } from './reconcile'
+import { buildHostFootprint } from './lifecycle/footprint'
+import { observeHost } from './lifecycle/adapter'
+import { executeHostGc, type HostGcOptions } from './lifecycle/gc'
+import { DEFAULT_LIFECYCLE_QUOTAS, evaluateQuotas, type QuotaRequest } from './lifecycle/quotas'
+import { nodeSharedCacheMounts } from './lifecycle/sharedCache'
+import type { IngressLedger } from './lifecycle/ingressLedger'
 import {
   reconcileVolumesState,
   executeVolumeGc,
@@ -198,6 +207,7 @@ import type { Db } from './store/db'
 import { changesRepo, type ChangesRepo } from './store/changesRepo'
 import { checksRepo, type ChecksRepo } from './store/checksRepo'
 import { roomsRepo, type RoomsRepo } from './store/roomsRepo'
+import { roomIdentityKey } from './roomIdentity'
 import { settingsRepo, type SettingsRepo } from './store/settingsRepo'
 import { nextWorkspaceVolumeRevision, retainedWorkspaceGenKey, workspaceGenMaxKey, workspaceSyncBaseKey } from './workingState'
 import {
@@ -252,6 +262,10 @@ const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 // screen witness. Keep the same public ceiling as locale acceptance so those
 // proofs can complete on a cold managed emulator without weakening any fence.
 const ANDROID_LOCALE_RECOVERY_TIMEOUT_MS = 120_000
+// A restarted managed emulator needs a cold Android boot before any exact
+// proof can run. This is one bounded wait, the same budget android_run gives a
+// fresh boot; it is never retried inside one startup pass.
+const ANDROID_LOCALE_RECOVERY_BOOT_TIMEOUT_MS = 5 * 60_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
@@ -438,6 +452,7 @@ function pendingAndroidLocaleOwnsCurrent(
 
 type AndroidLocaleRecoveryInvariantClass =
   | 'target-unavailable'
+  | 'workload-not-booted'
   | 'install-mismatch'
   | 'user-mismatch'
   | 'api-mismatch'
@@ -480,6 +495,21 @@ function parsePendingAndroidLocaleRecoveryDiagnostic(raw: string | null): Androi
     return null
   }
   return null
+}
+
+const ANDROID_LOCALE_RECOVERY_BOOT_ADB_STATES = new Set(['device', 'offline', 'unauthorized', 'missing', 'unknown'])
+const ANDROID_LOCALE_RECOVERY_BOOT_PROPERTIES = new Set(['1', 'empty', 'other'])
+
+/** Only the fixed enum states survive into a diagnostic; anything else reads as unknown. */
+function androidLocaleRecoveryBootEvidence(evidence: unknown): { adbState: string; bootProperty: string } {
+  const record = typeof evidence === 'object' && evidence !== null ? evidence as Record<string, unknown> : {}
+  const adbState = typeof record['adbState'] === 'string' && ANDROID_LOCALE_RECOVERY_BOOT_ADB_STATES.has(record['adbState'])
+    ? record['adbState']
+    : 'unknown'
+  const bootProperty = typeof record['bootProperty'] === 'string' && ANDROID_LOCALE_RECOVERY_BOOT_PROPERTIES.has(record['bootProperty'])
+    ? record['bootProperty']
+    : 'other'
+  return { adbState, bootProperty }
 }
 
 function classifyAndroidLocaleRecoveryFailure(
@@ -575,6 +605,18 @@ function classifyAndroidLocaleRecoveryFailure(
           reason: 'Managed emulator target is unavailable or could not be started',
           operatorAction: 'Verify emulator container health and isolation backend status, then restart DevHotel.'
         }
+      case 'ANDROID_LOCALE_TARGET_NOT_BOOTED': {
+        // The container topology was proved and the exact container is
+        // running; only the Android workload inside it failed to boot. The
+        // ADB state and boot property are DevHotel's own bounded enums, never
+        // guest output, so they can name which liveness invariant failed.
+        const boot = androidLocaleRecoveryBootEvidence(error.evidence)
+        return {
+          invariantClass: 'workload-not-booted',
+          reason: `Retained emulator container is running but its Android workload did not reach a booted ADB device state (adb: ${boot.adbState}, boot: ${boot.bootProperty})`,
+          operatorAction: 'Keep the exact emulator container; inspect its container logs for the emulator process, repair the isolation backend (for example a stale emulator lock or missing KVM), then restart DevHotel. Do not recreate the emulator: that discards the retained install/user/target fence.'
+        }
+      }
     }
   }
   if (error instanceof Error) {
@@ -1212,6 +1254,10 @@ export interface OrchestratorOptions {
   appVersion: string
   /** Exact desktop build that seals new acceptance evidence. */
   appBuild?: BuildIdentity
+  /** Product-level runtime readiness; separate from the currently selected Room backend. */
+  managedRuntimeStatus?: () => Promise<ManagedRuntimeObservation>
+  /** Semantic selection exposed to clients without leaking a provider command or native identifier. */
+  runtimeMode?: 'managed' | 'compatibility'
   /** clears a Room's browser profile; supplied by the desktop app, which owns the Electron session */
   clearBrowserData?: (roomId: string) => Promise<void>
   /**
@@ -1222,6 +1268,45 @@ export interface OrchestratorOptions {
   gitCredential?: GitCredentialResolver
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
+  lifecyclePolicy?: Partial<RoomLifecyclePolicy>
+  /**
+   * Durable record of the Host ingress ports this install opened. Supplied when
+   * the Room executor publishes Host-side ports of its own; without it an
+   * ingress route is invisible to the Host footprint and cannot be revoked
+   * after an unclean exit.
+   */
+  ingressLedger?: IngressLedger
+  /** Closes one inherited Host ingress port and forgets its ledger entry. */
+  revokeIngress?: (roomId: string) => Promise<void>
+  /** The runtime generation serving Rooms; ingress from any other generation is stale. */
+  runtimeId?: string | null
+  /**
+   * Whether Node Rooms share one Hotel-scoped package store. Content-addressed
+   * by construction, so the bytes are identical between Rooms; on by default
+   * because the per-Room copy only ever bought a second download.
+   */
+  sharedPackageCache?: boolean
+  /** Limits DevHotel places on itself; breaches refuse creation, never delete. */
+  quotas?: LifecycleQuotas
+}
+
+export interface RoomLifecyclePolicy {
+  idleSleepAfterMs: number
+  expireAfterMs: number
+  graceAfterMs: number
+}
+
+export const DEFAULT_ROOM_LIFECYCLE_POLICY: Readonly<RoomLifecyclePolicy> = {
+  idleSleepAfterMs: 60 * 60 * 1000,
+  expireAfterMs: 7 * 24 * 60 * 60 * 1000,
+  graceAfterMs: 24 * 60 * 60 * 1000
+}
+
+export interface RoomLifecycleSweepResult {
+  slept: string[]
+  expired: string[]
+  deleted: string[]
+  retained: Array<{ roomId: string; reason: string }>
 }
 
 type ExactRoomRuntimeFenceBackend = IsolationBackend & {
@@ -1273,10 +1358,18 @@ export class RoomOrchestrator {
   private readonly gateway: Gateway
   private readonly appVersion: string
   private readonly appBuild: BuildIdentity
+  private readonly managedRuntimeStatus?: () => Promise<ManagedRuntimeObservation>
+  private readonly runtimeMode: 'managed' | 'compatibility'
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
   private readonly gitCredential?: GitCredentialResolver
+  private readonly lifecyclePolicy: RoomLifecyclePolicy
+  private readonly ingressLedger: IngressLedger | null
+  private readonly revokeIngressRoute: ((roomId: string) => Promise<void>) | null
+  private readonly runtimeId: string | null
+  private readonly sharedPackageCache: boolean
+  private readonly quotas: LifecycleQuotas
 
   constructor(opts: OrchestratorOptions) {
     this.userData = opts.userData
@@ -1291,8 +1384,19 @@ export class RoomOrchestrator {
       buildTime: '1970-01-01T00:00:00.000Z',
       sourceVerified: false
     }
+    this.managedRuntimeStatus = opts.managedRuntimeStatus
+    this.runtimeMode = opts.runtimeMode ?? 'compatibility'
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
+    this.lifecyclePolicy = { ...DEFAULT_ROOM_LIFECYCLE_POLICY, ...opts.lifecyclePolicy }
+    this.ingressLedger = opts.ingressLedger ?? null
+    this.revokeIngressRoute = opts.revokeIngress ?? null
+    this.runtimeId = opts.runtimeId ?? null
+    this.sharedPackageCache = opts.sharedPackageCache ?? true
+    this.quotas = opts.quotas ?? DEFAULT_LIFECYCLE_QUOTAS
+    for (const [name, value] of Object.entries(this.lifecyclePolicy)) {
+      if (!Number.isFinite(value) || value <= 0) throw new Error(`Room lifecycle ${name} must be a positive duration`)
+    }
     this.rooms = roomsRepo(opts.db)
     this.changes = changesRepo(opts.db)
     this.checks = checksRepo(opts.db)
@@ -1395,7 +1499,11 @@ export class RoomOrchestrator {
           preserveAwakeRoomIds: new Set([
             ...pendingAndroidLocaleRecoveryRooms,
             ...acceptanceRecoveryRooms
-          ])
+          ]),
+          userData: this.userData,
+          ingressRoutes: this.ingressLedger?.list() ?? [],
+          ...(this.revokeIngressRoute ? { revokeIngress: this.revokeIngressRoute } : {}),
+          currentRuntimeId: this.runtimeId
         }
       )
     }
@@ -1454,6 +1562,22 @@ export class RoomOrchestrator {
               this.rooms.update(room.id, { status: 'attention' })
             }
             await this.backend.startExistingEmulatorForRecovery(room.id)
+            // A proved container topology is not a live emulator. After an
+            // unclean stop the exact container can be running while the
+            // emulator process inside never reaches ADB `device` with
+            // sys.boot_completed=1; every session probe below would then fail
+            // and be misread as a user/install invariant. Prove the workload
+            // once, bounded, before any ADB proof runs.
+            const boot = await this.backend.waitForFencedEmulatorRecoveryBoot(room.id, {
+              timeoutMs: ANDROID_LOCALE_RECOVERY_BOOT_TIMEOUT_MS
+            })
+            if (!boot.booted) {
+              throw new DevHotelError(
+                'ANDROID_LOCALE_TARGET_NOT_BOOTED',
+                'Retained emulator workload did not boot within the recovery budget',
+                { evidence: { adbState: boot.adbState, bootProperty: boot.bootProperty } }
+              )
+            }
             const session = await this.openAndroidAutomationSessionLocked(
               room.id,
               selector,
@@ -2966,7 +3090,7 @@ export class RoomOrchestrator {
   }
 
   private runtimeExpectation(room: RoomRecord): RoomRuntimeStatus['expected'] {
-    if (room.status === 'preparing') return 'transitional'
+    if (room.status === 'preparing' || room.status === 'deleting') return 'transitional'
     if (room.status === 'running' || room.status === 'ready' || room.status === 'attention') return 'running'
     return 'stopped'
   }
@@ -3144,8 +3268,67 @@ export class RoomOrchestrator {
     }
   }
 
+  private readonly roomAdmissions = new Map<string, Promise<unknown>>()
+
+  /** Match and create share a source-level queue, including differing profiles and task IDs. */
+  private admitRoom<T>(input: CreateRoomInput, fn: () => Promise<T>): Promise<T> {
+    return this.trackMutation(async () => {
+      const key = roomIdentityKey(input)
+      const previous = this.roomAdmissions.get(key) ?? Promise.resolve()
+      const next = previous.catch(() => undefined).then(fn)
+      this.roomAdmissions.set(key, next)
+      try {
+        return await next
+      } finally {
+        if (this.roomAdmissions.get(key) === next) this.roomAdmissions.delete(key)
+      }
+    })
+  }
+
   createRoom(input: CreateRoomInput): Promise<RoomRecord> {
-    return this.trackMutation(() => this.createRoomAdmitted(input))
+    return this.admitRoom(input, async () => {
+      if (input.actor === 'agent') {
+        const candidate = this.rooms.findCompatible(input)
+        if (candidate) throw new DevHotelError('ROOM_REUSE_REQUIRED', `Reuse Room ${candidate.id} with acquire_room.`, {
+          evidence: { roomId: candidate.id },
+          recoveryHint: 'Use acquire_room, or supply a distinct taskId or issueRef for parallel work.'
+        })
+      }
+      return this.createRoomAdmitted(input)
+    })
+  }
+
+  acquireRoom(input: CreateRoomInput): Promise<AcquireRoomResult> {
+    return this.admitRoom(input, async () => {
+      const candidate = this.rooms.findCompatible(input)
+      let room: RoomRecord
+      let disposition: AcquireRoomResult['disposition']
+      if (!candidate) {
+        room = await this.createRoomAdmitted(input)
+        disposition = 'created'
+      } else {
+        room = candidate
+        disposition = 'reused'
+        if (room.status === 'sleeping') {
+          await this.startRoom(room.id, input.actor)
+          room = this.mustGet(room.id)
+          if (room.status !== 'ready' && room.status !== 'running') {
+            throw new DevHotelError('ROOM_WAKE_FAILED', `Room ${room.id} could not be woken.`, {
+              evidence: { roomId: room.id, status: room.status },
+              recoveryHint: 'Inspect the existing Room and its start operation before retrying.'
+            })
+          }
+          disposition = 'woken'
+        }
+      }
+      const modified = room.syncStatus === 'modified'
+      const reason = disposition === 'created'
+        ? 'No compatible Room exists for this source, project, provider, profile and task identity.'
+        : 'Matched canonical source, project, provider, requested profile and task identity; existing state preserved.'
+      this.appendJournal(room.id, 'acquire-room', `Room ${disposition}: ${room.id}`, input.actor, 'Room', null,
+        { roomId: room.id, disposition, reason, modified })
+      return { room, disposition, reason, modified }
+    })
   }
 
   private async createRoomAdmitted(input: CreateRoomInput): Promise<RoomRecord> {
@@ -3180,6 +3363,8 @@ export class RoomOrchestrator {
       id,
       project: input.project,
       nickname: input.nickname,
+      ...(input.taskId?.trim() ? { taskId: input.taskId.trim() } : {}),
+      ...(input.issueRef?.trim() ? { issueRef: input.issueRef.trim() } : {}),
       roomNumber: this.rooms.nextRoomNumber(),
       provider: providerKind,
       sourceType: input.sourceType,
@@ -3203,6 +3388,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
     this.rooms.create(record)
@@ -3249,7 +3437,7 @@ export class RoomOrchestrator {
         if (providerKind === 'android') {
           this.olog(id, 'start emulator')
           try {
-            await this.backend.createEmulator(id, this.mustGet(id).android)
+            await this.backend.createEmulator(id, this.mustGet(id).android, this.mustGet(id).os)
           } catch (err) {
             // No KVM or a failed image pull must not brick the room — it can
             // still build APKs; checks surface the missing emulator screen.
@@ -3262,7 +3450,44 @@ export class RoomOrchestrator {
         this.olog(id, `room up: ${verify.detail}`)
       } catch (err) {
         this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
-        this.rooms.update(id, { status: 'broken' })
+        this.logs.detach(id)
+        this.gateway.removeRoute(record.domain)
+        await this.releaseAndroidDeviceLocked(id, 'Room creation failed').catch(() => undefined)
+        try {
+          await this.backend.deleteRoomPod(id, { volumes: true })
+          rmSync(join(this.userData, 'rooms', id), { recursive: true, force: true })
+          this.rooms.delete(id)
+          this.operations.forgetRoom(id)
+          this.pendingHostResyncConfirmations.delete(id)
+          this.emit(id, 'deleted')
+        } catch (cleanupError) {
+          const detail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          this.rooms.update(id, { status: 'broken' })
+          this.appendJournal(
+            id,
+            'create-room-cleanup-required',
+            `Create failed; cleanup required for room ${id}`,
+            input.actor,
+            'Room',
+            null,
+            { error: err instanceof Error ? err.message : String(err), cleanupError: detail }
+          )
+          this.olog(id, `automatic cleanup failed; room ownership retained for retry: ${detail}`)
+          try {
+            await writeManifest(this.userData, this.mustGet(id))
+          } catch {
+            // best-effort
+          }
+          this.emit(id, 'status')
+        }
+        if (err instanceof DevHotelError && err.code === 'ROOM_CREATION_FAILED') {
+          throw err
+        }
+        throw new DevHotelError(
+          'ROOM_CREATION_FAILED',
+          `Room creation failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err }
+        )
       }
     }, { admittedBeforeGate: true })
 
@@ -3298,6 +3523,8 @@ export class RoomOrchestrator {
       id,
       project: input.project,
       nickname: input.nickname,
+      ...(input.taskId?.trim() ? { taskId: input.taskId.trim() } : {}),
+      ...(input.issueRef?.trim() ? { issueRef: input.issueRef.trim() } : {}),
       roomNumber: this.rooms.nextRoomNumber(),
       provider: 'windows',
       sourceType: 'empty',
@@ -3322,6 +3549,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
     this.rooms.create(record)
@@ -3426,6 +3656,9 @@ export class RoomOrchestrator {
       hostPort: null,
       createdAt: now,
       lastUsedAt: now,
+      lastActivityAt: now,
+      pinned: false,
+      lifecycle: { state: 'active', expiredAt: null },
       thumbPath: null
     }
 
@@ -3658,7 +3891,9 @@ export class RoomOrchestrator {
     // cleanup cannot be followed by a terminal write that resurrects an orphan
     // operation row.
     if (this.mutationGate !== 'open') throw this.mutationGateError()
-    if (this.deletingRooms.has(roomId)) throw new Error(`Room ${roomId} is being deleted and cannot be started`)
+    if (this.deletingRooms.has(roomId) || this.rooms.get(roomId)?.status === 'deleting') {
+      throw new Error(`Room ${roomId} is being deleted and cannot be started`)
+    }
     // Fail an unknown Room before an operation exists: there is nothing to poll.
     this.mustGet(roomId)
     this.assertNoPendingArtifactExport(roomId)
@@ -3699,6 +3934,7 @@ export class RoomOrchestrator {
 
   private async startRoomLocked(roomId: string, _actor: Actor, report: OperationReporter): Promise<void> {
     const room = this.mustGet(roomId)
+    this.recordRoomActivity(roomId)
     const alreadyAwake = room.status === 'running' || room.status === 'ready'
     report.begin('preparing', 'Prepare the Room record')
     if (room.provider === 'windows') {
@@ -3752,43 +3988,64 @@ export class RoomOrchestrator {
         this.rooms.update(roomId, { internalPort: 6080 })
       }
       report.begin('container-start', 'Start the Room containers')
-      const { hostPort } = await this.backend.recreateAnchor({
-        roomId,
-        internalPort: this.mustGet(roomId).internalPort,
-        androidRuntimeIsolation: room.provider === 'android'
-      })
-      this.rooms.update(roomId, { hostPort, status: 'running' })
-      let emulatorStarted = false
-      if (room.provider === 'android') {
-        // the emulator joins the fresh anchor's netns, so it is recreated with it
-        this.olog(roomId, 'start emulator')
-        report.begin('emulator-boot', 'Start the Room emulator')
-        try {
-          this.clearAndroidEmulatorInstalls(roomId)
-          await this.backend.removeEmulator(roomId)
-          await this.backend.createEmulator(roomId, room.android)
-          emulatorStarted = true
-          report.detail('emulator container started')
-        } catch (err) {
-          // No KVM or a failed image pull must not brick the room — it can
-          // still build APKs; checks surface the missing emulator screen.
-          const detail = `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`
-          this.olog(roomId, detail)
-          report.skip(detail)
-        }
-      }
-      report.begin('services-start', 'Start the Room services')
-      // Services use the fresh runtime anchor (separate from Android's control
-      // bridge), so every provider recreates them after anchor replacement.
       const services = Object.entries(room.services) as ['postgres' | 'redis', { version: string }][]
-      if (services.length === 0) report.skip('this Room has no Room Services')
-      for (const [svc, cfg] of services) {
-        this.olog(roomId, `start service ${svc} ${cfg.version}`)
-        await this.backend.removeService(roomId, svc, { volume: false })
-        await this.backend.createService(roomId, svc, cfg.version)
+      // Warm wake first: a Room whose retained containers are still exactly the
+      // ones it went to sleep with keeps its running state, which for an Android
+      // Room is the booted AVD and everything installed on it. The backend
+      // refuses rather than throws whenever that cannot be proved, and the
+      // ordinary recreation path below is what materializes any change made
+      // while the Room slept.
+      const resume = await this.backend.resumeRoomPod(this.webSpecFor(this.mustGet(roomId)), {
+        services: services.map(([kind, cfg]) => ({ kind, version: cfg.version }))
+      })
+      let emulatorStarted = false
+      if (resume.reused) {
+        this.rooms.update(roomId, { hostPort: resume.hostPort, status: 'running' })
+        this.olog(roomId, 'wake reused the retained Room runtime')
+        report.detail('reused the retained Room runtime')
+        // The tracked installs deliberately survive: nothing was recreated, and
+        // every one of them is re-proved against package, user and incarnation
+        // before it is used again.
+        emulatorStarted = room.provider === 'android'
+      } else {
+        this.olog(roomId, `wake recreated the Room runtime: ${resume.reason}`)
+        report.detail(`recreated the Room runtime: ${resume.reason}`)
+        const { hostPort } = await this.backend.recreateAnchor({
+          roomId,
+          internalPort: this.mustGet(roomId).internalPort,
+          androidRuntimeIsolation: room.provider === 'android'
+        })
+        this.rooms.update(roomId, { hostPort, status: 'running' })
+        if (room.provider === 'android') {
+          // the emulator joins the fresh anchor's netns, so it is recreated with it
+          this.olog(roomId, 'start emulator')
+          report.begin('emulator-boot', 'Start the Room emulator')
+          try {
+            this.clearAndroidEmulatorInstalls(roomId)
+            await this.backend.removeEmulator(roomId)
+            await this.backend.createEmulator(roomId, room.android, room.os)
+            emulatorStarted = true
+            report.detail('emulator container started')
+          } catch (err) {
+            // No KVM or a failed image pull must not brick the room — it can
+            // still build APKs; checks surface the missing emulator screen.
+            const detail = `emulator unavailable, room continues build-only: ${err instanceof Error ? err.message : String(err)}`
+            this.olog(roomId, detail)
+            report.skip(detail)
+          }
+        }
+        report.begin('services-start', 'Start the Room services')
+        // Services use the fresh runtime anchor (separate from Android's control
+        // bridge), so every provider recreates them after anchor replacement.
+        if (services.length === 0) report.skip('this Room has no Room Services')
+        for (const [svc, cfg] of services) {
+          this.olog(roomId, `start service ${svc} ${cfg.version}`)
+          await this.backend.removeService(roomId, svc, { volume: false })
+          await this.backend.createService(roomId, svc, cfg.version)
+        }
+        report.begin('web-start', 'Start the Room web process')
+        await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       }
-      report.begin('web-start', 'Start the Room web process')
-      await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
       report.begin('verify', 'Verify the Room answers')
@@ -3844,7 +4101,10 @@ export class RoomOrchestrator {
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
     return this.withRoomLock(
       roomId,
-      () => this.sleepRoomLocked(roomId, actor),
+      () => {
+        this.recordRoomActivity(roomId)
+        return this.sleepRoomLocked(roomId, actor)
+      },
       { allowPendingArtifactExport: true }
     )
   }
@@ -3876,6 +4136,159 @@ export class RoomOrchestrator {
     })
     await writeManifest(this.userData, this.mustGet(roomId))
     this.emit(roomId, 'status')
+  }
+
+  /** Pinning is durable and immediately cancels an outstanding expiry grace period. */
+  setRoomPinned(roomId: string, pinned: boolean, actor: Actor): Promise<RoomRecord> {
+    return this.withRoomLock(roomId, async () => {
+      const before = this.mustGet(roomId)
+      const now = new Date().toISOString()
+      this.rooms.update(roomId, {
+        pinned,
+        lastActivityAt: now,
+        lifecycle: { state: 'active', expiredAt: null }
+      })
+      this.appendJournal(
+        roomId,
+        pinned ? 'pin-room' : 'unpin-room',
+        pinned ? 'Room pinned against automatic deletion' : 'Room unpinned',
+        actor,
+        'Room lifecycle',
+        { pinned: before.pinned ?? false },
+        { pinned }
+      )
+      this.emit(roomId, 'change')
+      return this.mustGet(roomId)
+    })
+  }
+
+  /**
+   * Apply one bounded lifecycle pass. Deletion is fail-closed: only a clean,
+   * untouched managed-Git Web Room without Room Services is eligible.
+   */
+  async sweepRoomLifecycle(now = new Date()): Promise<RoomLifecycleSweepResult> {
+    const result: RoomLifecycleSweepResult = { slept: [], expired: [], deleted: [], retained: [] }
+    for (const snapshot of this.rooms.list()) {
+      if (this.deletingRooms.has(snapshot.id) || snapshot.status === 'preparing' || snapshot.status === 'deleting') continue
+      try {
+        await this.withRoomLock(snapshot.id, async () => {
+          let room = this.mustGet(snapshot.id)
+          const activityMs = Date.parse(room.lastActivityAt ?? room.lastUsedAt)
+          if (!Number.isFinite(activityMs)) {
+            result.retained.push({ roomId: room.id, reason: 'invalid activity timestamp' })
+            return
+          }
+          const inactiveFor = Math.max(0, now.getTime() - activityMs)
+          const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+          if (awake && inactiveFor >= this.lifecyclePolicy.idleSleepAfterMs) {
+            await this.sleepRoomLocked(room.id, 'devhotel')
+            const autoSleptAt = now.toISOString()
+            this.rooms.update(room.id, {
+              lifecycle: { ...(room.lifecycle ?? { state: 'active', expiredAt: null }), autoSleptAt }
+            })
+            this.appendJournal(
+              room.id,
+              'auto-sleep-room',
+              'Room slept after its idle timeout',
+              'devhotel',
+              'Room lifecycle',
+              { status: room.status, lastActivityAt: room.lastActivityAt ?? room.lastUsedAt },
+              { status: 'sleeping', autoSleptAt }
+            )
+            this.emit(room.id, 'change')
+            result.slept.push(room.id)
+            room = this.mustGet(room.id)
+          }
+
+          if (room.pinned) {
+            result.retained.push({ roomId: room.id, reason: 'pinned' })
+            return
+          }
+          const unsafeReason = this.automaticDeletionUnsafeReason(room)
+          if (unsafeReason) {
+            result.retained.push({ roomId: room.id, reason: unsafeReason })
+            return
+          }
+          const lifecycle = room.lifecycle ?? { state: 'active' as const, expiredAt: null }
+          if (lifecycle.state === 'active') {
+            if (inactiveFor < this.lifecyclePolicy.expireAfterMs) return
+            const expiredAt = now.toISOString()
+            this.rooms.update(room.id, { lifecycle: { ...lifecycle, state: 'expired', expiredAt } })
+            this.appendJournal(
+              room.id,
+              'expire-room',
+              'Room entered expiry grace',
+              'devhotel',
+              'Room lifecycle',
+              { state: 'active', lastActivityAt: room.lastActivityAt ?? room.lastUsedAt },
+              { state: 'expired', expiredAt }
+            )
+            this.emit(room.id, 'change')
+            result.expired.push(room.id)
+            return
+          }
+          const expiredMs = lifecycle.expiredAt === null ? Number.NaN : Date.parse(lifecycle.expiredAt)
+          if (!Number.isFinite(expiredMs)) {
+            result.retained.push({ roomId: room.id, reason: 'invalid expiry timestamp' })
+            return
+          }
+          if (now.getTime() - expiredMs < this.lifecyclePolicy.graceAfterMs) return
+          this.appendJournal(
+            room.id,
+            'auto-delete-room',
+            'Room grace elapsed; automatic deletion started',
+            'devhotel',
+            'Room lifecycle',
+            { state: 'expired', expiredAt: lifecycle.expiredAt },
+            { state: 'deleting' }
+          )
+          this.deletingRooms.add(room.id)
+          try {
+            await this.deleteRoomLocked(room.id, 'devhotel')
+            result.deleted.push(room.id)
+          } finally {
+            this.deletingRooms.delete(room.id)
+          }
+        })
+      } catch (error) {
+        result.retained.push({
+          roomId: snapshot.id,
+          reason: `lifecycle action failed: ${error instanceof Error ? error.message : String(error)}`
+        })
+      }
+    }
+    return result
+  }
+
+  private automaticDeletionUnsafeReason(room: RoomRecord): string | null {
+    if (room.provider !== 'web') return 'provider state is not safely disposable'
+    if (Object.keys(room.services).length > 0) return 'Room has database or service data'
+    if (room.sourceType !== 'managed-git' || room.workspaceMode !== 'hotel') return 'workspace ownership is unsafe'
+    if (room.syncStatus !== 'synced') return 'workspace is modified or uncommitted'
+    if (room.stateRevision !== 1) return 'workspace clean-import revision is uncertain'
+    return null
+  }
+
+  private recordRoomActivity(roomId: string): void {
+    const room = this.mustGet(roomId)
+    const wasExpired = room.lifecycle?.state === 'expired'
+    const lastActivityAt = new Date().toISOString()
+    this.rooms.update(roomId, {
+      lastActivityAt,
+      lifecycle: { state: 'active', expiredAt: null, autoSleptAt: null }
+    })
+    if (wasExpired) {
+      this.appendJournal(
+        roomId,
+        'reactivate-room',
+        'Room activity cancelled expiry grace',
+        'devhotel',
+        'Room lifecycle',
+        room.lifecycle,
+        { state: 'active', lastActivityAt }
+      )
+      this.emit(roomId, 'change')
+    }
   }
 
   restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
@@ -4034,6 +4447,7 @@ export class RoomOrchestrator {
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
+      this.rooms.update(roomId, { status: 'deleting' })
       const { reclaimedBytes } = await windowsVm.delete(roomId)
       this.rooms.delete(roomId)
       this.operations.forgetRoom(roomId)
@@ -4042,6 +4456,7 @@ export class RoomOrchestrator {
       this.emit(roomId, 'deleted')
       return { reclaimedBytes }
     }
+    this.rooms.update(roomId, { status: 'deleting' })
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
@@ -4058,8 +4473,10 @@ export class RoomOrchestrator {
    * classifying each volume (retained, sleeping, fenced, orphaned, unowned)
    * without deleting anything.
    */
-  private async volumeReconciliationContext(): Promise<VolumeReconciliationContext> {
-    const volumes = await this.backend.listVolumesWithUsage()
+  private async volumeReconciliationContext(
+    reuse: { volumes?: DockerVolumeUsage[] } = {}
+  ): Promise<VolumeReconciliationContext> {
+    const volumes = reuse.volumes ?? await this.backend.listVolumesWithUsage()
     const allRooms = this.rooms.list()
     const activeOps = this.operations.listLive()
     return {
@@ -4081,12 +4498,27 @@ export class RoomOrchestrator {
    * By default, runs in dry-run mode. Never touches fenced rooms (#61) or sleeping rooms.
    */
   async gcVolumes(opts?: VolumeGcOptions): Promise<VolumeGcResult> {
+    // One inventory pass per run. Each candidate is re-proved under its Room
+    // lock from a single-volume observation (existence, labels, attachments)
+    // laid over that inventory, together with fresh Room, operation, change
+    // and settings state. The size is the one the pass was planned with: only
+    // `docker system df` measures sizes, and it is not run again.
     const context = await this.volumeReconciliationContext()
     return await executeVolumeGc(this.backend, context, opts, {
-      removeCandidateIfStillSafe: async (candidate, remainingBytes) => {
+      removeCandidateIfStillSafe: async (candidate, remainingBytes, deadlineAt) => {
         if (!candidate.roomId) throw new Error(`Volume ${candidate.name} has no Room ownership identity`)
         return await this.withRoomLock(candidate.roomId, async () => {
-          const refreshed = reconcileVolumesState(await this.volumeReconciliationContext())
+          if (Date.now() >= deadlineAt) throw new Error(`Volume ${candidate.name} was not re-proved: the pass deadline elapsed`)
+          const observed = await this.backend.inspectVolumeUsage(candidate.name)
+          if (!observed) throw new Error(`Volume ${candidate.name} disappeared before guarded removal`)
+          const planned = context.volumes.find((volume) => volume.name === candidate.name)
+          if (!planned) throw new Error(`Volume ${candidate.name} was not in the planned inventory`)
+          const refreshed = reconcileVolumesState({
+            ...(await this.volumeReconciliationContext({ volumes: context.volumes })),
+            volumes: context.volumes.map((volume) =>
+              volume.name === candidate.name ? { ...planned, ...observed } : volume
+            )
+          })
           const current = refreshed.volumes.find((volume) => volume.name === candidate.name)
           if (!current) throw new Error(`Volume ${candidate.name} disappeared before guarded removal`)
           if (
@@ -4101,6 +4533,101 @@ export class RoomOrchestrator {
           }
           await this.backend.removeManagedVolume(current.name)
           return current.sizeBytes
+        })
+      }
+    })
+  }
+
+  /**
+   * Everything DevHotel owns on this Host, in one list.
+   *
+   * The Room disk verdicts come straight from the fail-closed reconciler above
+   * — this does not get a second opinion about them — and the containers,
+   * isolation domains, Hotel-scoped shared caches and Host ingress ports are
+   * added alongside so the answer is about the Host rather than about one
+   * engine's idea of storage. A call that could not reach part of the engine
+   * comes back incomplete rather than short.
+   */
+  async hostFootprint(): Promise<HostFootprint> {
+    const context = await this.volumeReconciliationContext()
+    const classified = reconcileVolumesState(context)
+    const observation = await observeHost({
+      backend: this.backend,
+      classifiedVolumes: classified.volumes,
+      volumeUsage: context.volumes,
+      ingress: this.ingressLedger?.list() ?? [],
+      ingressLedgerDamaged: this.ingressLedger?.isDamaged() ?? false,
+      runtimeMode: this.runtimeMode
+    })
+    return buildHostFootprint(observation, {
+      rooms: context.rooms,
+      ...(context.roomDirExists ? { roomDirExists: context.roomDirExists } : {}),
+      currentRuntimeId: this.runtimeId
+    })
+  }
+
+  /**
+   * May this Host take on one more of something?
+   *
+   * Answers from the footprint and nothing else, and never acts. A breach is a
+   * refusal to create, with the limit and the numbers behind it; what to free is
+   * a decision for a human holding the footprint, and freeing it still has to
+   * satisfy the GC proofs.
+   */
+  async checkQuotas(request: QuotaRequest = {}): Promise<QuotaVerdict> {
+    return evaluateQuotas(await this.hostFootprint(), this.quotas, request)
+  }
+
+  /**
+   * Bounded collection across every kind of owned artifact.
+   *
+   * Dry by default. A real pass re-proves each artifact under the Room lock
+   * immediately before removing it, because a plan describes the moment it was
+   * made and a Room can wake in between. Anything whose ownership, reachability
+   * or size cannot be established again is left exactly where it is, and the
+   * refusal is reported rather than swallowed.
+   */
+  async gcHostFootprint(opts: HostGcOptions = {}): Promise<HostGcResult> {
+    const footprint = await this.hostFootprint()
+    return await executeHostGc(footprint, opts, {
+      collect: async (artifact, remainingBytes) => {
+        if (artifact.kind === 'shared-cache') {
+          // Hotel-scoped: no Room lock applies, and the reachability proof is
+          // "no Room remains", which is re-established from a fresh footprint.
+          const refreshed = await this.hostFootprint()
+          const current = refreshed.artifacts.find((candidate) => candidate.id === artifact.id)
+          if (!current || !current.collectable || current.sizeBytes > remainingBytes) {
+            throw new Error(`Shared cache ${artifact.id} changed state before guarded removal`)
+          }
+          await this.backend.removeSharedCache(current.id.slice('shared-cache:'.length))
+          return current.sizeBytes
+        }
+        if (!artifact.roomId) throw new Error(`Artifact ${artifact.id} has no Room ownership identity`)
+        return await this.withRoomLock(artifact.roomId, async () => {
+          const refreshed = await this.hostFootprint()
+          const current = refreshed.artifacts.find((candidate) => candidate.id === artifact.id)
+          if (!current) throw new Error(`Artifact ${artifact.id} disappeared before guarded removal`)
+          if (!current.collectable || current.sizeBytes > remainingBytes) {
+            throw new Error(`Artifact ${artifact.id} changed state before guarded removal`)
+          }
+          if (current.kind === 'room-disk') {
+            await this.backend.removeManagedVolume(current.id.slice('disk:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'room-container') {
+            await this.backend.removeManagedContainer(current.id.slice('container:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'room-network') {
+            await this.backend.removeManagedNetwork(current.id.slice('network:'.length))
+            return current.sizeBytes
+          }
+          if (current.kind === 'ingress-route') {
+            if (!this.revokeIngressRoute) throw new Error('No ingress revoker is configured for this runtime')
+            await this.revokeIngressRoute(current.roomId ?? '')
+            return current.sizeBytes
+          }
+          throw new Error(`Unsupported artifact kind for collection: ${current.kind}`)
         })
       }
     })
@@ -7465,11 +7992,13 @@ export class RoomOrchestrator {
   /** One-call answer to "is DevHotel ready and what is running" for agents. */
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
+    runtime: { mode: 'managed' | 'compatibility'; managed: ManagedRuntimeObservation | null }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     devices: DeviceBrokerStatus
   }> {
     const backend = await this.backend.health()
+    const managedRuntime = this.managedRuntimeStatus ? await this.managedRuntimeStatus() : null
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
       const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
@@ -7490,7 +8019,13 @@ export class RoomOrchestrator {
         runtimeStatus
       })
     }
-    return { backend, gateway: this.gateway.status(), rooms, devices: this.devices.status() }
+    return {
+      backend,
+      runtime: { mode: this.runtimeMode, managed: managedRuntime },
+      gateway: this.gateway.status(),
+      rooms,
+      devices: this.devices.status()
+    }
   }
 
   inspectRoom(roomId: string): RoomInspection {
@@ -8434,12 +8969,16 @@ export class RoomOrchestrator {
     })
   }
 
-  execInRoom(
+  async execInRoom(
     roomId: string,
     cmd: string[],
     opts?: { timeoutMs?: number; output?: OutputSelection },
     actor: Actor = 'agent'
   ): Promise<RoomExecResult> {
+    const beforeUse = this.mustGet(roomId)
+    if (beforeUse.status === 'sleeping' && beforeUse.lifecycle?.autoSleptAt) {
+      await this.startRoom(roomId, actor)
+    }
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
@@ -8449,6 +8988,7 @@ export class RoomOrchestrator {
       if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
       const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
       if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
+      this.recordRoomActivity(roomId)
       this.advanceStateRevision(roomId)
       const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
       let sawStdout = false
@@ -9064,6 +9604,10 @@ export class RoomOrchestrator {
       startCommand: room.startCommand,
       env: osEnv,
       depsVolumeOverride: gen > 0 ? depsVolumeForGen(room.id, room.runtime.version, gen) : undefined,
+      // The package store is content-addressed, so every Room that mounts this
+      // holds the same bytes. `/cache` stays per-Room for everything a Room can
+      // actually dirty.
+      ...(this.sharedPackageCache ? { sharedCaches: nodeSharedCacheMounts() } : {}),
       ...osOverlay,
       ...overrides
     }
@@ -9142,16 +9686,12 @@ export class RoomOrchestrator {
   ): Promise<{ reader: SourceReader; cleanup: () => void }> {
     if (sourceType === 'linked-folder') return { reader: fsSourceReader(sourceRef), cleanup: () => undefined }
     if (sourceType === 'empty') return { reader: EMPTY_READER, cleanup: () => undefined }
-    // managed-git: shallow clone into a temp dir through docker so the host
-    // never needs git installed
+    // managed-git: shallow clone into a temp dir through the Room backend, so
+    // the Host needs neither git nor any knowledge of where the engine runs.
     const tmp = join(this.userData, 'tmp', `plan-${newRoomId()}`)
     mkdirSync(tmp, { recursive: true })
     const credential = urlCredential ?? (await this.resolveGitCredential('system', sourceRef))
-    const run = gitCloneRun(['-v', `${tmp}:/workspace`, '-w', '/workspace'], sourceRef, ['--depth', '1'], credential)
-    const result = await runDocker(run.args, {
-      timeoutMs: 180_000,
-      ...(run.input === undefined ? {} : { input: run.input })
-    })
+    const result = await this.backend.cloneToHostDirectory(sourceRef, tmp, { credential })
     if (result.code !== 0) {
       rmSync(tmp, { recursive: true, force: true })
       throw new Error(`Could not read repository ${sourceRef}: ${result.stderr.slice(-300)}`)
