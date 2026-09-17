@@ -91,6 +91,51 @@ describe('Room start as a trackable operation', () => {
     return { backend, gateway, windowsVm, orch, room: record, db, userData }
   }
 
+  it('reuses the proved retained runtime on wake instead of recreating it', async () => {
+    const { backend, orch, room } = await setup()
+    backend.resumeResult = { reused: true, hostPort: backend.hostPort }
+
+    await orch.startRoom(room.id, 'agent')
+
+    expect(orch.rooms.get(room.id)!.status).toBe('ready')
+    expect(backend.calls).toContain(`resumeRoomPod:${room.id}:web`)
+    // A reused Room keeps its containers, so nothing may be replaced.
+    expect(backend.calls.some((call) => call.startsWith('recreateAnchor:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('removeService:'))).toBe(false)
+    // ...and it still has to be routed and proved to answer before it is ready.
+    expect(orch.rooms.get(room.id)!.hostPort).toBe(backend.hostPort)
+  })
+
+  it('recreates the Room when the retained runtime cannot be proved reusable', async () => {
+    const { backend, orch, room } = await setup()
+    backend.resumeResult = { reused: false, reason: 'the Room image changed while it slept' }
+
+    await orch.startRoom(room.id, 'agent')
+    const record = orch.listOperations(room.id)[0]!
+
+    expect(orch.rooms.get(room.id)!.status).toBe('ready')
+    expect(backend.calls).toContain(`resumeRoomPod:${room.id}:web`)
+    expect(backend.calls.some((call) => call.startsWith('recreateAnchor:'))).toBe(true)
+    expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(true)
+    // The refusal reason is reported, not swallowed: a Room that quietly
+    // recreated every wake is exactly the bug this path exists to surface.
+    const containerStart = stage(record, 'container-start')
+    expect(containerStart?.detail).toContain('the Room image changed while it slept')
+  })
+
+  it('restarts a retained Room Service instead of replacing it on a warm wake', async () => {
+    const { backend, orch, room } = await setup({ services: { postgres: { version: '17' } } })
+    backend.resumeResult = { reused: true, hostPort: backend.hostPort }
+
+    await orch.startRoom(room.id, 'agent')
+
+    // The data volume is never at risk on the warm path because the service
+    // container is never removed in the first place.
+    expect(backend.calls.some((call) => call.startsWith('removeService:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('createService:'))).toBe(false)
+  })
+
   it('does not queue a second wake behind a wake that is still running', async () => {
     const { backend, orch, room } = await setup()
     const slow = gate()

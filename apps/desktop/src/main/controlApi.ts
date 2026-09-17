@@ -20,6 +20,7 @@ import {
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
+  zAgentAcquireRoomInput,
   zAgentAdbBody,
   zArtifactId,
   zArtifactListLimit,
@@ -277,6 +278,13 @@ export async function startControlApi(
         sendJson(res, 200, await orch.gcVolumes(body))
         return
       }
+    }
+
+    if (parts[1] === 'rooms' && parts[2] === 'acquire' && parts.length === 3 && req.method === 'POST') {
+      const body = zAgentAcquireRoomInput.parse(await readBody(req))
+      const result = await orch.acquireRoom({ ...body, actor: 'agent' })
+      sendJson(res, 200, { ...result, room: roomForAgent(result.room) })
+      return
     }
 
     if (parts[1] === 'rooms') {
@@ -635,15 +643,25 @@ export async function startControlApi(
           }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
-            // A command can outlive the connection that asked for it. If this
-            // response is never delivered, the bounded window inside it is lost
-            // too — so the complete raw output is retained instead of deleted,
-            // and list_room_runs can still find it by run ID.
+            // A caller that stops waiting must not leave its command running in
+            // the Room: closing the response before it was sent cancels the
+            // command, and the backend reaps the guest process group it owned.
+            // The same close also means the bounded window in this response is
+            // lost, so whatever output the command produced is retained in full
+            // instead of deleted, and list_room_runs can still find it by run ID.
+            const cancel = new AbortController()
             let closedEarly = false
-            const markLost = (): void => {
-              if (!res.writableFinished) closedEarly = true
+            const onClose = (): void => {
+              if (res.writableEnded) return
+              closedEarly = true
+              cancel.abort(
+                new DevHotelError('ROOM_COMMAND_CANCELLED', 'The command was cancelled: the caller closed the response.', {
+                  recoveryHint: 'Run the command again and keep the request open until it answers.',
+                  httpStatus: 409
+                })
+              )
             }
-            res.on('close', markLost)
+            res.once('close', onClose)
             // Both the event and the current socket state, because the two can
             // be observed in either order relative to the command finishing.
             const responseLost = (): boolean =>
@@ -652,12 +670,12 @@ export async function startControlApi(
               const result = await orch.execInRoom(
                 safeRoomId,
                 body.cmd,
-                { timeoutMs: body.timeoutMs, output: body.output, responseLost },
+                { timeoutMs: body.timeoutMs, output: body.output, signal: cancel.signal, responseLost },
                 'agent'
               )
               sendJson(res, 200, result)
             } finally {
-              res.off('close', markLost)
+              res.off('close', onClose)
             }
             return
           }

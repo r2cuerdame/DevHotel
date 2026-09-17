@@ -46,12 +46,43 @@ describe('agent control API bounded command output', () => {
         {
           timeoutMs: 30_000,
           output: { maxBytes: 4096, mode: 'head', include: 'FATAL', ignoreCase: true },
-          // The route also hands over the question "was this answer delivered?",
-          // which decides whether the full output is kept.
+          // The route also hands over the cancel signal and the question "was
+          // this answer delivered?", which decides whether the full output is kept.
+          signal: expect.any(AbortSignal),
           responseLost: expect.any(Function)
         },
         'agent'
       )
+    })
+  })
+
+  it('cancels the command when the caller closes the response before it was answered', async () => {
+    let signal: AbortSignal | undefined
+    let release: () => void = () => {}
+    const execInRoom = vi.fn(
+      (_roomId: string, _cmd: string[], opts: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          signal = opts.signal
+          release = () => resolve({ code: 0, stdout: '', stderr: '', output: { runId: RUN_ID } })
+        })
+    )
+    await withApi({ execInRoom } as unknown as Partial<RoomOrchestrator>, async (base, headers) => {
+      const abandon = new AbortController()
+      const request = fetch(`${base}/v1/rooms/room1abc/exec`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ cmd: ['sleep', '600'] }),
+        signal: abandon.signal
+      })
+      await vi.waitFor(() => expect(execInRoom).toHaveBeenCalledTimes(1))
+      expect(signal?.aborted).toBe(false)
+
+      abandon.abort()
+      await expect(request).rejects.toThrow()
+
+      await vi.waitFor(() => expect(signal?.aborted).toBe(true))
+      expect(signal?.reason).toMatchObject({ code: 'ROOM_COMMAND_CANCELLED', httpStatus: 409 })
+      release()
     })
   })
 
@@ -71,7 +102,7 @@ describe('agent control API bounded command output', () => {
       expect(execInRoom).toHaveBeenCalledWith(
         'room1abc',
         cmd,
-        { timeoutMs: undefined, output: undefined, responseLost: expect.any(Function) },
+        { timeoutMs: undefined, output: undefined, signal: expect.any(AbortSignal), responseLost: expect.any(Function) },
         'agent'
       )
     })

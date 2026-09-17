@@ -148,6 +148,30 @@ describe('long Room mutations as pollable operations', () => {
     )
   })
 
+  it('keeps the typed reuse refusal when a tracked create finds a compatible Room', async () => {
+    const { orch, room } = await setup({ taskId: 'task-71' })
+    const input = {
+      sourceType: 'managed-git' as const,
+      sourceRef: 'https://example.test/demo.git',
+      project: room.project,
+      nickname: 'second',
+      actor: 'agent' as const,
+      taskId: 'task-71'
+    }
+    // Both the legacy hold and a bounded wait that saw the failure: the
+    // caller needs the code and evidence, not a flattened message.
+    await expect(orch.createRoomOperation(input)).rejects.toMatchObject({
+      code: 'ROOM_REUSE_REQUIRED',
+      evidence: { roomId: room.id }
+    })
+    await expect(orch.createRoomOperation(input, { operationId: CALLER_ID, waitMs: 5_000 })).rejects.toMatchObject({
+      code: 'ROOM_REUSE_REQUIRED',
+      evidence: { roomId: room.id }
+    })
+    expect(orch.getOperation(CALLER_ID)?.status).toBe('failed')
+    expect(orch.rooms.list()).toHaveLength(1)
+  })
+
   it('leaves the delete receipt pollable after the Room it removed is gone', async () => {
     const { orch, room } = await setup()
 
