@@ -143,6 +143,7 @@ import {
 } from './backend/naming'
 import {
   RoomArtifactPublicationError,
+  managedContainerInventory,
   type DockerVolumeUsage,
   type ExecResult,
   type GitCredential,
@@ -1549,7 +1550,18 @@ export class RoomOrchestrator {
     try {
       const staleJobs = (await this.backend.listManagedContainers()).filter((container) => container.role === 'job')
       for (const job of staleJobs) await this.backend.removeManagedContainer(job.name)
-      return !(await this.backend.listManagedContainers()).some((container) => container.role === 'job')
+      // Reconcile tolerates an unowned labeled row; the Android recovery fence
+      // does not. A row whose ownership cannot be proved could still be a job
+      // whose metadata was damaged, so the role is not proven absent and the
+      // fence stays gated rather than being weakened by a foreign container.
+      const inventory = await managedContainerInventory(this.backend)
+      if (inventory.invalid.length > 0) {
+        for (const entry of inventory.invalid) {
+          this.olog('system', `startup: container ${entry.name} is not owned by DevHotel and was left untouched (${entry.reason})`)
+        }
+        return false
+      }
+      return !inventory.owned.some((container) => container.role === 'job')
     } catch {
       return false
     }

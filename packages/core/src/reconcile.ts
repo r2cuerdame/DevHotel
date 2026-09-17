@@ -1,7 +1,7 @@
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReconcilePlan } from '@devhotel/shared'
-import type { IsolationBackend } from './backend/types'
+import { managedContainerInventory, type IsolationBackend } from './backend/types'
 import type { RoomsRepo } from './store/roomsRepo'
 import { emptyObservation, type IngressRouteObservation } from './lifecycle/observations'
 import { planReconciliation } from './lifecycle/reconcilePlan'
@@ -13,6 +13,11 @@ export interface ReconcileResult {
   roomsDeleted?: string[]
   /** Host ingress ports closed because nothing survives a restart behind them. */
   ingressRevoked?: string[]
+  /**
+   * Containers carrying the DevHotel label whose ownership could not be proved.
+   * They are not DevHotel's to touch, so they were left alone and only named.
+   */
+  invalidContainers?: { name: string; reason: string }[]
   /**
    * The plan that was executed. Two builds that agree on what a restart owes the
    * Rooms produce the same digest, which is how a change in recovery behaviour
@@ -55,7 +60,14 @@ export async function reconcile(
   options: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
   const observation = emptyObservation(new Date().toISOString())
-  observation.containers = (await backend.listManagedContainers()).map((container) => ({
+  // A foreign container that merely wears the label is not an owned resource
+  // and must not stop the proven ones from being reconciled. It is named here
+  // as unowned so that a human can see it, and it is never acted on.
+  const inventory = await managedContainerInventory(backend)
+  for (const entry of inventory.invalid) {
+    log(`reconcile: ignoring container ${entry.name}: not owned by DevHotel (${entry.reason})`)
+  }
+  observation.containers = inventory.owned.map((container) => ({
     name: container.name,
     roomId: container.roomId || null,
     role: container.role,
@@ -182,6 +194,7 @@ export async function reconcile(
     roomsSlept,
     plan,
     ...(roomsDeleted.length > 0 ? { roomsDeleted } : {}),
-    ...(ingressRevoked.length > 0 ? { ingressRevoked } : {})
+    ...(ingressRevoked.length > 0 ? { ingressRevoked } : {}),
+    ...(inventory.invalid.length > 0 ? { invalidContainers: inventory.invalid } : {})
   }
 }

@@ -117,13 +117,13 @@ describe('OciCliBackend engine identity pin', () => {
   })
 
   it.each([
-    ['invalid JSON', '{'],
-    ['missing state', JSON.stringify({ Names: managedJobName, Labels: `devhotel.managed=1,devhotel.room=${roomId},devhotel.role=job` })],
-    ['missing managed label', managedRow({ labels: `devhotel.room=${roomId},devhotel.role=job` })],
-    ['missing Room label', managedRow({ labels: 'devhotel.managed=1,devhotel.role=job' })],
-    ['unknown role', managedRow({ labels: `devhotel.managed=1,devhotel.room=${roomId},devhotel.role=unknown` })],
-    ['name outside the strict role form', managedRow({ name: `dh-${roomId}-job-not-a-uuid` })]
-  ])('fails closed on a malformed managed-container row: %s', async (_label, stdout) => {
+    ['invalid JSON', '{', 'unknown'],
+    ['missing state', JSON.stringify({ Names: managedJobName, Labels: `devhotel.managed=1,devhotel.room=${roomId},devhotel.role=job` }), managedJobName],
+    ['missing managed label', managedRow({ labels: `devhotel.room=${roomId},devhotel.role=job` }), managedJobName],
+    ['missing Room label', managedRow({ labels: 'devhotel.managed=1,devhotel.role=job' }), managedJobName],
+    ['unknown role', managedRow({ labels: `devhotel.managed=1,devhotel.room=${roomId},devhotel.role=unknown` }), managedJobName],
+    ['name outside the strict role form', managedRow({ name: `dh-${roomId}-job-not-a-uuid` }), `dh-${roomId}-job-not-a-uuid`]
+  ])('reports a malformed managed-container row as unowned instead of aborting: %s', async (_label, stdout, name) => {
     const identityFile = join(dir, 'docker-engine.json')
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'info') {
@@ -133,25 +133,39 @@ describe('OciCliBackend engine identity pin', () => {
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(new OciCliBackend({ identityFile }).listManagedContainers()).rejects.toThrow(
-      /invalid JSON|ownership metadata is invalid/
-    )
+    const backend = new OciCliBackend({ identityFile })
+    const inventory = await backend.listManagedContainerInventory()
+    expect(inventory.owned).toEqual([])
+    expect(inventory.invalid).toEqual([
+      { name, reason: expect.stringMatching(/invalid JSON|ownership metadata is invalid/) }
+    ])
+    await expect(backend.listManagedContainers()).resolves.toEqual([])
+    // The row is reported, never acted on: nothing inspects or removes it.
+    expect(mockedRunDocker.mock.calls.map(([args]) => args[0])).not.toContain('rm')
   })
 
-  it('rejects the whole managed list when a malformed row follows a valid row', async () => {
+  it('keeps every proven owned row when a malformed foreign row sits between them', async () => {
     const identityFile = join(dir, 'docker-engine.json')
+    const foreign = JSON.stringify({
+      Names: 'someone-elses-container',
+      State: 'running',
+      Labels: 'devhotel.managed=1,devhotel.room=stranger,devhotel.role=web'
+    })
+    const secondJob = jobName(roomId, '22222222-3333-4444-8555-666666666666')
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'info') {
         return { code: 0, stdout: JSON.stringify({ ID: engineId }), stderr: '' }
       }
       if (args[0] === 'ps') {
-        return { code: 0, stdout: `${managedRow()}\n${managedRow({ state: '' })}`, stderr: '' }
+        return { code: 0, stdout: `${managedRow()}\n${foreign}\n${managedRow({ name: secondJob })}`, stderr: '' }
       }
       return { code: 0, stdout: '', stderr: '' }
     })
 
-    await expect(new OciCliBackend({ identityFile }).listManagedContainers()).rejects.toThrow(
-      /ownership metadata is invalid/
-    )
+    const inventory = await new OciCliBackend({ identityFile }).listManagedContainerInventory()
+    expect(inventory.owned.map((container) => container.name)).toEqual([managedJobName, secondJob])
+    expect(inventory.invalid).toEqual([
+      { name: 'someone-elses-container', reason: expect.stringMatching(/ownership metadata is invalid/) }
+    ])
   })
 })
