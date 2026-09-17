@@ -578,12 +578,40 @@ function quoteShellWord(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
+/**
+ * Seconds `docker stop` gives a Room web container between TERM and KILL. Set
+ * on the container itself so engine-initiated stops honour it too, and reused
+ * by the explicit Room stop so both paths agree.
+ */
+export const WEB_STOP_TIMEOUT_SECONDS = 8
+
 export function wrapStartCommand(startCommand: string): string {
-  // `exec <text>` only works when <text> begins with a simple command. Room
-  // commands are shell programs and may begin with `if`, `for`, assignments,
-  // or pipelines. Execute an inner shell so those programs remain valid while
-  // it still replaces the container's PID 1 for correct signal handling.
-  return `export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1; exec sh -lc ${quoteShellWord(startCommand)}`
+  // Room commands are shell programs and may begin with `if`, `for`,
+  // assignments, or pipelines, so they run in an inner shell rather than an
+  // `exec`. A shell does not forward TERM to its children: left as the
+  // container's leading process it would swallow `docker stop` until the
+  // engine's KILL fell on the whole tree (exit 137) with no graceful boundary
+  // for the user's server. Instead the outer shell traps TERM and hands it to
+  // its own process group, which is every process in the Room command tree,
+  // then keeps waiting until the inner program has really gone so the
+  // container's exit code is the program's own (0 or 143), never 137.
+  //
+  // The inner shell installs a no-op trap: `docker stop` semantics reach its
+  // child directly through the group signal, and a handler (unlike SIG_IGN)
+  // resets on exec, so the user's program still receives TERM. The outer
+  // shell re-arms itself the same way before signalling so the copy it
+  // receives cannot re-enter the handler. `wait` returns early when the trap
+  // fires, so it is repeated while the child still exists.
+  const program = `trap : TERM; ${startCommand}`
+  return [
+    'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+    'command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1',
+    `sh -lc ${quoteShellWord(program)} & child=$!`,
+    `trap 'trap : TERM; kill -TERM -$$ 2>/dev/null' TERM`,
+    'wait "$child"; status=$?',
+    'while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done',
+    'exit "$status"'
+  ].join('; ')
 }
 
 export function buildWebCreateArgs(spec: WebSpec, networkAuthority?: NetworkNamespaceAuthority): string[] {
@@ -599,6 +627,11 @@ export function buildWebCreateArgs(spec: WebSpec, networkAuthority?: NetworkName
       )}`,
     '--cap-drop',
     'NET_RAW',
+    // An init at PID 1 reaps orphans and forwards TERM to the command shell
+    // below; the shell in turn forwards it to the Room process tree.
+    '--init',
+    '--stop-timeout',
+    String(WEB_STOP_TIMEOUT_SECONDS),
     ...labelArgs(spec.roomId, 'web'),
     ...networkAuthorityLabelArgs(networkAuthority?.sandboxId, networkAuthority?.startedAt),
     ...mountArgs(spec),
