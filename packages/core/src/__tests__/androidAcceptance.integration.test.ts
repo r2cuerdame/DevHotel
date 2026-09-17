@@ -23,6 +23,12 @@ const APP_ID = 'com.example.app'
 const CHANGE_ID = '11111111-2222-4333-8444-555555555555'
 const INSTALLED_AT = '2026-08-30T00:00:00.000Z'
 const APK_SHA256 = 'a'.repeat(64)
+const DEVHOTEL_BUILD = {
+  version: '0.5.2',
+  commit: 'd'.repeat(40),
+  buildTime: '2026-09-08T01:02:03.004Z',
+  sourceVerified: true
+}
 
 describe('Android acceptance orchestration', () => {
   const roots: string[] = []
@@ -57,7 +63,8 @@ describe('Android acceptance orchestration', () => {
       backend,
       gateway: gateway.asGateway(),
       adb,
-      appVersion: 'test'
+      appVersion: DEVHOTEL_BUILD.version,
+      appBuild: DEVHOTEL_BUILD
     })
     orch.rooms.create(makeRoom({
       id: ROOM_ID,
@@ -453,10 +460,11 @@ describe('Android acceptance orchestration', () => {
     }, 'agent')
 
     expect(result.report).toMatchObject({
-      schema: 1,
+      schema: 3,
       roomId: ROOM_ID,
       stage: 'development',
       status: 'pass',
+      devhotelBuild: DEVHOTEL_BUILD,
       target: { kind: 'emulator', deviceId: null, apiLevel: 35, leaseIdentity: null },
       build: { changeId: CHANGE_ID, apkSha256: APK_SHA256 },
       locale: {
