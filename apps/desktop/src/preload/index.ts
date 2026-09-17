@@ -73,7 +73,9 @@ const api: IpcApi = {
     mcpInfo: () => ipcRenderer.invoke(IPC.mcpInfo),
     footprint: () => ipcRenderer.invoke(IPC.footprint),
     setAutostart: (enabled) => ipcRenderer.invoke(IPC.autostartSet, enabled),
-    cleanUninstall: () => ipcRenderer.invoke(IPC.cleanUninstall)
+    cleanUninstall: () => ipcRenderer.invoke(IPC.cleanUninstall),
+    enableManagedRuntimeFeatures: () => ipcRenderer.invoke(IPC.enableManagedRuntimeFeatures),
+    managedRuntimeStatus: () => ipcRenderer.invoke(IPC.managedRuntimeStatus)
   },
   android: {
     action: (roomId, action) => ipcRenderer.invoke(IPC.androidAction, roomId, action),

@@ -4,6 +4,7 @@ import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
+  WEB_STOP_TIMEOUT_SECONDS,
   anchorName,
   androidControlNetworkName,
   androidRuntimeAnchorName,
@@ -18,6 +19,11 @@ import {
   cacheVolume,
   depsVolume,
   emulatorAvdOverride,
+  emulatorBudget,
+  EMULATOR_BUDGET_CORES,
+  EMULATOR_BUDGET_MEMORY_MB,
+  EMULATOR_HOST_RESERVE_MB,
+  EMULATOR_MIN_MEMORY_MB,
   parsePortOutput,
   roomNetworkName,
   srcVolume,
@@ -28,6 +34,7 @@ import {
   workspaceSnapshotVolume,
   wrapStartCommand,
 } from '../backend/naming'
+import { nodeSharedCacheMounts, SHARED_CACHE_MOUNT } from '../lifecycle/sharedCache'
 import type { WebSpec } from '../backend/types'
 
 function spec(overrides: Partial<WebSpec> = {}): WebSpec {
@@ -320,7 +327,75 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('SCREEN_HEIGHT=1140')
     expect(args).toContain('EMULATOR_DEVICE=Samsung Galaxy S10')
     expect(args).toContain('EMULATOR_CONFIG_PATH=/home/androidusr/devhotel-avd-override.ini')
-    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-no-boot-anim -skip-adb-auth')
+    expect(args).toContain('EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth')
+  })
+
+  it('budgets emulator CPU and RAM while preserving KVM and the image software renderer', () => {
+    for (const args of [
+      buildEmulatorArgs('r1'),
+      buildEmulatorArgs('r1', { device: 'Nexus 5', version: '13.0', resolution: 'fast', orientation: 'landscape' })
+    ]) {
+      expect(envs(args).filter((env) => env.startsWith('EMULATOR_ADDITIONAL_ARGS='))).toEqual([
+        'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth'
+      ])
+      expect(args.flatMap((arg, index) => (arg === '--device' ? [args[index + 1]] : []))).toEqual(['/dev/kvm'])
+      expect(args).not.toContain('--gpus')
+      // Leave the image's swiftshader_indirect renderer in place.
+      expect(args.join(' ')).not.toContain('-gpu')
+    }
+  })
+
+  it('holds the emulator guest budget to the Room CPU and memory the user selected', () => {
+    // The whole point of #104's budget is that it is a ceiling. A Room capped
+    // at 1 CPU / 1 GB in the System tab must not get a 4-core, 4 GB emulator.
+    const small = buildEmulatorArgs('r1', undefined, { limits: { cpus: 1, memoryMB: 1024 } })
+    expect(envs(small)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 1 -memory 1024 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    const mid = buildEmulatorArgs('r1', undefined, { limits: { cpus: 2, memoryMB: 4096 } })
+    expect(envs(mid)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 2 -memory 3072 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    // A Room with headroom above the measured profile still stops at it.
+    const large = buildEmulatorArgs('r1', undefined, { limits: { cpus: 8, memoryMB: 8192 } })
+    expect(envs(large)).toContain(
+      'EMULATOR_ADDITIONAL_ARGS=-cores 4 -memory 4096 -noaudio -no-boot-anim -skip-adb-auth'
+    )
+    // Bounding the guest must not be traded for a container cap that turns a
+    // slow emulator into an OOM-killed one.
+    for (const args of [small, mid, large]) {
+      expect(args).not.toContain('--memory')
+      expect(args).not.toContain('--cpus')
+      expect(args.flatMap((arg, index) => (arg === '--device' ? [args[index + 1]] : []))).toEqual(['/dev/kvm'])
+    }
+  })
+
+  it('clamps the emulator budget rather than trusting the Room limit arithmetic', () => {
+    expect(emulatorBudget()).toEqual({ cores: EMULATOR_BUDGET_CORES, memoryMB: EMULATOR_BUDGET_MEMORY_MB })
+    expect(emulatorBudget({})).toEqual({ cores: EMULATOR_BUDGET_CORES, memoryMB: EMULATOR_BUDGET_MEMORY_MB })
+    // An unlimited Room keeps the measured profile.
+    expect(emulatorBudget({ cpus: undefined, memoryMB: undefined }).cores).toBe(EMULATOR_BUDGET_CORES)
+    // memoryMB - reserve can go to zero or negative; the floor is what an
+    // Android 14 AVD needs to reach boot_completed at all.
+    expect(emulatorBudget({ memoryMB: EMULATOR_HOST_RESERVE_MB }).memoryMB).toBe(EMULATOR_MIN_MEMORY_MB)
+    expect(emulatorBudget({ memoryMB: 1 }).memoryMB).toBe(EMULATOR_MIN_MEMORY_MB)
+    // Never zero or fractional cores.
+    expect(emulatorBudget({ cpus: 0 }).cores).toBe(EMULATOR_BUDGET_CORES)
+    expect(emulatorBudget({ cpus: 1.5 }).cores).toBe(1)
+    expect(emulatorBudget({ cpus: Number.NaN }).cores).toBe(EMULATOR_BUDGET_CORES)
+    expect(emulatorBudget({ memoryMB: Number.POSITIVE_INFINITY }).memoryMB).toBe(EMULATOR_BUDGET_MEMORY_MB)
+  })
+
+  it('never asks for a GPU and never gives up KVM', () => {
+    const args = buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })
+    const joined = args.join(' ')
+    // --gpus all + -gpu host makes the emulator select llvmpipe and Vulkan then
+    // fails with VK_ERROR_INCOMPATIBLE_DRIVER, so software rendering has to stay
+    // implicit: the image's swiftshader_indirect is never overridden from here.
+    expect(args).not.toContain('--gpus')
+    expect(joined).not.toContain('-gpu')
+    // ...while KVM has to survive every change to these arguments.
+    expect(args[args.indexOf('--device') + 1]).toBe('/dev/kvm')
   })
 
   it('rotates the X screen and AVD orientation for landscape emulators', () => {
@@ -330,25 +405,27 @@ describe('buildWebCreateArgs', () => {
     // the panel itself must be landscape-shaped: Android reads its orientation
     // from the panel, and qemu keeps the panel aspect no matter the X screen
     const land = emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'landscape')
-    expect(land).toContain('hw.lcd.width=2280')
-    expect(land).toContain('hw.lcd.height=1080')
+    expect(land).toContain('hw.lcd.width=1520')
+    expect(land).toContain('hw.lcd.height=720')
     expect(land).toContain('hw.initialOrientation=landscape')
     // native resolution still has to swap the axes, or landscape does nothing
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'native', 'landscape')).toContain('hw.lcd.width=3040')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).not.toContain('hw.initialOrientation')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).toContain('hw.lcd.width=1080')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced', 'portrait')).toContain('hw.lcd.width=720')
     // portrait stays the default
     expect(buildEmulatorArgs('r1', { device: 'Samsung Galaxy S10', version: '14.0' })).toContain('SCREEN_WIDTH=540')
   })
 
   it('scales the guest LCD per resolution preset for software rendering speed', () => {
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=1080')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=2280')
-    expect(emulatorAvdOverride('Samsung Galaxy S10', 'fast')).toContain('hw.lcd.width=720')
-    expect(emulatorAvdOverride('Nexus 5', 'fast')).toContain('hw.lcd.height=960')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.width=720')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'balanced')).toContain('hw.lcd.height=1520')
+    expect(emulatorAvdOverride('Samsung Galaxy S10', 'fast')).toContain('hw.lcd.width=540')
+    expect(emulatorAvdOverride('Nexus 5', 'fast')).toContain('hw.lcd.height=720')
     expect(emulatorAvdOverride('Samsung Galaxy S10', 'native')).not.toContain('hw.lcd')
-    // default preset is 'balanced'
-    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.width=1080')
+    // default preset is 'fast' and matches the normal 540px Room preview
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.width=540')
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.height=1140')
+    expect(emulatorAvdOverride('Samsung Galaxy S10')).toContain('hw.lcd.density=240')
   })
 
   it('carries the devhotel labels', () => {
@@ -359,11 +436,29 @@ describe('buildWebCreateArgs', () => {
 
   it('sets cache env, passes extra env, and never sets CI', () => {
     const args = buildWebCreateArgs(spec({ env: { FOO: 'bar' } }))
-    expect(envs(args)).toEqual(['npm_config_cache=/cache/npm', 'PNPM_HOME=/cache/pnpm', 'FOO=bar'])
+    expect(envs(args)).toEqual([
+      'npm_config_cache=/cache/npm',
+      'PNPM_HOME=/cache/pnpm',
+      'PLAYWRIGHT_BROWSERS_PATH=/cache/playwright',
+      'XDG_CACHE_HOME=/cache/xdg',
+      'FOO=bar'
+    ])
     expect(envs(args).some((e) => e.startsWith('CI='))).toBe(false)
   })
 
-  it('wraps the start command with a tolerant corepack enable and exec', () => {
+  it('keeps browser and XDG caches Room-scoped even with the shared package cache', () => {
+    const args = buildWebCreateArgs(spec({ sharedCaches: nodeSharedCacheMounts() }))
+    const env = envs(args)
+    // The package store is content-addressed, so it may live in the Hotel-scoped
+    // volume...
+    expect(env).toContain(`npm_config_cache=${SHARED_CACHE_MOUNT}/npm`)
+    expect(env).toContain(`PNPM_HOME=${SHARED_CACHE_MOUNT}/pnpm`)
+    // ...but these are not, so one Room must never reach another's.
+    expect(env).toContain('PLAYWRIGHT_BROWSERS_PATH=/cache/playwright')
+    expect(env).toContain('XDG_CACHE_HOME=/cache/xdg')
+  })
+
+  it('wraps the start command with a tolerant corepack enable and a signal-forwarding shell', () => {
     const args = buildWebCreateArgs(spec())
     expect(args.slice(-3)).toEqual([
       'sh',
@@ -373,6 +468,35 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('node:22-bookworm')
     const w = args.indexOf('-w')
     expect(args[w + 1]).toBe('/workspace')
+  })
+
+  it('runs the web container under an init with a declared stop timeout', () => {
+    const args = buildWebCreateArgs(spec())
+    expect(args).toContain('--init')
+    const timeout = args.indexOf('--stop-timeout')
+    expect(timeout).toBeGreaterThan(0)
+    expect(args[timeout + 1]).toBe(String(WEB_STOP_TIMEOUT_SECONDS))
+    expect(WEB_STOP_TIMEOUT_SECONDS).toBe(8)
+  })
+})
+
+describe('wrapStartCommand', () => {
+  it('forwards TERM to the whole Room process group instead of dying as a bare shell', () => {
+    const wrapped = wrapStartCommand('npm run dev')
+    // The user program runs in an inner login shell that outlives TERM long
+    // enough to report its child's real exit status...
+    expect(wrapped).toContain(`sh -lc 'trap : TERM; npm run dev' & child=$!`)
+    // ...while the outer shell hands TERM to every process in its group and
+    // ignores the copy it receives itself.
+    expect(wrapped).toContain(`trap 'trap : TERM; kill -TERM -$$ 2>/dev/null' TERM`)
+    expect(wrapped).not.toContain('exec sh')
+  })
+
+  it('exits with the inner program status once the program has really gone', () => {
+    const wrapped = wrapStartCommand('node server.js')
+    expect(wrapped).toContain('wait "$child"; status=$?')
+    expect(wrapped).toContain('while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done')
+    expect(wrapped.endsWith('exit "$status"')).toBe(true)
   })
 })
 
@@ -411,13 +535,13 @@ describe('buildOneShotArgs', () => {
   it('preserves compound shell programs behind a PID-1 inner shell', () => {
     const command = "if [ -f ./gradlew ]; then sh ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi"
     const wrapped = wrapStartCommand(command)
-    expect(wrapped).toContain("exec sh -lc 'if [ -f ./gradlew ]; then")
+    expect(wrapped).toContain("sh -lc 'trap : TERM; if [ -f ./gradlew ]; then")
     expect(wrapped).not.toContain('exec if ')
     expect(buildOneShotArgs(spec({ standalone: true }), command, jobId).slice(-1)).toEqual([wrapped])
   })
 
   it('shell-quotes apostrophes in Room commands', () => {
-    expect(wrapStartCommand("printf '%s\\n' ok")).toContain(`exec sh -lc 'printf '"'"'%s\\n'"'"' ok'`)
+    expect(wrapStartCommand("printf '%s\\n' ok")).toContain(`sh -lc 'trap : TERM; printf '"'"'%s\\n'"'"' ok'`)
   })
 
   it('keeps standalone one-shots off Docker default bridge', () => {

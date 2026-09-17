@@ -2,11 +2,12 @@ appId: io.devhotel.app
 productName: DevHotel
 directories:
   output: release
+beforePack: scripts/verify-package-source.mjs
+afterPack: scripts/write-packaged-build-identity.mjs
+afterAllArtifactBuild: scripts/finalize-packaged-build-identity.mjs
 files:
   - out/**
   - package.json
-asarUnpack:
-  - out/main/chunks/**
 extraResources:
   - from: ../../packages/mcp/dist/index.js
     to: mcp/index.js
