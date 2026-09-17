@@ -75,7 +75,7 @@ describe('OciCliBackend engine executor seam', () => {
     await backend.listManagedContainers()
     await backend.followRoomLogs('r1', 50).catch(() => undefined)
 
-    expect(engine.runs.map(({ args }) => args[0])).toContain('version')
+    expect(engine.runs.map(({ args }) => args[0])).toContain('info')
     expect(engine.runs.map(({ args }) => args[0])).toContain('ps')
     expect(mockedRunDocker).not.toHaveBeenCalled()
     expect(mockedSpawn).not.toHaveBeenCalled()

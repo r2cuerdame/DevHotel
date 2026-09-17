@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Status and wake stay inside a Docker-process budget
+
+- `hotel_status`, the Room list, and Room inspection answer from one engine
+  health read plus one bulk owned-container inventory instead of inspecting
+  Rooms one at a time, and report their own `budget` (Docker processes started,
+  elapsed time). A running Android emulator still gets its fenced topology
+  proof, now from a single inspect.
+- The pinned Docker engine identity is proven once per process and reused by
+  Room operations; every health read re-proves it from the same `docker info`,
+  and any transport or context failure drops the proof so the next operation
+  must re-prove the endpoint before touching anything.
+- Wake re-proves the relay credential once per verification instead of on every
+  poll, reads the published relay port from the anchor it already inspected,
+  inspects only the network the anchor is attached to, and settles already
+  labelled volumes from the volume listing. Room logs record the Docker
+  processes each wake used.
+- One Room event now triggers at most one renderer refresh of each kind and one
+  debounced tray rebuild, instead of duplicate refreshes and a tray rebuild
+  with its own health probe per event.
+
+### Isolated Client Browsers for agent web automation (#114)
+
+- Agents can borrow a DevHotel-owned Chromium per Room with
+  `allocate_client_browser` (`POST /v1/rooms/:id/browsers`). Every session is
+  its own process and profile — cookies, localStorage, sessionStorage, tabs —
+  and is reachable only through a token-gated loopback endpoint
+  (`/cdp/<sessionId>/<token>`) that Playwright's `connectOverCDP`, puppeteer
+  and raw CDP clients consume unchanged. Two Rooms, or two agents, never share
+  login state and cannot attach to each other's browser without the token.
+- `attach_client_browser`, `inspect_client_browser` (owner, liveness,
+  tunnelled client count, page targets), `navigate_client_browser`,
+  `screenshot_client_browser` and `release_client_browser` complete the
+  surface; fifty-nine MCP tools are now available.
+- A Room's browsers are released when the Room sleeps or is deleted and on
+  DevHotel shutdown; startup stops and cleans browsers and profiles a previous
+  process left behind, only after proving the process owns that profile.
+- Only the token's SHA-256 digest is stored. Tokens never appear in listings,
+  inspection or logs.
+- `docs/client-browser.md` explains how the Client Browser capability differs
+  from the Web Server Room capability.
+
+### Agents can tear down sleeping, fully-synced Host-linked Rooms (#90)
+
+- `DELETE /v1/rooms/:id` (and the `delete_room` MCP tool) no longer answers
+  `403` for every Host-linked Room. A `linked-folder` or `legacy-host-bind`
+  Room may be deleted by an agent while it is `sleeping` with `syncStatus`
+  `synced` or `legacy`; awake Rooms and Rooms holding unsynced Room-owned edits
+  stay a human decision. Deleting never touches the Host folder, so disposable
+  test Rooms stop piling up bridge networks and volumes on the host.
+
 ### Gateway routes are revoked for dead, broken, and sleeping Rooms (#87)
 
 - The Gateway drops a Room's route as soon as its hostPort is cleared, when a
