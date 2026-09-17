@@ -29,6 +29,7 @@ DevHotel is a local Agent Runtime that gives AI a strongly isolated, persistent 
 - **Guarded Host Sync:** Inbound sync from Host folders uses `safe_resync_from_host`: drift is inspected first, common generated build outputs are ignored, and meaningful drift returns an opaque single-use confirmation token before anything is imported.
 - **Bounded Command Execution & Run Retention:** `run_in_room` returns a bounded stream view (default 64KB per stream) with server-side substring filtering (`include`/`exclude`). When output exceeds the inline window, the full raw stream is durably retained under the Room and paged with `read_run_output`.
 - **Durable Long Operations:** Long-running lifecycle actions like `start_room` return a durable operation ID with observable progress stages (`check_operation`), surviving client timeouts and disconnects.
+- **Isolated Client Browsers:** An agent that needs to *visit* a site borrows a DevHotel-owned Chromium per Room — its own process, profile, cookies, storage and tabs, reachable only through a token-gated CDP endpoint that Playwright's `connectOverCDP` consumes directly. Two Rooms or two agents never share login state or attach to each other's debugger, and the browser is torn down with the Room. This is separate from the Web Server Room that *hosts* the site. See [Client Browser](./docs/client-browser.md).
 - **One USB Phone, Many Projects (Device Broker):** A physical Android phone is a shared Hotel Service lent to one Room at a time under an exclusive lease. Waiters see the queue and current owner. Crucially, verified builds stay installed on release or reclaim without destructive uninstalls. See [Android Device Broker](./docs/android-device-broker.md).
 
 ## Room providers
@@ -95,9 +96,9 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "<path-to-DevHotel.
 
 Agents should start with `acquire_room`. Matching ignores nicknames and uses canonical source, project, provider and requested runtime settings. Existing modified state is preserved. Direct `create_room` rejects compatible duplicates with `ROOM_REUSE_REQUIRED` and `evidence.roomId`; a distinct `taskId` or `issueRef` permits parallel work and is persisted for subsequent reuse. Manual desktop creation remains available.
 
-### MCP tool surface (53 tools)
+### MCP tool surface (59 tools)
 
-The bundled MCP server exposes 53 tools across the complete development lifecycle:
+The bundled MCP server exposes 59 tools across the complete development lifecycle:
 
 - **Room Lifecycle & Health (13):** `list_rooms`, `acquire_room` (default; reuses/wakes compatible Rooms), `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
 - **Working State, Changes & Sync (10):** `apply_quick_change`, `undo_change`, `list_changes`, `room_components`, `restart_web`, `clone_room`, `reset_room`, `safe_resync_from_host`, `sync_from_host`, `reset_sync_baseline`.
@@ -107,6 +108,7 @@ The bundled MCP server exposes 53 tools across the complete development lifecycl
 - **Android Automation & Verification (11):** `android_run`, `android_launch_app`, `android_force_stop`, `android_wait_for_text`, `android_tap_text`, `android_dump_ui`, `android_logcat`, `android_run_crash_scenario`, `android_screenshot`, `android_locale_screenshot_matrix`, `abandon_android_locale_matrix_recovery`.
 - **Android Acceptance Reports (3):** `android_create_acceptance_report`, `list_android_acceptance_reports`, `get_android_acceptance_report` (cryptographically sealed HMAC receipts for emulator development or final physical proof).
 - **Shared Device Broker (6):** `android_devices`, `attach_android_device`, `release_android_device`, `heartbeat_android_device`, `cancel_android_device_request`, `android_device_adb`.
+- **Client Browser (6):** `allocate_client_browser`, `attach_client_browser`, `inspect_client_browser`, `navigate_client_browser`, `screenshot_client_browser`, `release_client_browser` (isolated per-Room Chromium with a token-gated CDP/Playwright endpoint; distinct from the Web Server Room).
 - **Hotel Services (2):** `hotel_github_status`, `hotel_github_install`.
 
 ### Control API (without MCP)
@@ -155,7 +157,7 @@ packages/core     Orchestrator — OCI room backend (docker CLI), VMware backend
                   local gateway (*.localhost + SNI TLS + local CA), SQLite store,
                   change transaction engine with undo, 15-step check pipeline,
                   secret-redacted diagnostics, device broker
-packages/mcp      devhotel-mcp — stdio MCP server (53 tools over the control API)
+packages/mcp      devhotel-mcp — stdio MCP server (59 tools over the control API)
 packages/shared   Shared schemas, contracts, and host input boundary definitions
 ```
 
@@ -165,6 +167,7 @@ packages/shared   Shared schemas, contracts, and host input boundary definitions
 - [Android Device Broker](./docs/android-device-broker.md) — Shared USB phone queue and exclusive lease model.
 - [Android Acceptance Reports](./docs/android-acceptance-reports.md) — Cryptographically sealed verification receipts.
 - [Android Locale Matrix](./docs/android-locale-matrix.md) — App-scoped locale testing and recovery contract.
+- [Client Browser](./docs/client-browser.md) — Isolated per-Room automation browsers, and how they differ from Web Server Rooms.
 - [Host Input Isolation](./docs/host-input-isolation.md) — Desktop cursor and window protection contract.
 - [The Host Footprint](./docs/host-footprint.md) — What DevHotel owns on a machine, and the proofs required to reclaim any of it.
 - [Room-aware volume GC](./docs/volume-gc.md) — Why `docker volume prune` is never the answer, and how a bounded pass proves each volume orphaned first.
