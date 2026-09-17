@@ -4,7 +4,7 @@ import type { ResetServiceMode, ServiceKind } from '@devhotel/shared'
 import { cacheVolume } from '../../backend/naming'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { verifyWebUp } from '../types'
-import { currentDepsGen, depsGenKey, depsGenMaxKey, depsVolumeForGen, pmInstallCommand } from './deps'
+import { currentDepsGen, depsGenKey, depsVolumeForGen, pmInstallCommand, reserveNextDepsGen } from './deps'
 import { backupServiceToFile, pingService } from './services'
 
 export interface RoomResetInput {
@@ -134,8 +134,7 @@ export const roomResetChange: ChangeDefinition<RoomResetInput> = {
       // same published-pointer rule as a clean reinstall: build a fresh
       // generation, then flip the pointer — the live volume is never wiped
       const major = room.runtime.version
-      const maxRaw = ctx.settings.get(depsGenMaxKey(ctx.roomId, major))
-      const nextGen = (maxRaw ? Number.parseInt(maxRaw, 10) : currentDepsGen(ctx)) + 1
+      const nextGen = reserveNextDepsGen(ctx, ctx.roomId, major, currentDepsGen(ctx))
       const freshVolume = depsVolumeForGen(ctx.roomId, major, nextGen)
       const installCmd = pmInstallCommand(room)
       steps.push('Create a fresh dependency volume')
@@ -146,7 +145,6 @@ export const roomResetChange: ChangeDefinition<RoomResetInput> = {
         throw new Error(`${installCmd} failed: ${result.stderr.slice(-400) || `exit ${result.code}`}`)
       }
       ctx.settings.set(depsGenKey(ctx.roomId, major), String(nextGen))
-      ctx.settings.set(depsGenMaxKey(ctx.roomId, major), String(nextGen))
     }
 
     if (p.clearBrowserData) {

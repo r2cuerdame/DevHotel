@@ -29,6 +29,24 @@ export function depsVolumeForGen(roomId: string, nodeMajor: string, gen: number)
   return gen === 0 ? depsVolume(roomId, nodeMajor) : `${depsVolume(roomId, nodeMajor)}-g${gen}`
 }
 
+/**
+ * Reserve the next dependency generation for (room, major) and return it.
+ *
+ * The high-water mark is written *before* the caller touches any volume, so a
+ * crash between "create the fresh volume" and "publish the pointer" leaves a
+ * number that is spent: the next attempt allocates above it and can never
+ * reuse a name whose contents are half-written. Generations are never
+ * recycled, whether they were undone, failed or interrupted.
+ */
+export function reserveNextDepsGen(ctx: ChangeCtx, roomId: string, nodeMajor: string, current: number): number {
+  const raw = ctx.settings.get(depsGenMaxKey(roomId, nodeMajor))
+  const parsed = raw === null ? current : Number.parseInt(raw, 10)
+  const highWater = Number.isSafeInteger(parsed) && parsed >= 0 ? Math.max(current, parsed) : current
+  const next = highWater + 1
+  ctx.settings.set(depsGenMaxKey(roomId, nodeMajor), String(next))
+  return next
+}
+
 export const depsInstallChange: ChangeDefinition<{ clean: boolean }> = {
   kind: 'deps-install',
   plan(ctx, p) {
@@ -53,10 +71,8 @@ export const depsInstallChange: ChangeDefinition<{ clean: boolean }> = {
     const installCmd = pmInstallCommand(room)
     if (p.clean) {
       const major = room.runtime.version
-      // generations are never reused: an undone generation's volume name must
-      // not be recycled with stale content, so allocate from a monotonic max
-      const maxRaw = ctx.settings.get(depsGenMaxKey(room.id, major))
-      const nextGen = (maxRaw ? Number.parseInt(maxRaw, 10) : currentDepsGen(ctx)) + 1
+      // generations are never reused: reserved durably before the volume exists
+      const nextGen = reserveNextDepsGen(ctx, room.id, major, currentDepsGen(ctx))
       const freshVolume = depsVolumeForGen(room.id, major, nextGen)
       steps.push('Create fresh dependency volume')
       await ctx.backend.resetVolume(ctx.roomId, freshVolume)
@@ -66,7 +82,6 @@ export const depsInstallChange: ChangeDefinition<{ clean: boolean }> = {
         throw new Error(`${installCmd} failed: ${result.stderr.slice(-400) || `exit ${result.code}`}`)
       }
       ctx.settings.set(depsGenKey(room.id, major), String(nextGen))
-      ctx.settings.set(depsGenMaxKey(room.id, major), String(nextGen))
     } else {
       steps.push(`Run ${installCmd}`)
       const result = await ctx.backend.runOneShot(ctx.webSpec(), installCmd, ctx.log)

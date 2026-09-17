@@ -154,6 +154,9 @@ export interface DockerVolumeUsage {
   createdAt?: string
 }
 
+/** One volume as seen right now, minus the size only a full `df` pass can measure. */
+export type DockerVolumeObservation = Omit<DockerVolumeUsage, 'sizeBytes' | 'sizeKnown'>
+
 export type RoomArtifactRecoveryOutcome =
   | 'committed'
   | 'absent'
@@ -348,6 +351,13 @@ export interface IsolationBackend {
   ): Promise<void>
   volumeSizes(roomId: string): Promise<Record<string, number>>
   listVolumesWithUsage(): Promise<DockerVolumeUsage[]>
+  /**
+   * Re-observe one volume's existence, labels, ownership and container
+   * attachments without a full inventory pass. Sizes are not re-measured:
+   * `docker system df` is the only source for them and one pass per GC run is
+   * the contract. Null when the volume no longer exists.
+   */
+  inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null>
   removeManagedVolume(name: string): Promise<void>
   /**
    * Remove one Hotel-scoped shared cache. Separate from `removeManagedVolume`

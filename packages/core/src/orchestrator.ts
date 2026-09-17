@@ -141,6 +141,7 @@ import {
 } from './backend/naming'
 import {
   RoomArtifactPublicationError,
+  type DockerVolumeUsage,
   type ExecResult,
   type GitCredential,
   type GitCredentialResolver,
@@ -4414,8 +4415,10 @@ export class RoomOrchestrator {
    * classifying each volume (retained, sleeping, fenced, orphaned, unowned)
    * without deleting anything.
    */
-  private async volumeReconciliationContext(): Promise<VolumeReconciliationContext> {
-    const volumes = await this.backend.listVolumesWithUsage()
+  private async volumeReconciliationContext(
+    reuse: { volumes?: DockerVolumeUsage[] } = {}
+  ): Promise<VolumeReconciliationContext> {
+    const volumes = reuse.volumes ?? await this.backend.listVolumesWithUsage()
     const allRooms = this.rooms.list()
     const activeOps = this.operations.listLive()
     return {
@@ -4437,12 +4440,27 @@ export class RoomOrchestrator {
    * By default, runs in dry-run mode. Never touches fenced rooms (#61) or sleeping rooms.
    */
   async gcVolumes(opts?: VolumeGcOptions): Promise<VolumeGcResult> {
+    // One inventory pass per run. Each candidate is re-proved under its Room
+    // lock from a single-volume observation (existence, labels, attachments)
+    // laid over that inventory, together with fresh Room, operation, change
+    // and settings state. The size is the one the pass was planned with: only
+    // `docker system df` measures sizes, and it is not run again.
     const context = await this.volumeReconciliationContext()
     return await executeVolumeGc(this.backend, context, opts, {
-      removeCandidateIfStillSafe: async (candidate, remainingBytes) => {
+      removeCandidateIfStillSafe: async (candidate, remainingBytes, deadlineAt) => {
         if (!candidate.roomId) throw new Error(`Volume ${candidate.name} has no Room ownership identity`)
         return await this.withRoomLock(candidate.roomId, async () => {
-          const refreshed = reconcileVolumesState(await this.volumeReconciliationContext())
+          if (Date.now() >= deadlineAt) throw new Error(`Volume ${candidate.name} was not re-proved: the pass deadline elapsed`)
+          const observed = await this.backend.inspectVolumeUsage(candidate.name)
+          if (!observed) throw new Error(`Volume ${candidate.name} disappeared before guarded removal`)
+          const planned = context.volumes.find((volume) => volume.name === candidate.name)
+          if (!planned) throw new Error(`Volume ${candidate.name} was not in the planned inventory`)
+          const refreshed = reconcileVolumesState({
+            ...(await this.volumeReconciliationContext({ volumes: context.volumes })),
+            volumes: context.volumes.map((volume) =>
+              volume.name === candidate.name ? { ...planned, ...observed } : volume
+            )
+          })
           const current = refreshed.volumes.find((volume) => volume.name === candidate.name)
           if (!current) throw new Error(`Volume ${candidate.name} disappeared before guarded removal`)
           if (
