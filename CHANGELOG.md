@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Gateway routes are revoked for dead, broken, and sleeping Rooms (#87)
+
+- The Gateway drops a Room's route as soon as its hostPort is cleared, when a
+  wake or check fails, and when runtime observation proves the workload is
+  dead, so a stopped Room answers with the 404 page instead of trapping the
+  browser in the 502 reload loop.
+
 ### Volume GC proves its work in one pass, on a clock (#63)
 
 - A real volume GC pass now runs one `docker system df` inventory and re-proves
