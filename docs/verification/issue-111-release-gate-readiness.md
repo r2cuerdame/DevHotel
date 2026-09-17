@@ -663,3 +663,210 @@ The remaining order, with one item struck out and one added:
 **Nothing above is a gate pass, and #111 is not acceptable on this evidence.**
 Every row of `issue-106-clean-windows-acceptance.md` and
 `issue-107-managed-web-rooms.md` is still blank.
+
+---
+
+## The fourth attempt — B1's last code item closed, and the media obtained
+
+Measured against `main@d38ac04`, which lands #138 (the locally built emulator
+preview image) and #139 (Android warm wake). This attempt deliberately did not
+re-litigate the environment: the previous three established that the Host cannot
+supply it, and re-measuring confirmed nothing had changed. It spent its time on
+the two things that were still code and could be finished without a VM.
+
+### 1. All four offered Android versions are pinned
+
+The third attempt left exactly one code-side item on B1: *"Pin the remaining
+three Android system images, or narrow the claim to the version that is
+pinned."* The narrower option was not taken. `ANDROID_SYSTEM_IMAGES` now carries
+API 34, 33, 32 and 30, so `pinnedAndroidVersions()` returns all four versions the
+Stack tab offers and no Room reaches `super.createEmulator` — the branch that
+pulls `budtmo/docker-android` through the guest engine.
+
+The three new pins, each the highest `google_apis;x86_64` revision published in
+`sys-img/google_apis/sys-img2-1.xml` when the pin was taken:
+
+| Android | API | Revision | Bytes | Upstream SHA-1 |
+|---|---|---|---|---|
+| 13.0 | 33 | `r17` | 1,707,857,511 | `2b96f5bd…5d9711` |
+| 12.0 | 32 | `r08` | 1,538,792,859 | `1b527946…eb8f1d` |
+| 11.0 | 30 | `r16` | 1,438,186,618 | `6ae21030…3e787d` |
+
+How they were produced matters more than the numbers, because Google publishes
+`<checksum type="sha1">` and nothing stronger:
+
+1. every `sizeBytes` and `upstreamSha1` above was read from Google's own
+   manifest **first**, and the manifest's API 34 row was checked against the
+   already-committed API 34 pin as a control — it matched byte-for-byte, which is
+   what makes the other three rows trustworthy rather than merely plausible;
+2. each artifact was then streamed and hashed, and DevHotel's SHA-256 and
+   SHA-512 recorded in `androidSdkPin.ts` where a reviewer reads them;
+3. `DEVHOTEL_PIN_ANDROID_SDK=1 pnpm --filter @devhotel/core pin:android-sdk`
+   was then run as an **independent re-download** of all seven artifacts
+   (~6.8 GB) and re-verified every checked-in digest. A second fetch is what
+   distinguishes a recorded digest from a transient corruption recorded as one.
+
+`pin:android-sdk` previously asserted only that Android 14.0's artifacts were
+genuinely pinned. Checking one version is how the other three stayed unpinned
+without anything going red, so it now iterates `pinnedAndroidVersions()` and
+asserts that set equals `ANDROID_API_LEVELS` — the two tables can no longer
+disagree silently.
+
+`UnpinnedAndroidSystemImageError` was **kept**, not deleted with its last live
+caller. It is what catches a fifth version added to `ANDROID_API_LEVELS` without
+a pin, and `__tests__/androidPinTestSupport.ts` registers a synthetic version so
+the branch keeps its coverage.
+
+**This is still not the B1 gate row.** It removes the last reason the row could
+not be attempted for three of the four versions. The emulator has not been
+booted on any machine, on any version.
+
+### 2. The Windows 11 Enterprise Evaluation ISO — obtained, and scripted
+
+The third attempt listed *"Fetch the Windows 11 Enterprise Evaluation ISO
+(~6 GB); none exists here"* as a remaining step. It is done, and there turned out
+to be an official unauthenticated path, which the earlier attempts had assumed
+there was not.
+
+`scripts/acceptance/issue-106/Get-Windows11EvaluationIso.ps1` resolves the
+Evaluation Center's own fwlink id (`2334167`, the en-US 64-bit Enterprise
+evaluation ISO) hop by hop:
+
+```
+https://go.microsoft.com/fwlink/?linkid=2334167&clcid=0x409&culture=en-us&country=us
+  -> https://aka.ms/Win11E-ISO-25H2-en-us
+  -> https://software-static.download.prss.microsoft.com/dbazure/.../26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso
+```
+
+No account, no registration form, no cookie and no paid resource: the last hop
+serves 7,092,807,680 bytes anonymously. Free, no licence key, 90-day evaluation —
+the media the acceptance procedure already named, now fetched by a script rather
+than by hand.
+
+Four things are asserted rather than assumed, because this is the media the whole
+gate's evidence rests on:
+
+- **the redirect chain is walked manually** and every hop recorded, so the ISO's
+  origin is evidence rather than "a redirect resolved to this". This needs
+  `HttpClient` rather than `Invoke-WebRequest`: PowerShell 7 treats
+  `-MaximumRedirection 0` as *redirect limit exceeded* and throws, so a 3xx and
+  its `Location` header are unreachable through that cmdlet —
+  `-SkipHttpErrorCheck` only suppresses 4xx/5xx;
+- **the final origin must be a Microsoft download host**, or the fetch stops
+  rather than caching a mirror;
+- **the filename must contain `ENTERPRISEEVAL`**, so the script cannot be pointed
+  at media that is not free to use for acceptance testing;
+- **the digest is measured and recorded**, because Microsoft publishes none for
+  this file. A `.provenance.json` sidecar carries the SHA-256, the SHA-512, the
+  byte length, the fwlink id and the redirect chain; `-ExpectedSha256` re-verifies
+  a cached copy and fails rather than silently re-fetching.
+
+The download lands under `%LOCALAPPDATA%\DevHotel\acceptance-media` —
+deliberately outside the repository, at 6.6 GB.
+
+### 3. The environment, re-measured a fourth time
+
+Unchanged, and still disqualifying:
+
+```
+Elevated               : False
+Microsoft-Hyper-V-All  : InstallState 2 (Disabled) — vmms.exe absent
+VirtualMachinePlatform : InstallState 1 (Enabled)  — why VMware stays in ULM
+HypervisorPlatform     : InstallState 2 (Disabled)
+Last boot              : 2026-09-16 18:57 — unchanged across all four attempts
+Free space on C:       : 454 GB
+```
+
+The Host is still mid-flight, so the milestone reboot's precondition — that it
+will not corrupt active work — is still not met:
+
+```
+9  DevHotel processes
+18 node, 5 claude, 12 orca processes   — a live multi-agent session
+csx-451-test-pg                    Up 15 hours   — another agent's Postgres
+dh-njfstb4z-{anchor,svc-emulator}  Up 15 hours   — a live Room with a running emulator
+dh-29c5e8ys-{anchor,svc-emulator}  Up 15 hours   — a second one
+searxng                            Up 15 hours
+```
+
+### 4. What was actually verified, and what that is worth
+
+Both of this attempt's deliverables were verified rather than asserted, and both
+verifications are recorded here because the next attempt should not have to
+re-run them:
+
+**The Android pin re-verified on an independent second fetch.**
+`DEVHOTEL_PIN_ANDROID_SDK=1 pnpm --filter @devhotel/core pin:android-sdk`
+re-downloaded all seven artifacts — three shared tools plus four system images,
+~6.8 GB — and re-verified every checked-in digest. It passed in 1,141,690 ms:
+
+```
+✓ keeps the checked-in pin internally consistent
+✓ re-measures every artifact against the checked-in pin   1141690ms
+  Tests  2 passed
+```
+
+Every `sizeBytes`, `upstreamSha1`, `sha256` and `sha512` in `androidSdkPin.ts`
+came back identical on bytes fetched a second time. That is the part a single
+measurement cannot give: one fetch records whatever arrived, including a
+corruption, as though it were the artifact.
+
+**The ISO digest re-confirmed from the cached file.** The fetch measured
+`a61adeab…e535e7b9`, and a second run with `-ExpectedSha256` read the 6.6 GB back
+off disk and agreed — so the recorded value is not merely what the download
+printed. A deliberately wrong digest was also passed, and the script refused
+instead of re-fetching, which is the behaviour that makes the check worth having.
+
+**None of this is gate evidence, and the distinction matters here more than
+anywhere else in this document.** Verifying that DevHotel will fetch the right
+Android bytes is not the same as an emulator booting; verifying the installation
+media is not the same as a clean guest reaching a healthy runtime. What these two
+verifications buy is narrower and still real: when the gate is finally run, a
+failure will not be attributable to unpinned Android images or unverified media,
+because both were closed and measured first.
+
+**Host-side suites, re-measured on this branch:**
+
+```
+@devhotel/core      94 files passed,  4 skipped   1755 passed, 10 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   2066 passed, 14 skipped
+```
+
+`pnpm -r typecheck` clean across all four packages. `pnpm lint` 0 errors, 4
+warnings — the same pre-existing unused-import warnings in
+`backend.network-lifecycle.test.ts`. Unlike the third attempt, the core suite
+passed at full parallelism on the first run, with no worker-RPC load flakes to
+disclose.
+
+### Where #111 stands after four attempts
+
+| Group | Claims | State |
+|---|---|---|
+| A | fresh install, upgrade, rollback, reboot, crash/recovery, uninstall, North Star Web | Environment-blocked. Nothing else remains. |
+| B1 | Android without Host adb / Android Studio / Docker | **Code-complete.** All four offered versions pinned and verified; no docker-android on any managed path. Never booted. |
+| B2 | Low disk | Behaviour landed (`bf6ce55`); needs its live row. |
+| B3 | Offline / retry | Behaviour landed (`bf6ce55`); needs its live row. |
+| B4 | Enterprise virtualization policy | Behaviour landed (`cffc4d0`); needs a policy-managed Host. |
+
+**There is no code-side item left on #111.** What remains is two things, neither
+of which this dispatch can take:
+
+1. ~~Pin the remaining three Android system images.~~ **Done.**
+2. ~~Fetch the Windows 11 Enterprise Evaluation ISO.~~ **Done, and scripted.**
+3. **Elevation + `Enable-WindowsOptionalFeature Microsoft-Hyper-V-All` + a Host
+   restart.** This needs a human at the UAC prompt — `recue` is in
+   `Administrators`, but `PromptOnSecureDesktop=1` puts the consent dialog on the
+   secure desktop, which an automated session cannot answer — **and** a Host with
+   no other agent's work on it. Right now a reboot would destroy two other
+   agents' running Rooms and a third agent's database.
+4. Then build the VM from the cached ISO and run #106 rows 1–15 and #107's
+   17-row matrix in the guest.
+
+**Nothing above is a gate pass, and #111 is not acceptable on this evidence.**
+Every row of `issue-106-clean-windows-acceptance.md` and
+`issue-107-managed-web-rooms.md` is still blank. The blocker is now exactly one
+thing — an elevated, quiescent Host — where it used to be four.

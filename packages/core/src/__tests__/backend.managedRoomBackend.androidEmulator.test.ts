@@ -11,6 +11,11 @@ import {
 } from '../backend/androidEmulatorLaunch'
 import { androidAvdVolume, androidSdkVolume, emulatorName } from '../backend/naming'
 import { androidApiLevel, pinnedAndroidVersions, UnpinnedAndroidSystemImageError } from '../backend/androidSdkPin'
+import {
+  UNPINNED_TEST_API_LEVEL,
+  UNPINNED_TEST_VERSION,
+  withUnpinnedAndroidVersion
+} from './androidPinTestSupport'
 
 const FAKE_SANDBOX = 'a'.repeat(64)
 const FAKE_STARTED_AT = '2026-09-17T00:00:00Z'
@@ -243,21 +248,60 @@ describe('buildManagedEmulatorContainerArgs (#108 wiring)', () => {
 })
 
 describe('managed runtime emulator version selection', () => {
-  it('pinnedAndroidVersions includes 14.0 (Android 14)', () => {
-    // This is the only version with a pinned system image today (#108).
-    expect(pinnedAndroidVersions()).toContain('14.0')
+  it('takes the managed path for every version the Stack tab offers', () => {
+    // `createEmulator` routes on exactly this predicate: a version outside
+    // `pinnedAndroidVersions()` falls through to `super.createEmulator`, which is
+    // budtmo/docker-android via the guest engine. So this assertion is the one
+    // that decides whether #111's "Android without Docker" claim covers what the
+    // product actually offers, or only its default.
+    const pinned = pinnedAndroidVersions()
+    for (const version of ['14.0', '13.0', '12.0', '11.0']) {
+      expect(pinned, `Android ${version} would fall back to docker-android`).toContain(version)
+    }
   })
 
-  it('androidAvdPlan throws UnpinnedAndroidSystemImageError for 13.0', () => {
-    // 13.0 is offered in the Stack tab but its system image is not yet pinned.
-    // The managed path must produce a named error so the fallback can route to
-    // docker-android rather than crashing the Room.
-    expect(() => androidAvdPlan('r1', { version: '13.0' })).toThrow(UnpinnedAndroidSystemImageError)
+  it('androidAvdPlan succeeds for every offered version', () => {
+    const expected: Record<string, string> = {
+      '14.0': 'system-images;android-34;google_apis;x86_64',
+      '13.0': 'system-images;android-33;google_apis;x86_64',
+      '12.0': 'system-images;android-32;google_apis;x86_64',
+      '11.0': 'system-images;android-30;google_apis;x86_64'
+    }
+    for (const [version, systemImage] of Object.entries(expected)) {
+      const plan = androidAvdPlan('r1', { version })
+      expect(plan.systemImage, `Android ${version}`).toBe(systemImage)
+      expect(plan.name).toBe('dh-r1')
+    }
   })
 
-  it('androidAvdPlan succeeds for 14.0 (the one pinned version)', () => {
-    const plan = androidAvdPlan('r1', { version: '14.0' })
-    expect(plan.systemImage).toBe('system-images;android-34;google_apis;x86_64')
-    expect(plan.name).toBe('dh-r1')
+  it('gives each API level its own SDK volume and mounts the right one', () => {
+    // The SDK volume is named after the API level, not the Room, so Rooms of one
+    // version share the ~2 GB download. Two versions sharing a volume would let
+    // one Room's system image satisfy another Room's provisioning sentinel.
+    const levels = ['14.0', '13.0', '12.0', '11.0'].map((v) => androidApiLevel(v))
+    const volumes = levels.map((l) => androidSdkVolume(l))
+    expect(new Set(volumes).size).toBe(levels.length)
+
+    for (const version of ['14.0', '13.0', '12.0', '11.0']) {
+      const apiLevel = androidApiLevel(version)
+      const plan = androidAvdPlan('r1', { version })
+      const launch = androidEmulatorLaunch('r1', { version })
+      const args = buildManagedEmulatorContainerArgs('r1', plan, launch, { ...baseLifecycle, apiLevel })
+      const vIdx = args.indexOf('-v')
+      expect(args[vIdx + 1], `Android ${version} SDK mount`).toBe(
+        `${androidSdkVolume(apiLevel)}:${ANDROID_SDK_ROOT}:ro`
+      )
+    }
+  })
+
+  it('androidAvdPlan still refuses a version with no pinned image', () => {
+    // No offered version reaches this any more; the branch guards the next one
+    // added, so it is exercised through a synthetic version rather than dropped.
+    withUnpinnedAndroidVersion(UNPINNED_TEST_VERSION, UNPINNED_TEST_API_LEVEL, () => {
+      expect(pinnedAndroidVersions()).not.toContain(UNPINNED_TEST_VERSION)
+      expect(() => androidAvdPlan('r1', { version: UNPINNED_TEST_VERSION })).toThrow(
+        UnpinnedAndroidSystemImageError
+      )
+    })
   })
 })

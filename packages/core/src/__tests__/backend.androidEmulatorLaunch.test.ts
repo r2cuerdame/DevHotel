@@ -9,13 +9,18 @@ import {
   androidAvdPlan,
   androidEmulatorLaunch
 } from '../backend/androidEmulatorLaunch'
-import { UnpinnedAndroidSystemImageError } from '../backend/androidSdkPin'
+import { ANDROID_API_LEVELS, UnpinnedAndroidSystemImageError } from '../backend/androidSdkPin'
 import {
   EMULATOR_ADB_SERIAL,
   EMULATOR_DEFAULT_VERSION,
   emulatorAvdOverride,
   emulatorBudget
 } from '../backend/naming'
+import {
+  UNPINNED_TEST_API_LEVEL,
+  UNPINNED_TEST_VERSION,
+  withUnpinnedAndroidVersion
+} from './androidPinTestSupport'
 
 /** `-flag value` pairs from an emulator argv. */
 function flag(argv: string[], name: string): string | undefined {
@@ -98,9 +103,28 @@ describe('direct Android emulator launch', () => {
     expect(androidAvdPlan('r1', { orientation: 'landscape' }).configIni).toContain('hw.initialOrientation=landscape')
   })
 
+  it('plans an AVD from the right system image for every offered version', () => {
+    // Each offered version has its own pinned image now, so the AVD must be
+    // created from the one matching the Room's Android — not from the default,
+    // which is the failure a single-version test could not have seen.
+    for (const [version, apiLevel] of Object.entries(ANDROID_API_LEVELS)) {
+      const plan = androidAvdPlan('r1', { version })
+      const expected = `system-images;android-${apiLevel};google_apis;x86_64`
+      expect(plan.systemImage, `Android ${version}`).toBe(expected)
+      expect(plan.createArgs).toContain(expected)
+      // One AVD name per Room, never per version: a Room keeps its AVD across a
+      // version change rather than silently growing a second one.
+      expect(plan.name).toBe(androidAvdName('r1'))
+    }
+  })
+
   it('refuses an Android version whose system image is not pinned', () => {
-    // 13.0 is offered in the Stack tab and works on docker-android; it simply
-    // has no managed-path image yet, and the error has to say which.
-    expect(() => androidAvdPlan('r1', { version: '13.0' })).toThrow(UnpinnedAndroidSystemImageError)
+    // Every offered version is pinned now, so this is exercised through a
+    // synthetic version — the branch still guards the next one added.
+    withUnpinnedAndroidVersion(UNPINNED_TEST_VERSION, UNPINNED_TEST_API_LEVEL, () => {
+      expect(() => androidAvdPlan('r1', { version: UNPINNED_TEST_VERSION })).toThrow(
+        UnpinnedAndroidSystemImageError
+      )
+    })
   })
 })

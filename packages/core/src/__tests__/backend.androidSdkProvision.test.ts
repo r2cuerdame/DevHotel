@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest'
 import {
   buildAndroidSdkProvisionScript,
   buildAndroidSdkProvisionArgs,
+  ANDROID_API_LEVELS,
   ANDROID_SDK_TOOLS,
   ANDROID_SYSTEM_IMAGES,
   UnpinnedAndroidSystemImageError
 } from '../backend/androidSdkPin'
 import { androidSdkVolume } from '../backend/naming'
 import { MANAGED_EMULATOR_PREVIEW_IMAGE } from '../backend/androidEmulatorLaunch'
+import {
+  UNPINNED_TEST_API_LEVEL,
+  UNPINNED_TEST_VERSION,
+  withUnpinnedAndroidVersion
+} from './androidPinTestSupport'
 
 const SDK_ROOT = '/opt/devhotel/android-sdk'
 const VERSION = '14.0'
@@ -71,8 +77,34 @@ describe('buildAndroidSdkProvisionScript (#108 sdk-less managed path)', () => {
     expect(script).toContain(`system-images/android-${API_LEVEL}/google_apis`)
   })
 
+  it('provisions each offered version from its own image and its own layout', () => {
+    // The whole point of pinning the other three: a 13.0 Room must download the
+    // API 33 bytes and unpack them under system-images/android-33, or it boots
+    // an Android the Room did not ask for. Asserting the digest as well as the
+    // URL is deliberate — the digest is what the guest actually verifies.
+    for (const [version, apiLevel] of Object.entries(ANDROID_API_LEVELS)) {
+      const script = buildAndroidSdkProvisionScript(version, SDK_ROOT)
+      const image = ANDROID_SYSTEM_IMAGES[apiLevel]!
+      expect(script, `Android ${version} url`).toContain(image.url)
+      expect(script, `Android ${version} sha256`).toContain(image.sha256)
+      expect(script, `Android ${version} layout`).toContain(`system-images/android-${apiLevel}/google_apis`)
+      expect(script, `Android ${version} sentinel`).toContain(`echo '${version}' >`)
+      // No other version's image may be fetched by this script.
+      for (const [otherLevel, other] of Object.entries(ANDROID_SYSTEM_IMAGES)) {
+        if (Number(otherLevel) === apiLevel) continue
+        expect(script, `Android ${version} also fetches API ${otherLevel}`).not.toContain(other.url)
+      }
+    }
+  })
+
   it('throws UnpinnedAndroidSystemImageError for unpinned versions', () => {
-    expect(() => buildAndroidSdkProvisionScript('13.0', SDK_ROOT)).toThrow(UnpinnedAndroidSystemImageError)
+    // Every offered version is pinned now; the branch is kept for the next one
+    // added and is exercised through a synthetic version.
+    withUnpinnedAndroidVersion(UNPINNED_TEST_VERSION, UNPINNED_TEST_API_LEVEL, () => {
+      expect(() => buildAndroidSdkProvisionScript(UNPINNED_TEST_VERSION, SDK_ROOT)).toThrow(
+        UnpinnedAndroidSystemImageError
+      )
+    })
   })
 
   it('writes a sentinel file after successful provisioning', () => {

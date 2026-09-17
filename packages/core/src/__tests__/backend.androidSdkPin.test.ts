@@ -15,7 +15,13 @@ import {
   pinnedAndroidVersions,
   type AndroidSdkArtifact
 } from '../backend/androidSdkPin'
+import { ANDROID_EMULATOR_VERSIONS } from '@devhotel/shared'
 import { EMULATOR_DEFAULT_VERSION } from '../backend/naming'
+import {
+  UNPINNED_TEST_API_LEVEL,
+  UNPINNED_TEST_VERSION,
+  withUnpinnedAndroidVersion
+} from './androidPinTestSupport'
 
 function artifact(overrides: Partial<AndroidSdkArtifact> = {}): AndroidSdkArtifact {
   return {
@@ -66,20 +72,58 @@ describe('pinned Android SDK provisioning set', () => {
     // Both are refusals, but only one of them is a DevHotel migration gap, and
     // the caller has to be able to say which to the user.
     expect(() => androidSdkArtifacts('9.9')).toThrow(UnknownAndroidVersionError)
-    expect(androidApiLevel('13.0')).toBe(33)
-    expect(() => androidSdkArtifacts('13.0')).toThrow(UnpinnedAndroidSystemImageError)
-    try {
-      androidSdkArtifacts('13.0')
-    } catch (err) {
-      expect(err).toBeInstanceOf(UnpinnedAndroidSystemImageError)
-      expect((err as UnpinnedAndroidSystemImageError).apiLevel).toBe(33)
+    // No offered version can trigger the second refusal any more, so it is
+    // exercised through a synthetic one — see androidPinTestSupport for why the
+    // branch is kept rather than deleted with its last live caller.
+    withUnpinnedAndroidVersion(UNPINNED_TEST_VERSION, UNPINNED_TEST_API_LEVEL, () => {
+      expect(androidApiLevel(UNPINNED_TEST_VERSION)).toBe(UNPINNED_TEST_API_LEVEL)
+      expect(() => androidSdkArtifacts(UNPINNED_TEST_VERSION)).toThrow(UnpinnedAndroidSystemImageError)
+      try {
+        androidSdkArtifacts(UNPINNED_TEST_VERSION)
+      } catch (err) {
+        expect(err).toBeInstanceOf(UnpinnedAndroidSystemImageError)
+        expect((err as UnpinnedAndroidSystemImageError).apiLevel).toBe(UNPINNED_TEST_API_LEVEL)
+      }
+      // A version with no pinned image must not be advertised as runnable.
+      expect(pinnedAndroidVersions()).not.toContain(UNPINNED_TEST_VERSION)
+    })
+  })
+
+  it('pins a system image for every Android version the Stack tab offers', () => {
+    // This is the #111 B1 claim in one assertion. While only API 34 was pinned,
+    // a Room on 13.0/12.0/11.0 fell through to budtmo/docker-android, so
+    // "Android without Docker" was true for one of the four offered versions.
+    //
+    // The offered list is read from the control schema rather than restated here,
+    // so adding a version the UI can select without pinning its system image
+    // fails this test instead of quietly reintroducing the docker-android path.
+    expect(Object.keys(ANDROID_API_LEVELS)).toEqual([...ANDROID_EMULATOR_VERSIONS])
+    expect(pinnedAndroidVersions()).toEqual([...ANDROID_EMULATOR_VERSIONS])
+    expect(pinnedAndroidVersions()).toContain(EMULATOR_DEFAULT_VERSION)
+
+    for (const [version, apiLevel] of Object.entries(ANDROID_API_LEVELS)) {
+      const image = ANDROID_SYSTEM_IMAGES[apiLevel]
+      expect(image, `Android ${version} (API ${apiLevel}) has no pinned system image`).toBeDefined()
+      // The pin must name the level it is filed under: an image filed at the
+      // wrong key boots a different Android than the Room asked for, and every
+      // other assertion here would still pass.
+      expect(image!.sdkPackage).toBe(`system-images;android-${apiLevel};google_apis;x86_64`)
+      expect(image!.id).toBe(`android-system-image-${apiLevel}`)
+      expect(image!.url).toContain(`x86_64-${apiLevel}_r`)
+      // Every offered version resolves to a full, verifiable provisioning set.
+      for (const a of androidSdkArtifacts(version)) assertAndroidSdkArtifactPinned(a)
     }
-    // Every version the Stack tab offers is at least mapped, so none of them
-    // reaches the managed path as "unknown".
-    for (const version of ['14.0', '13.0', '12.0', '11.0']) {
-      expect(ANDROID_API_LEVELS[version]).toBeGreaterThan(0)
+  })
+
+  it('keeps each system image on its own bytes', () => {
+    // Four entries copied from one another is the likeliest way this table goes
+    // wrong, and a duplicated digest would make three versions provision the
+    // fourth one's Android while every per-artifact check still passed.
+    const images = Object.values(ANDROID_SYSTEM_IMAGES)
+    expect(images.length).toBe(Object.keys(ANDROID_API_LEVELS).length)
+    for (const field of ['url', 'sha256', 'sha512', 'upstreamSha1', 'sizeBytes'] as const) {
+      expect(new Set(images.map((i) => i[field])).size, `system images share a ${field}`).toBe(images.length)
     }
-    expect(pinnedAndroidVersions()).toEqual([EMULATOR_DEFAULT_VERSION])
   })
 
   it('refuses a pin that could only be verified by the upstream SHA-1', () => {
