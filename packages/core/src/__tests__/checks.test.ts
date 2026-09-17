@@ -67,6 +67,32 @@ describe('runChecks', () => {
     }
   })
 
+  it('does not self-heal a missing route while the web process is exited', async () => {
+    const backend = new FakeBackend()
+    backend.webStateValue = 'exited'
+    let syncRouteCalled = false
+    const room = makeRoom({
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      syncStatus: 'empty',
+      status: 'attention',
+      hostPort: 45000
+    })
+    const ctx = ctxWith({
+      backend,
+      room,
+      syncRoute: async () => {
+        syncRouteCalled = true
+      }
+    })
+    const report = await runChecks(ctx)
+    const by = Object.fromEntries(report.results.map((r) => [r.step, r]))
+    expect(syncRouteCalled).toBe(false)
+    expect(by.gateway!.status).toBe('unknown')
+    expect(by.gateway!.summary).toBe('not routed — web process not running')
+  })
+
   it('checks an Android Room end to end including the relayed emulator screen', async () => {
     const { port, close } = await listeningPort()
     try {

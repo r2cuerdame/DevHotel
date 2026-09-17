@@ -171,6 +171,25 @@ describe('gateway e2e', () => {
     expect(res.body).toContain('DevHotel — no room at this address')
   }, 30000)
 
+  it('transitions from 502 with auto-reload to 404 without reload when route is revoked', async () => {
+    const probe = net.createServer()
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', () => resolve()))
+    const closedPort = (probe.address() as net.AddressInfo).port
+    await new Promise<void>((resolve) => probe.close(() => resolve()))
+
+    await gateway.setRoute({ domain: 'dead.localhost', roomId: 'room-dead', targetPort: closedPort, https: false })
+    const res502 = await request('http', httpPort, 'dead.localhost')
+    expect(res502.status).toBe(502)
+    expect(res502.body).toContain('location.reload()')
+
+    gateway.removeRoute('dead.localhost')
+    const res404 = await request('http', httpPort, 'dead.localhost')
+    expect(res404.status).toBe(404)
+    expect(res404.body).toContain('DevHotel — no room at this address')
+    expect(res404.body).not.toContain('location.reload')
+    expect(res404.body).not.toContain('http-equiv="refresh"')
+  }, 30000)
+
   it('308-redirects plain http to https for https routes', async () => {
     const res = await request('http', httpPort, 'b.localhost', '/some/path?q=1')
     expect(res.status).toBe(308)
