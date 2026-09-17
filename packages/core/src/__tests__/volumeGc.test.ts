@@ -107,12 +107,12 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
   })
 
   describe('isRoomFencedForRecovery', () => {
-    it('fences explicit rooms and attention status', () => {
+    it('fences explicit rooms and durable recovery intents, never a bare status', () => {
       const settings = new Map<string, string>()
       const getSettings = { get: (k: string) => settings.get(k) ?? null }
 
       expect(isRoomFencedForRecovery('njfstb4z', getSettings, new Set(['njfstb4z']))).toBe(true)
-      expect(isRoomFencedForRecovery('room1', getSettings, undefined, 'attention')).toBe(true)
+      expect(isRoomFencedForRecovery('room1', getSettings, undefined, 'attention')).toBe(false)
       expect(isRoomFencedForRecovery('room1', getSettings, undefined, 'ready')).toBe(false)
 
       settings.set('androidLocaleRestorePending:room1', '{}')
@@ -188,7 +188,12 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
     })
 
     it('preserves sleeping room persistent cache, sdk, services, and current revision', () => {
-      const room = makeRoom({ id: 'cgwwdje7', status: 'sleeping', workspaceVolumeRevision: 38 })
+      const room = makeRoom({
+        id: 'cgwwdje7',
+        status: 'sleeping',
+        workspaceVolumeRevision: 38,
+        services: { postgres: { version: '17' } }
+      })
       const settings = new Map<string, string>([
         [retainedWorkspaceGenKey('cgwwdje7'), '37']
       ])
@@ -574,7 +579,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       const result = await executeVolumeGc(
         backend,
         context,
-        { dryRun: false, maxVolumes: 2, maxBytes: 10_000 },
+        { dryRun: false, maxVolumes: 2, maxBytes: 10_000, deadlineMs: 60_000 },
         removalGuard(backend)
       )
       expect(result.dryRun).toBe(false)
@@ -603,7 +608,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       const result = await executeVolumeGc(
         backend,
         context,
-        { dryRun: false, maxVolumes: 10, maxBytes: 4000 },
+        { dryRun: false, maxVolumes: 10, maxBytes: 4000, deadlineMs: 60_000 },
         removalGuard(backend)
       )
       expect(result.dryRun).toBe(false)
@@ -626,6 +631,11 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         backend,
         context,
         { dryRun: false, maxVolumes: 1, maxBytes: 1000 }
+      )).rejects.toThrow(/deadline/)
+      await expect(executeVolumeGc(
+        backend,
+        context,
+        { dryRun: false, maxVolumes: 1, maxBytes: 1000, deadlineMs: 60_000 }
       )).rejects.toThrow(/concurrent-state/)
       expect(backend.removedManagedVolumes).toEqual([])
     })
@@ -710,7 +720,7 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
       expect(dryRun.deletedCount).toBe(0)
       expect(backend.removedManagedVolumes).toHaveLength(0)
 
-      const executed = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000 })
+      const executed = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000, deadlineMs: 60_000 })
       expect(executed.dryRun).toBe(false)
       expect(executed.deletedCount).toBe(1)
       expect(executed.reclaimedBytes).toBe(80000)
@@ -730,15 +740,14 @@ describe('Volume GC & Reconciliation (Issue #63)', () => {
         linksKnown: true,
         labels: { 'devhotel.managed': '1', 'devhotel.room': 'delroom1', 'devhotel.role': 'volume' }
       }]
-      let lists = 0
-      const originalList = backend.listVolumesWithUsage.bind(backend)
-      backend.listVolumesWithUsage = async () => {
-        lists += 1
-        if (lists === 2) orch.rooms.create(makeRoom({ id: 'delroom1', status: 'sleeping' }))
-        return await originalList()
+      const originalInspect = backend.inspectVolumeUsage.bind(backend)
+      backend.inspectVolumeUsage = async (name) => {
+        // the Room comes back between the plan and the guarded re-proof
+        orch.rooms.create(makeRoom({ id: 'delroom1', status: 'sleeping' }))
+        return await originalInspect(name)
       }
 
-      const result = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000 })
+      const result = await orch.gcVolumes({ dryRun: false, maxVolumes: 1, maxBytes: 80_000, deadlineMs: 60_000 })
       expect(result.deletedCount).toBe(0)
       expect(result.errors).toEqual([expect.stringContaining('changed state before guarded removal')])
       expect(backend.removedManagedVolumes).toEqual([])

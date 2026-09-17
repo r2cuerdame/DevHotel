@@ -32,6 +32,7 @@ import {
   zTermId,
   zTermInput,
   zTermResize,
+  type ManagedRuntimeStatusInfo,
   type McpSetupInfo
 } from '@devhotel/shared'
 import {
@@ -47,10 +48,12 @@ import {
 import type { PreviewManager } from './previewManager'
 import type { TermManager } from './termManager'
 import {
+  CLEAN_REMOVAL_RESPONSES,
   cleanRemovalConfirmation,
   launchCleanRemovalCoordinator,
   validateCleanRemovalUninstaller,
-  validateCleanRemovalTarget
+  validateCleanRemovalTarget,
+  type CleanRemovalScope
 } from './cleanRemoval'
 import type { CleanRemovalOperation } from './cleanRemovalGate'
 import { assertTrustedMainFrame, type RendererIpcEvent } from './ipcSecurity'
@@ -79,6 +82,15 @@ export function registerIpc(opts: {
   requestRelaunch: () => void
   runCleanRemoval: (operation: CleanRemovalOperation) => Promise<boolean>
   finishCleanRemoval: () => void
+  /** Removes the DevHotel-owned managed runtime VM, or reports why it could not. */
+  removeManagedRuntime: (scope: CleanRemovalScope) => Promise<'nothing-owned' | 'removed' | 'refused' | 'preserved'>
+  enableManagedRuntimeFeatures: () => Promise<{
+    stage: string
+    restartRequired: boolean
+    edition: string | null
+    detail: string
+  }>
+  managedRuntimeStatus: () => Promise<ManagedRuntimeStatusInfo>
 }): void {
   const {
     win,
@@ -92,7 +104,10 @@ export function registerIpc(opts: {
     github,
     requestRelaunch,
     runCleanRemoval,
-    finishCleanRemoval
+    finishCleanRemoval,
+    removeManagedRuntime,
+    enableManagedRuntimeFeatures,
+    managedRuntimeStatus
   } = opts
   const caDir = join(userData, 'ca')
   const installDir = dirname(process.execPath)
@@ -342,6 +357,10 @@ export function registerIpc(opts: {
     installDir,
     autostart: app.getLoginItemSettings().openAtLogin
   }))
+  // The only Host-level Windows mutation DevHotel performs, and only when the
+  // human asks for it here. Never invoked during launch or provisioning.
+  handle(IPC.enableManagedRuntimeFeatures, () => enableManagedRuntimeFeatures())
+  handle(IPC.managedRuntimeStatus, () => managedRuntimeStatus())
   handle(IPC.autostartSet, (_event, enabled) => {
     app.setLoginItemSettings({ openAtLogin: zAutostartEnabled.parse(enabled), args: ['--hidden'] })
   })
@@ -362,15 +381,40 @@ export function registerIpc(opts: {
       const resolvedUserData = validateCleanRemovalTarget(userData, app.getPath('appData'), dataOwnershipId)
 
       const confirmation = await dialog.showMessageBox(win, cleanRemovalConfirmation(orch.listRooms().length))
-      if (confirmation.response !== 1) return false
+      const scope = CLEAN_REMOVAL_RESPONSES[confirmation.response] ?? null
+      if (!scope) return false
 
-      // This closes the orchestrator mutation gate, drains admitted work, and
-      // deletes one stable inventory. Failed Room ownership stays retryable.
-      await orch.deleteAllRooms('user')
+      // Only a complete uninstall deletes Rooms. An app-only one is asked for
+      // precisely so that the work survives the application, and it would be
+      // the same destructive act either way if this did not branch.
+      if (scope === 'complete') await orch.deleteAllRooms('user')
+      // The managed runtime has to be dealt with while DevHotel is still
+      // running: the coordinator that deletes app data runs after this process
+      // exits, and a registered Hyper-V VM holds its VHDX attachments open
+      // against that delete -- and would survive it as a VM pointing at disks
+      // that no longer exist. A complete uninstall removes it, proving
+      // ownership first; an app-only one stops it with its state intact and
+      // leaves it, which is what the user chose.
+      let managedRuntimeRemoval: 'nothing-owned' | 'removed' | 'refused' | 'preserved'
+      try {
+        managedRuntimeRemoval = await removeManagedRuntime(scope)
+      } catch (err) {
+        throw new Error(
+          `${scope === 'complete' ? 'Rooms were removed, but the' : 'The'} DevHotel managed runtime could not be ${scope === 'complete' ? 'removed' : 'stopped'}: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      if (managedRuntimeRemoval === 'refused') {
+        throw new Error(
+          'Rooms were removed, but DevHotel could not prove it owns the managed runtime virtual machine, so it was left in place. Remove it in Hyper-V Manager and try again.'
+        )
+      }
+      // Host trust and startup state go in both scopes. They are the two things
+      // an uninstalled application cannot come back and clean up, and neither
+      // is worth anything without the app that installed it.
       try {
         if ((await caTrustStatus(caDir)) === 'trusted') await untrustCaInWindows(caDir)
       } catch (err) {
-        throw new Error(`Rooms were removed, but DevHotel CA trust could not be removed: ${err instanceof Error ? err.message : String(err)}`)
+        throw new Error(`DevHotel CA trust could not be removed: ${err instanceof Error ? err.message : String(err)}`)
       }
       app.setLoginItemSettings({ openAtLogin: false })
       // Re-check after the potentially long Room drain: never schedule a path
@@ -386,7 +430,8 @@ export function registerIpc(opts: {
         target: resolvedUserData,
         ownershipId: dataOwnershipId,
         uninstaller: resolvedUninstaller,
-        failureLog: cleanupFailureLog
+        failureLog: cleanupFailureLog,
+        scope
       })
       finishCleanRemoval()
       return true

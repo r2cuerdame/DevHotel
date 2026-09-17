@@ -85,6 +85,94 @@ describe('OciCliBackend.stopRoomPod', () => {
     await expect(new OciCliBackend().stopRoomPod('r1')).rejects.toThrow(/stop Room r1 web container failed/)
   })
 
+  it('treats a dead container as already stopped', async () => {
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'ps') {
+        return {
+          code: 0,
+          stdout: `${row('aaa111', 'dh-r1-web', 'web', 'dead')}\n${row('bbb222', 'dh-r1-anchor', 'anchor', 'exited')}\n`,
+          stderr: ''
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await expect(new OciCliBackend().stopRoomPod('r1')).resolves.toBeUndefined()
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'stop')).toBe(false)
+  })
+
+  it('keeps stopping later groups when an earlier stop fails and names the exact survivors', async () => {
+    let emulatorState = 'running'
+    let runtimeState = 'running'
+    let anchorState = 'running'
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'ps') {
+        return {
+          code: 0,
+          stdout: `${row('aaa111', 'dh-r1-web', 'web', 'running')}\n${row(
+            'ccc333',
+            'dh-r1-svc-emulator',
+            'svc-emulator',
+            emulatorState
+          )}\n${row('ddd444', 'dh-r1-android-runtime-anchor', 'android-runtime-anchor', runtimeState)}\n${row(
+            'bbb222',
+            'dh-r1-anchor',
+            'anchor',
+            anchorState
+          )}\n`,
+          stderr: ''
+        }
+      }
+      if (args[0] === 'stop' && args.includes('aaa111')) {
+        return { code: 1, stdout: '', stderr: 'web is wedged' }
+      }
+      if (args[0] === 'stop' && args.includes('ccc333')) emulatorState = 'exited'
+      if (args[0] === 'stop' && args.includes('ddd444')) runtimeState = 'exited'
+      if (args[0] === 'stop' && args.includes('bbb222')) anchorState = 'exited'
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    const failure = await new OciCliBackend()
+      .stopRoomPod('r1')
+      .then(() => 'resolved', (error: unknown) => (error instanceof Error ? error.message : String(error)))
+    expect(failure).toMatch(/Room r1 stop incomplete: dh-r1-web/)
+    expect(failure).toMatch(/web is wedged/)
+    expect(failure).not.toMatch(/dh-r1-anchor|dh-r1-svc-emulator|dh-r1-android-runtime-anchor/)
+    const stopped = mockedRunDocker.mock.calls.map(([args]) => args).filter((args) => args[0] === 'stop')
+    expect(stopped.map((args) => args.at(-1))).toEqual(['aaa111', 'ccc333', 'ddd444', 'bbb222'])
+  })
+
+  it('never force-kills: only graceful stops of owned active containers, fenced helpers included', async () => {
+    let webState = 'running'
+    let jobState = 'running'
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'ps') {
+        return {
+          code: 0,
+          stdout: `${row('aaa111', 'dh-r1-web', 'web', webState)}\n${row(
+            'eee555',
+            'dh-r1-job-11111111222243338444555555555555',
+            'job',
+            jobState
+          )}\n${row('bbb222', 'dh-r1-anchor', 'anchor', 'exited')}\n`,
+          stderr: ''
+        }
+      }
+      if (args[0] === 'stop' && args.includes('aaa111')) webState = 'exited'
+      if (args[0] === 'stop' && args.includes('eee555')) jobState = 'exited'
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await new OciCliBackend().stopRoomPod('r1')
+
+    const commands = mockedRunDocker.mock.calls.map(([args]) => args)
+    expect(commands.filter((args) => args[0] === 'kill' || args[0] === 'rm')).toEqual([])
+    expect(commands.filter((args) => args[0] === 'stop')).toEqual([
+      ['stop', '-t', '8', 'aaa111'],
+      ['stop', '-t', '5', 'eee555']
+    ])
+  })
+
   it('throws when a container still reports running after successful stop', async () => {
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'ps') {

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { BuildIdentity } from './buildIdentity'
 
 /** Zod schemas shared by the loopback control API (main process) and the MCP server. */
 
@@ -7,6 +8,18 @@ export const zActor = z.enum(['user', 'devhotel', 'agent'])
 export const zPmKind = z.enum(['npm', 'pnpm'])
 export const zProviderKind = z.enum(['web', 'android', 'windows'])
 export const zServiceKind = z.enum(['postgres', 'redis'])
+/**
+ * The Android emulator versions a Room may be configured for.
+ *
+ * Named rather than inlined so there is exactly one list. The Stack tab renders
+ * it, this schema validates against it, and `ANDROID_API_LEVELS` in
+ * `@devhotel/core` maps it to API levels — and a version present here with no
+ * pinned system image silently routes a managed Room back to
+ * `budtmo/docker-android`, which is the regression #111's Android claim turns on.
+ * `backend.androidSdkPin.test.ts` asserts the two agree.
+ */
+export const zAndroidEmulatorVersion = z.enum(['14.0', '13.0', '12.0', '11.0'])
+export const ANDROID_EMULATOR_VERSIONS = zAndroidEmulatorVersion.options
 export const zRoomId = z.string().regex(/^[a-z0-9]{8}$/, 'valid Room ID')
 export const zChangeId = z.string().uuid()
 export const zOperationId = z.string().uuid()
@@ -88,7 +101,7 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('emulator-config'),
     device: z.string().regex(/^[A-Za-z0-9 ().-]{2,40}$/),
-    version: z.enum(['14.0', '13.0', '12.0', '11.0']),
+    version: zAndroidEmulatorVersion,
     resolution: z.enum(['native', 'balanced', 'fast']).optional(),
     orientation: z.enum(['portrait', 'landscape']).optional()
   }).strict(),
@@ -132,7 +145,13 @@ export const zRendererPlanRoomInput = zPlanRoomInput.superRefine((input, ctx) =>
 })
 export type RendererPlanRoomInput = z.infer<typeof zRendererPlanRoomInput>
 
+export const zRoomTaskIdentity = z.object({
+  taskId: z.string().trim().min(1).max(200).optional(),
+  issueRef: z.string().trim().min(1).max(500).optional()
+}).strict()
+
 export const zCreateRoomInput = z.object({
+  ...zRoomTaskIdentity.shape,
   sourceType: zSourceType,
   sourceRef: z.string().max(4096),
   project: z.string().trim().min(1).max(100),
@@ -169,6 +188,9 @@ export const zAgentCreateRoomInput = zPublicCreateRoomInput
     message: 'Agents cannot create linked-folder Rooms without a user-approved host-folder grant',
     path: ['sourceType']
   })
+/** Acquisition uses the same strict agent source and provider boundary. */
+export const zAgentAcquireRoomInput = zAgentCreateRoomInput
+export type AgentAcquireRoomInput = z.infer<typeof zAgentAcquireRoomInput>
 export type AgentCreateRoomInput = z.infer<typeof zAgentCreateRoomInput>
 
 /** Room mutations agents may request through the control API, beyond create/change. */
@@ -232,11 +254,10 @@ export const zRunInRoomInput = z.object({
   timeoutMs: z.number().int().positive().max(600_000).optional()
 }).strict()
 
-export interface ControlInfo {
+export interface ControlInfo extends BuildIdentity {
   port: number
   token: string
   pid: number
-  version: string
 }
 
 /**
@@ -248,6 +269,7 @@ export const CONTROL_ROUTES = {
   ping: { method: 'GET', path: '/v1/ping' },
   listRooms: { method: 'GET', path: '/v1/rooms' },
   createRoom: { method: 'POST', path: '/v1/rooms' },
+  acquireRoom: { method: 'POST', path: '/v1/rooms/acquire' },
   inspectRoom: { method: 'GET', path: '/v1/rooms/:id' },
   startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
   getOperation: { method: 'GET', path: '/v1/operations/:operationId' },

@@ -57,6 +57,8 @@ DevHotel is currently in developer preview. While the long-term goal is a zero-p
 
 Run the installer and DevHotel starts in the system tray. Auto-updates verify checksums against `latest.yml` before downloading. Releases are cut locally — see [Releasing](./docs/releasing.md).
 
+Packaged DevHotel sends at most one anonymous PurplePulse startup ping per UTC day containing only install ID, app version, OS, platform, and telemetry schema version; the payload does not include usernames, device names, paths, arguments, or an IP field.
+
 ## Hotel Services
 
 A **Hotel Service** is shared infrastructure owned once by DevHotel and lent or bound to Rooms with explicit permissions, rather than being re-installed in every Room:
@@ -91,11 +93,13 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "<path-to-DevHotel.
 ```
 *Always register using absolute paths so agents started outside DevHotel's environment can resolve the executable.*
 
-### MCP tool surface (52 tools)
+Agents should start with `acquire_room`. Matching ignores nicknames and uses canonical source, project, provider and requested runtime settings. Existing modified state is preserved. Direct `create_room` rejects compatible duplicates with `ROOM_REUSE_REQUIRED` and `evidence.roomId`; a distinct `taskId` or `issueRef` permits parallel work and is persisted for subsequent reuse. Manual desktop creation remains available.
 
-The bundled MCP server exposes 52 tools across the complete development lifecycle:
+### MCP tool surface (53 tools)
 
-- **Room Lifecycle & Health (12):** `list_rooms`, `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
+The bundled MCP server exposes 53 tools across the complete development lifecycle:
+
+- **Room Lifecycle & Health (13):** `list_rooms`, `acquire_room` (default; reuses/wakes compatible Rooms), `create_room` (`web` | `android`), `inspect_room`, `start_room`, `check_operation`, `sleep_room`, `delete_room`, `rename_room`, `hotel_status`, `check_room` (15-step pipeline), `room_logs`, `copy_diagnostic`.
 - **Working State, Changes & Sync (10):** `apply_quick_change`, `undo_change`, `list_changes`, `room_components`, `restart_web`, `clone_room`, `reset_room`, `safe_resync_from_host`, `sync_from_host`, `reset_sync_baseline`.
 - **Execution & Output Retention (3):** `run_in_room` (bounded output with server-side substring filter), `read_run_output` (paging retained output by byte offset with optional base64), `list_room_runs`.
 - **Room Files (2):** `room_pull_file`, `room_push_file` (workspace-scoped file transfer).
@@ -110,7 +114,7 @@ The bundled MCP server exposes 52 tools across the complete development lifecycl
 External agents can drive DevHotel directly over the loopback REST API without MCP. On startup, DevHotel writes `%APPDATA%\DevHotel\control.json` containing the current port and bearer token:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.2" }
+{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.4" }
 ```
 
 See [Control API (v1)](./docs/control-api.md) for endpoint details and agent security boundaries.
@@ -151,7 +155,7 @@ packages/core     Orchestrator — OCI room backend (docker CLI), VMware backend
                   local gateway (*.localhost + SNI TLS + local CA), SQLite store,
                   change transaction engine with undo, 15-step check pipeline,
                   secret-redacted diagnostics, device broker
-packages/mcp      devhotel-mcp — stdio MCP server (52 tools over the control API)
+packages/mcp      devhotel-mcp — stdio MCP server (53 tools over the control API)
 packages/shared   Shared schemas, contracts, and host input boundary definitions
 ```
 
@@ -162,6 +166,8 @@ packages/shared   Shared schemas, contracts, and host input boundary definitions
 - [Android Acceptance Reports](./docs/android-acceptance-reports.md) — Cryptographically sealed verification receipts.
 - [Android Locale Matrix](./docs/android-locale-matrix.md) — App-scoped locale testing and recovery contract.
 - [Host Input Isolation](./docs/host-input-isolation.md) — Desktop cursor and window protection contract.
+- [The Host Footprint](./docs/host-footprint.md) — What DevHotel owns on a machine, and the proofs required to reclaim any of it.
+- [Room-aware volume GC](./docs/volume-gc.md) — Why `docker volume prune` is never the answer, and how a bounded pass proves each volume orphaned first.
 - [Releasing](./docs/releasing.md) — Release packaging, checksum verification, and update process.
 - [Changelog](./CHANGELOG.md) — Detailed version history and release notes.
 - [Product Definition (`goal.md`)](./goal.md) — Original product specification (Korean).

@@ -158,10 +158,14 @@ export function classifyNetworkCreateError(
 ): Error {
   if (err instanceof DevHotelError) return err
   const detail = `${(err as { stderr?: string })?.stderr ?? ''} ${(err as Error)?.message ?? String(err)}`
-  if (/all predefined address pools have been fully subnetted|could not find an available, non-overlapping IPv4 address pool/i.test(detail)) {
+  if (
+    /all predefined address pools have been fully subnetted|could not find an available, non-overlapping IPv4 address pool|Pool overlaps with other one on this address space|invalid pool request/i.test(
+      detail
+    )
+  ) {
     return new DevHotelError(
       'NETWORK_POOL_EXHAUSTED',
-      `DevHotel network address pool exhausted: Docker reported address pools fully subnetted when creating network ${networkName}.`,
+      `DevHotel network address pool exhausted: Docker reported address pools fully subnetted or overlapping when creating network ${networkName}.`,
       {
         recoveryHint: 'Delete unused rooms or clean up unattached networks to free subnet capacity before creating new rooms.',
         httpStatus: 507,

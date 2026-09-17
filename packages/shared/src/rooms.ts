@@ -1,4 +1,4 @@
-export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken'
+export type RoomStatus = 'preparing' | 'running' | 'ready' | 'sleeping' | 'attention' | 'broken' | 'deleting'
 export type SourceType = 'managed-git' | 'linked-folder' | 'empty'
 export type Actor = 'user' | 'devhotel' | 'agent'
 export type PmKind = 'npm' | 'pnpm' | 'gradle' | 'none'
@@ -29,6 +29,15 @@ export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
 export type RuntimeComponentState = 'running' | 'exited' | 'stopped' | 'missing' | 'unknown' | 'not-checked'
 export type RoomRuntimeState = 'running' | 'degraded' | 'dead' | 'stopped' | 'unknown'
+export type RoomLifecycleState = 'active' | 'expired'
+
+export interface RoomLifecycleMetadata {
+  state: RoomLifecycleState
+  /** Set when the Room first enters expiry grace; null while active. */
+  expiredAt: string | null
+  /** Present only when policy, rather than a person or recovery gate, slept the Room. */
+  autoSleptAt?: string | null
+}
 
 /** Live, read-only runtime observation. This never replaces persisted working-state or sync metadata. */
 export interface RoomRuntimeStatus {
@@ -70,7 +79,21 @@ export interface VmwareRoomConfig {
   snapshot: string
 }
 
-export interface RoomRecord {
+export interface RoomTaskIdentity {
+  /** Stable task ID; changing a display nickname never creates a new identity. */
+  taskId?: string
+  issueRef?: string
+}
+
+export interface AcquireRoomResult {
+  room: RoomRecord
+  disposition: 'created' | 'reused' | 'woken'
+  reason: string
+  /** Existing Room source state is preserved, including unsynced modifications. */
+  modified: boolean
+}
+
+export interface RoomRecord extends RoomTaskIdentity {
   id: string
   project: string
   nickname: string
@@ -115,6 +138,12 @@ export interface RoomRecord {
   hostPort: number | null
   createdAt: string
   lastUsedAt: string
+  /** Durable activity clock used by automatic sleep and expiry policy. */
+  lastActivityAt?: string
+  /** Pinned Rooms may sleep but are never expired or automatically deleted. */
+  pinned?: boolean
+  /** Durable lifecycle transition metadata. Missing legacy data means active. */
+  lifecycle?: RoomLifecycleMetadata
   thumbPath: string | null
 }
 
@@ -185,7 +214,7 @@ export interface RoomPlan {
   warnings: string[]
 }
 
-export interface CreateRoomInput {
+export interface CreateRoomInput extends RoomTaskIdentity {
   sourceType: SourceType
   sourceRef: string
   project: string

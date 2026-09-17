@@ -114,14 +114,15 @@ describe('streaming Room process guards', () => {
     })
 
     expect(mockedRunDocker).toHaveBeenCalledWith(
-      ['exec', id, 'sh', '-lc', 'bounded'],
+      ['exec', '-e', expect.stringMatching(/^DEVHOTEL_EXEC_TOKEN=[0-9a-f-]{36}$/), id, 'sh', '-lc', 'bounded'],
       {
         timeoutMs: 30_000,
         signal: controller.signal,
         maxStdoutBytes: 1234,
         maxStderrBytes: 5678,
         onStdout,
-        onStderr
+        onStderr,
+        onAbort: expect.any(Function)
       }
     )
   })
