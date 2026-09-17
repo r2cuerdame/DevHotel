@@ -105,6 +105,10 @@ import {
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
 import type { HostFootprint, HostGcResult, LifecycleQuotas, QuotaVerdict } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
+import { ClientBrowserManager } from './browser/clientBrowserManager'
+import { HostChromiumRuntime } from './browser/hostChromiumRuntime'
+import type { ClientBrowserRuntime } from './browser/runtime'
+import { clientBrowserRepo } from './store/clientBrowserRepo'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
@@ -1285,6 +1289,11 @@ export interface OrchestratorOptions {
   gitCredential?: GitCredentialResolver
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
+  /**
+   * Where Client Browsers run. Defaults to host-side Chromium, which is what
+   * the Docker path can offer; a managed runtime supplies its own.
+   */
+  clientBrowserRuntime?: ClientBrowserRuntime
   lifecyclePolicy?: Partial<RoomLifecyclePolicy>
   /**
    * Durable record of the Host ingress ports this install opened. Supplied when
@@ -1418,6 +1427,8 @@ export class RoomOrchestrator {
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
+  /** Isolated automation browsers agents borrow per Room; separate from the Room's hosted web server. */
+  readonly clientBrowsers: ClientBrowserManager
   private readonly gitCredential?: GitCredentialResolver
   private readonly lifecyclePolicy: RoomLifecyclePolicy
   private readonly ingressLedger: IngressLedger | null
@@ -1504,6 +1515,20 @@ export class RoomOrchestrator {
         return room !== null && room.status !== 'sleeping' && room.status !== 'broken'
       }
     })
+    this.clientBrowsers = new ClientBrowserManager({
+      userData: opts.userData,
+      repo: clientBrowserRepo(opts.db),
+      settings: this.settings,
+      runtime: opts.clientBrowserRuntime ?? new HostChromiumRuntime(),
+      generation: randomUUID(),
+      rooms: {
+        get: (roomId) => {
+          const room = this.rooms.get(roomId)
+          return room ? { id: room.id, project: room.project, nickname: room.nickname, status: room.status } : null
+        }
+      },
+      log: (line) => this.olog('system', line)
+    })
     registerQuickChanges(this.engine)
   }
 
@@ -1579,6 +1604,15 @@ export class RoomOrchestrator {
       }
     }
     await this.gateway.start()
+    // Browsers from the previous process are unreachable through their
+    // endpoints; stop what is provably ours and forget the rest. Fail-soft:
+    // a stuck browser must not keep Rooms from reconciling.
+    try {
+      await this.clientBrowsers.reconcile()
+      await this.clientBrowsers.start()
+    } catch (error) {
+      this.olog('system', `client browser reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
     if (health.ok) {
@@ -2558,6 +2592,13 @@ export class RoomOrchestrator {
       }
     }))
     failures.push(...roomFailures.filter((error): error is Error => error !== null))
+    // Sleeping a Room already released its browsers; this catches the rest
+    // (broken Rooms, fenced Rooms) and closes the endpoint.
+    try {
+      await bounded('Client Browsers stop', () => this.clientBrowsers.shutdown())
+    } catch (error) {
+      failures.push(asShutdownError('Client Browsers could not be stopped', error))
+    }
     try {
       this.logs.dispose()
     } catch (error) {
@@ -4351,6 +4392,7 @@ export class RoomOrchestrator {
     this.olog(roomId, 'sleep room')
     this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
+    await this.releaseClientBrowsersLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
       this.rooms.update(roomId, {
@@ -4693,6 +4735,7 @@ export class RoomOrchestrator {
     this.olog(roomId, 'delete room')
     this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
+    await this.releaseClientBrowsersLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
       this.rooms.update(roomId, { status: 'deleting' })
@@ -7549,6 +7592,19 @@ export class RoomOrchestrator {
 
   refreshAndroidDevices(): Promise<ReturnType<AndroidDeviceBroker['listDevices']>> {
     return this.devices.refreshInventory()
+  }
+
+  /**
+   * A Room's browsers end with the Room's runtime. Fail-soft: a browser that
+   * will not die is logged and left for the next reconcile, never a reason to
+   * keep a Room awake or undeleted.
+   */
+  private async releaseClientBrowsersLocked(roomId: string, reason: string): Promise<void> {
+    try {
+      await this.clientBrowsers.releaseRoom(roomId, reason)
+    } catch (error) {
+      this.olog(roomId, `client browser release failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   androidDeviceStatus(): DeviceBrokerStatus {
