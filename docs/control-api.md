@@ -43,8 +43,13 @@ Mutations through this API run as actor `agent` and appear (undoably) in the
 room's Changes list. Host boundaries hold:
 
 - Linked-folder rooms: `sourceRef` reads as `[Host folder hidden]`, inspection
-  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms
-  or delete Host-linked ones.
+  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms.
+  Agents may delete a Host-linked room (`linked-folder` source or
+  `legacy-host-bind` workspace) only while it is `sleeping` and holds no
+  pending Room-owned edits (`syncStatus` is `synced` or `legacy`); an awake or
+  `modified` room answers `403`. Deletion tears down the Room's guest
+  containers, networks and internal volumes only — the Host folder is never
+  deleted or modified.
 - Agent mutations on `legacy-host-bind` rooms are refused until the user moves
   the room into the Hotel.
 - `safe-resync-from-host` (and the lower-level `sync-from-host`) runs under the Room's **inbound-sync grant**: the human
@@ -290,7 +295,7 @@ credential connected to the GitHub Service even when the URL carries none.
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
 | `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
-| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
+| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms unless they are `sleeping` with `syncStatus` `synced` or `legacy` (the Host folder itself is never touched) |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
 | `POST /v1/rooms/:id/sleep` | | `204` |
 | `POST /v1/rooms/:id/restart-web` | | change entry |

@@ -11,6 +11,16 @@ import type {
 import type { Db } from './db'
 import { redactSecrets } from '../diagnostics/redact'
 
+/**
+ * Android device events kept across the whole Hotel, newest first. The
+ * broker reads at most the latest few dozen for status; the window bounds a
+ * flapping USB bus that would otherwise append forever. Detail text is capped
+ * per row so the retained window has a byte budget, not only a row budget.
+ * See docs/control-plane-retention.md.
+ */
+export const ANDROID_DEVICE_EVENTS_RETAINED = 2_000
+export const ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS = 2_048
+
 interface DeviceRow {
   id: string
   serial: string
@@ -585,14 +595,35 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
     },
     recordEvent(input) {
       const id = randomUUID()
-      const detail = redactSecrets(input.detail)
-      sqlite
-        .prepare('INSERT INTO android_device_events (id, device_id, room_id, kind, detail, at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, input.deviceId, input.roomId, input.kind, detail, input.at)
+      const redacted = redactSecrets(input.detail)
+      const detail = redacted.length > ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS
+        ? `${redacted.slice(0, ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS - 1)}…`
+        : redacted
+      const ownsTransaction = !sqlite.isTransaction
+      if (ownsTransaction) sqlite.exec('BEGIN')
+      try {
+        sqlite
+          .prepare('INSERT INTO android_device_events (id, device_id, room_id, kind, detail, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(id, input.deviceId, input.roomId, input.kind, detail, input.at)
+        // Walk the `at` index past the retained window and drop the rest. The
+        // rowid tiebreak is covered by that index; ordering by id would read
+        // every retained row's page on each insert.
+        sqlite
+          .prepare(
+            `DELETE FROM android_device_events WHERE rowid IN (
+               SELECT rowid FROM android_device_events ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?
+             )`
+          )
+          .run(ANDROID_DEVICE_EVENTS_RETAINED)
+        if (ownsTransaction) sqlite.exec('COMMIT')
+      } catch (error) {
+        if (ownsTransaction && sqlite.isTransaction) sqlite.exec('ROLLBACK')
+        throw error
+      }
       return { id, deviceId: input.deviceId, roomId: input.roomId, kind: input.kind, detail, at: input.at }
     },
     recentEvents: (limit = 50) =>
-      (sqlite.prepare('SELECT * FROM android_device_events ORDER BY at DESC, id DESC LIMIT ?').all(limit) as unknown as EventRow[]).map(toEvent)
+      (sqlite.prepare('SELECT * FROM android_device_events ORDER BY at DESC, rowid DESC LIMIT ?').all(limit) as unknown as EventRow[]).map(toEvent)
   }
   return repo
 }

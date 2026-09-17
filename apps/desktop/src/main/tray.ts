@@ -48,6 +48,9 @@ export function createTray(opts: {
     const rooms = orch.listRooms()
     const running = rooms.filter((r) => r.status === 'running' || r.status === 'ready' || r.status === 'attention')
     const health = await orch.backendHealth().catch(() => ({ ok: false, detail: 'unreachable' }))
+    // A half-started Hotel must say so where the human looks first; the same
+    // code is what /v1/status carries for agents.
+    const startup = orch.startupStatus()
 
     const menu = Menu.buildFromTemplate([
       { label: 'Open DevHotel', click: show },
@@ -66,6 +69,9 @@ export function createTray(opts: {
         }
       },
       { type: 'separator' },
+      ...(startup.state === 'failed'
+        ? [{ label: `Startup failed (${startup.code}) · open DevHotel for details`, click: show }]
+        : []),
       { label: health.ok ? 'Backend: healthy' : 'Backend: not available', enabled: false },
       {
         label: 'Start with Windows',
