@@ -27,7 +27,15 @@ async function silentServer(): Promise<number> {
 }
 
 function clientFor(port: number): ControlClient {
-  return new ControlClient({ port, token: TOKEN, pid: process.pid, version: 'test' })
+  return new ControlClient({
+    port,
+    token: TOKEN,
+    pid: process.pid,
+    version: 'test',
+    commit: 'a'.repeat(40),
+    buildTime: '2026-08-25T00:00:00.000Z',
+    sourceVerified: true
+  })
 }
 
 describe('the client’s own deadline', () => {
