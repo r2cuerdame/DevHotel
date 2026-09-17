@@ -197,6 +197,7 @@ import { buildHostFootprint } from './lifecycle/footprint'
 import { observeHost } from './lifecycle/adapter'
 import { executeHostGc, type HostGcOptions } from './lifecycle/gc'
 import { DEFAULT_LIFECYCLE_QUOTAS, evaluateQuotas, type QuotaRequest } from './lifecycle/quotas'
+import { sweepStaleStaging, type StagingSweepReport } from './lifecycle/stagingSweep'
 import { nodeSharedCacheMounts } from './lifecycle/sharedCache'
 import type { IngressLedger } from './lifecycle/ingressLedger'
 import {
@@ -1336,6 +1337,8 @@ export interface StartupStatus {
   detail: string | null
   backendOk: boolean | null
   at: string | null
+  /** Crash-leftover staging reclaimed by the latest init; counts only, never paths. */
+  stagingSweep: StagingSweepReport | null
 }
 
 export interface ShutdownOptions {
@@ -1398,7 +1401,10 @@ export class RoomOrchestrator {
   private readonly materializingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
-  private startup: StartupStatus = { state: 'pending', code: null, detail: null, backendOk: null, at: null }
+  private startup: StartupStatus = { state: 'pending', code: null, detail: null, backendOk: null, at: null, stagingSweep: null }
+  private lastStagingSweep: StagingSweepReport | null = null
+  /** Host-private staging directories owned by in-flight operations of this process. */
+  private readonly liveStaging = new Set<string>()
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
   private readonly userData: string
   private readonly backend: IsolationBackend
@@ -1504,7 +1510,14 @@ export class RoomOrchestrator {
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
     try {
       const result = await this.initLocked()
-      this.startup = { state: 'ready', code: null, detail: null, backendOk: result.backendOk, at: new Date().toISOString() }
+      this.startup = {
+        state: 'ready',
+        code: null,
+        detail: null,
+        backendOk: result.backendOk,
+        at: new Date().toISOString(),
+        stagingSweep: this.lastStagingSweep
+      }
       return result
     } catch (error) {
       // The failure still propagates: the desktop decides what to keep
@@ -1514,7 +1527,8 @@ export class RoomOrchestrator {
         code: 'STARTUP_INIT_FAILED',
         detail: error instanceof Error ? error.message : String(error),
         backendOk: null,
-        at: new Date().toISOString()
+        at: new Date().toISOString(),
+        stagingSweep: this.lastStagingSweep
       }
       throw error
     }
@@ -1548,6 +1562,11 @@ export class RoomOrchestrator {
     // stop an uncertain exported workspace before any unrelated startup work
     // can abort initialization and leave the old Room record admissible.
     await this.reconcileInterruptedArtifactExports(staleJobsAbsent)
+    // Pull/push, physical ADB and sealed-install staging is Host-private and
+    // flat, so a crash before its finally leaves only bytes to reclaim. The
+    // sweep reports counts and never throws: a stuck stage must not stop
+    // unrelated Room reconciliation below.
+    this.lastStagingSweep = this.sweepStaleStagingDirectories()
     // Callers must never keep polling work that died with the prior process.
     this.markInterruptedOperations()
     for (const room of this.rooms.list()) {
@@ -2358,6 +2377,14 @@ export class RoomOrchestrator {
       }
     } catch {
       // Startup continues without exposing the Host-private cleanup detail.
+    }
+  }
+
+  private sweepStaleStagingDirectories(): StagingSweepReport {
+    try {
+      return sweepStaleStaging(this.userData, { live: this.liveStaging })
+    } catch {
+      return { rootOk: false, removed: 0, retained: 0, failed: 0 }
     }
   }
 
@@ -4878,6 +4905,7 @@ export class RoomOrchestrator {
       const safePath = this.validateRoomFilePath(roomId, path)
       const tmp = join(this.userData, 'tmp', `pull-${newRoomId()}`)
       mkdirSync(tmp, { recursive: true })
+      this.liveStaging.add(tmp)
       const hostFile = join(tmp, 'file.bin')
       try {
         await this.backend.copyFromRoom(roomId, safePath, hostFile)
@@ -4888,6 +4916,7 @@ export class RoomOrchestrator {
         return { path: safePath, size: stats.size, contentBase64: readFileSync(hostFile).toString('base64') }
       } finally {
         rmSync(tmp, { recursive: true, force: true })
+        this.liveStaging.delete(tmp)
       }
     })
   }
@@ -4908,12 +4937,14 @@ export class RoomOrchestrator {
       if (mkdir.code !== 0) throw new Error(`could not create ${dir}: ${mkdir.stderr.slice(-200)}`)
       const tmp = join(this.userData, 'tmp', `push-${newRoomId()}`)
       mkdirSync(tmp, { recursive: true })
+      this.liveStaging.add(tmp)
       const hostFile = join(tmp, 'file.bin')
       try {
         writeFileSync(hostFile, content)
         await this.backend.copyIntoRoom(roomId, hostFile, safePath)
       } finally {
         rmSync(tmp, { recursive: true, force: true })
+        this.liveStaging.delete(tmp)
       }
       this.markWorkspaceModified(roomId)
       return { path: safePath, size: content.byteLength }
@@ -7930,6 +7961,7 @@ export class RoomOrchestrator {
         const stagingRoot = join(this.userData, 'tmp')
         mkdirSync(stagingRoot, { recursive: true })
         stagedDir = mkdtempSync(join(stagingRoot, 'device-adb-'))
+        this.liveStaging.add(stagedDir)
         const privateStagingRoot = realpathSync(stagedDir)
         let stagedInstallBytes = 0
         for (const [stagedIndex, input] of workspaceInputs.entries()) {
@@ -7996,7 +8028,13 @@ export class RoomOrchestrator {
       // that happens to echo the transport serial cannot pierce the opaque ID.
       return redactAdbResult(result, authorized.serial, outputReplacements)
     } finally {
-      if (stagedDir) rmSync(stagedDir, { recursive: true, force: true })
+      if (stagedDir) {
+        try {
+          rmSync(stagedDir, { recursive: true, force: true })
+        } finally {
+          this.liveStaging.delete(stagedDir)
+        }
+      }
     }
   }
 
@@ -9680,6 +9718,7 @@ export class RoomOrchestrator {
 
       mkdirSync(stagingRoot, { recursive: true })
       stagingDir = mkdtempSync(join(stagingRoot, 'android-sealed-install-'))
+      this.liveStaging.add(stagingDir)
       stagedApk = join(stagingDir, 'installed.apk')
       copyFileSync(canonicalSource, stagedApk, constants.COPYFILE_EXCL)
       chmodSync(stagedApk, 0o400)
@@ -9806,6 +9845,10 @@ export class RoomOrchestrator {
           [stagingRoot, stagingDir, stagedApk],
           'Android private APK staging cleanup failed'
         )
+      } finally {
+        // A stage whose cleanup failed is no longer live; the next startup
+        // sweep may reclaim it once nothing in this process references it.
+        this.liveStaging.delete(stagingDir)
       }
     }
     if (operationError || cleanupError) {
