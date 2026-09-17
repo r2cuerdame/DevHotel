@@ -5,6 +5,7 @@ import type { ExecResult } from '../backend/types'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
+import { SCHEDULING_ALLOWANCE_MS } from './timing'
 
 const ROOM = 'room1abc'
 
@@ -66,7 +67,8 @@ describe('Room workload slot vs lifecycle lock', () => {
 
     const sleepStarted = Date.now()
     await orch.sleepRoom(ROOM, 'user')
-    expect(Date.now() - sleepStarted).toBeLessThan(2_000)
+    // Sleep pre-empted the 600s command instead of queueing behind it.
+    expect(Date.now() - sleepStarted).toBeLessThan(SCHEDULING_ALLOWANCE_MS)
 
     await expect(exec).rejects.toMatchObject({ code: 'ROOM_COMMAND_CANCELLED', httpStatus: 409 })
     expect(backend.reapedExecs).toHaveLength(1)

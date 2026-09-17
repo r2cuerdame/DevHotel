@@ -14,6 +14,7 @@ import {
 } from '../backend/managedRuntimeGuestProtocol'
 import type { ManagedRuntimeChannel } from '../backend/managedRuntimeEngine'
 import type { ManagedHyperVGuestChannel } from '../backend/managedHyperVRuntime'
+import { until } from './timing'
 
 vi.mock('../backend/cli', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backend/cli')>()
@@ -133,7 +134,10 @@ describe('connectGuestChannel', () => {
 
     const channel = await connectGuestChannel({ ...channelFacts, address: '127.0.0.1', port })
     channel.onData((chunk) => received.push(chunk))
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    await until(
+      () => new GuestFrameDecoder().push(Buffer.concat(received)).some((frame) => frame.id === 99),
+      { what: 'the guest reply frame over loopback' }
+    )
 
     const frames = new GuestFrameDecoder().push(Buffer.concat(received))
     expect(frames.map((frame) => frame.id)).toContain(99)
