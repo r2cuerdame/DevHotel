@@ -492,3 +492,174 @@ The order has not changed, but one step has been added ahead of the reboot:
 Nothing above is a gate pass. Two of the reasons it is not are now smaller than
 they were this morning, and one of them — the feature read — was a defect the
 VM would have found for us at much greater cost.
+
+---
+
+# What the third attempt found — 2026-09-17, `main@cffc4d0`
+
+The gate was dispatched a third time. It still did not run. What changed is that
+the **registry blocker is gone from the code**, and the one environment
+alternative this machine appeared to offer was measured and ruled out rather
+than left as an open possibility.
+
+## Blocker 1 is closed in code — the runtime builds the preview image
+
+The second attempt escalated the private GHCR package as something only a human
+could fix, because making a package public is an outward-facing, irreversible
+publish. The coordinator's direction was to remove the dependency instead, and
+that is what landed.
+
+`ManagedRoomBackend.createEmulator()` no longer runs `docker pull` against
+`ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe…`. It calls
+`ensureEmulatorPreviewImage()`, which builds the image inside the managed
+runtime from `images/android-emulator-preview/Dockerfile`.
+
+| Property | How it is held |
+|---|---|
+| Runtime has no repository tree | The Dockerfile is embedded in `managedEmulatorPreviewImage.ts`; a test asserts it is byte-identical to the committed file, so the copy cannot drift from what a reviewer reads |
+| One tag per Dockerfile, every platform | The digest is taken over the embedded LF string, not the file on disk — a `core.autocrlf` checkout would otherwise build a differently-tagged identical image |
+| Cache across Rooms, rename across edits | The tag **is** the Dockerfile's SHA-256, so the second Room builds nothing and an edited Dockerfile is a different image rather than a stale one |
+| A tag is not evidence | The build stamps the digest into a label; a cache hit is adopted only when the label agrees, and anything else on the tag is rebuilt over rather than trusted |
+| A build that lies is caught early | The label is re-read after the build, so a build that exits 0 without leaving a usable image fails where the cause is visible, not at `docker create` |
+| The boundary is crossed explicitly | The Dockerfile is staged into the guest with `putFile` — a Host path handed to the guest engine would have resolved inside the guest and found nothing — and discarded in a `finally` |
+| No Host Docker | Everything above goes through `this.managedEngine`, the guest engine |
+| Still not docker-android | Asserted directly; #136's contract is unchanged |
+
+What crosses the network is the Ubuntu base layer, pinned by digest and served
+anonymously by Docker Hub, and Ubuntu's own apt pool — the same bytes the GHCR
+image was itself built from. **A clean Windows 11 VM now needs no GitHub
+credential to reach a working emulator preview.**
+
+`String.raw` in the embedding is load-bearing and has its own test. The
+Dockerfile's line continuations are trailing backslashes; in a cooked template
+literal a backslash-newline is a line continuation that *deletes* the newline,
+which would collapse the `apt-get` block into one line that still looks correct
+in the diff and is wrong in the container.
+
+The publish workflow was repurposed rather than deleted. It no longer logs in,
+no longer asks for `packages: write`, and no longer pushes — which also ends the
+`permission_denied: read_package` failure that had been red on `main`. It builds
+the Dockerfile and asserts that every tool the managed entrypoint calls by name
+is present. That guard matters **more** now, not less: the build has moved onto
+every user's machine, so a package leaving the Jammy apt pool would break every
+fresh install rather than one release. It is also scheduled weekly, because the
+apt pool moves without this repository changing.
+
+**This is not the Android gate row.** It removes the reason that row could not
+be attempted. The row still needs a clean Windows 11 VM, and the emulator still
+has to actually boot — which has not happened on any machine.
+
+## The VMware path — measured, and closed
+
+Both earlier attempts recorded that this Host cannot supply the environment
+because Hyper-V is absent. Neither noticed that **VMware Workstation 26.0.0 is
+installed here**, with three existing Windows 11 guests under
+`C:\Users\recue\Documents\Virtual Machines`. That looked like an environment
+this gate could use without touching Hyper-V at all, so it was tested rather
+than assumed.
+
+A throwaway VM was created in the scratchpad with `vhv.enable = "TRUE"` — the
+setting that exposes nested virtualization to the guest — and powered on
+headless. VMware's own log:
+
+```
+IOPL_Init: Hyper-V detected by CPUID
+Monitor Mode: ULM
+[msg.cpuid.noVHVQuestion] Virtualized AMD-V/RVI is not supported on this platform.
+```
+
+The probe VM was destroyed afterwards; the three existing VMs were not touched.
+
+Read in order, those three lines are the whole answer. The root Hyper-V
+hypervisor is running — `VirtualMachinePlatform` is enabled, which is what WSL2
+and Docker Desktop need — so VMware runs in **ULM** (user-level monitor) mode,
+and ULM cannot expose AMD-V to a guest. A Windows 11 guest under VMware on this
+Host therefore **cannot run Hyper-V**, and so cannot host DevHotel's managed
+Linux runtime. The gate cannot be run from there.
+
+The irony is worth recording because it closes the alternative properly rather
+than by preference: making VMware able to host this gate would mean disabling
+`VirtualMachinePlatform`, which is exactly what Docker Desktop and WSL2 run
+on — the compatibility backend the other agents' Rooms are using right now. Both
+paths, Hyper-V and VMware, converge on the same precondition: elevation, a
+reboot, and a Host with no active work on it.
+
+## The environment, re-measured a third time
+
+```
+Edition                : Microsoft Windows 11 Pro (26200)
+Elevated               : False
+Microsoft-Hyper-V-All  : InstallState 2 (Disabled) — vmms.exe absent, New-VM not recognised
+VirtualMachinePlatform : InstallState 1 (Enabled)  — why VMware is stuck in ULM
+HypervisorPlatform     : InstallState 2 (Disabled)
+Free space on C:       : 457.6 GB
+Windows 11 ISO         : none on this machine
+Last boot              : 2026-09-16 18:57 — unchanged since the second attempt
+```
+
+The Host is still mid-flight, so the milestone reboot's precondition — that it
+will not corrupt active work — is still not met:
+
+```
+8  DevHotel processes (oldest 2026-09-16 18:59)
+14 node, 4 claude, 12 orca processes  — a live multi-agent session
+csx-451-test-pg                     Up 13 hours   — another agent's Postgres
+dh-njfstb4z-{anchor,svc-emulator}   Up 14 hours   — a live Room with a running emulator
+dh-29c5e8ys-{anchor,svc-emulator}   Up 14 hours   — a second one
+```
+
+Rebooting would destroy two other agents' running Rooms and a third agent's
+database. That is not a decision this dispatch can take on their behalf.
+
+## Suites, re-measured on this branch
+
+```
+@devhotel/core      96 files passed,  5 skipped   1751 passed, 12 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   2062 passed, 16 skipped
+```
+
+Core is 1751 rather than 1730: 21 of the new tests are
+`backend.managedEmulatorPreviewImage.test.ts`. `pnpm -r typecheck` clean across
+all four packages. `pnpm lint` 0 errors, 4 warnings — the same pre-existing
+unused-import warnings in `backend.network-lifecycle.test.ts`.
+
+One honest note on how that number was obtained: the first full-parallelism run
+of the core suite reported four failures, three of which
+(`artifacts.export`, `deviceBroker.room`, `roomStart.operations`) were
+accompanied by vitest `Timeout calling "onTaskUpdate"` worker-RPC errors and
+passed in isolation and at `--maxWorkers=4`. They are load flakes on a Host
+running two emulators and a live agent fleet, not regressions. The fourth was
+real and was this change's own: `backend.managedRoomBackend.androidEmulator`
+still asserted the image ref contained `ghcr.io/...` and was digest-pinned. It
+now asserts the opposite — that the ref names no registry at all.
+
+## Where #111 stands after three attempts
+
+| Group | Claims | State |
+|---|---|---|
+| A | fresh install, upgrade, rollback, reboot, crash/recovery, uninstall, North Star Web | Environment-blocked. Nothing else remains. |
+| B1 | Android without Host adb / Android Studio / Docker | **No longer registry-blocked.** Still only Android 14.0 is pinned; 13.0/12.0/11.0 fall through to docker-android. Never booted. |
+| B2 | Low disk | Behaviour landed (`bf6ce55`); needs its live row. |
+| B3 | Offline / retry | Behaviour landed (`bf6ce55`); needs its live row. |
+| B4 | Enterprise virtualization policy | Behaviour landed (`cffc4d0`); needs a policy-managed Host. |
+
+The remaining order, with one item struck out and one added:
+
+1. ~~Make the GHCR package publicly pullable and grant it to the repository.~~
+   **Obsolete** — the runtime builds the image, so there is no package to grant.
+2. Pin the remaining three Android system images, or narrow the claim to the
+   version that is pinned. This is now the only code-side item left on B1.
+3. **Then take the reboot**, on a Host with no active agent work, and run #106
+   rows 1–15 and #107's 17-row matrix in the clean VM. That needs a human at the
+   UAC prompt: `recue` is in `Administrators`, but `PromptOnSecureDesktop=1` puts
+   the consent dialog on the secure desktop, which an automated session cannot
+   answer.
+4. Fetch the Windows 11 Enterprise Evaluation ISO (~6 GB); none exists here.
+
+**Nothing above is a gate pass, and #111 is not acceptable on this evidence.**
+Every row of `issue-106-clean-windows-acceptance.md` and
+`issue-107-managed-web-rooms.md` is still blank.

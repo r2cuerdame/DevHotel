@@ -11,6 +11,7 @@ import {
   type EmulatorOpts
 } from './naming'
 import { androidApiLevel, ANDROID_SYSTEM_IMAGES, UnpinnedAndroidSystemImageError } from './androidSdkPin'
+import { MANAGED_EMULATOR_PREVIEW_IMAGE_REF } from './managedEmulatorPreviewImage'
 
 /**
  * The direct `emulator` launch plan for a managed Android Room (#108).
@@ -41,16 +42,15 @@ export const ANDROID_EMULATOR_DISPLAY = ':0'
  * any Android SDK baked in — the SDK is provisioned from pinned artifacts and
  * mounted as a volume at {@link ANDROID_SDK_ROOT}.
  *
- * This is NOT docker-android. It is a DevHotel-owned image built from
- * `images/android-emulator-preview/Dockerfile` in this repository and published
- * to GHCR via `.github/workflows/android-emulator-preview-image.yml`.
- *
- * The digest is pinned so the managed emulator path never implicitly updates.
- * To update: rebuild the image, replace the digest below, run
- * `pnpm typecheck && pnpm test`, and open a PR.
+ * This is NOT docker-android, and as of #111 it is no longer pulled from a
+ * registry either. It is built inside the managed runtime from the Dockerfile
+ * this repository carries, so a machine with no GitHub credential can reach it;
+ * see `managedEmulatorPreviewImage.ts` for why that matters and what the tag
+ * proves. The reference is a local, content-addressed tag — there is nothing
+ * to pull and nothing to publish.
  */
-export const MANAGED_EMULATOR_PREVIEW_IMAGE =
-  'ghcr.io/r2cuerdame/devhotel-android-emulator-preview@sha256:6ca7fe3869a5d049a0d328873d4594a49435a348f34ef6f07413165e8fd8118c'
+export const MANAGED_EMULATOR_PREVIEW_IMAGE = MANAGED_EMULATOR_PREVIEW_IMAGE_REF
+
 
 /**
  * Fixed console/adb ports.
@@ -335,6 +335,17 @@ export function buildManagedEmulatorContainerArgs(
 
   return [
     'create',
+    // The preview image is built locally and never published, so a reference to
+    // it must never become a registry request. Without this, a tag Docker cannot
+    // find is resolved against Docker Hub: measured, a missing
+    // `devhotel/android-emulator-preview` answers "pull access denied … may
+    // require 'docker login'", which is precisely the failure #111 exists to
+    // remove, and on a name anyone could register. `--pull never` fails in
+    // milliseconds against the local daemon instead, and says what is actually
+    // wrong. `ensureEmulatorPreviewImage` has already proved the image is here;
+    // this makes that the only way it can be.
+    '--pull',
+    'never',
     '--name',
     emulatorName(roomId),
     // Join the control anchor's network namespace (same as docker-android path).

@@ -321,6 +321,11 @@ export function buildAndroidSdkProvisionArgs(opts: {
   return [
     'run',
     '--rm',
+    // The preview image is built locally and never published, so a missing tag
+    // must fail against the local daemon rather than be resolved against Docker
+    // Hub — see the same flag on the emulator's `docker create`.
+    '--pull',
+    'never',
     // Never in a network: provisioner only downloads from dl.google.com.
     // Attach to the default bridge so DNS works, but no other container access.
     '--network',
