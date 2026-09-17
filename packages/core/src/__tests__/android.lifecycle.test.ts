@@ -98,6 +98,33 @@ describe('Android room lifecycle', () => {
     expect(backend.calls).toEqual(callsAfterWake)
   })
 
+  it('hands the emulator the Room CPU/memory limits so its budget cannot exceed them', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      provider: 'android',
+      sourceType: 'empty',
+      sourceRef: '',
+      workspaceMode: 'empty',
+      syncStatus: 'empty',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: 'gradle assembleDebug --no-daemon',
+      internalPort: 6080,
+      status: 'sleeping',
+      hostPort: null,
+      android: { device: 'Pixel 6', version: '15.0' },
+      os: { env: {}, cpus: 2, memoryMB: 2048 }
+    })
+    orch.rooms.create(room)
+
+    await orch.startRoom(room.id, 'user')
+
+    // The System tab's limits are documented as applying to the Room's
+    // containers; the emulator sidecar is one of them. Without this the
+    // measured 4-core/4096MB profile is requested for a 2-core/2GB Room.
+    expect(backend.emulatorLimits).toEqual([{ env: {}, cpus: 2, memoryMB: 2048 }])
+  })
+
   it('keeps the room usable for builds when the emulator cannot start (no KVM / pull failure)', async () => {
     const { backend, orch } = setup()
     backend.createEmulator = async () => {
@@ -119,6 +146,30 @@ describe('Android room lifecycle', () => {
     await orch.sleepRoom(room.id, 'user')
     await orch.startRoom(room.id, 'user')
     expect(orch.rooms.get(room.id)!.status).toBe('ready')
+  })
+
+  it('reuses a retained Android emulator on wake', async () => {
+    const { backend, orch } = setup()
+    const room = await orch.createRoom({
+      provider: 'android',
+      sourceType: 'empty',
+      sourceRef: '',
+      project: 'android-warm',
+      nickname: 'dev',
+      actor: 'user'
+    })
+
+    await orch.sleepRoom(room.id, 'user')
+    backend.resumeResult = { reused: true, hostPort: backend.hostPort }
+    backend.calls.length = 0
+    await orch.startRoom(room.id, 'user')
+
+    expect(orch.rooms.get(room.id)!.status).toBe('ready')
+    expect(backend.calls).toContain(`resumeRoomPod:${room.id}:android`)
+    // The emulator is started in-place alongside the web container.
+    expect(backend.calls.some((call) => call.startsWith('recreateAnchor:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('removeEmulator:'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('createEmulator:'))).toBe(false)
   })
 
   it('records an immutable APK build without marking the live working state as changed', async () => {

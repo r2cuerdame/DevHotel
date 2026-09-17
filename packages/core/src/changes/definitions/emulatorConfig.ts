@@ -17,13 +17,13 @@ type EmulatorSelection = {
 const DEFAULT_SELECTION: EmulatorSelection = {
   device: EMULATOR_DEFAULT_DEVICE,
   version: EMULATOR_DEFAULT_VERSION,
-  resolution: 'balanced',
+  resolution: 'fast',
   orientation: 'portrait'
 }
 
 function label(selection: EmulatorSelection): string {
   const orientation = selection.orientation === 'landscape' ? ', landscape' : ''
-  return `${selection.device} (Android ${selection.version}, ${selection.resolution ?? 'balanced'}${orientation})`
+  return `${selection.device} (Android ${selection.version}, ${selection.resolution ?? 'fast'}${orientation})`
 }
 
 export const emulatorConfigChange: ChangeDefinition<{
@@ -42,7 +42,7 @@ export const emulatorConfigChange: ChangeDefinition<{
       after: {
         device: p.device,
         version: p.version,
-        resolution: p.resolution ?? 'balanced',
+        resolution: p.resolution ?? 'fast',
         orientation: p.orientation ?? 'portrait'
       },
       undoable: true,
@@ -58,7 +58,7 @@ export const emulatorConfigChange: ChangeDefinition<{
       prev &&
       prev.device === p.device &&
       prev.version === p.version &&
-      (prev.resolution ?? 'balanced') === (p.resolution ?? 'balanced') &&
+      (prev.resolution ?? 'fast') === (p.resolution ?? 'fast') &&
       (prev.orientation ?? 'portrait') === (p.orientation ?? 'portrait')
     ) {
       throw new Error('Emulator settings are unchanged')
@@ -71,7 +71,7 @@ export const emulatorConfigChange: ChangeDefinition<{
     const next: EmulatorSelection = {
       device: p.device,
       version: p.version,
-      resolution: p.resolution ?? 'balanced',
+      resolution: p.resolution ?? 'fast',
       orientation: p.orientation ?? 'portrait'
     }
     ctx.rooms.update(ctx.roomId, { android: next })

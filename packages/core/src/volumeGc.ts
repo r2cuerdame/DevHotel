@@ -2,6 +2,7 @@ import type { RoomRecord } from '@devhotel/shared'
 import type {
   VolumeClassSummary,
   VolumeGcResult,
+  VolumeGcSkip,
   VolumeLivenessClass,
   VolumePurpose,
   VolumeReconciliationReport,
@@ -193,9 +194,18 @@ export interface VolumeReconciliationContext {
   rooms: RoomRecord[]
   settings: { get(key: string): string | null }
   activeOperations?: Array<{ id: string; roomId: string; status: string; extra?: unknown }>
-  changes?: { list(roomId: string): Array<{ undoable?: boolean; status?: string; captured?: unknown }> }
+  changes?: { list(roomId: string): ReconciliationChange[] }
   fencedRoomIds?: ReadonlySet<string>
   roomDirExists?: (roomId: string) => boolean
+}
+
+/** The slice of a change-history row the reconciler reads. */
+export interface ReconciliationChange {
+  kind?: string
+  seq?: number
+  undoable?: boolean
+  status?: string
+  captured?: unknown
 }
 
 function isApplicableUndoableChange(change: { undoable?: boolean; status?: string }): boolean {
@@ -203,19 +213,155 @@ function isApplicableUndoableChange(change: { undoable?: boolean; status?: strin
     (change.status === undefined || change.status === 'applied' || change.status === 'verified')
 }
 
+/**
+ * Durable recovery/operation intent records that fence a Room's volumes.
+ *
+ * A Room's *status* is not on this list on purpose. `attention` is what any
+ * awake Room becomes when a verify probe fails; it says nothing about whether
+ * a recovery is in flight, and fencing on it would hide exactly the stale
+ * generations a long-lived attention Room accumulates. What does fence is a
+ * record something wrote because it intends to come back for this Room's
+ * state: a pending restore, a pending export, a recovery diagnostic, or an
+ * explicit fence handed in by the caller.
+ */
+const DURABLE_FENCE_KEY_PREFIXES = [
+  'androidLocaleRestorePending',
+  'androidAcceptanceRestorePending',
+  'artifactExportPending',
+  'androidLocaleRecoveryDiagnostic'
+] as const
+
 export function isRoomFencedForRecovery(
   roomId: string,
   settings: { get(key: string): string | null },
   explicitFences?: ReadonlySet<string>,
-  roomStatus?: string
+  _roomStatus?: string
 ): boolean {
   if (explicitFences?.has(roomId)) return true
-  if (roomStatus === 'attention') return true
-  if (settings.get(`androidLocaleRestorePending:${roomId}`) !== null) return true
-  if (settings.get(`androidAcceptanceRestorePending:${roomId}`) !== null) return true
-  if (settings.get(`artifactExportPending:${roomId}`) !== null) return true
-  return false
+  return DURABLE_FENCE_KEY_PREFIXES.some((prefix) => settings.get(`${prefix}:${roomId}`) !== null)
 }
+
+/** Everything one undoable change would still need on disk to be undone. */
+export interface UndoReferences {
+  workspaceRevisions: Set<number>
+  /** Exact (major, generation) pairs. */
+  depsGenerations: Array<{ major: string; gen: number }>
+  /** Majors whose *current* generation is needed (a Node switch that can be undone). */
+  nodeMajors: Set<string>
+  services: Set<string>
+}
+
+function emptyReferences(): UndoReferences {
+  return { workspaceRevisions: new Set(), depsGenerations: [], nodeMajors: new Set(), services: new Set() }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null
+}
+
+function asInt(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : null
+}
+
+/**
+ * The retention rule for package-install history.
+ *
+ * A package install stages a new workspace generation and a new dependency
+ * generation, then publishes both pointers together. Its undo only works
+ * while the Room still points at the generations it staged: the moment a
+ * later install (or reset) publishes past them, `undo` refuses with "no
+ * longer matches either side", and nothing that row names can be reached
+ * through it again. So a superseded row retains nothing — its previous
+ * generations are held only by whichever row is still live — and a row is
+ * live exactly when the Room's published workspace revision is the one it
+ * staged. Without this rule every install a Room ever made would pin one
+ * more workspace copy and one more `node_modules` forever.
+ */
+export function isPackageInstallSuperseded(
+  change: ReconciliationChange,
+  room: Pick<RoomRecord, 'workspaceVolumeRevision'>
+): boolean {
+  const captured = asRecord(change.captured)
+  const staged = asInt(captured?.['nextWorkspaceGeneration'])
+  if (staged === null) return false
+  return room.workspaceVolumeRevision !== staged
+}
+
+function isPackageInstallShaped(change: ReconciliationChange): boolean {
+  if (change.kind === 'package-install') return true
+  const captured = asRecord(change.captured)
+  return captured !== null && 'nextWorkspaceGeneration' in captured && 'previousDepsGeneration' in captured
+}
+
+/**
+ * What one change's undo still references. Returns nothing for a change that
+ * cannot be undone any more, whether because of its status or because the
+ * retention rule above has superseded it.
+ */
+export function undoReferences(
+  change: ReconciliationChange,
+  room: Pick<RoomRecord, 'workspaceVolumeRevision' | 'runtime'>
+): UndoReferences {
+  const refs = emptyReferences()
+  if (!isApplicableUndoableChange(change)) return refs
+  const captured = asRecord(change.captured)
+  if (!captured) return refs
+
+  if (isPackageInstallShaped(change)) {
+    if (isPackageInstallSuperseded(change, room)) return refs
+    const major = typeof captured['nodeMajor'] === 'string' ? captured['nodeMajor'] : room.runtime.version
+    const previousWorkspace = asInt(captured['previousWorkspaceGeneration'])
+    const nextWorkspace = asInt(captured['nextWorkspaceGeneration'])
+    const previousDeps = asInt(captured['previousDepsGeneration'])
+    const nextDeps = asInt(captured['nextDepsGeneration'])
+    if (previousWorkspace !== null) refs.workspaceRevisions.add(previousWorkspace)
+    if (nextWorkspace !== null) refs.workspaceRevisions.add(nextWorkspace)
+    if (previousDeps !== null) refs.depsGenerations.push({ major, gen: previousDeps })
+    if (nextDeps !== null) refs.depsGenerations.push({ major, gen: nextDeps })
+    return refs
+  }
+
+  const previousWorkspace = asInt(captured['previousWorkspaceGeneration'])
+  if (previousWorkspace !== null) refs.workspaceRevisions.add(previousWorkspace)
+
+  const depsCapture = asRecord(captured['deps']) ?? captured
+  const prevGen = asInt(depsCapture['prevGen']) ?? asInt(depsCapture['gen'])
+  if (prevGen !== null) {
+    const major = typeof depsCapture['nodeMajor'] === 'string' ? depsCapture['nodeMajor'] : room.runtime.version
+    refs.depsGenerations.push({ major, gen: prevGen })
+  }
+
+  if (typeof captured['prevVersion'] === 'string') refs.nodeMajors.add(captured['prevVersion'])
+  if (typeof captured['service'] === 'string') refs.services.add(captured['service'])
+  return refs
+}
+
+/** Merged references of every change whose undo is still possible. */
+export function liveUndoReferences(
+  changes: ReconciliationChange[],
+  room: Pick<RoomRecord, 'workspaceVolumeRevision' | 'runtime'>
+): UndoReferences & { supersededWorkspaceRevisions: Set<number>; supersededDepsGenerations: Array<{ major: string; gen: number }> } {
+  const merged = { ...emptyReferences(), supersededWorkspaceRevisions: new Set<number>(), supersededDepsGenerations: [] as Array<{ major: string; gen: number }> }
+  for (const change of changes) {
+    if (isApplicableUndoableChange(change) && isPackageInstallShaped(change) && isPackageInstallSuperseded(change, room)) {
+      const captured = asRecord(change.captured)
+      const major = typeof captured?.['nodeMajor'] === 'string' ? captured['nodeMajor'] : room.runtime.version
+      const previousWorkspace = asInt(captured?.['previousWorkspaceGeneration'])
+      const previousDeps = asInt(captured?.['previousDepsGeneration'])
+      if (previousWorkspace !== null) merged.supersededWorkspaceRevisions.add(previousWorkspace)
+      if (previousDeps !== null) merged.supersededDepsGenerations.push({ major, gen: previousDeps })
+      continue
+    }
+    const refs = undoReferences(change, room)
+    for (const rev of refs.workspaceRevisions) merged.workspaceRevisions.add(rev)
+    merged.depsGenerations.push(...refs.depsGenerations)
+    for (const major of refs.nodeMajors) merged.nodeMajors.add(major)
+    for (const service of refs.services) merged.services.add(service)
+  }
+  return merged
+}
+
+const AWAKE_STATUSES: ReadonlySet<string> = new Set(['running', 'ready', 'attention', 'preparing'])
 
 export function reconcileVolumesState(context: VolumeReconciliationContext): VolumeReconciliationReport {
   const roomsMap = new Map<string, RoomRecord>(context.rooms.map((r) => [r.id, r]))
@@ -231,6 +377,7 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
     'orphaned-stale-generation',
     'orphaned-stale-snapshot',
     'orphaned-stale-deps',
+    'orphaned-removed-service',
     'unowned'
   ]
 
@@ -258,7 +405,7 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
       reason = 'Volume is not owned or managed by DevHotel (external or anonymous Docker volume).'
     } else {
       const room = roomsMap.get(parsed.roomId)
-      const fenced = isRoomFencedForRecovery(parsed.roomId, context.settings, context.fencedRoomIds, room?.status)
+      const fenced = isRoomFencedForRecovery(parsed.roomId, context.settings, context.fencedRoomIds)
       const runningOperation = context.activeOperations?.find(
         (operation) => operation.roomId === parsed.roomId && operation.status === 'running'
       )
@@ -304,7 +451,9 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
         }
       } else {
         // Room exists in canonical registry
-        const isRoomAwake = room.status === 'running' || room.status === 'ready'
+        const isRoomAwake = AWAKE_STATUSES.has(room.status)
+        const roomChanges = context.changes?.list(parsed.roomId)
+        const undo = roomChanges ? liveUndoReferences(roomChanges, room) : null
 
         switch (parsed.purpose) {
           case 'cache': {
@@ -320,9 +469,34 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
             break
           }
           case 'service-data': {
-            livenessClass = isRoomAwake ? 'retained-active' : 'retained-sleeping'
-            safeToDelete = false
-            reason = `Persistent ${parsed.serviceKind ?? 'database'} service data volume for room ${parsed.roomId}.`
+            const service = parsed.serviceKind ?? 'database'
+            const declared = parsed.serviceKind !== null &&
+              Object.prototype.hasOwnProperty.call(room.services, parsed.serviceKind)
+            if (declared) {
+              livenessClass = isRoomAwake ? 'retained-active' : 'retained-sleeping'
+              safeToDelete = false
+              reason = `Persistent ${service} service data volume for room ${parsed.roomId}.`
+            } else if (!undo) {
+              livenessClass = 'retained-recovery'
+              safeToDelete = false
+              reason = `Room ${parsed.roomId} no longer declares ${service}, but change history is unavailable; preserving its data fail-closed.`
+            } else if (undo.services.has(service)) {
+              livenessClass = 'retained-recovery'
+              safeToDelete = false
+              reason = `Room ${parsed.roomId} no longer declares ${service}, but an undoable change still names it.`
+            } else {
+              livenessClass = 'orphaned-removed-service'
+              safeToDelete = hasExplicitOwnership && vol.linksKnown && !isAttached && vol.sizeKnown
+              reason = !vol.linksKnown
+                ? `Data for removed service ${service} has unknown container attachment state.`
+                : isAttached
+                ? `Data for removed service ${service} is still attached to a container.`
+                : !hasExplicitOwnership
+                  ? `Data for removed service ${service} lacks explicit managed ownership proof.`
+                  : !vol.sizeKnown
+                    ? `Data for removed service ${service} has unknown size; bounded GC must fail closed.`
+                : `Room ${parsed.roomId} removed service ${service}; its data volume is provably orphaned (no undo references it).`
+            }
             break
           }
           case 'workspace': {
@@ -341,19 +515,15 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
               reason = `Retained recovery workspace generation r${rev} for room ${parsed.roomId}.`
             } else if (rev < currentRev) {
               // Older historical generation
-              const roomChanges = context.changes?.list(parsed.roomId)
-              const neededForUndo = roomChanges?.some((change) => {
-                if (!isApplicableUndoableChange(change)) return false
-                const captured = change.captured as Record<string, unknown> | null
-                return captured?.previousWorkspaceGeneration === rev
-              }) ?? false
+              const neededForUndo = undo?.workspaceRevisions.has(rev) ?? false
+              const supersededOnly = undo?.supersededWorkspaceRevisions.has(rev) ?? false
               const activeOpUsing = context.activeOperations?.find(
                 (op) =>
                   op.roomId === parsed.roomId &&
                   op.status === 'running' &&
                   (op.extra as Record<string, unknown> | undefined)?.workspaceVolumeRevision === rev
               )
-              if (!roomChanges) {
+              if (!undo) {
                 livenessClass = 'retained-recovery'
                 safeToDelete = false
                 reason = `Workspace change history is unavailable; preserving generation r${rev} fail-closed.`
@@ -376,6 +546,8 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
                     ? `Stale workspace generation r${rev} lacks explicit managed ownership proof.`
                     : !vol.sizeKnown
                       ? `Stale workspace generation r${rev} has unknown size; bounded GC must fail closed.`
+                  : supersededOnly
+                    ? `Stale workspace generation r${rev} is referenced only by a superseded package install that can no longer be undone (Room is at r${currentRev}).`
                   : `Stale historical workspace generation r${rev} superseded by r${currentRev} (retained recovery is r${retainedGen ?? 'none'}).`
               }
             } else {
@@ -417,35 +589,34 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
           case 'dependencies': {
             const major = parsed.nodeMajor ?? room.runtime.version
             const gen = parsed.generation ?? 0
+            const majorIsCurrent = major === room.runtime.version
             const currentGenRaw =
               context.settings.get(depsGenKey(parsed.roomId, major)) ??
-              (major === room.runtime.version ? context.settings.get(`depsGen:${parsed.roomId}`) : null)
+              (majorIsCurrent ? context.settings.get(`depsGen:${parsed.roomId}`) : null)
             const currentGen = currentGenRaw ? Number.parseInt(currentGenRaw, 10) : 0
 
-            if (gen === currentGen) {
+            if (majorIsCurrent && gen === currentGen) {
               livenessClass = isRoomAwake ? 'retained-active' : 'retained-sleeping'
               safeToDelete = false
               reason = `Active dependency volume for Node ${major} generation ${gen} for room ${parsed.roomId}.`
             } else {
-              const roomChanges = context.changes?.list(parsed.roomId)
-              if (!roomChanges) {
+              if (!undo) {
                 livenessClass = 'retained-recovery'
                 safeToDelete = false
                 reason = `Dependency change history is unavailable; preserving generation ${gen} fail-closed.`
                 break
               }
-              const neededForUndo = roomChanges.some((c) => {
-                if (!isApplicableUndoableChange(c)) return false
-                const rawCap = c.captured as Record<string, unknown> | null
-                const cap = (rawCap?.deps as Record<string, unknown> | undefined) ?? rawCap
-                const prevGen = cap?.prevGen ?? cap?.gen
-                const capMajor = (cap?.nodeMajor as string | undefined) ?? room.runtime.version
-                return prevGen === gen && capMajor === major
-              })
-              if (neededForUndo) {
+              const neededForUndo = undo.depsGenerations.some((ref) => ref.major === major && ref.gen === gen)
+              // A Node switch that can still be undone comes back to this
+              // major's *current* generation, whatever number that is.
+              const neededForNodeUndo = !majorIsCurrent && gen === currentGen && undo.nodeMajors.has(major)
+              const supersededOnly = undo.supersededDepsGenerations.some((ref) => ref.major === major && ref.gen === gen)
+              if (neededForUndo || neededForNodeUndo) {
                 livenessClass = 'retained-recovery'
                 safeToDelete = false
-                reason = `Retained dependency generation ${gen} for Node ${major} required for change undo.`
+                reason = neededForNodeUndo
+                  ? `Retained Node ${major} dependencies: an undoable Node version change would switch the Room back to them.`
+                  : `Retained dependency generation ${gen} for Node ${major} required for change undo.`
               } else {
                 livenessClass = 'orphaned-stale-deps'
                 safeToDelete = hasExplicitOwnership && vol.linksKnown && !isAttached && vol.sizeKnown
@@ -457,6 +628,10 @@ export function reconcileVolumesState(context: VolumeReconciliationContext): Vol
                     ? `Stale dependency volume lacks explicit managed ownership proof.`
                     : !vol.sizeKnown
                       ? `Stale dependency volume has unknown size; bounded GC must fail closed.`
+                  : !majorIsCurrent
+                    ? `Node ${major} dependencies (generation ${gen}) for a major the Room no longer runs (now Node ${room.runtime.version}); no undo references them.`
+                  : supersededOnly
+                    ? `Stale dependency generation ${gen} for Node ${major} is referenced only by a superseded package install that can no longer be undone.`
                   : `Stale dependency generation ${gen} for Node ${major} superseded by generation ${currentGen}.`
               }
             }
@@ -578,11 +753,22 @@ export interface VolumeGcOptions {
   dryRun?: boolean
   maxVolumes?: number
   maxBytes?: number
+  /** Wall-clock budget for the whole pass. Required for a real pass; no candidate is attempted once it has elapsed. */
+  deadlineMs?: number
+  /** Clock, for tests. */
+  now?: () => number
 }
 
 export interface VolumeGcRemovalGuard {
-  removeCandidateIfStillSafe(candidate: VolumeRecord, remainingBytes: number): Promise<number>
+  /**
+   * Re-prove one candidate against current state and remove it. Must throw
+   * rather than remove when anything changed; `deadlineAt` is the absolute
+   * time (per the pass clock) by which the pass wants to be finished.
+   */
+  removeCandidateIfStillSafe(candidate: VolumeRecord, remainingBytes: number, deadlineAt: number): Promise<number>
 }
+
+const MAX_VOLUME_GC_DEADLINE_MS = 60 * 60 * 1000
 
 export async function executeVolumeGc(
   _backend: IsolationBackend,
@@ -590,6 +776,8 @@ export async function executeVolumeGc(
   opts: VolumeGcOptions = {},
   guard?: VolumeGcRemovalGuard
 ): Promise<VolumeGcResult> {
+  // One inventory pass. The report is the plan; the guard re-proves each
+  // candidate from a single-volume observation, never from another full pass.
   const report = reconcileVolumesState(context)
   const isDryRun = opts.dryRun !== false
 
@@ -600,27 +788,56 @@ export async function executeVolumeGc(
       deletedCount: 0,
       reclaimedBytes: 0,
       deletedVolumes: [],
-      errors: []
+      errors: [],
+      attemptedCount: 0,
+      deadlineReached: false,
+      skipped: []
     }
   }
 
-  const { maxVolumes, maxBytes } = opts
+  const { maxVolumes, maxBytes, deadlineMs } = opts
   if (typeof maxVolumes !== 'number' || !Number.isSafeInteger(maxVolumes) || maxVolumes <= 0 || maxVolumes > 500) {
     throw new Error('Real volume GC requires an explicit bounded maxVolumes')
   }
   if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
     throw new Error('Real volume GC requires an explicit bounded maxBytes')
   }
+  if (
+    typeof deadlineMs !== 'number' || !Number.isSafeInteger(deadlineMs) || deadlineMs <= 0 ||
+    deadlineMs > MAX_VOLUME_GC_DEADLINE_MS
+  ) {
+    throw new Error('Real volume GC requires an explicit finite wall-clock deadline (deadlineMs)')
+  }
   if (!guard) throw new Error('Real volume GC requires a concurrent-state removal guard')
 
+  const now = opts.now ?? Date.now
+  const deadlineAt = now() + deadlineMs
   const candidates = report.volumes.filter((v) => v.safeToDelete)
   const deletedVolumes: string[] = []
   const errors: string[] = []
+  const skipped: VolumeGcSkip[] = []
   let reclaimedBytes = 0
+  let attemptedCount = 0
+  let deadlineReached = false
 
   for (const candidate of candidates) {
-    if (deletedVolumes.length >= maxVolumes) break
-    if (!candidate.sizeKnown || reclaimedBytes + candidate.sizeBytes > maxBytes) continue
+    // Attempts, not successes: a pass that keeps failing must still end.
+    if (attemptedCount >= maxVolumes) {
+      skipped.push({ name: candidate.name, reason: `maxVolumes bound (${maxVolumes} attempts) reached before this candidate.` })
+      continue
+    }
+    if (now() >= deadlineAt) {
+      deadlineReached = true
+      skipped.push({ name: candidate.name, reason: `Wall-clock deadline (${deadlineMs} ms) reached before this candidate.` })
+      continue
+    }
+    if (!candidate.sizeKnown || reclaimedBytes + candidate.sizeBytes > maxBytes) {
+      skipped.push({
+        name: candidate.name,
+        reason: `maxBytes bound would be exceeded (${reclaimedBytes} reclaimed + ${candidate.sizeBytes} > ${maxBytes}).`
+      })
+      continue
+    }
 
     // Double-check fail-closed invariants
     if (
@@ -638,8 +855,9 @@ export async function executeVolumeGc(
       continue
     }
 
+    attemptedCount += 1
     try {
-      const removedBytes = await guard.removeCandidateIfStillSafe(candidate, maxBytes - reclaimedBytes)
+      const removedBytes = await guard.removeCandidateIfStillSafe(candidate, maxBytes - reclaimedBytes, deadlineAt)
       deletedVolumes.push(candidate.name)
       reclaimedBytes += removedBytes
     } catch (err) {
@@ -655,6 +873,9 @@ export async function executeVolumeGc(
     deletedCount: deletedVolumes.length,
     reclaimedBytes,
     deletedVolumes,
-    errors
+    errors,
+    attemptedCount,
+    deadlineReached,
+    skipped
   }
 }

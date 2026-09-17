@@ -1,113 +1,199 @@
+import { rmSync } from 'node:fs'
+import { join } from 'node:path'
+import type { ReconcilePlan } from '@devhotel/shared'
 import type { IsolationBackend } from './backend/types'
 import type { RoomsRepo } from './store/roomsRepo'
+import { emptyObservation, type IngressRouteObservation } from './lifecycle/observations'
+import { planReconciliation } from './lifecycle/reconcilePlan'
 
 export interface ReconcileResult {
   straysRemoved: string[]
   networksRemoved: string[]
   roomsSlept: string[]
+  roomsDeleted?: string[]
+  /** Host ingress ports closed because nothing survives a restart behind them. */
+  ingressRevoked?: string[]
+  /**
+   * The plan that was executed. Two builds that agree on what a restart owes the
+   * Rooms produce the same digest, which is how a change in recovery behaviour
+   * becomes visible in a diff instead of in a user's Rooms.
+   */
+  plan?: ReconcilePlan
+}
+
+export interface ReconcileOptions {
+  preserveAwakeRoomIds?: ReadonlySet<string>
+  userData?: string
+  /** Host ingress routes inherited from a previous run, from the durable ledger. */
+  ingressRoutes?: readonly IngressRouteObservation[]
+  /** Closes one inherited Host port and forgets its ledger entry. */
+  revokeIngress?: (roomId: string) => Promise<void>
+  /** The runtime generation now serving Rooms; routes from any other are stale. */
+  currentRuntimeId?: string | null
 }
 
 /**
- * Boot-time crash recovery: containers with our label but no room record are
- * removed; rooms that believe they are awake are put to sleep (the app just
- * started — nothing should be running yet). Room data is never touched.
+ * Boot-time crash recovery, decided before it is done.
+ *
+ * The rules are unchanged and deliberately so — containers with our label but
+ * no Room record are removed, Rooms that believe they are awake are put to
+ * sleep because nothing can be running yet, and Room data is never touched.
+ * What changed with #109 is that the decision now lives in
+ * `planReconciliation`, a pure function over an observed snapshot. This
+ * function observes, asks for the plan, and carries it out.
+ *
+ * That separation is what makes the lifecycle testable without an engine and
+ * comparable between builds. It also adds the one artifact that had no owner
+ * before: a Host ingress port inherited from a process that did not exit
+ * cleanly, which no engine can enumerate and which would otherwise accept
+ * connections on behalf of a container that no longer exists.
  */
 export async function reconcile(
   backend: IsolationBackend,
   rooms: RoomsRepo,
   log: (line: string) => void,
-  options: { preserveAwakeRoomIds?: ReadonlySet<string> } = {}
+  options: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
-  const knownOciRooms = new Set(rooms.list().filter((room) => room.provider !== 'windows').map((room) => room.id))
+  const observation = emptyObservation(new Date().toISOString())
+  observation.containers = (await backend.listManagedContainers()).map((container) => ({
+    name: container.name,
+    roomId: container.roomId || null,
+    role: container.role,
+    state: container.state
+  }))
+  observation.networks = (await backend.listManagedNetworks()).map((network) => ({
+    name: network.name,
+    roomId: network.roomId || null
+  }))
+  observation.ingress = [...(options.ingressRoutes ?? [])]
+
+  const plan = planReconciliation(observation, {
+    rooms: rooms.list(),
+    ...(options.preserveAwakeRoomIds ? { preserveAwakeRoomIds: options.preserveAwakeRoomIds } : {}),
+    currentRuntimeId: options.currentRuntimeId ?? null
+  })
+  log(`reconcile: plan ${plan.digest.slice(0, 12)} with ${plan.actions.length} action(s)`)
+
   const straysRemoved: string[] = []
-  const managedContainers = await backend.listManagedContainers()
-  for (const c of managedContainers) {
-    // A one-shot process is owned by the client operation that started it.
-    // At process startup no such operation is live, even when its Room still
-    // exists, so every surviving job container is stale and must be reaped.
-    const interruptedEmulatorCreate = c.role === 'svc-emulator' && c.state === 'created'
-    if (c.role === 'job' || interruptedEmulatorCreate || !c.roomId || !knownOciRooms.has(c.roomId)) {
-      const kind = c.role === 'job'
-        ? 'stale job container'
-        : interruptedEmulatorCreate
-          ? 'interrupted emulator create'
-          : 'stray container'
-      log(`reconcile: removing ${kind} ${c.name} (room ${c.roomId || 'unknown'})`)
-      await backend.removeManagedContainer(c.name)
-      straysRemoved.push(c.name)
-    }
-  }
-
   const networksRemoved: string[] = []
-  for (const network of await backend.listManagedNetworks()) {
-    if (!network.roomId || !knownOciRooms.has(network.roomId)) {
-      log(`reconcile: removing stray network ${network.name} (room ${network.roomId || 'unknown'})`)
-      try {
-        await backend.removeManagedNetwork(network.name)
-        networksRemoved.push(network.name)
-      } catch (err) {
-        log(`reconcile: could not remove stray network ${network.name}: ${err instanceof Error ? err.message : String(err)}`)
+  const roomsSlept: string[] = []
+  const roomsDeleted: string[] = []
+  const ingressRevoked: string[] = []
+  // A Room whose deletion could not be finished must not then be treated as a
+  // live Room by the rest of the plan, nor silently forgotten.
+  const deletionStalled = new Set<string>()
+
+  for (const action of plan.actions) {
+    switch (action.kind) {
+      case 'resume-delete': {
+        log(`reconcile: resuming deletion of room ${action.roomId}`)
+        try {
+          await backend.deleteRoomPod(action.target, { volumes: true })
+        } catch (err) {
+          log(
+            `reconcile: could not finish deleting room pod ${action.target}: ${err instanceof Error ? err.message : String(err)}`
+          )
+          deletionStalled.add(action.target)
+          break
+        }
+        if (options.userData) {
+          rmSync(join(options.userData, 'rooms', action.target), { recursive: true, force: true })
+        }
+        rooms.delete(action.target)
+        roomsDeleted.push(action.target)
+        break
       }
+      case 'revoke-ingress': {
+        if (!options.revokeIngress) break
+        log(`reconcile: revoking inherited Host ingress for room ${action.roomId} (${action.reason})`)
+        try {
+          await options.revokeIngress(action.roomId ?? '')
+          ingressRevoked.push(action.target)
+        } catch (err) {
+          log(
+            `reconcile: could not revoke ingress ${action.target}: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+        break
+      }
+      case 'remove-container': {
+        log(`reconcile: removing container ${action.target} (room ${action.roomId || 'unknown'}) — ${action.reason}`)
+        await backend.removeManagedContainer(action.target)
+        straysRemoved.push(action.target)
+        break
+      }
+      case 'remove-network': {
+        log(`reconcile: removing stray network ${action.target} (room ${action.roomId || 'unknown'})`)
+        try {
+          await backend.removeManagedNetwork(action.target)
+          networksRemoved.push(action.target)
+        } catch (err) {
+          log(
+            `reconcile: could not remove stray network ${action.target}: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+        break
+      }
+      case 'adopt-network': {
+        try {
+          await backend.adoptManagedNetwork?.(action.target)
+        } catch (err) {
+          log(`reconcile: could not adopt network ${action.target}: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        break
+      }
+      case 'mark-broken': {
+        log(`reconcile: room ${action.target} was interrupted while preparing — marking broken`)
+        rooms.update(action.target, { status: 'broken', hostPort: null })
+        try {
+          await backend.stopRoomPod(action.target)
+        } catch (err) {
+          log(
+            `reconcile: could not stop interrupted room ${action.target}: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+        break
+      }
+      case 'stop-room': {
+        // A broken Room can still own running containers — anchor up, web dead.
+        // A sleeping Room can too, when the process died between stopping the
+        // pod and recording the sleep; either way the record keeps its status.
+        log(`reconcile: room ${action.target} — ${action.reason}`)
+        try {
+          await backend.stopRoomPod(action.target)
+        } catch (err) {
+          log(`reconcile: could not stop room ${action.target}: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        rooms.update(action.target, { hostPort: null })
+        break
+      }
+      case 'sleep-room': {
+        log(`reconcile: ${action.reason} — putting room ${action.target} to sleep after restart`)
+        await backend.stopRoomPod(action.target)
+        rooms.update(action.target, { status: 'sleeping', hostPort: null })
+        roomsSlept.push(action.target)
+        break
+      }
+      case 'preserve':
+        // Room-level preservation behind a recovery fence is worth a line: it
+        // is the one case where a live runtime is deliberately left alone.
+        if (action.target === action.roomId && options.preserveAwakeRoomIds?.has(action.target)) {
+          log(`reconcile: preserving fenced Room ${action.target} — ${action.reason}`)
+        }
+        break
     }
   }
 
-  const roomsSlept: string[] = []
-  for (const room of rooms.list()) {
-    // Windows VMs have a separate ownership ledger and lifecycle reconciler.
-    // Never hand one to the OCI backend just because it shares the Room table.
-    if (room.provider === 'windows') continue
-    // Some startup recovery protocols retain an exact live runtime as durable
-    // restoration authority. Stopping or sleeping it here would turn their
-    // mutation gate into a permanent recovery deadlock.
-    if (
-      options.preserveAwakeRoomIds?.has(room.id) &&
-      (room.status === 'running' || room.status === 'ready' || room.status === 'attention' || room.status === 'sleeping')
-    ) {
-      if (room.status === 'sleeping') {
-        log(`reconcile: preserving fenced Room ${room.id} for recovery`)
-      } else {
-        log(`reconcile: preserving attention-gated Room ${room.id} for exact Android locale recovery`)
-      }
-      continue
-    }
-    if (room.status === 'sleeping') {
-      const hasStray = managedContainers.some(
-        (c) => c.roomId === room.id && !straysRemoved.includes(c.name) && (c.state === 'running' || c.state === 'restarting' || c.state === 'paused')
-      )
-      if (hasStray) {
-        log(`reconcile: room ${room.id} is sleeping but has stray runtimes — stopping proven owned resources`)
-        try {
-          await backend.stopRoomPod(room.id)
-        } catch (err) {
-          log(`reconcile: could not stop stray runtime for room ${room.id}: ${err instanceof Error ? err.message : String(err)}`)
-        }
-        rooms.update(room.id, { hostPort: null })
-      }
-      continue
-    }
-    if (room.status === 'preparing') {
-      // Creation/clone is not resumable: its workspace or data volumes may be
-      // only partly initialized. Keep that fact visible instead of presenting
-      // the room as a complete sleeping environment that can be woken.
-      log(`reconcile: room ${room.id} was interrupted while preparing — marking broken`)
-      rooms.update(room.id, { status: 'broken', hostPort: null })
-      try {
-        await backend.stopRoomPod(room.id)
-      } catch (err) {
-        log(`reconcile: could not stop interrupted room ${room.id}: ${err instanceof Error ? err.message : String(err)}`)
-      }
-      continue
-    }
-    if (room.status === 'broken') {
-      // broken rooms can still own running containers (e.g. anchor up, web crashed)
-      await backend.stopRoomPod(room.id)
-      rooms.update(room.id, { hostPort: null })
-      continue
-    }
-    log(`reconcile: room ${room.id} was ${room.status} — putting to sleep after restart`)
-    await backend.stopRoomPod(room.id)
-    rooms.update(room.id, { status: 'sleeping', hostPort: null })
-    roomsSlept.push(room.id)
+  for (const roomId of deletionStalled) {
+    log(`reconcile: room ${roomId} remains in deleting state and will be retried on the next start`)
   }
-  return { straysRemoved, networksRemoved, roomsSlept }
+
+  return {
+    straysRemoved,
+    networksRemoved,
+    roomsSlept,
+    plan,
+    ...(roomsDeleted.length > 0 ? { roomsDeleted } : {}),
+    ...(ingressRevoked.length > 0 ? { ingressRevoked } : {})
+  }
 }

@@ -115,6 +115,17 @@ and topology-reproved before an immutable helper ID can be started; a helper
 still visible after a crash is force-removed before the absence proof. A legacy
 physical pending record is never auto-consumed: its exact lease remains
 protected and the Room stays attention-gated for explicit recovery.
+
+Startup restarts only the exact exited control anchor/emulator containers, at
+most once per pass, and then proves the emulator *workload* rather than its
+container: a bounded recovery boot witness must observe ADB `device` with
+`sys.boot_completed=1` before any session proof runs. A running container whose
+emulator never boots is recorded as the `workload-not-booted` invariant class
+with only DevHotel's own bounded ADB/boot enum states; the fence, containers,
+install/user/target identity are preserved and nothing is recreated or killed.
+Every other startup failure is likewise recorded as a structured, non-sensitive
+`invariantClass` / `reason` / `operatorAction` diagnostic that the
+`ANDROID_LOCALE_RECOVERY_REQUIRED` refusal carries as `evidence`.
 Until a fresh post-witness locale/install/PID proof succeeds and the exact
 intent is released by compare-and-delete, the Room remains attention-gated
 against further mutations. Shutdown and clean removal refuse to discard this

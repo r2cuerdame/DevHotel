@@ -438,6 +438,29 @@ describe('SubnetAllocator unit tests', () => {
     expect(dhe.httpStatus).toBe(507)
     expect(dhe.recoveryHint).toContain('free subnet capacity')
   })
+
+  it('classifies Docker pool overlap and invalid pool request errors into NETWORK_POOL_EXHAUSTED', () => {
+    const overlapErrors = [
+      new Error('Error response from daemon: invalid pool request: Pool overlaps with other one on this address space'),
+      new Error('Error response from daemon: Pool overlaps with other one on this address space'),
+      new Error('invalid pool request: Pool overlaps with other one on this address space'),
+      { stderr: 'Error response from daemon: invalid pool request: Pool overlaps with other one on this address space' }
+    ]
+
+    for (const err of overlapErrors) {
+      const classified = classifyNetworkCreateError(err, 'room1', 'dh-room1-net', '10.214.0.0/24')
+      expect(classified).toBeInstanceOf(DevHotelError)
+      const dhe = classified as DevHotelError
+      expect(dhe.code).toBe('NETWORK_POOL_EXHAUSTED')
+      expect(dhe.httpStatus).toBe(507)
+      expect(dhe.recoveryHint).toContain('free subnet capacity')
+      expect(dhe.evidence).toEqual({
+        roomId: 'room1',
+        networkName: 'dh-room1-net',
+        subnet: '10.214.0.0/24'
+      })
+    }
+  })
 })
 
 describe('OciCliBackend Network Lifecycle & Scale Acceptance', () => {
@@ -651,5 +674,155 @@ describe('OciCliBackend Network Lifecycle & Scale Acceptance', () => {
     expect(subnetA).toBe('10.214.0.0/24')
     expect(subnetB).toBe('10.214.1.0/24')
     expect(subnetA).not.toBe(subnetB)
+  })
+
+  it('collectDockerSubnets isolates network inspect failures and parses surviving subnets even when inspect exits code 1', async () => {
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'network' && args[1] === 'ls') {
+        return { code: 0, stdout: 'dh-surviving-net\ndh-deleted-net\n', stderr: '' }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        if (args.includes('dh-surviving-net') && args.includes('dh-deleted-net')) {
+          // Real Docker behavior: outputs JSON for valid networks but exits code 1 with stderr
+          return {
+            code: 1,
+            stdout: JSON.stringify([
+              {
+                Name: 'dh-surviving-net',
+                IPAM: { Config: [{ Subnet: '10.214.5.0/24' }] }
+              }
+            ]),
+            stderr: 'Error response from daemon: network dh-deleted-net not found'
+          }
+        }
+        if (args.includes('dh-deleted-net')) {
+          return { code: 1, stdout: '', stderr: 'network not found' }
+        }
+        if (args.includes('dh-surviving-net')) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                Name: 'dh-surviving-net',
+                IPAM: { Config: [{ Subnet: '10.214.5.0/24' }] }
+              }
+            ]),
+            stderr: ''
+          }
+        }
+      }
+      return ok
+    })
+
+    const backend = new OciCliBackend()
+    const used = await backend.collectDockerSubnets()
+    expect(used.has('10.214.5.0/24')).toBe(true)
+    expect(used.size).toBe(1)
+  })
+
+  it('collectDockerSubnets falls back to individual inspect when batch inspect throws or returns unparseable stdout', async () => {
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'network' && args[1] === 'ls') {
+        return { code: 0, stdout: 'dh-first-net\ndh-deleted-net\ndh-third-net\n', stderr: '' }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        if (args.length > 3) {
+          // Batch inspect fails completely with non-zero code and unparseable stderr
+          return {
+            code: 1,
+            stdout: '',
+            stderr: 'Error response from daemon: network dh-deleted-net not found'
+          }
+        }
+        if (args.includes('dh-first-net')) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{ Name: 'dh-first-net', IPAM: { Config: [{ Subnet: '10.214.10.0/24' }] } }]),
+            stderr: ''
+          }
+        }
+        if (args.includes('dh-deleted-net')) {
+          return { code: 1, stdout: '', stderr: 'No such network' }
+        }
+        if (args.includes('dh-third-net')) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{ Name: 'dh-third-net', IPAM: { Config: [{ Subnet: '10.214.11.0/24' }] } }]),
+            stderr: ''
+          }
+        }
+      }
+      return ok
+    })
+
+    const backend = new OciCliBackend()
+    const used = await backend.collectDockerSubnets()
+    expect(used.has('10.214.10.0/24')).toBe(true)
+    expect(used.has('10.214.11.0/24')).toBe(true)
+    expect(used.size).toBe(2)
+  })
+
+  it('adopts surviving room networks on reconcile and prevents IPAM collisions on new room creation without waking sleeping rooms', async () => {
+    const { dockerNetworks } = setupDockerMock()
+
+    // 1. Existing sleeping room with a preserved network in Docker
+    const sleepingRoom = makeRoom({ id: 'sleep01', status: 'sleeping' })
+    const rooms = { list: () => [sleepingRoom] } as RoomsRepo
+
+    dockerNetworks.set('dh-sleep01-net', {
+      name: 'dh-sleep01-net',
+      labels: {
+        'devhotel.managed': '1',
+        'devhotel.role': 'network',
+        'devhotel.room': 'sleep01'
+      },
+      subnet: '10.214.0.0/24',
+      containers: {}
+    })
+
+    // 2. Fresh OciCliBackend after restart (empty in-memory IPAM tracking)
+    const backend = new OciCliBackend()
+    expect(backend.subnetAllocator.getCapacity().usedCount).toBe(0)
+
+    // 3. Reconcile startup runs
+    const logs: string[] = []
+    const reconcileResult = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(reconcileResult.networksRemoved).toEqual([])
+    expect(reconcileResult.roomsSlept).toEqual([])
+    expect(sleepingRoom.status).toBe('sleeping')
+
+    // Verify surviving network was adopted into backend SubnetAllocator
+    expect(backend.subnetAllocator.getCapacity().usedCount).toBe(1)
+    expect(backend.subnetAllocator.isSubnetInPool('10.214.0.0/24')).toBe(true)
+
+    // 4. Create new room 'new01' without waking 'sleep01'
+    await backend.createRoomPod(webSpec('new01', { standalone: true }), { startWeb: false })
+
+    // Verify new room's network received next non-colliding subnet (10.214.1.0/24)
+    expect(dockerNetworks.has('dh-new01-net')).toBe(true)
+    expect(dockerNetworks.get('dh-new01-net')?.subnet).toBe('10.214.1.0/24')
+    expect(dockerNetworks.get('dh-sleep01-net')?.subnet).toBe('10.214.0.0/24')
+  })
+
+  it('adoptManagedNetwork rejects unmanaged or spoofed networks', async () => {
+    const { dockerNetworks } = setupDockerMock()
+    dockerNetworks.set('unmanaged-net', {
+      name: 'unmanaged-net',
+      labels: {},
+      subnet: '10.214.0.0/24',
+      containers: {}
+    })
+
+    const backend = new OciCliBackend()
+    await expect(backend.adoptManagedNetwork('unmanaged-net')).rejects.toThrow(/invalid DevHotel network name/)
+
+    dockerNetworks.set('dh-spoofed-net', {
+      name: 'dh-spoofed-net',
+      labels: { 'devhotel.managed': '0' },
+      subnet: '10.214.0.0/24',
+      containers: {}
+    })
+    await expect(backend.adoptManagedNetwork('dh-spoofed-net')).rejects.toThrow(/refusing to adopt network not owned by DevHotel/)
   })
 })

@@ -625,6 +625,7 @@ describe('OciCliBackend Android artifact export', () => {
     let bootStart = false
     let bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
     let bootHelperCode = 0
+    let webStatus = 'running'
     const inspect = (name: string, role: string, id: string, paused = false) => JSON.stringify([{
       Id: id,
       ...(role === 'svc-emulator' ? { Image: emulatorImageId } : {}),
@@ -646,7 +647,7 @@ describe('OciCliBackend Android artifact export', () => {
             : {})
       } },
       State: {
-        Status: 'running',
+        Status: role === 'web' ? webStatus : 'running',
         Paused: paused,
         StartedAt: role === 'anchor'
           ? controlStartedAt
@@ -990,6 +991,44 @@ describe('OciCliBackend Android artifact export', () => {
     bootStart = false
     expect(mockedRunDocker.mock.calls.filter(([args]) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
     expect(helper).toBeNull()
+    bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
+    bootHelperCode = 0
+
+    // Locale recovery (#61) runs while the Room web workload is exited. The
+    // live boot witness refuses that topology; the recovery witness proves the
+    // emulator workload through the retained control anchor and reports a
+    // dead workload as bounded evidence without starting or touching web.
+    mockedRunDocker.mockClear()
+    const liveWebSandboxId = webSandboxId
+    webStatus = 'exited'
+    webSandboxId = ''
+    bootReceipt = 'devhotel-emulator-boot-v1\ttimeout\toffline\tempty\t1\n'
+    bootHelperCode = 74
+    bootStart = true
+    await expect(new OciCliBackend().waitForFencedEmulatorBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .rejects.toThrow(/network namespace/)
+    expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'create' || args[0] === 'start')).toBe(false)
+    mockedRunDocker.mockClear()
+    await expect(new OciCliBackend().waitForFencedEmulatorRecoveryBoot(ROOM_ID, { timeoutMs: 20_000 }))
+      .resolves.toEqual({
+        booted: false,
+        adbState: 'offline',
+        bootProperty: 'empty',
+        lastAdbCode: 1,
+        helperCode: 74
+      })
+    bootStart = false
+    const recoveryBootCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    expect(recoveryBootCalls.filter((args) => args[0] === 'create')).toHaveLength(1)
+    expect(recoveryBootCalls.filter((args) => args[0] === 'start')).toEqual([['start', '-a', ids.helper]])
+    expect(recoveryBootCalls.filter((args) => args[0] === 'rm' && args[2] === ids.helper)).toHaveLength(1)
+    const recoveryBootCreate = recoveryBootCalls.find((args) => args[0] === 'create')!
+    expect(recoveryBootCreate.slice(-1)).toEqual(['wait-for-boot'])
+    expect(recoveryBootCreate).toContain(`container:${ids.emulator}`)
+    expect(recoveryBootCreate).not.toContain('devhotel-fenced-resident')
+    expect(helper).toBeNull()
+    webStatus = 'running'
+    webSandboxId = liveWebSandboxId
     bootReceipt = 'devhotel-emulator-boot-v1\tready\tdevice\t1\t0\n'
     bootHelperCode = 0
 
@@ -1701,6 +1740,11 @@ describe('OciCliBackend Android artifact export', () => {
       if (args[0] === 'info') {
         return { code: 0, stdout: JSON.stringify({ ID: 'engine-recovery-test' }), stderr: '' }
       }
+      if (args[0] === 'cp' && args[1] === `${ids.emulator}:/etc/passwd`) {
+        writeFileSync(args[2]!, 'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n', 'utf8')
+        return ok
+      }
+      if (args[0] === 'cp' && args[2] === `${ids.emulator}:/etc/passwd`) return ok
       if (args[0] === 'start') {
         if (args[1] === ids.anchor) {
           anchorState = 'running'
@@ -1969,6 +2013,13 @@ describe('OciCliBackend Android artifact export', () => {
     expect(mockedRunDocker.mock.calls
       .filter(([args]) => args[0] === 'start')
       .map(([args]) => args[1])).toEqual([ids.anchor, ids.emulator])
+    const recoveryCalls = mockedRunDocker.mock.calls.map(([args]) => args)
+    const passwdReadAt = recoveryCalls.findIndex((args) => args[0] === 'cp' && args[1] === `${ids.emulator}:/etc/passwd`)
+    const passwdRestoreAt = recoveryCalls.findIndex((args) => args[0] === 'cp' && args[2] === `${ids.emulator}:/etc/passwd`)
+    const emulatorStartAt = recoveryCalls.findIndex((args) => args[0] === 'start' && args[1] === ids.emulator)
+    expect(passwdReadAt).toBeGreaterThanOrEqual(0)
+    expect(passwdRestoreAt).toBeGreaterThan(passwdReadAt)
+    expect(emulatorStartAt).toBeGreaterThan(passwdRestoreAt)
     expect(runtimeAnchorState).toBe('exited')
     expect(webState).toBe('exited')
     expect(existsSync(join(
