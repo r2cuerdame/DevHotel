@@ -15,7 +15,13 @@ import {
   managedEmulatorPreviewInspectArgs,
   managedEmulatorPreviewStageDir
 } from '../backend/managedEmulatorPreviewImage'
-import { MANAGED_EMULATOR_PREVIEW_IMAGE } from '../backend/androidEmulatorLaunch'
+import {
+  MANAGED_EMULATOR_PREVIEW_IMAGE,
+  androidAvdPlan,
+  androidEmulatorLaunch,
+  buildManagedEmulatorContainerArgs
+} from '../backend/androidEmulatorLaunch'
+import { androidApiLevel, buildAndroidSdkProvisionArgs } from '../backend/androidSdkPin'
 import { MANAGED_RUNTIME_GUEST_STAGE_ROOT } from '../backend/managedRuntimeGuestAgent'
 import { ManagedRoomBackend } from '../backend/managedRoomBackend'
 import { ManagedRuntimeIngress } from '../backend/managedRuntimeIngress'
@@ -87,6 +93,32 @@ describe('the image reference is content-addressed and local', () => {
 
   it('is the reference the emulator launch path actually uses', () => {
     expect(MANAGED_EMULATOR_PREVIEW_IMAGE).toBe(MANAGED_EMULATOR_PREVIEW_IMAGE_REF)
+  })
+
+  it('is never resolved against a registry by the commands that use it', () => {
+    // Measured against a real Docker daemon: a missing `devhotel/...` tag is
+    // resolved against Docker Hub and answers "pull access denied ... may
+    // require 'docker login'" — the exact failure this change exists to remove,
+    // on a name anyone could register. `--pull never` fails against the local
+    // daemon in milliseconds instead. `localhost/`-prefixing was measured too
+    // and is worse: it hangs for a full minute reaching for a local registry.
+    const create = buildManagedEmulatorContainerArgs('r1', androidAvdPlan('r1'), androidEmulatorLaunch('r1'), {
+      networkNamespace: 'b'.repeat(64),
+      networkAuthoritySandboxId: 'a'.repeat(64),
+      networkAuthorityStartedAt: '2026-09-17T00:00:00Z',
+      abortToken: 'c'.repeat(36),
+      apiLevel: androidApiLevel('14.0')
+    })
+    expect(create[create.indexOf('--pull') + 1]).toBe('never')
+
+    const provision = buildAndroidSdkProvisionArgs({
+      version: '14.0',
+      sdkRoot: '/opt/devhotel/android-sdk',
+      sdkVolumeName: 'dh-sdk-34',
+      imageRef: MANAGED_EMULATOR_PREVIEW_IMAGE_REF,
+      roomId: 'r1'
+    })
+    expect(provision[provision.indexOf('--pull') + 1]).toBe('never')
   })
 
   it('is what the inspect probe asks about', () => {

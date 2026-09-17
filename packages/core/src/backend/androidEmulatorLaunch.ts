@@ -335,6 +335,17 @@ export function buildManagedEmulatorContainerArgs(
 
   return [
     'create',
+    // The preview image is built locally and never published, so a reference to
+    // it must never become a registry request. Without this, a tag Docker cannot
+    // find is resolved against Docker Hub: measured, a missing
+    // `devhotel/android-emulator-preview` answers "pull access denied … may
+    // require 'docker login'", which is precisely the failure #111 exists to
+    // remove, and on a name anyone could register. `--pull never` fails in
+    // milliseconds against the local daemon instead, and says what is actually
+    // wrong. `ensureEmulatorPreviewImage` has already proved the image is here;
+    // this makes that the only way it can be.
+    '--pull',
+    'never',
     '--name',
     emulatorName(roomId),
     // Join the control anchor's network namespace (same as docker-android path).
