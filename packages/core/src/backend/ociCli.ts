@@ -70,6 +70,8 @@ import type {
   GitCredential,
   FencedEmulatorBootResult,
   IsolationBackend,
+  ManagedContainer,
+  ManagedContainerInventory,
   ManagedNetwork,
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
@@ -3015,13 +3017,23 @@ export class OciCliBackend implements IsolationBackend {
     return 'running'
   }
 
-  async listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]> {
+  async listManagedContainers(): Promise<ManagedContainer[]> {
+    return (await this.listManagedContainerInventory()).owned
+  }
+
+  /**
+   * One malformed row must not hide every proven Room behind it. A foreign
+   * container that merely copies the `devhotel.managed=1` label is reported as
+   * invalid, with the reason, and is otherwise left exactly as it was found.
+   */
+  async listManagedContainerInventory(): Promise<ManagedContainerInventory> {
     await this.assertPinnedEngineIdentity()
     const result = must(
       await this.engine.run(['ps', '-a', '--filter', 'label=devhotel.managed=1', '--format', '{{json .}}']),
       'list managed containers',
     )
-    const out: { roomId: string; role: string; state: string; name: string }[] = []
+    const owned: ManagedContainer[] = []
+    const invalid: ManagedContainerInventory['invalid'] = []
     for (const line of result.stdout.split(/\r?\n/)) {
       const trimmed = line.trim()
       if (trimmed.length === 0) continue
@@ -3029,12 +3041,13 @@ export class OciCliBackend implements IsolationBackend {
       try {
         row = JSON.parse(trimmed) as { Names?: string; State?: string; Labels?: string }
       } catch {
-        throw new Error('list managed containers returned invalid JSON')
+        invalid.push({ name: 'unknown', reason: 'list managed containers returned invalid JSON' })
+        continue
       }
-      const name = row.Names ?? ''
-      const state = row.State ?? ''
+      const name = typeof row.Names === 'string' ? row.Names : ''
+      const state = typeof row.State === 'string' ? row.State : ''
       const labels = new Map<string, string>()
-      for (const pair of (row.Labels ?? '').split(',')) {
+      for (const pair of (typeof row.Labels === 'string' ? row.Labels : '').split(',')) {
         const eq = pair.indexOf('=')
         if (eq > 0) labels.set(pair.slice(0, eq), pair.slice(eq + 1))
       }
@@ -3047,16 +3060,20 @@ export class OciCliBackend implements IsolationBackend {
         !roomId ||
         !isExpectedRoomContainer(roomId, name, role)
       ) {
-        throw new Error(`managed container ownership metadata is invalid: ${name || 'unknown'}`)
+        invalid.push({
+          name: name || 'unknown',
+          reason: `managed container ownership metadata is invalid: ${name || 'unknown'}`
+        })
+        continue
       }
-      out.push({
+      owned.push({
         roomId,
         role,
         state,
         name,
       })
     }
-    return out
+    return { owned, invalid }
   }
 
   async removeManagedContainer(name: string): Promise<void> {

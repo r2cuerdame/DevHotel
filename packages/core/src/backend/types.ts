@@ -97,6 +97,33 @@ export interface ManagedNetwork {
   name: string
 }
 
+export interface ManagedContainer {
+  roomId: string
+  role: string
+  state: string
+  name: string
+}
+
+/**
+ * The engine's answer to "what carries the DevHotel label", split by proof.
+ * A row that carries `devhotel.managed=1` but whose ownership metadata does
+ * not match the strict naming/label contract was not created by this DevHotel
+ * (or was tampered with); it is reported so that it is visible, and never
+ * acted on, but it cannot abort reconciliation of the proven rows.
+ */
+export interface ManagedContainerInventory {
+  owned: ManagedContainer[]
+  invalid: { name: string; reason: string }[]
+}
+
+/** Inventory from any backend: one that cannot tell invalid rows apart reports none. */
+export async function managedContainerInventory(
+  backend: Pick<IsolationBackend, 'listManagedContainers' | 'listManagedContainerInventory'>
+): Promise<ManagedContainerInventory> {
+  if (backend.listManagedContainerInventory) return backend.listManagedContainerInventory()
+  return { owned: await backend.listManagedContainers(), invalid: [] }
+}
+
 export interface ExportedArtifact {
   /** Path relative to the exported artifact directory. */
   relativePath: string
@@ -288,7 +315,10 @@ export interface IsolationBackend {
     stageToken: string
   ): Promise<RoomArtifactRecoveryOutcome>
   webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
-  listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]>
+  /** Proven owned containers only; malformed labeled rows are dropped (see `listManagedContainerInventory`). */
+  listManagedContainers(): Promise<ManagedContainer[]>
+  /** Owned rows plus the labeled rows whose ownership could not be proved. */
+  listManagedContainerInventory?(): Promise<ManagedContainerInventory>
   /** Remove a container after re-validating exact DevHotel ownership metadata. */
   removeManagedContainer(name: string): Promise<void>
   listManagedNetworks(): Promise<ManagedNetwork[]>

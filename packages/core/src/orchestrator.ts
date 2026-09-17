@@ -143,6 +143,7 @@ import {
 } from './backend/naming'
 import {
   RoomArtifactPublicationError,
+  managedContainerInventory,
   type DockerVolumeUsage,
   type ExecResult,
   type GitCredential,
@@ -276,6 +277,13 @@ const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
  */
 const COMPONENT_OBSERVATION_MAX_AGE_MS = 5 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
+/**
+ * Shutdown is fail-soft at the control-plane boundary: a hung engine must end
+ * in a terminal, reported failure rather than a process that never exits. The
+ * desktop keeps its own overall deadline above this one, so every step here
+ * shares one budget that leaves room for runtime disposal after it.
+ */
+export const SHUTDOWN_DEADLINE_MS = 30_000
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
 const ANDROID_ACCEPTANCE_RESTORE_PENDING_PREFIX = 'androidAcceptanceRestorePending:'
 const ANDROID_ACCEPTANCE_RESTORE_MAX_BYTES = 8 * 1024
@@ -1317,6 +1325,24 @@ export interface RoomLifecycleSweepResult {
   retained: Array<{ roomId: string; reason: string }>
 }
 
+/**
+ * Durable answer to "did DevHotel start". An init failure used to be one log
+ * line; the tray and `/v1/status` now carry it with a stable code so an agent
+ * or a human can tell a half-started Hotel from a healthy one.
+ */
+export interface StartupStatus {
+  state: 'pending' | 'ready' | 'failed'
+  code: 'STARTUP_INIT_FAILED' | null
+  detail: string | null
+  backendOk: boolean | null
+  at: string | null
+}
+
+export interface ShutdownOptions {
+  /** Overall budget for stopping Rooms and the gateway; defaults to SHUTDOWN_DEADLINE_MS. */
+  deadlineMs?: number
+}
+
 type ExactRoomRuntimeFenceBackend = IsolationBackend & {
   captureRoomArtifactWebFence(spec: WebSpec): Promise<RoomArtifactWebRuntimeFence>
   pauseRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
@@ -1372,6 +1398,7 @@ export class RoomOrchestrator {
   private readonly materializingRooms = new Set<string>()
   private mutationGate: 'open' | 'delete-all' | 'shutdown' = 'open'
   private shutdownTask: Promise<void> | null = null
+  private startup: StartupStatus = { state: 'pending', code: null, detail: null, backendOk: null, at: null }
   private deleteAllTask: Promise<{ deletedRooms: number; reclaimedBytes: number }> | null = null
   private readonly userData: string
   private readonly backend: IsolationBackend
@@ -1475,6 +1502,29 @@ export class RoomOrchestrator {
   }
 
   async init(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
+    try {
+      const result = await this.initLocked()
+      this.startup = { state: 'ready', code: null, detail: null, backendOk: result.backendOk, at: new Date().toISOString() }
+      return result
+    } catch (error) {
+      // The failure still propagates: the desktop decides what to keep
+      // serving. What changes is that it is no longer only a console line.
+      this.startup = {
+        state: 'failed',
+        code: 'STARTUP_INIT_FAILED',
+        detail: error instanceof Error ? error.message : String(error),
+        backendOk: null,
+        at: new Date().toISOString()
+      }
+      throw error
+    }
+  }
+
+  startupStatus(): StartupStatus {
+    return { ...this.startup }
+  }
+
+  private async initLocked(): Promise<{ backendOk: boolean; reconciled: ReconcileResult | null }> {
     // A proof gate is read-only, so an exact dead owner can be released at
     // startup. Durable writer intents are deliberately never cleared here:
     // their Host ADB children may have survived the parent process.
@@ -1549,7 +1599,18 @@ export class RoomOrchestrator {
     try {
       const staleJobs = (await this.backend.listManagedContainers()).filter((container) => container.role === 'job')
       for (const job of staleJobs) await this.backend.removeManagedContainer(job.name)
-      return !(await this.backend.listManagedContainers()).some((container) => container.role === 'job')
+      // Reconcile tolerates an unowned labeled row; the Android recovery fence
+      // does not. A row whose ownership cannot be proved could still be a job
+      // whose metadata was damaged, so the role is not proven absent and the
+      // fence stays gated rather than being weakened by a foreign container.
+      const inventory = await managedContainerInventory(this.backend)
+      if (inventory.invalid.length > 0) {
+        for (const entry of inventory.invalid) {
+          this.olog('system', `startup: container ${entry.name} is not owned by DevHotel and was left untouched (${entry.reason})`)
+        }
+        return false
+      }
+      return !inventory.owned.some((container) => container.role === 'job')
     } catch {
       return false
     }
@@ -2359,21 +2420,50 @@ export class RoomOrchestrator {
     }
   }
 
-  shutdown(): Promise<void> {
+  shutdown(options: ShutdownOptions = {}): Promise<void> {
     if (this.shutdownTask) return this.shutdownTask
     this.mutationGate = 'shutdown'
-    this.shutdownTask = this.shutdownLocked()
+    this.shutdownTask = this.shutdownLocked(options.deadlineMs ?? SHUTDOWN_DEADLINE_MS)
     return this.shutdownTask
   }
 
-  private async shutdownLocked(): Promise<void> {
+  /**
+   * Fail-soft, fence-safe, bounded. Every Room is attempted independently so
+   * one failure cannot hide another; a Room owned by an Android recovery fence
+   * is never touched and is named in the result instead; and nothing here can
+   * wait past the deadline, so a hung engine ends in a terminal report rather
+   * than a process that never exits. No path clears a recovery key, forces a
+   * fenced Room, or bypasses a manual gate: a fenced Room stays exactly as it
+   * was for the next startup to recover.
+   */
+  private async shutdownLocked(deadlineMs: number): Promise<void> {
     const failures: Error[] = []
+    const deadline = Date.now() + deadlineMs
+    const remaining = (): number => Math.max(0, deadline - Date.now())
+    const bounded = async <T>(step: string, work: () => Promise<T>, cap = Number.POSITIVE_INFINITY): Promise<T> => {
+      const budget = Math.min(remaining(), cap)
+      if (budget === 0) {
+        throw new DevHotelError('SHUTDOWN_DEADLINE_EXCEEDED', `${step} was not attempted: the shutdown deadline is exhausted`)
+      }
+      let timer: NodeJS.Timeout | null = null
+      const expiry = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new DevHotelError('SHUTDOWN_DEADLINE_EXCEEDED', `${step} did not finish inside the shutdown deadline`))
+        }, budget)
+        timer.unref?.()
+      })
+      try {
+        return await Promise.race([work(), expiry])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
     // A clean-removal request owns the inventory while it runs. Quitting waits
     // for it, then handles anything it deliberately left behind after failure.
     const deleteAllTask = this.deleteAllTask
     if (deleteAllTask) {
       try {
-        await deleteAllTask
+        await bounded('Clean removal', () => deleteAllTask.then(() => undefined))
       } catch (error) {
         failures.push(asShutdownError('Clean removal failed before shutdown', error))
       }
@@ -2381,63 +2471,93 @@ export class RoomOrchestrator {
     // createRoom can still be detecting a source before it has a room ID, while
     // all other lifecycle work is represented in roomOps. The global gate above
     // prevents new work; waiting for both sets makes the room list stable.
-    await this.drainRoomMutations()
-    const localeRecoveryRooms = this.rooms.list().filter(
-      (room) => this.settings.get(pendingAndroidLocaleRestoreKey(room.id)) !== null
-    )
-    if (localeRecoveryRooms.length > 0) {
-      throw new AggregateError(
-        localeRecoveryRooms.map(() => new Error('An Android locale recovery fence still owns its exact target.')),
-        `DevHotel shutdown blocked by ${localeRecoveryRooms.length} pending Android locale restoration${
-          localeRecoveryRooms.length === 1 ? '' : 's'
-        }`
-      )
+    // One hung admitted operation must not spend the budget every other Room
+    // needs: the drain gets at most half, and a Room still inside the engine
+    // after that is reported as busy rather than interleaved with.
+    let drained = true
+    try {
+      await bounded('Admitted Room work', () => this.drainRoomMutations(), Math.floor(deadlineMs / 2))
+    } catch (error) {
+      drained = false
+      failures.push(asShutdownError('Admitted Room work did not settle', error))
     }
-    const acceptanceRecoveryRooms = this.rooms.list().filter(
-      (room) => this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null
-    )
-    if (acceptanceRecoveryRooms.length > 0) {
-      throw new AggregateError(
-        acceptanceRecoveryRooms.map(() => new Error('An Android acceptance recovery fence still owns its emulator runtime.')),
-        `DevHotel shutdown blocked by ${acceptanceRecoveryRooms.length} pending Android acceptance restoration${
-          acceptanceRecoveryRooms.length === 1 ? '' : 's'
-        }`
-      )
-    }
+    // #61 is the authority for a fenced Android target. Shutdown never stops,
+    // recreates or releases one; it reports the exact Room and moves on so the
+    // unrelated Rooms are still slept inside the deadline.
+    const fencedRoomIds = new Set<string>()
+    const fenced: Error[] = []
     for (const room of this.rooms.list()) {
-      if (room.status === 'sleeping') continue
-      try {
-        // This is redundant with the all-Room preflight, but keeps the locked
-        // lifecycle implementation fail-closed if its caller changes later.
-        this.assertNoPendingAndroidAcceptanceRestore(room.id)
-        if (room.status === 'broken') {
-          // broken rooms may still own running containers — stop them but keep the status visible
-          if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
-          if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
-          else await this.backend.stopRoomPod(room.id)
-          this.rooms.update(room.id, { hostPort: null })
-        } else {
-          // The shutdown gate rejects public lifecycle calls. All admitted work
-          // has settled, so shutdown owns the lifecycle and can call the locked
-          // implementation directly without queueing behind itself.
-          await this.sleepRoomLocked(room.id, 'devhotel')
-        }
-      } catch (error) {
-        failures.push(asShutdownError(`Room ${room.project} / ${room.nickname} could not be stopped`, error))
-      }
+      const locale = this.settings.get(pendingAndroidLocaleRestoreKey(room.id)) !== null
+      const acceptance = this.settings.get(pendingAndroidAcceptanceRestoreKey(room.id)) !== null
+      if (!locale && !acceptance) continue
+      fencedRoomIds.add(room.id)
+      fenced.push(new DevHotelError(
+        'SHUTDOWN_ROOM_FENCED',
+        `Room ${room.project} / ${room.nickname} (${room.id}) is owned by a pending Android ${
+          locale ? 'locale' : 'acceptance'
+        } recovery fence; its exact runtime and recovery key were left untouched`,
+        { recoveryHint: 'Keep the exact target and restart DevHotel to let recovery finish.' }
+      ))
     }
+    failures.push(...fenced)
+    // Rooms are stopped together, each against the same deadline, so one Room
+    // whose engine call hangs cannot spend the budget the others needed. Each
+    // Room still owns its own lock; nothing here interleaves inside one Room.
+    const roomFailures = await Promise.all(this.rooms.list().map(async (room): Promise<Error | null> => {
+      if (room.status === 'sleeping' || fencedRoomIds.has(room.id)) return null
+      if (!drained && this.activeRoomLocks.has(room.id)) {
+        // Its earlier operation is still inside the engine. Calling the locked
+        // implementation now would interleave with it; report instead.
+        return new DevHotelError(
+          'SHUTDOWN_ROOM_BUSY',
+          `Room ${room.project} / ${room.nickname} (${room.id}) still has admitted work in the engine and was not stopped`
+        )
+      }
+      try {
+        await bounded(`Room ${room.project} / ${room.nickname} stop`, async () => {
+          // This is redundant with the fence pass above, but keeps the locked
+          // lifecycle implementation fail-closed if its caller changes later.
+          this.assertNoPendingAndroidLocaleRestoration(room.id)
+          this.assertNoPendingAndroidAcceptanceRestore(room.id)
+          if (room.status === 'broken') {
+            // broken rooms may still own running containers — stop them but keep the status visible
+            if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
+            if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
+            else await this.backend.stopRoomPod(room.id)
+            this.rooms.update(room.id, { hostPort: null })
+          } else {
+            // The shutdown gate rejects public lifecycle calls. All admitted work
+            // has settled, so shutdown owns the lifecycle and can call the locked
+            // implementation directly without queueing behind itself.
+            await this.sleepRoomLocked(room.id, 'devhotel')
+          }
+        })
+        return null
+      } catch (error) {
+        return asShutdownError(`Room ${room.project} / ${room.nickname} could not be stopped`, error)
+      }
+    }))
+    failures.push(...roomFailures.filter((error): error is Error => error !== null))
     try {
       this.logs.dispose()
     } catch (error) {
       failures.push(asShutdownError('Room log streams could not be disposed', error))
     }
+    // The gateway is in-process and closes its own sockets; the Host ports it
+    // holds must be released even after the engine ate the whole budget.
     try {
       await this.gateway.stop()
     } catch (error) {
       failures.push(asShutdownError('Gateway could not be stopped', error))
     }
     if (failures.length > 0) {
-      throw new AggregateError(failures, `DevHotel shutdown incomplete (${failures.length} failure${failures.length === 1 ? '' : 's'})`)
+      const others = failures.length - fenced.length
+      const message = fenced.length > 0
+        ? `DevHotel shutdown blocked by ${fenced.length} pending Android restoration${fenced.length === 1 ? '' : 's'}${
+            others > 0 ? ` and ${others} other failure${others === 1 ? '' : 's'}` : ''
+          }`
+        : `DevHotel shutdown incomplete (${failures.length} failure${failures.length === 1 ? '' : 's'})`
+      throw new AggregateError(failures, message)
     }
   }
 
@@ -3158,7 +3278,7 @@ export class RoomOrchestrator {
     }
     const rooms: RuntimeRoomRecord[] = []
     for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backendAvailable)
       rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
     }
     return rooms
@@ -3403,6 +3523,21 @@ export class RoomOrchestrator {
   private effectiveRoom(room: RoomRecord, runtimeStatus: RoomRuntimeStatus): RoomRecord {
     if (runtimeStatus.expected !== 'running' || runtimeStatus.state === 'running') return room
     return { ...room, status: runtimeStatus.state === 'dead' ? 'broken' : 'attention' }
+  }
+
+  /** Runtime revalidation plus invariant I2: a proven-dead workload loses ingress on observation. */
+  private async observeRuntimeStatusForIngress(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+    const opsBefore = this.roomOps.get(room.id)
+    const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+    if (
+      runtimeStatus.expected === 'running' &&
+      runtimeStatus.state === 'dead' &&
+      this.roomOps.get(room.id) === opsBefore &&
+      !this.activeRoomLocks.has(room.id)
+    ) {
+      this.revokeRouteFor(room.id, `runtime is dead (${runtimeStatus.detail})`)
+    }
+    return runtimeStatus
   }
 
   async planRoom(input: {
@@ -4227,6 +4362,7 @@ export class RoomOrchestrator {
     } catch (err) {
       this.olog(roomId, `wake failed: ${err instanceof Error ? err.message : String(err)}`)
       this.rooms.update(roomId, { status: 'broken' })
+      this.revokeRouteFor(roomId, 'wake failed')
       report.fail('wake failed', err)
     }
     this.emit(roomId, 'status')
@@ -4274,6 +4410,7 @@ export class RoomOrchestrator {
     const room = this.mustGet(roomId)
     const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
+    this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
@@ -4287,7 +4424,6 @@ export class RoomOrchestrator {
       return
     }
     this.logs.detach(roomId)
-    this.gateway.removeRoute(room.domain)
     // A running agent command must not outlive the runtime that hosts it, and
     // sleep must not queue behind it either: cancel the workload slot, then stop.
     await this.cancelRoomWorkloads(roomId, 'the Room went to sleep')
@@ -4616,6 +4752,7 @@ export class RoomOrchestrator {
     this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
+    this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
@@ -4630,7 +4767,6 @@ export class RoomOrchestrator {
     }
     this.rooms.update(roomId, { status: 'deleting' })
     this.logs.detach(roomId)
-    this.gateway.removeRoute(room.domain)
     await this.cancelRoomWorkloads(roomId, 'the Room was deleted')
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
@@ -8165,6 +8301,7 @@ export class RoomOrchestrator {
   /** One-call answer to "is DevHotel ready and what is running" for agents. */
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
+    startup: StartupStatus
     runtime: { mode: 'managed' | 'compatibility'; managed: ManagedRuntimeObservation | null }
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
@@ -8174,7 +8311,7 @@ export class RoomOrchestrator {
     const managedRuntime = this.managedRuntimeStatus ? await this.managedRuntimeStatus() : null
     const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
     for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatus(room, backend.ok)
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backend.ok)
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing' | 'degraded'
@@ -8194,6 +8331,7 @@ export class RoomOrchestrator {
     }
     return {
       backend,
+      startup: this.startupStatus(),
       runtime: { mode: this.runtimeMode, managed: managedRuntime },
       gateway: this.gateway.status(),
       rooms,
@@ -8239,7 +8377,7 @@ export class RoomOrchestrator {
   /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
   async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
     const recorded = this.mustGet(roomId)
-    const runtimeStatus = await this.observeRuntimeStatus(recorded)
+    const runtimeStatus = await this.observeRuntimeStatusForIngress(recorded)
     const inspection = this.inspectRoom(roomId)
     return {
       ...inspection,
@@ -9026,6 +9164,8 @@ export class RoomOrchestrator {
       )
       const anyBad = report.results.some((r) => r.status === 'broken' || r.status === 'warning')
       this.rooms.update(roomId, { status: coreBroken ? 'broken' : anyBad ? 'attention' : 'ready' })
+      const processDead = report.results.some((r) => r.step === 'process' && r.status === 'broken')
+      if (processDead) this.revokeRouteFor(roomId, 'check proved the web workload is not running')
     }
     this.emit(roomId, 'check', report.overall)
     return report
@@ -9896,20 +10036,54 @@ export class RoomOrchestrator {
       status: 'broken',
       hostPort: null
     })
+    const isRouted = this.gateway.status().routes.some((r) => r.domain === room.domain)
+    if (isRouted) {
+      this.gateway.removeRoute(room.domain)
+    }
   }
 
+  /**
+   * Derive the Room's gateway route from its record (invariant I1).
+   * Entitled  → setRoute (fetches the relay token; Docker-costly).
+   * Otherwise → removeRoute (pure in-memory; never touches the backend).
+   * If the relay token cannot be issued the route is revoked before rethrowing:
+   * ingress must fail closed without a valid relay credential.
+   */
   private async syncRouteFor(roomId: string): Promise<void> {
     const room = this.mustGet(roomId)
-    if (room.hostPort != null) {
-      const relayToken = await this.backend.relayToken(room.id)
-      await this.gateway.setRoute({
-        domain: room.domain,
-        roomId: room.id,
-        targetPort: room.hostPort,
-        https: room.https,
-        relayToken
-      })
+    const entitled =
+      room.provider !== 'windows' &&
+      room.hostPort != null &&
+      room.status !== 'sleeping' &&
+      room.status !== 'preparing' &&
+      room.status !== 'deleting'
+    if (!entitled) {
+      this.gateway.removeRoute(room.domain)
+      return
     }
+    let relayToken: string
+    try {
+      relayToken = await this.backend.relayToken(room.id)
+    } catch (error) {
+      this.gateway.removeRoute(room.domain)
+      throw error
+    }
+    await this.gateway.setRoute({
+      domain: room.domain,
+      roomId: room.id,
+      targetPort: room.hostPort!,
+      https: room.https,
+      relayToken
+    })
+  }
+
+  /** Invariant I2: revoke ingress now. Sync, idempotent, in-memory, no backend calls. */
+  private revokeRouteFor(roomId: string, reason: string): void {
+    const room = this.rooms.get(roomId)
+    if (!room) return
+    const wasRouted = this.gateway.status().routes.some((r) => r.domain === room.domain)
+    this.gateway.removeRoute(room.domain)
+    if (wasRouted) this.olog(roomId, `ingress revoked: ${reason}`)
   }
 
   private uniqueDomain(domain: string): string {
@@ -10083,5 +10257,10 @@ function deriveProjectName(sourceType: SourceType, sourceRef: string): string {
 }
 
 function asShutdownError(context: string, error: unknown): Error {
-  return new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+  const message = `${context}: ${error instanceof Error ? error.message : String(error)}`
+  // A bounded step already carries its stable code; the context only names it.
+  if (error instanceof DevHotelError && error.code === 'SHUTDOWN_DEADLINE_EXCEEDED') {
+    return new DevHotelError(error.code, message, { cause: error })
+  }
+  return new DevHotelError('SHUTDOWN_ROOM_STOP_FAILED', message, { cause: error })
 }

@@ -1,5 +1,5 @@
 import type { VolumeRecord } from '@devhotel/shared'
-import type { DockerVolumeUsage, IsolationBackend } from '../backend/types'
+import { managedContainerInventory, type DockerVolumeUsage, type IsolationBackend } from '../backend/types'
 import type { IngressRouteObservation, LifecycleObservation, SharedCacheObservation } from './observations'
 import { isSharedCacheVolumeName, provesSharedCacheOwnership, sharedCachePurpose } from './sharedCache'
 
@@ -51,12 +51,16 @@ export async function observeHost(opts: ObserveHostOptions): Promise<LifecycleOb
 
   let containers: LifecycleObservation['containers'] = []
   try {
-    containers = (await opts.backend.listManagedContainers()).map((container) => ({
+    const inventory = await managedContainerInventory(opts.backend)
+    containers = inventory.owned.map((container) => ({
       name: container.name,
       roomId: container.roomId || null,
       role: container.role,
       state: container.state
     }))
+    for (const entry of inventory.invalid) {
+      gaps.push(`Container ${entry.name} carries the DevHotel label but is not owned by DevHotel: ${entry.reason}`)
+    }
   } catch (error) {
     gaps.push(`Owned containers could not be listed: ${error instanceof Error ? error.message : String(error)}`)
   }

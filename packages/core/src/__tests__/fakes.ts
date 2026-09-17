@@ -14,6 +14,7 @@ import type {
   GitCredential,
   FencedEmulatorBootResult,
   IsolationBackend,
+  ManagedContainerInventory,
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
   RoomArtifactWebRuntimeFence,
@@ -418,6 +419,8 @@ export class FakeBackend implements IsolationBackend {
   async listManagedContainers() {
     return this.managedContainers
   }
+  /** Tests set this to report labeled rows whose ownership could not be proved. */
+  listManagedContainerInventory?: () => Promise<ManagedContainerInventory>
   async removeManagedContainer(name: string) {
     this.calls.push(`removeManagedContainer:${name}`)
     this.managedContainers = this.managedContainers.filter((container) => container.name !== name)

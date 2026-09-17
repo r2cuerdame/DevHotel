@@ -374,3 +374,39 @@ describe('reconcile sleeping room stray runtimes', () => {
     expect(logs.some((l) => l.includes('sleeppaused') && l.includes('stray runtime'))).toBe(true)
   })
 })
+
+describe('reconcile containment of unowned labeled containers', () => {
+  const dirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('reports a malformed foreign labeled container and still reconciles every proven owned resource', async () => {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    const rooms = roomsRepo(db)
+    rooms.create(makeRoom({ id: 'owned0001', domain: 'owned.localhost', status: 'ready', hostPort: 41010 }))
+    const backend = new FakeBackend()
+    const stray = jobName('gone00001', '11111111-2222-4333-8444-555555555555')
+    backend.managedContainers = [{ roomId: 'gone00001', role: 'job', state: 'exited', name: stray }]
+    backend.listManagedContainerInventory = async () => ({
+      owned: backend.managedContainers,
+      invalid: [{ name: 'someone-elses-container', reason: 'managed container ownership metadata is invalid' }]
+    })
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(result.invalidContainers).toEqual([
+      { name: 'someone-elses-container', reason: 'managed container ownership metadata is invalid' }
+    ])
+    expect(result.straysRemoved).toContain(stray)
+    expect(rooms.get('owned0001')?.status).toBe('sleeping')
+    expect(backend.calls).toContain(`removeManagedContainer:${stray}`)
+    expect(backend.calls).not.toContain('removeManagedContainer:someone-elses-container')
+    expect(logs.some((line) => line.includes('someone-elses-container') && line.includes('not owned by DevHotel'))).toBe(true)
+    db.close()
+  })
+})
