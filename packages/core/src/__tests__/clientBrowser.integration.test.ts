@@ -218,6 +218,14 @@ describe.skipIf(!browserAvailable)('Client Browser sessions on real Chromium', (
       expect(roundTrip.product).toMatch(/Chrome|Edg|Chromium|HeadlessChrome/)
     }
 
+    // An agent closing the page DevHotel drives does not strand navigate: it picks another page.
+    const driven = aInspect.targets.find((target) => target.url.endsWith('/whoami'))
+    expect(driven).toBeTruthy()
+    await cdpCall(a.endpoint.ws, 'Target.closeTarget', { targetId: driven!.targetId })
+    const afterClose = await manager.navigate(a.session.id, a.token, `${site.origin}/login?user=alice`)
+    expect(afterClose.loaded).toBe(true)
+    expect(afterClose.title).toBe('login alice')
+
     // Screenshot comes back as opaque PNG bytes.
     const shot = await manager.screenshot(a.session.id, a.token)
     expect(shot.mimeType).toBe('image/png')

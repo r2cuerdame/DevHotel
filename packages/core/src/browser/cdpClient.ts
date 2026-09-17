@@ -10,6 +10,11 @@ export interface CdpTarget {
 }
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void }
+
+function isStaleSessionError(error: unknown): boolean {
+  if (!(error instanceof DevHotelError) || error.code !== 'CDP_COMMAND_ERROR') return false
+  return /session with given id not found|target closed|no target with given id/i.test(error.message)
+}
 type EventHandler = (params: any, sessionId: string | undefined) => void
 
 /**
@@ -99,6 +104,11 @@ export class SimpleCdpClient {
           return
         }
         if (typeof data.method === 'string') {
+          // An agent on the endpoint may close the page we attached to; the
+          // next operation then attaches to (or creates) another one.
+          if (data.method === 'Target.detachedFromTarget' && data.params?.sessionId === this.pageSessionId) {
+            this.pageSessionId = null
+          }
           const handlers = this.handlers.get(data.method)
           if (handlers) for (const handler of handlers) handler(data.params, data.sessionId)
         }
@@ -161,8 +171,27 @@ export class SimpleCdpClient {
     return this.pageSessionId
   }
 
-  async navigate(url: string, timeoutMs = 15_000): Promise<{ loaded: boolean; title: string; finalUrl: string }> {
-    const sessionId = await this.ensurePageSession()
+  /**
+   * Runs page work, once more on a fresh page if the attached one vanished
+   * meanwhile: an agent on the endpoint can close it between two of our
+   * commands, and the detach event may arrive after our next send.
+   */
+  private async withPage<T>(work: (sessionId: string) => Promise<T>): Promise<T> {
+    const first = await this.ensurePageSession()
+    try {
+      return await work(first)
+    } catch (error) {
+      if (!isStaleSessionError(error)) throw error
+      if (this.pageSessionId === first) this.pageSessionId = null
+      return await work(await this.ensurePageSession())
+    }
+  }
+
+  navigate(url: string, timeoutMs = 15_000): Promise<{ loaded: boolean; title: string; finalUrl: string }> {
+    return this.withPage((sessionId) => this.navigateOn(sessionId, url, timeoutMs))
+  }
+
+  private async navigateOn(sessionId: string, url: string, timeoutMs: number): Promise<{ loaded: boolean; title: string; finalUrl: string }> {
     let loadedResolve!: () => void
     const loaded = new Promise<void>((resolve) => {
       loadedResolve = resolve
@@ -177,7 +206,8 @@ export class SimpleCdpClient {
       }
       const timer = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), timeoutMs))
       const outcome = await Promise.race([loaded.then(() => 'loaded' as const), timer])
-      const state = await this.evaluate<{ title: string; href: string; readyState: string }>(
+      const state = await this.evaluateOn<{ title: string; href: string; readyState: string }>(
+        sessionId,
         '({ title: document.title, href: location.href, readyState: document.readyState })'
       )
       return {
@@ -190,21 +220,25 @@ export class SimpleCdpClient {
     }
   }
 
-  async captureScreenshot(
+  captureScreenshot(
     format: 'png' | 'jpeg' = 'png',
     fullPage = false
   ): Promise<{ data: string; mimeType: 'image/png' | 'image/jpeg' }> {
-    const sessionId = await this.ensurePageSession()
-    const result = await this.send<{ data: string }>(
-      'Page.captureScreenshot',
-      { format, captureBeyondViewport: fullPage },
-      sessionId
-    )
-    return { data: result.data, mimeType: format === 'jpeg' ? 'image/jpeg' : 'image/png' }
+    return this.withPage(async (sessionId) => {
+      const result = await this.send<{ data: string }>(
+        'Page.captureScreenshot',
+        { format, captureBeyondViewport: fullPage },
+        sessionId
+      )
+      return { data: result.data, mimeType: format === 'jpeg' ? 'image/jpeg' : 'image/png' }
+    })
   }
 
-  async evaluate<T = any>(expression: string): Promise<T> {
-    const sessionId = await this.ensurePageSession()
+  evaluate<T = any>(expression: string): Promise<T> {
+    return this.withPage((sessionId) => this.evaluateOn<T>(sessionId, expression))
+  }
+
+  private async evaluateOn<T>(sessionId: string, expression: string): Promise<T> {
     const result = await this.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)
     if (result?.exceptionDetails) {
       throw new DevHotelError('CLIENT_BROWSER_EVAL_FAILED', result.exceptionDetails.text ?? 'JavaScript evaluation failed')

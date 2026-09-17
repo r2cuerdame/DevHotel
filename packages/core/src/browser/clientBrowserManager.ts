@@ -144,13 +144,15 @@ export class ClientBrowserManager {
     return record
   }
 
+  /** Serializes work per session so a release cannot interleave with a navigate on the same browser. */
   private withLock<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(sessionId) ?? Promise.resolve()
     const next = previous.then(work, work)
-    this.locks.set(sessionId, next.catch(() => undefined))
-    void next.finally(() => {
-      if (this.locks.get(sessionId) === next) this.locks.delete(sessionId)
-    }).catch(() => undefined)
+    const settled = next.then(() => undefined, () => undefined)
+    this.locks.set(sessionId, settled)
+    void settled.then(() => {
+      if (this.locks.get(sessionId) === settled) this.locks.delete(sessionId)
+    })
     return next
   }
 
