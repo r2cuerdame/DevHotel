@@ -4197,6 +4197,15 @@ export class RoomOrchestrator {
           }
           const inactiveFor = Math.max(0, now.getTime() - activityMs)
           const awake = room.status === 'running' || room.status === 'ready' || room.status === 'attention'
+          // A command running in the workload slot no longer holds the lifecycle
+          // lock, so the sweep must see it as activity itself: an idle timeout
+          // must never cancel a long build. The refreshed timestamp also keeps the
+          // idle clock honest once the command ends.
+          if (awake && this.workloadSlotBusy(room.id)) {
+            this.recordRoomActivity(room.id)
+            result.retained.push({ roomId: room.id, reason: 'a command is running in the Room' })
+            return
+          }
           if (awake && inactiveFor >= this.lifecyclePolicy.idleSleepAfterMs) {
             await this.sleepRoomLocked(room.id, 'devhotel')
             const autoSleptAt = now.toISOString()
@@ -8302,6 +8311,10 @@ export class RoomOrchestrator {
     if (!awake || (await this.backend.webState(roomId)) !== 'running') {
       throw new Error('Wake the Room before importing Host changes')
     }
+    // Replacing the workspace recreates the runtime that hosts any running
+    // command, and the drift guards below need a quiescent workspace to compare:
+    // cancel the workload slot first instead of pulling the volume out from under it.
+    await this.cancelRoomWorkloads(roomId, 'the Room workspace is being replaced from the Host')
     if (!migrateLegacy) {
       const currentSnapshot = await this.backend.snapshotWorkspace(roomId, room.workspaceVolumeRevision)
       if (options.acceptedCurrentSnapshot && currentSnapshot.fingerprint !== options.acceptedCurrentSnapshot.fingerprint) {
@@ -9036,14 +9049,17 @@ export class RoomOrchestrator {
     actor: Actor,
     signal: AbortSignal
   ): Promise<RoomExecResult> {
+    const cancelled = (): unknown =>
+      signal.reason ??
+      new DevHotelError('ROOM_COMMAND_CANCELLED', 'The command was cancelled before it started.', { httpStatus: 409 })
     // Re-read after queueing: a sleep or delete may have won the lifecycle
     // lock while this command waited for an earlier one to finish.
-    if (signal.aborted) throw signal.reason
+    if (signal.aborted) throw cancelled()
     const room = this.mustGet(roomId)
     if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
     const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
     if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
-    if (signal.aborted) throw signal.reason
+    if (signal.aborted) throw cancelled()
     const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
     let sawStdout = false
     let sawStderr = false

@@ -1,4 +1,5 @@
-import { rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ExecResult } from '../backend/types'
 import { RoomOrchestrator } from '../orchestrator'
@@ -129,6 +130,52 @@ describe('Room workload slot vs lifecycle lock', () => {
     await expect(first).rejects.toMatchObject({ code: 'ROOM_COMMAND_CANCELLED' })
     await expect(second).rejects.toMatchObject({ code: 'ROOM_COMMAND_CANCELLED' })
     expect(backend.execInRoomCalls).toHaveLength(1)
+  })
+
+  it('counts a running command as activity so the idle sweep never cancels it, then sleeps the Room once it is idle', async () => {
+    const guest = hangingExec(backend)
+    const exec = orch.execInRoom(ROOM, ['sleep', '600'], { timeoutMs: 600_000 })
+    await guest.started
+    const twoHoursOn = new Date(Date.now() + 2 * 60 * 60 * 1000)
+
+    const busy = await orch.sweepRoomLifecycle(twoHoursOn)
+    expect(busy.slept).toEqual([])
+    expect(busy.retained).toEqual([{ roomId: ROOM, reason: 'a command is running in the Room' }])
+    expect(backend.reapedExecs).toEqual([])
+    expect(orch.rooms.get(ROOM)?.status).toBe('ready')
+
+    guest.finish({ code: 0, stdout: '', stderr: '' })
+    await expect(exec).resolves.toMatchObject({ code: 0 })
+    const idle = await orch.sweepRoomLifecycle(twoHoursOn)
+    expect(idle.slept).toEqual([ROOM])
+    expect(orch.rooms.get(ROOM)?.status).toBe('sleeping')
+  })
+
+  it('cancels a running command before Host resync replaces the workspace under it', async () => {
+    const sourceDir = join(tempDir(), 'project')
+    mkdirSync(sourceDir, { recursive: true })
+    writeFileSync(join(sourceDir, 'package.json'), JSON.stringify({ name: 'demo' }))
+    try {
+      orch.rooms.update(ROOM, {
+        sourceType: 'linked-folder',
+        sourceRef: sourceDir,
+        workspaceVolumeRevision: 1,
+        hostSyncEnabled: true,
+        workspaceFingerprint: 'same-fingerprint'
+      })
+      backend.workspaceFingerprintValue = 'same-fingerprint'
+      const guest = hangingExec(backend)
+      const exec = expectedToReject(orch.execInRoom(ROOM, ['sleep', '600'], { timeoutMs: 600_000 }))
+      await guest.started
+
+      await expect(orch.syncFromHost(ROOM, 'user')).resolves.toMatchObject({ syncStatus: 'synced' })
+
+      await expect(exec).rejects.toMatchObject({ code: 'ROOM_COMMAND_CANCELLED' })
+      expect(backend.reapedExecs).toHaveLength(1)
+      expect(backend.calls.some((call) => call.startsWith(`recreateWeb:${ROOM}:`))).toBe(true)
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true })
+    }
   })
 
   it('still refuses admission behind an Android recovery fence, and cancellation never touches it', async () => {
