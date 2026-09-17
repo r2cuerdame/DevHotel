@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -311,5 +311,121 @@ describe('legacy Room volume adoption', () => {
       })
     )
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'volume' && args[1] === 'create')).toBe(false)
+  })
+})
+
+describe('deleteRoomPod legacy volume adoption', () => {
+  let dir: string
+
+  function mockLegacyHost(state: { exists: boolean; containers?: string[] }) {
+    mockedRunDocker.mockReset()
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: JSON.stringify({ ID: 'engine-one' }), stderr: '' }
+      if (args[0] === 'volume' && args[1] === 'ls') {
+        return { code: 0, stdout: state.exists ? `${VOLUME}\n` : '', stderr: '' }
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') {
+        return state.exists
+          ? { code: 0, stdout: legacyInspect(), stderr: '' }
+          : { code: 1, stdout: '', stderr: 'no such volume' }
+      }
+      if (args[0] === 'volume' && args[1] === 'rm') {
+        state.exists = false
+        return { code: 0, stdout: `${VOLUME}\n`, stderr: '' }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return { code: 1, stdout: '', stderr: 'no such network' }
+      }
+      if (args[0] === 'rm') {
+        state.containers = []
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'ps') {
+        const rows = (state.containers ?? []).map((name) =>
+          JSON.stringify({
+            ID: `${name}-id`,
+            Names: name,
+            State: 'exited',
+            Labels: `devhotel.managed=1,devhotel.room=${ROOM_ID},devhotel.role=web`
+          })
+        )
+        return { code: 0, stdout: rows.join('\n'), stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dh-delete-adopt-'))
+  })
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  it('adopts an authorized pre-label volume during deletion, removes it, and retires the adoption record', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    const state = { exists: true }
+    mockLegacyHost(state)
+    const backend = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: (roomId, name) => roomId === ROOM_ID && name === VOLUME
+    })
+
+    await backend.deleteRoomPod(ROOM_ID, { volumes: true })
+
+    expect(
+      mockedRunDocker.mock.calls.some(([args]) => args[0] === 'volume' && args[1] === 'rm' && args.includes(VOLUME))
+    ).toBe(true)
+    expect(state.exists).toBe(false)
+    const registry = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { schema: number; volumes: Record<string, unknown> }
+    expect(registry.schema).toBe(2)
+    expect(registry.volumes[VOLUME]).toBeUndefined()
+  })
+
+  it('retires a previously adopted legacy volume from the registry when the Room is deleted', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    const state = { exists: true }
+    mockLegacyHost(state)
+    const adopter = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => true
+    })
+    await expect(adopter.adoptLegacyRoomVolumes(ROOM_ID)).resolves.toEqual([VOLUME])
+    const before = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { volumes: Record<string, unknown> }
+    expect(before.volumes[VOLUME]).toBeDefined()
+
+    // A fresh backend instance must load the on-disk registry, not an in-memory copy.
+    const deleter = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => false
+    })
+    await deleter.deleteRoomPod(ROOM_ID, { volumes: true })
+
+    expect(state.exists).toBe(false)
+    const after = JSON.parse(readFileSync(adoptionFile, 'utf8')) as { volumes: Record<string, unknown> }
+    expect(after.volumes[VOLUME]).toBeUndefined()
+  })
+
+  it('fails closed on an unauthorized volume collision before any container or network is removed', async () => {
+    const adoptionFile = join(dir, 'legacy-volumes.json')
+    const state = { exists: true, containers: [`dh-${ROOM_ID}-web`] }
+    mockLegacyHost(state)
+    const backend = new OciCliBackend({
+      identityFile: join(dir, 'engine.json'),
+      legacyVolumeAdoptionFile: adoptionFile,
+      canAdoptLegacyVolume: () => false
+    })
+
+    await expect(backend.deleteRoomPod(ROOM_ID, { volumes: true })).rejects.toThrow(/not authorized/)
+
+    expect(state.exists).toBe(true)
+    expect(
+      mockedRunDocker.mock.calls.some(
+        ([args]) => args[0] === 'rm' || (args[0] === 'volume' && args[1] === 'rm') || (args[0] === 'network' && args[1] === 'rm')
+      )
+    ).toBe(false)
+    expect(existsSync(adoptionFile)).toBe(false)
   })
 })

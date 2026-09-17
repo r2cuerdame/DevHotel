@@ -22,6 +22,15 @@
   debounced tray rebuild, instead of duplicate refreshes and a tray rebuild
   with its own health probe per event.
 
+### Agents can tear down sleeping, fully-synced Host-linked Rooms (#90)
+
+- `DELETE /v1/rooms/:id` (and the `delete_room` MCP tool) no longer answers
+  `403` for every Host-linked Room. A `linked-folder` or `legacy-host-bind`
+  Room may be deleted by an agent while it is `sleeping` with `syncStatus`
+  `synced` or `legacy`; awake Rooms and Rooms holding unsynced Room-owned edits
+  stay a human decision. Deleting never touches the Host folder, so disposable
+  test Rooms stop piling up bridge networks and volumes on the host.
+
 ### Gateway routes are revoked for dead, broken, and sleeping Rooms (#87)
 
 - The Gateway drops a Room's route as soon as its hostPort is cleared, when a
