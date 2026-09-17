@@ -411,6 +411,15 @@ export interface IsolationBackend {
   ): Promise<FencedEmulatorBootResult>
   /** Recovery-only ADB through the retained control anchor; never starts the Room web workload. */
   execFencedEmulatorRecoveryAdb(roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult>
+  /**
+   * Recovery-only boot witness under the retained control-anchor topology. It
+   * proves the emulator *workload* (ADB `device` + sys.boot_completed), not
+   * merely a running container, while the Room web workload may be exited.
+   */
+  waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult>
   /** Install one Host-private staged APK without reopening the Room workspace. */
   installFencedEmulatorApk(roomId: string, hostApkPath: string, opts?: ExecOpts): Promise<ExecResult>
   /* --- android emulator sidecar (KVM) --- */

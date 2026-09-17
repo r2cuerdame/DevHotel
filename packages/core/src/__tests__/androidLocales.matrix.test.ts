@@ -1765,6 +1765,106 @@ describe('Android locale screenshot matrix', () => {
     expect(diag.operatorAction).toContain('has a launchable activity')
   })
 
+  it('retains fence and records workload-not-booted structured diagnostic when the retained emulator container runs but never boots (issue #61)', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'unrecoverable-dead-workload'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    const retained = settings.get(pendingKey)
+    const mutationCount = fixture.applied.length
+    // Unclean stop: the exact container comes back `exited`, restart brings it
+    // to `running`, but the emulator workload inside never reaches ADB `device`
+    // with sys.boot_completed=1 (the docker-android stale X lock shape).
+    fixture.backend.emulatorStateValue = 'exited'
+    fixture.backend.fencedEmulatorBootHandler = () => ({
+      booted: false,
+      adbState: 'offline',
+      bootProperty: 'empty',
+      lastAdbCode: 1,
+      helperCode: 74
+    })
+    fixture.backend.calls.length = 0
+    fixture.open.mockClear()
+
+    await fixture.orch.init()
+
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('attention')
+    expect(settings.get(pendingKey)).toBe(retained)
+    expect(fixture.applied).toHaveLength(mutationCount)
+    // Exactly one bounded exact-container restart and one boot proof; no
+    // session ADB traffic, no recreate, no removal, no retry loop.
+    const starts = fixture.backend.calls.filter((call) => call === `startExistingEmulatorForRecovery:${ROOM_ID}`)
+    const bootProofs = fixture.backend.calls.filter((call) => call === `waitForFencedEmulatorRecoveryBoot:${ROOM_ID}`)
+    expect(starts).toHaveLength(1)
+    expect(bootProofs).toHaveLength(1)
+    expect(fixture.backend.calls.indexOf(`startExistingEmulatorForRecovery:${ROOM_ID}`))
+      .toBeLessThan(fixture.backend.calls.indexOf(`waitForFencedEmulatorRecoveryBoot:${ROOM_ID}`))
+    expect(fixture.open).not.toHaveBeenCalled()
+    expect(fixture.backend.calls).not.toContain(`removeEmulator:${ROOM_ID}`)
+    expect(fixture.backend.calls).not.toContain(`createEmulator:${ROOM_ID}`)
+    expect(fixture.backend.calls).not.toContain(`stopRoomPod:${ROOM_ID}`)
+    expect(fixture.backend.calls).not.toContain(`deleteRoomPod:${ROOM_ID}`)
+    expect(fixture.backend.emulatorStateValue).toBe('running')
+    const diag = JSON.parse(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)!) as {
+      invariantClass: string
+      reason: string
+      operatorAction: string
+    }
+    expect(diag.invariantClass).toBe('workload-not-booted')
+    expect(diag.reason).toBe(
+      'Retained emulator container is running but its Android workload did not reach a booted ADB device state (adb: offline, boot: empty)'
+    )
+    expect(diag.operatorAction).toContain('Keep the exact emulator container')
+    expect(diag.operatorAction).toContain('restart DevHotel')
+    expect(diag.reason).not.toMatch(/ROOM_ID|\/|\\|[a-f0-9]{12,}/)
+    // Startup still refuses ordinary mutation behind the retained fence, and
+    // the structured evidence is what the Control API/MCP surface carries.
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'blocked-dead-workload'
+    }, 'agent')).rejects.toMatchObject({
+      code: 'ANDROID_LOCALE_RECOVERY_REQUIRED',
+      evidence: { invariantClass: 'workload-not-booted' }
+    })
+  })
+
+  it('proves the retained emulator workload booted before opening the recovery session', async () => {
+    const fixture = setup({ failRestore: true })
+    const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
+    await expect(fixture.orch.androidLocaleScreenshotMatrix(ROOM_ID, {
+      applicationId: APP_ID,
+      locales: ['ko-KR'],
+      filenamePrefix: 'boot-proof-order'
+    }, 'agent')).rejects.toMatchObject({ code: 'ANDROID_LOCALE_RESTORE_FAILED' })
+    fixture.controls.failRestore = false
+    fixture.backend.emulatorStateValue = 'exited'
+    fixture.backend.calls.length = 0
+    fixture.events.length = 0
+    fixture.backend.fencedEmulatorBootHandler = () => {
+      fixture.events.push('boot-proof')
+      return { booted: true, adbState: 'device', bootProperty: '1', lastAdbCode: 0, helperCode: 0 }
+    }
+
+    await fixture.orch.init()
+
+    expect(fixture.backend.calls.indexOf(`startExistingEmulatorForRecovery:${ROOM_ID}`))
+      .toBeLessThan(fixture.backend.calls.indexOf(`waitForFencedEmulatorRecoveryBoot:${ROOM_ID}`))
+    expect(fixture.events.indexOf('boot-proof')).toBeLessThan(fixture.events.indexOf('open'))
+    expect(fixture.backend.fencedEmulatorBootCalls.at(-1)?.opts?.timeoutMs).toBe(5 * 60_000)
+    expect(fixture.backend.calls.filter((call) => call === `waitForFencedEmulatorRecoveryBoot:${ROOM_ID}`)).toHaveLength(1)
+    const settings = (fixture.orch as unknown as { settings: { get(key: string): string | null } }).settings
+    expect(settings.get(pendingKey)).toBeNull()
+    expect(settings.get(`androidLocaleRecoveryDiagnostic:${ROOM_ID}`)).toBeNull()
+    expect(fixture.currentLocaleTags()).toEqual(['en-US'])
+    expect(fixture.orch.rooms.get(ROOM_ID)?.status).toBe('sleeping')
+  })
+
   it('clears recovery diagnostic when an outside recovery intent is abandoned', async () => {
     const fixture = setup({ externalBeforeFirstMutation: ['fr-FR'] })
     const pendingKey = `androidLocaleRestorePending:${ROOM_ID}`
