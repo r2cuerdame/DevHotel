@@ -789,6 +789,59 @@ dh-29c5e8ys-{anchor,svc-emulator}  Up 15 hours   — a second one
 searxng                            Up 15 hours
 ```
 
+### 4. What was actually verified, and what that is worth
+
+Both of this attempt's deliverables were verified rather than asserted, and both
+verifications are recorded here because the next attempt should not have to
+re-run them:
+
+**The Android pin re-verified on an independent second fetch.**
+`DEVHOTEL_PIN_ANDROID_SDK=1 pnpm --filter @devhotel/core pin:android-sdk`
+re-downloaded all seven artifacts — three shared tools plus four system images,
+~6.8 GB — and re-verified every checked-in digest. It passed in 1,141,690 ms:
+
+```
+✓ keeps the checked-in pin internally consistent
+✓ re-measures every artifact against the checked-in pin   1141690ms
+  Tests  2 passed
+```
+
+Every `sizeBytes`, `upstreamSha1`, `sha256` and `sha512` in `androidSdkPin.ts`
+came back identical on bytes fetched a second time. That is the part a single
+measurement cannot give: one fetch records whatever arrived, including a
+corruption, as though it were the artifact.
+
+**The ISO digest re-confirmed from the cached file.** The fetch measured
+`a61adeab…e535e7b9`, and a second run with `-ExpectedSha256` read the 6.6 GB back
+off disk and agreed — so the recorded value is not merely what the download
+printed. A deliberately wrong digest was also passed, and the script refused
+instead of re-fetching, which is the behaviour that makes the check worth having.
+
+**None of this is gate evidence, and the distinction matters here more than
+anywhere else in this document.** Verifying that DevHotel will fetch the right
+Android bytes is not the same as an emulator booting; verifying the installation
+media is not the same as a clean guest reaching a healthy runtime. What these two
+verifications buy is narrower and still real: when the gate is finally run, a
+failure will not be attributable to unpinned Android images or unverified media,
+because both were closed and measured first.
+
+**Host-side suites, re-measured on this branch:**
+
+```
+@devhotel/core      94 files passed,  4 skipped   1755 passed, 10 skipped
+@devhotel/shared     5 files passed                  52 passed
+devhotel-mcp         3 files passed                  56 passed
+devhotel (desktop)  35 files passed                 203 passed,  4 skipped
+                                                   ----------------------
+                                                   2066 passed, 14 skipped
+```
+
+`pnpm -r typecheck` clean across all four packages. `pnpm lint` 0 errors, 4
+warnings — the same pre-existing unused-import warnings in
+`backend.network-lifecycle.test.ts`. Unlike the third attempt, the core suite
+passed at full parallelism on the first run, with no worker-RPC load flakes to
+disclose.
+
 ### Where #111 stands after four attempts
 
 | Group | Claims | State |

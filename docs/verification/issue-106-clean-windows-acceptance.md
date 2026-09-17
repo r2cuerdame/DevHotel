@@ -70,7 +70,13 @@ A second machine confirms it has the same bytes the evidence names with
 | File | `26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso` |
 | Build | 26200.6584 (25H2), Enterprise Evaluation, x64, en-US |
 | Size | 7,092,807,680 bytes |
-| SHA-256 | _see the provenance sidecar; recorded when the gate is run_ |
+| SHA-256 | `a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9` |
+| SHA-512 | `d9880aa30635de940f27bd2892727650dbc957a4c688d7c937f2ee8cda97a910eae43f034901a818519c55ddb11465b2ca68bbf780b170deb1b5ebef205ff6c0` |
+
+Both digests were measured on this Host on 2026-09-17 and re-confirmed by a second
+run with `-ExpectedSha256`, which read the cached file back rather than trusting
+the value the first run printed. Passing a deliberately wrong digest was also
+checked, and it refuses rather than re-fetching.
 
 Record the digest in the matrix below. The VM script refuses to build from media
 whose digest does not match what the run declares.
