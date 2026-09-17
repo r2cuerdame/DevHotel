@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { DockerVolumeUsage } from '@devhotel/shared'
+import type { DockerVolumeUsage } from '../backend/types'
 import { depsVolume, srcVolume, svcVolume } from '../backend/naming'
 import { depsGenKey, depsGenMaxKey } from '../changes/definitions/deps'
 import { RoomOrchestrator } from '../orchestrator'
@@ -296,8 +296,8 @@ describe('crash → fresh orchestrator recovery', () => {
       await first.orch.init()
       // The engine finished; the process died before the row went away.
       const deleteRoomPod = backend.deleteRoomPod.bind(backend)
-      backend.deleteRoomPod = async (roomId, opts) => {
-        await deleteRoomPod(roomId, opts)
+      backend.deleteRoomPod = async (roomId: string) => {
+        await deleteRoomPod(roomId)
         return new Promise<never>(() => undefined)
       }
       const abandoned = first.orch.deleteRoom(ROOM_ID, 'user')
@@ -351,7 +351,7 @@ describe('crash → fresh orchestrator recovery', () => {
       expect(reconciled?.roomsDeleted).toBeUndefined()
       expect(second.orch.rooms.get(ROOM_ID)?.status).toBe('deleting')
       expect(existsSync(roomDir(userData))).toBe(true)
-      expect(reconciled?.plan.actions).toContainEqual(expect.objectContaining({ kind: 'resume-delete', target: ROOM_ID }))
+      expect(reconciled?.plan?.actions).toContainEqual(expect.objectContaining({ kind: 'resume-delete', target: ROOM_ID }))
       // The tombstone still gates every lifecycle entry point in this process.
       expect(() => second.orch.startRoomOperation(ROOM_ID, 'agent')).toThrow(/being deleted/)
       expect(() => second.orch.applyChange(ROOM_ID, { kind: 'deps-install', clean: false }, 'user')).toThrow(/being deleted and cannot be modified/)
