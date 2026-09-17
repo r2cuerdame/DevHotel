@@ -8,6 +8,15 @@ import {
   SCREENSHOT_ARTIFACT_MAX_BYTES,
   type AgentCreateRoomInput,
   type AgentAcquireRoomInput,
+  type AllocateClientBrowserBody,
+  type ClientBrowserAllocation,
+  type ClientBrowserInspection,
+  type ClientBrowserNavigationResult,
+  type ClientBrowserReleaseResult,
+  type ClientBrowserScreenshotResult,
+  type ClientBrowserSessionInfo,
+  type NavigateClientBrowserBody,
+  type ScreenshotClientBrowserBody,
   type AcquireRoomResult,
   type AbandonAndroidLocaleMatrixRecoveryInput,
   type AbandonAndroidLocaleMatrixRecoveryResult,
@@ -574,6 +583,29 @@ export class ControlClient {
   }
   cancelAndroidDeviceRequest(requestId: string) {
     return this.req<unknown>('POST', '/v1/devices/cancel', { requestId })
+  }
+  allocateClientBrowser(roomId: string, body: AllocateClientBrowserBody) {
+    return this.req<ClientBrowserAllocation>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/browsers`, body)
+  }
+  listClientBrowsers(roomId?: string) {
+    return roomId
+      ? this.req<ClientBrowserSessionInfo[]>('GET', `/v1/rooms/${encodeURIComponent(roomId)}/browsers`)
+      : this.req<{ runtime: string; sessions: ClientBrowserSessionInfo[] }>('GET', '/v1/browsers')
+  }
+  attachClientBrowser(sessionId: string, token: string) {
+    return this.req<ClientBrowserAllocation>('POST', `/v1/browsers/${encodeURIComponent(sessionId)}/attach`, { token })
+  }
+  inspectClientBrowser(sessionId: string, token: string) {
+    return this.req<ClientBrowserInspection>('POST', `/v1/browsers/${encodeURIComponent(sessionId)}/inspect`, { token })
+  }
+  navigateClientBrowser(sessionId: string, body: NavigateClientBrowserBody) {
+    return this.req<ClientBrowserNavigationResult>('POST', `/v1/browsers/${encodeURIComponent(sessionId)}/navigate`, body)
+  }
+  screenshotClientBrowser(sessionId: string, body: ScreenshotClientBrowserBody) {
+    return this.req<ClientBrowserScreenshotResult>('POST', `/v1/browsers/${encodeURIComponent(sessionId)}/screenshot`, body)
+  }
+  releaseClientBrowser(sessionId: string, token: string) {
+    return this.req<ClientBrowserReleaseResult>('POST', `/v1/browsers/${encodeURIComponent(sessionId)}/release`, { token })
   }
   hotelGithubStatus() {
     return this.req<unknown>('GET', '/v1/hotel/github')

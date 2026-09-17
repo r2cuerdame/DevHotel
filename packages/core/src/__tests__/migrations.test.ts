@@ -35,7 +35,7 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
@@ -219,7 +219,7 @@ describe('database migrations', () => {
       expect(sqlite.prepare(
         "SELECT length(value) AS bytes FROM android_acceptance_secrets WHERE name = 'acceptance-hmac-v1'"
       ).get()).toEqual({ bytes: 32 })
-      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 13 })
+      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 14 })
     } finally {
       sqlite.close()
     }

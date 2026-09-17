@@ -21,6 +21,9 @@ import {
   zArtifactId,
   zArtifactListLimit,
   zChangeId,
+  zClientBrowserProfileMode,
+  zClientBrowserSessionId,
+  zClientBrowserToken,
   zLeasePurpose,
   zPmKind,
   zQuickChange,
@@ -994,6 +997,80 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
         timeoutMs: z.number().int().positive().max(MAX_ADB_TIMEOUT_MS).optional()
       },
       handler: wrap(async (a) => (await getClient()).adbOnDevice(a.roomId, a.args, a.timeoutMs))
+    },
+    {
+      name: 'allocate_client_browser',
+      description:
+        "Borrow an isolated Chromium for web automation on behalf of this Room. This is the Client Browser capability — the thing that visits a site — and is separate from the Web Server Room that hosts one. Each allocation is its own process, profile, cookie jar, storage and tab set; nothing is shared with the Host's Chrome, other Rooms, or other agents. Returns the session, a secret token and a stable CDP endpoint: pass `endpoint.http` to Playwright's chromium.connectOverCDP (or `endpoint.ws` to any raw CDP client). Keep the token: every later call needs it and nobody without it can reach this browser. Ephemeral by default — the profile is deleted on release, Room sleep, Room delete and DevHotel restart. The Room must be awake.",
+      schema: {
+        roomId: zRoomId,
+        profileMode: zClientBrowserProfileMode.optional().describe("'ephemeral' (default) is wiped on release; 'persistent' keeps one Room-owned profile across sessions"),
+        headless: z.boolean().optional().describe('default true; false opens a visible window on the Host desktop')
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...body } = a
+        return (await getClient()).allocateClientBrowser(roomId, body)
+      })
+    },
+    {
+      name: 'attach_client_browser',
+      description:
+        'Re-fetch the CDP endpoint of a Client Browser session you already own. Requires the exact session ID and token from allocate_client_browser; any other token is refused, so two agents on the same Host cannot pick up each other’s browser by accident.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).attachClientBrowser(a.sessionId, a.token))
+    },
+    {
+      name: 'inspect_client_browser',
+      description:
+        'Status of one Client Browser session: which Room owns it, whether its process is alive and its CDP listener answers, the browser version, how many automation clients are tunnelled through its endpoint right now, and its open page targets. Call this when a Playwright/CDP connection misbehaves before allocating another browser.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).inspectClientBrowser(a.sessionId, a.token))
+    },
+    {
+      name: 'navigate_client_browser',
+      description:
+        'Navigate the session’s page to an http(s) URL (or about:blank) and wait for it to load; returns the final URL and title. Convenient for a quick check without wiring a CDP client; full automation belongs on the endpoint. Non-web schemes such as file: are refused.',
+      schema: {
+        sessionId: zClientBrowserSessionId,
+        token: zClientBrowserToken,
+        url: z.string().min(1).max(4096).describe('absolute http:// or https:// URL, or about:blank'),
+        timeoutMs: z.number().int().min(100).max(120_000).optional().describe('load wait budget, default 15000')
+      },
+      handler: wrap(async (a) => {
+        const { sessionId, ...body } = a
+        return (await getClient()).navigateClientBrowser(sessionId, body)
+      })
+    },
+    {
+      name: 'screenshot_client_browser',
+      description: 'Capture the session’s current page as an image and return it directly for review. Nothing is stored; use Room artifacts for durable evidence.',
+      schema: {
+        sessionId: zClientBrowserSessionId,
+        token: zClientBrowserToken,
+        format: z.enum(['png', 'jpeg']).optional(),
+        fullPage: z.boolean().optional().describe('capture beyond the viewport')
+      },
+      handler: async (a: { sessionId: string; token: string; format?: 'png' | 'jpeg'; fullPage?: boolean }): Promise<ToolResult> => {
+        try {
+          const { sessionId, ...body } = a
+          const shot = await (await getClient()).screenshotClientBrowser(sessionId, body)
+          return {
+            content: [
+              { type: 'text', text: JSON.stringify({ sessionId: shot.sessionId, mimeType: shot.mimeType, sizeBytes: shot.sizeBytes }, null, 2) },
+              { type: 'image', data: shot.contentBase64, mimeType: shot.mimeType }
+            ]
+          }
+        } catch (err) {
+          return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+        }
+      }
+    },
+    {
+      name: 'release_client_browser',
+      description:
+        'Close the browser process and delete its ephemeral profile, dropping any client still tunnelled to it. No other Room or session is touched. Always release when your automation is done; a Room going to sleep or being deleted releases its browsers too.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).releaseClientBrowser(a.sessionId, a.token))
     },
     {
       name: 'hotel_github_status',
