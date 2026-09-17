@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoomOrchestrator } from '@devhotel/core'
-import type { VolumeGcResult, VolumeReconciliationReport } from '@devhotel/shared'
+import { VOLUME_GC_DEFAULT_DEADLINE_MS, type VolumeGcResult, type VolumeReconciliationReport } from '@devhotel/shared'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -66,7 +66,7 @@ describe('agent control API storage volume endpoints (issue #63)', () => {
       expect(res.status).toBe(200)
       const data = await res.json()
       expect(data.dryRun).toBe(true)
-      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: true, maxVolumes: 25 })
+      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: true, maxVolumes: 25, deadlineMs: VOLUME_GC_DEFAULT_DEADLINE_MS })
     })
   })
 
@@ -86,7 +86,7 @@ describe('agent control API storage volume endpoints (issue #63)', () => {
         headers
       })
       expect(res.status).toBe(200)
-      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: true, maxVolumes: 50 })
+      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: true, maxVolumes: 50, deadlineMs: VOLUME_GC_DEFAULT_DEADLINE_MS })
     })
   })
 
@@ -105,10 +105,10 @@ describe('agent control API storage volume endpoints (issue #63)', () => {
       const accepted = await fetch(`${base}/v1/storage/volumes/gc`, {
         method: 'POST',
         headers: { ...headers, 'content-type': 'application/json' },
-        body: JSON.stringify({ dryRun: false, maxVolumes: 1, maxBytes: 4096 })
+        body: JSON.stringify({ dryRun: false, maxVolumes: 1, maxBytes: 4096, deadlineMs: 120_000 })
       })
       expect(accepted.status).toBe(200)
-      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: false, maxVolumes: 1, maxBytes: 4096 })
+      expect(gcVolumes).toHaveBeenCalledWith({ dryRun: false, maxVolumes: 1, maxBytes: 4096, deadlineMs: 120_000 })
     })
   })
 })

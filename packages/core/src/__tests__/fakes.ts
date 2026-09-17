@@ -8,6 +8,7 @@ import type {
   AnchorSpec,
   ExecOpts,
   ExecResult,
+  DockerVolumeObservation,
   DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
@@ -479,6 +480,13 @@ export class FakeBackend implements IsolationBackend {
   async listVolumesWithUsage(): Promise<DockerVolumeUsage[]> {
     this.calls.push('listVolumesWithUsage')
     return this.managedVolumes
+  }
+  async inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null> {
+    this.calls.push(`inspectVolumeUsage:${name}`)
+    const found = this.managedVolumes.find((v) => v.name === name)
+    if (!found) return null
+    const { sizeBytes: _size, sizeKnown: _known, ...observation } = found
+    return observation
   }
   async removeManagedVolume(name: string): Promise<void> {
     this.calls.push(`removeManagedVolume:${name}`)

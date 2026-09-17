@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Volume GC proves its work in one pass, on a clock (#63)
+
+- A real volume GC pass now runs one `docker system df` inventory and re-proves
+  each candidate from a single-volume inspection under its Room lock, finishes
+  within an explicit wall-clock deadline, and counts every removal attempt —
+  failed ones included — against `maxVolumes`; `maxBytes` stays fail-closed.
+  Every candidate it did not reach is reported with the bound that stopped it.
+- Rooms are fenced by durable recovery intents (pending restores and exports,
+  recovery diagnostics, explicit fences), not by the generic `attention` status.
+  The #61 recovery Rooms remain fenced through their pending-restore records.
+- Dependencies for a Node major the Room no longer runs, and data for a service
+  the Room no longer declares, are classified positively stale — only with exact
+  ownership, known size, zero attachments and no undo reference.
+- Superseded package-install history no longer pins generations forever: a row
+  retains its previous generations only while its staged generation is the
+  published one, which is exactly when it can still be undone.
+- Clean dependency reinstalls and Room resets reserve the next dependency
+  generation durably before creating any volume, so a crash can never reuse a
+  half-written generation name.
+- `pnpm --filter @devhotel/core report:volume-gc` prints the read-only host
+  dry-run: every volume, its class, its bytes and the reason it is safe or held.
+
 ### The managed runtime updates, rolls back and uninstalls on its own terms
 
 - The runtime is now a versioned product component. Every release this build can

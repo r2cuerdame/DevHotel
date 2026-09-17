@@ -63,6 +63,7 @@ import type {
   ExecOpts,
   ExecOutputChunk,
   ExecResult,
+  DockerVolumeObservation,
   DockerVolumeUsage,
   ExportedArtifact,
   GitCredential,
@@ -7838,6 +7839,36 @@ export class OciCliBackend implements IsolationBackend {
       }
     }
     return usages
+  }
+
+  async inspectVolumeUsage(name: string): Promise<DockerVolumeObservation | null> {
+    await this.assertPinnedEngineIdentity()
+    const inspected = await this.inspectVolume(name)
+    if (!inspected) return null
+    // Every container, in any state, that references the volume. This is what
+    // `docker system df` counts as Links, observed for one volume instead of
+    // all of them.
+    const attached = await this.engine.run(['ps', '-a', '--filter', `volume=${name}`, '--format', '{{.ID}}'], { timeoutMs: 30_000 })
+    const linksKnown = attached.code === 0
+    const links = linksKnown
+      ? attached.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).length
+      : 0
+    const labels: Record<string, string> = {}
+    for (const [key, value] of Object.entries(inspected.Labels ?? {})) labels[key] = value
+    const usage = await this.completeVolumeUsage({
+      name,
+      driver: inspected.Driver ?? 'local',
+      scope: inspected.Scope ?? 'local',
+      mountpoint: inspected.Mountpoint ?? '',
+      sizeBytes: 0,
+      sizeKnown: false,
+      links,
+      linksKnown,
+      labels,
+      ...(inspected.CreatedAt ? { createdAt: inspected.CreatedAt } : {})
+    })
+    const { sizeBytes: _size, sizeKnown: _known, ...observation } = usage
+    return observation
   }
 
   async removeManagedVolume(name: string): Promise<void> {
