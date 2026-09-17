@@ -205,6 +205,8 @@ async function bootstrap(): Promise<void> {
   try {
     await orch.init()
   } catch (err) {
+    // The orchestrator already recorded this durably: the tray and /v1/status
+    // report startup.code = STARTUP_INIT_FAILED until the next successful init.
     console.error('orchestrator init failed:', err)
   }
 
@@ -279,6 +281,14 @@ async function bootstrap(): Promise<void> {
       reportFailure: async (failedAction, error) => {
         const detail = error instanceof Error ? error.message : String(error)
         console.error(`DevHotel ${failedAction} shutdown failed:`, error)
+        // Each Room outcome is its own line with its stable code, so a fenced
+        // Android Room is named explicitly rather than folded into one message.
+        if (error instanceof AggregateError) {
+          for (const entry of error.errors) {
+            const code = entry instanceof Error && 'code' in entry ? String(entry.code) : 'SHUTDOWN_FAILURE'
+            console.error(`  [${code}] ${entry instanceof Error ? entry.message : String(entry)}`)
+          }
+        }
         if (failedAction === 'install-update') {
           await dialog.showMessageBox(mainWindow!, {
             type: 'error',
