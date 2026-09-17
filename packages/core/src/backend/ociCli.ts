@@ -2213,6 +2213,10 @@ export class OciCliBackend implements IsolationBackend {
     let reclaimedBytes = 0
     let ownedVolumes: string[] = []
     if (opts.volumes) {
+      // Pre-label volumes of a Room that was never woken on this build carry
+      // no ownership label; adopt them here under the same DB+manifest gate
+      // as create, or they outlive the Room as unmanaged storage.
+      await this.adoptLegacyRoomVolumes(roomId)
       // Ownership is a preflight: a legacy/user collision must block before
       // any container or network is removed.
       ownedVolumes = await this.listRoomVolumes(roomId)
@@ -2268,6 +2272,9 @@ export class OciCliBackend implements IsolationBackend {
       if (remainingVolumes.length > 0) {
         throw new Error(`Room ${roomId} volume cleanup incomplete: ${remainingVolumes.join(', ')}`)
       }
+      // Adoption records describe volumes that no longer exist; retire them
+      // only now that Docker has confirmed the removal.
+      await this.retireLegacyVolumeRecords(ownedVolumes)
     }
     this.relayTokens.delete(roomId)
     return { reclaimedBytes }
@@ -5555,6 +5562,15 @@ export class OciCliBackend implements IsolationBackend {
     }
     this.legacyVolumeAdoptions = parsed
     return parsed
+  }
+
+  private async retireLegacyVolumeRecords(names: string[]): Promise<void> {
+    if (!this.legacyVolumeAdoptionFile || names.length === 0) return
+    const registry = await this.loadLegacyVolumeRegistry()
+    if (!names.some((name) => name in registry.volumes)) return
+    const retired: LegacyVolumeAdoptionRegistry = { ...registry, volumes: { ...registry.volumes } }
+    for (const name of names) delete retired.volumes[name]
+    this.writeLegacyVolumeRegistry(retired)
   }
 
   private writeLegacyVolumeRegistry(registry: LegacyVolumeAdoptionRegistry): void {
