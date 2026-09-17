@@ -41,14 +41,39 @@ does not stack three levels: a Host that is itself a VM cannot provide this.
 
 Windows 11 Enterprise Evaluation, free and unlicensed for 90 days, from
 <https://www.microsoft.com/evalcenter>. Microsoft rotates the download, so the
-digest is measured per run and recorded rather than hard-coded:
+digest is measured per run and recorded rather than hard-coded — and Microsoft
+publishes no digest for this file at all, so the value in the matrix below is one
+DevHotel measured.
+
+Fetching and measuring it is scripted rather than done by hand, because the
+hand-done version is what differs between attempts and leaves no record of which
+bytes the evidence came from:
 
 ```powershell
-(Get-FileHash -LiteralPath <iso> -Algorithm SHA256).Hash
+.\scripts\acceptance\issue-106\Get-Windows11EvaluationIso.ps1
 ```
 
-Record it in the matrix below. The script refuses to build from media whose
-digest does not match what the run declares.
+It resolves the Evaluation Center's own fwlink (no account, no form, no paid
+resource), refuses any origin that is not a Microsoft download host and any media
+that is not an `ENTERPRISEEVAL` image, caches the ISO under
+`%LOCALAPPDATA%\DevHotel\acceptance-media`, and writes a `.provenance.json`
+sidecar naming every redirect hop it followed plus the measured SHA-256/SHA-512.
+It prints the exact `New-CleanWindowsAcceptanceVm.ps1` line to run next.
+
+A second machine confirms it has the same bytes the evidence names with
+`-ExpectedSha256 <digest>`, which fails rather than silently re-fetching.
+
+**Cached for this attempt** (2026-09-17):
+
+| | |
+|---|---|
+| File | `26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso` |
+| Build | 26200.6584 (25H2), Enterprise Evaluation, x64, en-US |
+| Size | 7,092,807,680 bytes |
+| SHA-256 | _see the provenance sidecar; recorded when the gate is run_ |
+
+Record the digest in the matrix below. The VM script refuses to build from media
+whose digest does not match what the run declares.
 
 ## 2. Build the VM
 
@@ -84,6 +109,14 @@ Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select S
 
 Copy in only the NSIS installer built by `pnpm build:installer`, and record its
 SHA-256 and the version it reports. Nothing else is copied into the guest.
+
+The installer does not have to be built on the Host. CI's `Package (no publish)`
+step already runs `electron-builder --win nsis` on every push and uploads the
+result as the `devhotel-installer` artifact, so the guest can be fed a build that
+is traceable to a commit — which is better evidence than a local build anyway.
+It also avoids a Host-specific obstacle: a running Orca holds a lock on its own
+`app.asar`, which makes a local NSIS build fail for a reason that has nothing to
+do with DevHotel. Record which commit the installer came from either way.
 
 ## 4. The matrix
 
