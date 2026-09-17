@@ -39,12 +39,16 @@ const BASE = `https://${ANDROID_SDK_HOST}/android/repository/`
 /**
  * Android platform API level per the emulator version the Stack tab offers.
  *
- * All four appear here because all four are selectable today; only the ones
- * with a pinned system image below can run on the managed path, and
- * `androidSdkArtifacts` distinguishes the two cases rather than collapsing them
- * into one "unsupported". docker-android carries images for all of them, which
- * is why it stays the default until this table and `ANDROID_SYSTEM_IMAGES`
- * agree — see the migration order in the design doc.
+ * All four appear here because all four are selectable today, and all four now
+ * have a pinned system image in `ANDROID_SYSTEM_IMAGES` — the condition the
+ * design doc names as the point at which docker-android stops being needed on
+ * the managed path.
+ *
+ * The two tables are still kept separate, and `androidSdkArtifacts` still tells
+ * "unknown version" apart from "known version, no pinned image". That is not
+ * dead generality: adding a fifth version here is a one-line change, and
+ * without the distinction it would route a managed Room at a system image that
+ * was never fetched instead of saying which of the two things went wrong.
  */
 export const ANDROID_API_LEVELS: Readonly<Record<string, number>> = {
   '14.0': 34,
@@ -93,7 +97,25 @@ export const ANDROID_SDK_TOOLS: readonly AndroidSdkArtifact[] = [
   }
 ]
 
-/** One system image per supported API level; the guest Android itself. */
+/**
+ * One system image per supported API level; the guest Android itself.
+ *
+ * All four of the versions `ANDROID_API_LEVELS` maps are pinned. That is the
+ * condition `androidSdkArtifacts` and `ManagedRoomBackend.createEmulator` were
+ * written against but could not meet while only API 34 was here: a Room on
+ * 13.0, 12.0 or 11.0 fell through to `budtmo/docker-android`, so "an Android
+ * Room without Host adb, Android Studio or Docker" held for one offered version
+ * out of four. Closing that is the last code-side item on #111's B1 claim.
+ *
+ * Every revision is the highest `google_apis;x86_64` build published in
+ * `sys-img/google_apis/sys-img2-1.xml` when the pin was taken, and each
+ * `sizeBytes`/`upstreamSha1` pair below was confirmed against that manifest
+ * before DevHotel's own digests were recorded. `x86_64` and `google_apis`
+ * (rather than `google_apis_playstore`) match API 34 deliberately: the emulator
+ * argv, the AVD plan and the `-skip-adb-auth` fencing in
+ * `androidEmulatorLaunch.ts` are written for a non-Play image, and a Play Store
+ * image is additionally not freely redistributable.
+ */
 export const ANDROID_SYSTEM_IMAGES: Readonly<Record<number, AndroidSdkArtifact>> = {
   34: {
     id: 'android-system-image-34',
@@ -103,6 +125,36 @@ export const ANDROID_SYSTEM_IMAGES: Readonly<Record<number, AndroidSdkArtifact>>
     upstreamSha1: 'e0f6c9a0691aa27bd597d0deb1bcfdc943ac8ca7',
     sha256: '783a40134baf4f3012d4464fbe1571b1612a0dbd2e7a44d14bd8328923443833',
     sha512: '891e0430412754f1af29b5ac4e5219e3663c70982c23e05e046014b21e22b09f6c177cb66c2a2ad6e46e327893360c6ec736ae575e2cbe258f868da8700229a3',
+    extension: '.zip'
+  },
+  33: {
+    id: 'android-system-image-33',
+    sdkPackage: 'system-images;android-33;google_apis;x86_64',
+    url: `${BASE}sys-img/google_apis/x86_64-33_r17.zip`,
+    sizeBytes: 1707857511,
+    upstreamSha1: '2b96f5bd5c79bfe1cc645e70b3e630b5755d9711',
+    sha256: '0455f853dcaf23e89b44f810e4b6391e8ef356326ec0e6c25b7f3f9de9ff5659',
+    sha512: '35ab662ff7ba88c5befe3e4dda22d5a7d4e3f497b0fb570264f5380e41bdeec056df622176f3988496a39382b63ae2427663a702aa457b18d2a6a0b754993d95',
+    extension: '.zip'
+  },
+  32: {
+    id: 'android-system-image-32',
+    sdkPackage: 'system-images;android-32;google_apis;x86_64',
+    url: `${BASE}sys-img/google_apis/x86_64-32_r08.zip`,
+    sizeBytes: 1538792859,
+    upstreamSha1: '1b52794699c6889a2fd155bf235b67a592eb8f1d',
+    sha256: '2709bcc5a4aa98539b12c2169df606dfe9184fc3b4a0aac7120f319721e63bf1',
+    sha512: '50654d3c4aff0770b037633537c177f8db4471b791194aacfa267dff17d20c5c96d95649dffe191f20fa976fd99bc38f926a17c2ddd996a9d5e799b27ed627f2',
+    extension: '.zip'
+  },
+  30: {
+    id: 'android-system-image-30',
+    sdkPackage: 'system-images;android-30;google_apis;x86_64',
+    url: `${BASE}sys-img/google_apis/x86_64-30_r16.zip`,
+    sizeBytes: 1438186618,
+    upstreamSha1: '6ae21030eaadc041078444d3798e4b399f3e787d',
+    sha256: 'daae27654be74ae83a484daea4db2c0c77b4f4ad661a645bd5f36d96ce03e4d5',
+    sha512: '8c808300e5014e2611c1927f0837a1854a4992f06d4389d057b26abdfc0395b7737575fcdee3320e315210c6ee48cb44a3d13fb0432a644005ed9de658b6ddd4',
     extension: '.zip'
   }
 }
@@ -240,9 +292,12 @@ export function buildAndroidSdkProvisionScript(version: string, sdkRoot: string)
    *
    * @param artifact  Pinned artifact descriptor.
    * @param destDir   Where the zip is extracted (the zip root lands here).
-   * @param extractOpts  Optional extra unzip args (e.g. `-j` to junk paths).
+   *
+   * Any zip that needs its unpacked directory moved afterwards does that at the
+   * call site, where the two names are readable next to each other — see the
+   * `cmdline-tools/cmdline-tools` -> `cmdline-tools/latest` rename below.
    */
-  function downloadStep(artifact: AndroidSdkArtifact, destDir: string, rename?: string): string {
+  function downloadStep(artifact: AndroidSdkArtifact, destDir: string): string {
     const tmp = `/tmp/dh-sdk-${artifact.id}.zip`
     return [
       `echo '[devhotel] provisioning ${artifact.id}...'`,
@@ -251,13 +306,7 @@ export function buildAndroidSdkProvisionScript(version: string, sdkRoot: string)
       `echo '${artifact.sha256}  ${sq(tmp)}' | sha256sum --check --strict`,
       `mkdir -p '${sq(destDir)}'`,
       `unzip -q -o '${sq(tmp)}' -d '${sq(destDir)}'`,
-      `rm -f '${sq(tmp)}'`,
-      ...(rename
-        ? [
-            // Some zips produce a subdirectory that needs to be renamed/moved.
-            `mv '${sq(destDir)}/${sq(rename[0]!)}' '${sq(destDir)}/${sq(rename[1]!)}'`
-          ]
-        : [])
+      `rm -f '${sq(tmp)}'`
     ].join('\n')
   }
 

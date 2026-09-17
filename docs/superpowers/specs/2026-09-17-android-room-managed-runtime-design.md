@@ -114,7 +114,9 @@ Pin four artifacts, each by an immutable build-numbered URL from
 **Implemented**: `packages/core/src/backend/androidSdkPin.ts` carries the pinned
 set, its verifier, and the known-version/unpinned-image distinction.
 `pnpm --filter @devhotel/core pin:android-sdk` is the maintainer task that
-captures the digests.
+captures the digests — three shared tools plus one system image per offered
+Android version, so `DEVHOTEL_PIN_ANDROID_SDK=1` now fetches ~6.8 GB and
+re-verifies every checked-in digest rather than only the default version's.
 
 ### Google publishes SHA-1 only
 
@@ -143,15 +145,31 @@ managed-runtime design applies to all four artifacts. Provisioning also needs
 network on first use; a fully offline first Android Room is out of scope and
 must say so rather than hang.
 
-### Only one Android version is pinned
+### Every offered Android version is pinned — **closed**
 
-The Stack tab offers Android 14.0, 13.0, 12.0 and 11.0, and docker-android has
-a system image for each. DevHotel pins **API 34 (Android 14.0)** only — the
-Room default. `ANDROID_API_LEVELS` maps all four, so a managed Android Room on
-13.0 fails with `UnpinnedAndroidSystemImageError` (a DevHotel migration gap the
-Room can be told about) rather than `UnknownAndroidVersionError`. That
-distinction is why docker-android stays the default until the two tables agree:
-removing it earlier would silently drop three offered versions.
+The Stack tab offers Android 14.0, 13.0, 12.0 and 11.0, and docker-android has a
+system image for each.
+
+This section first recorded that DevHotel pinned **API 34 (Android 14.0)** only,
+the Room default, and that the other three therefore fell through to
+docker-android — which is why docker-android had to stay the fallback. That is no
+longer the case: `ANDROID_SYSTEM_IMAGES` now carries API 34, 33, 32 and 30, so
+`ANDROID_API_LEVELS` and `ANDROID_SYSTEM_IMAGES` agree and
+`pinnedAndroidVersions()` returns all four. No version the product offers reaches
+`super.createEmulator`, so none of them pulls `budtmo/docker-android`.
+
+Each is the highest `google_apis;x86_64` revision published in
+`sys-img/google_apis/sys-img2-1.xml` at pin time, `google_apis` rather than
+`google_apis_playstore` for the same two reasons as API 34: the emulator argv and
+`-skip-adb-auth` fencing are written for a non-Play image, and a Play Store image
+is not freely redistributable.
+
+The known-version/unpinned-image distinction stays in the code even though
+nothing triggers it today. It is what catches a fifth version added to
+`ANDROID_API_LEVELS` without a matching pin — the one-line change that would
+otherwise route a managed Room at a system image that was never fetched — and
+`__tests__/androidPinTestSupport.ts` registers a synthetic version so the branch
+keeps its tests rather than losing them along with its last live caller.
 
 ### Where they live
 

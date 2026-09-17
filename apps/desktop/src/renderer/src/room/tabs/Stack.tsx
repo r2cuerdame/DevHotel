@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
-import type { ComponentInfo, RoomRecord } from '@devhotel/shared'
+import { ANDROID_EMULATOR_VERSIONS, type ComponentInfo, type RoomRecord } from '@devhotel/shared'
 import { api } from '../../api'
 import { useStore, useT } from '../../state/store'
 import { PackageStoreModal } from '../PackageStoreModal'
 
 const ANDROID_DEVICES = ['Samsung Galaxy S10', 'Samsung Galaxy S9', 'Nexus 5', 'Nexus 4', 'Nexus One']
-const ANDROID_VERSIONS = ['14.0', '13.0', '12.0', '11.0']
+// One list, shared with the control schema that validates it and with the pin
+// table that has to have a system image for every entry.
+const ANDROID_VERSIONS = ANDROID_EMULATOR_VERSIONS
 type AndroidResolution = 'balanced' | 'fast' | 'native'
 type AndroidOrientation = 'portrait' | 'landscape'
 

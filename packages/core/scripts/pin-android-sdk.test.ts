@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  ANDROID_API_LEVELS,
   ANDROID_SDK_TOOLS,
   ANDROID_SYSTEM_IMAGES,
   androidSdkArtifacts,
   isAndroidSdkArtifactPinned,
+  pinnedAndroidVersions,
   type AndroidSdkArtifact
 } from '../src/backend/androidSdkPin'
 
@@ -22,7 +24,8 @@ import {
  *
  *   DEVHOTEL_PIN_ANDROID_SDK=1 pnpm --filter @devhotel/core pin:android-sdk
  *
- * It downloads ~2.1 GB. Without the environment variable it only asserts that
+ * It downloads ~6.8 GB — the three shared tools plus one system image per
+ * offered Android version. Without the environment variable it only asserts that
  * the checked-in pin is internally consistent, which is what CI runs.
  */
 
@@ -80,13 +83,18 @@ describe('pinned Android SDK artifacts', () => {
       expect(artifact.upstreamSha1).toMatch(/^[a-f0-9]{40}$/)
       expect(Number.isSafeInteger(artifact.sizeBytes) && artifact.sizeBytes > 0).toBe(true)
     }
-    // Every artifact one supported Room needs must be genuinely pinned. A pin
-    // left blank is the failure this file exists to make loud.
-    for (const artifact of androidSdkArtifacts('14.0')) {
-      expect(
-        isAndroidSdkArtifactPinned(artifact),
-        `${artifact.id} has no DevHotel digest — run pin:android-sdk`
-      ).toBe(true)
+    // Every artifact every supported Room needs must be genuinely pinned. A pin
+    // left blank is the failure this file exists to make loud, and checking only
+    // the default version is how the other three stayed unpinned unnoticed.
+    const versions = pinnedAndroidVersions()
+    expect(versions).toEqual(Object.keys(ANDROID_API_LEVELS))
+    for (const version of versions) {
+      for (const artifact of androidSdkArtifacts(version)) {
+        expect(
+          isAndroidSdkArtifactPinned(artifact),
+          `${artifact.id} (Android ${version}) has no DevHotel digest — run pin:android-sdk`
+        ).toBe(true)
+      }
     }
   })
 
