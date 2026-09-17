@@ -21,12 +21,12 @@ describe('documentation and capability drift', () => {
   })
 
   it('proves the exact MCP tool count matches across implementation and README, retaining historical CHANGELOG counts', () => {
-    expect(tools).toHaveLength(53)
-    expect(new Set(toolNames).size).toBe(53)
+    expect(tools).toHaveLength(59)
+    expect(new Set(toolNames).size).toBe(59)
 
     // README documents the exact count
-    expect(readme).toContain(`MCP tool surface (53 tools)`)
-    expect(readme).toContain(`53 tools across the complete development lifecycle`)
+    expect(readme).toContain(`MCP tool surface (59 tools)`)
+    expect(readme).toContain(`59 tools across the complete development lifecycle`)
 
     // Keep the historical 0.5.0 release count intact.
     expect(changelog).toContain(`Fifty-two MCP tools are now available`)
@@ -68,6 +68,7 @@ describe('documentation and capability drift', () => {
     expect(readme).toContain(`./docs/android-device-broker.md`)
     expect(readme).toContain(`./docs/android-acceptance-reports.md`)
     expect(readme).toContain(`./docs/android-locale-matrix.md`)
+    expect(readme).toContain(`./docs/client-browser.md`)
     expect(readme).toContain(`safe_resync_from_host`)
     expect(readme).toContain(`verified builds stay installed`)
   })

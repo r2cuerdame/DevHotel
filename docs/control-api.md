@@ -179,6 +179,30 @@ port, token or pairing code. All JSON responses pass through the same
 structured secret-redaction boundary used by diagnostics, logs and device
 events.
 
+### Client Browsers
+
+An isolated Chromium an agent borrows for web automation — the thing that
+visits a site, as opposed to the Web Server Room that hosts one. See
+[Client Browser](./client-browser.md). Sessions are addressed by session ID
+and proven by the token returned once at allocation; the Room in the path
+only says who owns the browser.
+
+| Method & path | Body | Result |
+|---|---|---|
+| `POST /v1/rooms/:id/browsers` | `{ profileMode?: 'ephemeral'\|'persistent', headless? }` | `{ session, token, endpoint: { http, ws } }` — a fresh process and profile for this Room. `endpoint.http` is a Playwright `connectOverCDP` / puppeteer `browserURL` target (it serves `/json/version` and friends); `endpoint.ws` is the browser-level CDP WebSocket. Both embed the token. The Room must be awake. `503 CLIENT_BROWSER_NOT_FOUND` when no Chromium is installed on the Host. |
+| `GET /v1/rooms/:id/browsers` | | this Room's sessions — IDs, status, PID, profile mode, timestamps; never tokens |
+| `GET /v1/browsers` | | `{ runtime, sessions[] }` across the Hotel, same fields |
+| `POST /v1/browsers/:sessionId/attach` | `{ token }` | the allocation again (session + endpoint) for a session you own |
+| `POST /v1/browsers/:sessionId/inspect` | `{ token }` | `{ session, owner: { roomId, project, nickname }, liveness: { processAlive, cdpReachable, browserVersion }, connection: { endpoint, activeClients }, targets[] }` |
+| `POST /v1/browsers/:sessionId/navigate` | `{ token, url, timeoutMs? }` | `{ sessionId, url, finalUrl, title, loaded }` — `http`, `https` or `about:blank` only; other schemes are `400 CLIENT_BROWSER_URL_REFUSED` |
+| `POST /v1/browsers/:sessionId/screenshot` | `{ token, format?: 'png'\|'jpeg', fullPage? }` | `{ sessionId, mimeType, contentBase64, sizeBytes }` — not stored |
+| `POST /v1/browsers/:sessionId/release` | `{ token }` | `{ sessionId, roomId, released, processStopped, profileRemoved }` — closes the process, drops tunnelled clients, deletes an ephemeral profile |
+
+A wrong token is `403 CLIENT_BROWSER_FORBIDDEN`; an unknown session is
+`404 CLIENT_BROWSER_NOT_FOUND`; a malformed ID or token is `400`. A Room
+going to sleep or being deleted releases its browsers, and a DevHotel restart
+reconciles whatever an earlier process left running.
+
 ### Tracked Android automation
 
 An `applicationId` is not authority by itself. These routes accept only an app
