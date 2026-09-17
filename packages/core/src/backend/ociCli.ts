@@ -70,6 +70,8 @@ import type {
   GitCredential,
   FencedEmulatorBootResult,
   IsolationBackend,
+  ManagedContainer,
+  ManagedContainerInventory,
   ManagedNetwork,
   RoomArtifactExpectation,
   RoomArtifactRecoveryOutcome,
@@ -2211,6 +2213,10 @@ export class OciCliBackend implements IsolationBackend {
     let reclaimedBytes = 0
     let ownedVolumes: string[] = []
     if (opts.volumes) {
+      // Pre-label volumes of a Room that was never woken on this build carry
+      // no ownership label; adopt them here under the same DB+manifest gate
+      // as create, or they outlive the Room as unmanaged storage.
+      await this.adoptLegacyRoomVolumes(roomId)
       // Ownership is a preflight: a legacy/user collision must block before
       // any container or network is removed.
       ownedVolumes = await this.listRoomVolumes(roomId)
@@ -2266,6 +2272,9 @@ export class OciCliBackend implements IsolationBackend {
       if (remainingVolumes.length > 0) {
         throw new Error(`Room ${roomId} volume cleanup incomplete: ${remainingVolumes.join(', ')}`)
       }
+      // Adoption records describe volumes that no longer exist; retire them
+      // only now that Docker has confirmed the removal.
+      await this.retireLegacyVolumeRecords(ownedVolumes)
     }
     this.relayTokens.delete(roomId)
     return { reclaimedBytes }
@@ -2997,13 +3006,23 @@ export class OciCliBackend implements IsolationBackend {
     return result.stdout.trim() === 'running' ? 'running' : 'exited'
   }
 
-  async listManagedContainers(): Promise<{ roomId: string; role: string; state: string; name: string }[]> {
+  async listManagedContainers(): Promise<ManagedContainer[]> {
+    return (await this.listManagedContainerInventory()).owned
+  }
+
+  /**
+   * One malformed row must not hide every proven Room behind it. A foreign
+   * container that merely copies the `devhotel.managed=1` label is reported as
+   * invalid, with the reason, and is otherwise left exactly as it was found.
+   */
+  async listManagedContainerInventory(): Promise<ManagedContainerInventory> {
     await this.assertPinnedEngineIdentity()
     const result = must(
       await this.engine.run(['ps', '-a', '--filter', 'label=devhotel.managed=1', '--format', '{{json .}}']),
       'list managed containers',
     )
-    const out: { roomId: string; role: string; state: string; name: string }[] = []
+    const owned: ManagedContainer[] = []
+    const invalid: ManagedContainerInventory['invalid'] = []
     for (const line of result.stdout.split(/\r?\n/)) {
       const trimmed = line.trim()
       if (trimmed.length === 0) continue
@@ -3011,12 +3030,13 @@ export class OciCliBackend implements IsolationBackend {
       try {
         row = JSON.parse(trimmed) as { Names?: string; State?: string; Labels?: string }
       } catch {
-        throw new Error('list managed containers returned invalid JSON')
+        invalid.push({ name: 'unknown', reason: 'list managed containers returned invalid JSON' })
+        continue
       }
-      const name = row.Names ?? ''
-      const state = row.State ?? ''
+      const name = typeof row.Names === 'string' ? row.Names : ''
+      const state = typeof row.State === 'string' ? row.State : ''
       const labels = new Map<string, string>()
-      for (const pair of (row.Labels ?? '').split(',')) {
+      for (const pair of (typeof row.Labels === 'string' ? row.Labels : '').split(',')) {
         const eq = pair.indexOf('=')
         if (eq > 0) labels.set(pair.slice(0, eq), pair.slice(eq + 1))
       }
@@ -3029,16 +3049,20 @@ export class OciCliBackend implements IsolationBackend {
         !roomId ||
         !isExpectedRoomContainer(roomId, name, role)
       ) {
-        throw new Error(`managed container ownership metadata is invalid: ${name || 'unknown'}`)
+        invalid.push({
+          name: name || 'unknown',
+          reason: `managed container ownership metadata is invalid: ${name || 'unknown'}`
+        })
+        continue
       }
-      out.push({
+      owned.push({
         roomId,
         role,
         state,
         name,
       })
     }
-    return out
+    return { owned, invalid }
   }
 
   async removeManagedContainer(name: string): Promise<void> {
@@ -5538,6 +5562,15 @@ export class OciCliBackend implements IsolationBackend {
     }
     this.legacyVolumeAdoptions = parsed
     return parsed
+  }
+
+  private async retireLegacyVolumeRecords(names: string[]): Promise<void> {
+    if (!this.legacyVolumeAdoptionFile || names.length === 0) return
+    const registry = await this.loadLegacyVolumeRegistry()
+    if (!names.some((name) => name in registry.volumes)) return
+    const retired: LegacyVolumeAdoptionRegistry = { ...registry, volumes: { ...registry.volumes } }
+    for (const name of names) delete retired.volumes[name]
+    this.writeLegacyVolumeRegistry(retired)
   }
 
   private writeLegacyVolumeRegistry(registry: LegacyVolumeAdoptionRegistry): void {

@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { srcVolume } from '../backend/naming'
@@ -110,6 +110,30 @@ describe('Room-owned working state', () => {
     expect(backend.calls).toContain(`importHostFolder:${sourceDir}:r1`)
     expect(backend.lastWebSpec?.workspaceMode).toBe('hotel')
     expect(backend.lastWebSpec?.workspaceVolumeRevision).toBe(1)
+  })
+
+  it('agent deletion of a sleeping synced Local Folder Room leaves the Host folder untouched', async () => {
+    const room = await orch.createRoom({
+      sourceType: 'linked-folder',
+      sourceRef: sourceDir,
+      project: 'demo',
+      nickname: 'dev',
+      actor: 'user'
+    })
+    await orch.sleepRoom(room.id, 'agent')
+    const sleeping = orch.rooms.get(room.id)!
+    expect(sleeping.status).toBe('sleeping')
+    expect(sleeping.syncStatus).toBe('synced')
+    const before = readFileSync(join(sourceDir, 'package.json'), 'utf8')
+
+    await orch.deleteRoom(room.id, 'agent')
+
+    expect(orch.rooms.get(room.id)).toBeFalsy()
+    // Deleting a Room only reclaims Room-owned storage (#90): the linked Host
+    // folder is the human's, and must survive byte for byte.
+    expect(existsSync(sourceDir)).toBe(true)
+    expect(readFileSync(join(sourceDir, 'package.json'), 'utf8')).toBe(before)
+    expect(backend.calls.some((call) => call.includes(sourceDir) && !call.startsWith('importHostFolder:'))).toBe(false)
   })
 
   it('blocks Agent commands before they can mutate a legacy Host bind', async () => {

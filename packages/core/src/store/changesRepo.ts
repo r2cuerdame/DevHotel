@@ -58,6 +58,16 @@ function rowToEntry(row: ChangeRow): ChangeEntry {
 
 type SetStatusPatch = Partial<Pick<ChangeEntry, 'verify' | 'undoneAt' | 'captured' | 'steps' | 'rawLogPath' | 'after'>>
 
+/**
+ * Journal entries kept per Room, newest first. Entries outside the window are
+ * pruned when a new one lands, except entries still `pending` (an interrupted
+ * operation the next startup must settle) and entries that anchor a tracked
+ * Android install receipt: acceptance re-proves the install against its
+ * originating change, so that provenance must outlive the display window.
+ * See docs/control-plane-retention.md.
+ */
+export const CHANGES_RETAINED_PER_ROOM = 500
+
 export interface ChangesRepo {
   append(e: Omit<ChangeEntry, 'seq'>): ChangeEntry
   list(roomId: string): ChangeEntry[]
@@ -105,6 +115,16 @@ export function changesRepo(db: Db): ChangesRepo {
             e.createdAt,
             e.undoneAt,
           )
+        // Keep sequence numbers monotonic by pruning only the oldest prefix;
+        // MAX(seq) above always comes from a surviving row.
+        sqlite
+          .prepare(
+            `DELETE FROM changes
+             WHERE rowid IN (SELECT rowid FROM changes WHERE room_id = ? ORDER BY seq DESC LIMIT -1 OFFSET ?)
+               AND status != 'pending'
+               AND id NOT IN (SELECT change_id FROM android_app_installs WHERE room_id = ?)`
+          )
+          .run(e.roomId, CHANGES_RETAINED_PER_ROOM, e.roomId)
         if (ownsTransaction) sqlite.exec('COMMIT')
         return { ...e, seq }
       } catch (err) {
