@@ -47,6 +47,7 @@ import {
   webName,
   wrapStartCommand,
   workspaceSnapshotVolume,
+  WEB_STOP_TIMEOUT_SECONDS,
   type NetworkNamespaceAuthority,
 } from './naming'
 import type { ResumeRoomPodOpts, ResumeServiceSpec, RoomResumeResult } from './types'
@@ -1540,6 +1541,30 @@ export class OciCliBackend implements IsolationBackend {
     await this.reapResidentFencedHelper(roomId)
     await this.assertPinnedEngineIdentity()
     const containers = await this.listRoomContainers(roomId)
+    const failures = await this.stopOwnedContainers(roomId, containers)
+    // The final inventory, not the stop transport, decides completeness: the
+    // survivors are named exactly, and a stop that failed but left nothing
+    // running has still reached the sleeping state.
+    const notStopped = (await this.listRoomContainers(roomId)).filter(
+      (container) => !isStoppedContainerState(container.state)
+    )
+    if (notStopped.length > 0) {
+      const survivors = notStopped.map((container) => container.name).join(', ')
+      const detail = failures.length > 0 ? ` (${failures.join('; ')})` : ''
+      throw new Error(`Room ${roomId} stop incomplete: ${survivors}${detail}`)
+    }
+  }
+
+  /**
+   * Gracefully stops every owned container that is still active, leaves
+   * first and network authorities last so a server shuts down while its
+   * namespace still exists. Only `docker stop` is ever issued here: the
+   * engine delivers TERM and escalates to KILL on its own timeout, and this
+   * flow never force-kills or removes anything itself. One failing group does
+   * not skip the next; the failures come back for the caller to weigh against
+   * the inventory it re-reads.
+   */
+  private async stopOwnedContainers(roomId: string, containers: ManagedRoomContainer[]): Promise<string[]> {
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
     for (const container of active) {
       if (container.state === 'paused') {
@@ -1550,28 +1575,28 @@ export class OciCliBackend implements IsolationBackend {
         }
       }
     }
-    const web = active.filter((container) => container.role === 'web').map((container) => container.id)
-    const leaves = active
-      .filter((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role))
-      .map((container) => container.id)
-    const runtimeAnchors = active
-      .filter((container) => container.role === 'android-runtime-anchor')
-      .map((container) => container.id)
-    const controlAnchors = active.filter((container) => container.role === 'anchor').map((container) => container.id)
-    if (web.length > 0) must(await this.engine.run(['stop', '-t', '8', ...web]), `stop Room ${roomId} web container`)
-    if (leaves.length > 0) must(await this.engine.run(['stop', '-t', '5', ...leaves]), `stop Room ${roomId} leaf containers`)
-    if (runtimeAnchors.length > 0) {
-      must(await this.engine.run(['stop', '-t', '5', ...runtimeAnchors]), `stop Room ${roomId} runtime anchor`)
+    const ids = (predicate: (container: ManagedRoomContainer) => boolean): string[] =>
+      active.filter(predicate).map((container) => container.id)
+    const groups: Array<{ ids: string[]; timeout: number; what: string }> = [
+      { ids: ids((container) => container.role === 'web'), timeout: WEB_STOP_TIMEOUT_SECONDS, what: 'web container' },
+      {
+        ids: ids((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role)),
+        timeout: 5,
+        what: 'leaf containers'
+      },
+      { ids: ids((container) => container.role === 'android-runtime-anchor'), timeout: 5, what: 'runtime anchor' },
+      { ids: ids((container) => container.role === 'anchor'), timeout: 5, what: 'control anchor' }
+    ]
+    const failures: string[] = []
+    for (const group of groups) {
+      if (group.ids.length === 0) continue
+      try {
+        must(await this.engine.run(['stop', '-t', String(group.timeout), ...group.ids]), `stop Room ${roomId} ${group.what}`)
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error))
+      }
     }
-    if (controlAnchors.length > 0) {
-      must(await this.engine.run(['stop', '-t', '5', ...controlAnchors]), `stop Room ${roomId} control anchor`)
-    }
-    const notStopped = (await this.listRoomContainers(roomId)).filter(
-      (container) => !isStoppedContainerState(container.state)
-    )
-    if (notStopped.length > 0) {
-      throw new Error(`Room ${roomId} stop incomplete: ${notStopped.map((container) => container.name).join(', ')}`)
-    }
+    return failures
   }
 
   async pauseWeb(roomId: string): Promise<void> {
@@ -1851,7 +1876,7 @@ export class OciCliBackend implements IsolationBackend {
       return
     }
     if (!isStoppedContainerState(web.State?.Status ?? '')) {
-      must(await this.engine.run(['stop', '-t', '8', id]), 'stop exact web container for restart')
+      must(await this.engine.run(['stop', '-t', String(WEB_STOP_TIMEOUT_SECONDS), id]), 'stop exact web container for restart')
       const stopped = await this.inspectContainer(id)
       if (!stopped || stopped.State?.Status !== 'exited') {
         throw new Error('web container restart could not prove its exact stopped state')
@@ -2145,6 +2170,10 @@ export class OciCliBackend implements IsolationBackend {
     const leafIds = containers
       .filter((container) => !['anchor', 'android-runtime-anchor'].includes(container.role))
       .map((container) => container.id)
+    // Services own persistent data and the web may be mid-write: give every
+    // active container its graceful TERM boundary first. Removal below is the
+    // forced boundary, so a stop that fails here does not block the delete.
+    await this.stopOwnedContainers(roomId, containers)
     if (leafIds.length > 0) {
       must(await this.engine.run(['rm', '-f', ...leafIds]), `remove Room ${roomId} leaf containers`)
     }
@@ -8256,8 +8285,9 @@ function containerEnvMap(container: DockerContainerInspect): Map<string, string>
   return env
 }
 
+/** Terminal states: nothing runs in any of these, so there is nothing to stop. */
 function isStoppedContainerState(state: string): boolean {
-  return state === 'exited' || state === 'created'
+  return state === 'exited' || state === 'created' || state === 'dead'
 }
 
 function assertExpectedRoomVolumeName(roomId: string, name: string): void {

@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --maxWorkers=1 --testTimeout=20000",
     "probe:managed-runtime": "vitest run scripts/probe-managed-runtime.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=180000",
+    "probe:graceful-stop": "vitest run scripts/probe-graceful-stop.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=120000",
     "pin:android-sdk": "vitest run scripts/pin-android-sdk.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=2700000",
     "report:host-footprint": "vitest run scripts/host-footprint-report.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=120000",
     "report:volume-gc": "vitest run scripts/volume-gc-report.test.ts --maxWorkers=1 --reporter=verbose --testTimeout=180000"

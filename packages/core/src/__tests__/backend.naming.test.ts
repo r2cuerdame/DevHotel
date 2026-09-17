@@ -4,6 +4,7 @@ import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
+  WEB_STOP_TIMEOUT_SECONDS,
   anchorName,
   androidControlNetworkName,
   androidRuntimeAnchorName,
@@ -457,7 +458,7 @@ describe('buildWebCreateArgs', () => {
     expect(env).toContain('XDG_CACHE_HOME=/cache/xdg')
   })
 
-  it('wraps the start command with a tolerant corepack enable and exec', () => {
+  it('wraps the start command with a tolerant corepack enable and a signal-forwarding shell', () => {
     const args = buildWebCreateArgs(spec())
     expect(args.slice(-3)).toEqual([
       'sh',
@@ -467,6 +468,35 @@ describe('buildWebCreateArgs', () => {
     expect(args).toContain('node:22-bookworm')
     const w = args.indexOf('-w')
     expect(args[w + 1]).toBe('/workspace')
+  })
+
+  it('runs the web container under an init with a declared stop timeout', () => {
+    const args = buildWebCreateArgs(spec())
+    expect(args).toContain('--init')
+    const timeout = args.indexOf('--stop-timeout')
+    expect(timeout).toBeGreaterThan(0)
+    expect(args[timeout + 1]).toBe(String(WEB_STOP_TIMEOUT_SECONDS))
+    expect(WEB_STOP_TIMEOUT_SECONDS).toBe(8)
+  })
+})
+
+describe('wrapStartCommand', () => {
+  it('forwards TERM to the whole Room process group instead of dying as a bare shell', () => {
+    const wrapped = wrapStartCommand('npm run dev')
+    // The user program runs in an inner login shell that outlives TERM long
+    // enough to report its child's real exit status...
+    expect(wrapped).toContain(`sh -lc 'trap : TERM; npm run dev' & child=$!`)
+    // ...while the outer shell hands TERM to every process in its group and
+    // ignores the copy it receives itself.
+    expect(wrapped).toContain(`trap 'trap : TERM; kill -TERM -$$ 2>/dev/null' TERM`)
+    expect(wrapped).not.toContain('exec sh')
+  })
+
+  it('exits with the inner program status once the program has really gone', () => {
+    const wrapped = wrapStartCommand('node server.js')
+    expect(wrapped).toContain('wait "$child"; status=$?')
+    expect(wrapped).toContain('while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done')
+    expect(wrapped.endsWith('exit "$status"')).toBe(true)
   })
 })
 
@@ -505,13 +535,13 @@ describe('buildOneShotArgs', () => {
   it('preserves compound shell programs behind a PID-1 inner shell', () => {
     const command = "if [ -f ./gradlew ]; then sh ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi"
     const wrapped = wrapStartCommand(command)
-    expect(wrapped).toContain("exec sh -lc 'if [ -f ./gradlew ]; then")
+    expect(wrapped).toContain("sh -lc 'trap : TERM; if [ -f ./gradlew ]; then")
     expect(wrapped).not.toContain('exec if ')
     expect(buildOneShotArgs(spec({ standalone: true }), command, jobId).slice(-1)).toEqual([wrapped])
   })
 
   it('shell-quotes apostrophes in Room commands', () => {
-    expect(wrapStartCommand("printf '%s\\n' ok")).toContain(`exec sh -lc 'printf '"'"'%s\\n'"'"' ok'`)
+    expect(wrapStartCommand("printf '%s\\n' ok")).toContain(`sh -lc 'trap : TERM; printf '"'"'%s\\n'"'"' ok'`)
   })
 
   it('keeps standalone one-shots off Docker default bridge', () => {
