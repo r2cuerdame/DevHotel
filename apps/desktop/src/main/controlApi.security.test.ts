@@ -327,12 +327,20 @@ describe('agent control API host boundary', () => {
     }
   })
 
-  it('refuses agent deletion of Host-linked rooms but allows Hotel-owned ones', async () => {
+  it('lets agents delete Host-linked rooms only while sleeping with nothing left to sync back', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-delete-'))
     roots.push(userData)
     const rooms = new Map([
-      ['room1abc', { id: 'room1abc', sourceType: 'linked-folder', workspaceMode: 'hotel' }],
-      ['room2def', { id: 'room2def', sourceType: 'managed-git', workspaceMode: 'hotel' }]
+      // Awake, or holding Room-owned edits never synced back: still a human decision.
+      ['lnkrun01', { id: 'lnkrun01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'running', syncStatus: 'synced' }],
+      ['lnkrdy01', { id: 'lnkrdy01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'ready', syncStatus: 'synced' }],
+      ['lnkatt01', { id: 'lnkatt01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'attention', syncStatus: 'synced' }],
+      ['lnkmod01', { id: 'lnkmod01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'sleeping', syncStatus: 'modified' }],
+      ['lgcrun01', { id: 'lgcrun01', sourceType: 'linked-folder', workspaceMode: 'legacy-host-bind', status: 'running', syncStatus: 'legacy' }],
+      // Sleeping with no pending Room-owned edits: disposable, the Host folder is never touched.
+      ['lnkokay1', { id: 'lnkokay1', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'sleeping', syncStatus: 'synced' }],
+      ['lgcokay1', { id: 'lgcokay1', sourceType: 'linked-folder', workspaceMode: 'legacy-host-bind', status: 'sleeping', syncStatus: 'legacy' }],
+      ['htlokay1', { id: 'htlokay1', sourceType: 'managed-git', workspaceMode: 'hotel', status: 'running', syncStatus: 'synced' }]
     ])
     const deleteRoom = vi.fn(async () => ({ reclaimedBytes: 42 }))
     const control = await startControlApi(
@@ -342,13 +350,22 @@ describe('agent control API host boundary', () => {
     )
     try {
       const headers = { authorization: `Bearer ${control.info.token}` }
-      const linked = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc`, { method: 'DELETE', headers })
-      expect(linked.status).toBe(403)
+      const del = (id: string) => fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/${id}`, { method: 'DELETE', headers })
+
+      for (const id of ['lnkrun01', 'lnkrdy01', 'lnkatt01', 'lnkmod01', 'lgcrun01']) {
+        const res = await del(id)
+        expect(res.status, id).toBe(403)
+        const body = (await res.json()) as { error: string }
+        expect(body.error, id).toMatch(/only while sleeping with no pending Room-owned edits/)
+      }
       expect(deleteRoom).not.toHaveBeenCalled()
 
-      const hotel = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room2def`, { method: 'DELETE', headers })
-      expect(hotel.status).toBe(200)
-      expect(deleteRoom).toHaveBeenCalledWith('room2def', 'agent')
+      for (const id of ['lnkokay1', 'lgcokay1', 'htlokay1']) {
+        const res = await del(id)
+        expect(res.status, id).toBe(200)
+        expect(deleteRoom).toHaveBeenCalledWith(id, 'agent')
+      }
+      expect(deleteRoom).toHaveBeenCalledTimes(3)
     } finally {
       control.stop()
     }

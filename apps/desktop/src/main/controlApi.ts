@@ -312,12 +312,23 @@ export async function startControlApi(
         return
       }
       if (safeRoomId && !op && req.method === 'DELETE') {
-        // Deletion is irreversible: rooms holding Host-linked working state
-        // (possibly with edits never synced back) stay a human decision.
+        // Deletion is irreversible, but it never touches the Host folder:
+        // only the Room's guest containers, networks and internal volumes go.
+        // What is at stake for a Host-linked Room is Room-owned working state
+        // never synced back, so the human decision is reserved for Rooms that
+        // are awake or hold pending edits; a sleeping, fully-synced Room is a
+        // disposable test fixture agents may tear down themselves (#90).
         const room = orch.rooms.get(safeRoomId)
         if (room && (room.sourceType === 'linked-folder' || room.workspaceMode === 'legacy-host-bind')) {
-          sendJson(res, 403, { error: 'Agents cannot delete Host-linked Rooms. Delete it in the DevHotel app.' })
-          return
+          const safeHostLinkedDeletion =
+            room.status === 'sleeping' && (room.syncStatus === 'synced' || room.syncStatus === 'legacy')
+          if (!safeHostLinkedDeletion) {
+            sendJson(res, 403, {
+              error:
+                'Agents can delete Host-linked Rooms only while sleeping with no pending Room-owned edits. Sleep the Room and sync it back first, or delete it in the DevHotel app.'
+            })
+            return
+          }
         }
         sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
         return
