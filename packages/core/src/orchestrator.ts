@@ -3459,6 +3459,16 @@ export class RoomOrchestrator {
     }
   }
 
+  /**
+   * The app URL is only advertised when it would actually be served: the
+   * runtime is observed running and the gateway holds the Room's route.
+   */
+  private servedUrlFor(room: RoomRecord, runtimeStatus: RoomRuntimeStatus): string | null {
+    if (runtimeStatus.state !== 'running') return null
+    if (!this.gateway.status().routes.some((r) => r.domain === room.domain)) return null
+    return this.inspectRoom(room.id).urls.app
+  }
+
   private effectiveRoom(room: RoomRecord, runtimeStatus: RoomRuntimeStatus): RoomRecord {
     if (runtimeStatus.expected !== 'running' || runtimeStatus.state === 'running') return room
     return { ...room, status: runtimeStatus.state === 'dead' ? 'broken' : 'attention' }
@@ -3467,11 +3477,15 @@ export class RoomOrchestrator {
   /** Runtime revalidation plus invariant I2: a proven-dead workload loses ingress on observation. */
   private async observeRuntimeStatusForIngress(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
     const opsBefore = this.roomOps.get(room.id)
+    // A lifecycle operation in flight at observation start may finish (and
+    // route the Room) during the probe; its outcome, not this snapshot, wins.
+    const lockedBefore = this.activeRoomLocks.has(room.id)
     const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
     if (
       runtimeStatus.expected === 'running' &&
       runtimeStatus.state === 'dead' &&
       this.roomOps.get(room.id) === opsBefore &&
+      !lockedBefore &&
       !this.activeRoomLocks.has(room.id)
     ) {
       this.revokeRouteFor(room.id, `runtime is dead (${runtimeStatus.detail})`)
@@ -4206,6 +4220,9 @@ export class RoomOrchestrator {
     if (alreadyAwake && room.hostPort != null) {
       const runtimeStatus = await this.observeRuntimeStatus(room)
       if (runtimeStatus.state === 'running') {
+        // The runtime is proven; the route may still be missing after an
+        // observation-driven revocation (I2), so re-derive it from the record (I1).
+        await this.syncRouteFor(roomId)
         report.skip('Room was already awake')
         return
       }
@@ -8266,7 +8283,7 @@ export class RoomOrchestrator {
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
         : null
-      const url = runtimeStatus.state === 'running' ? this.inspectRoom(room.id).urls.app : null
+      const url = this.servedUrlFor(room, runtimeStatus)
       rooms.push({
         id: room.id,
         project: room.project,
@@ -8332,7 +8349,7 @@ export class RoomOrchestrator {
     return {
       ...inspection,
       room: this.effectiveRoom(recorded, runtimeStatus),
-      urls: { app: runtimeStatus.state === 'running' ? inspection.urls.app : null },
+      urls: { app: this.servedUrlFor(recorded, runtimeStatus) },
       runtimeStatus
     }
   }

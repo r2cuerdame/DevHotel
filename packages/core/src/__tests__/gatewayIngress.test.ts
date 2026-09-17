@@ -269,4 +269,103 @@ describe('gateway ingress invariant (#87)', () => {
     expect(orch.rooms.get(room.id)?.status).toBe('broken')
     expect(gateway.routes.has(room.domain)).toBe(true)
   })
+
+  describe('positive-side route repair after revocation (#94)', () => {
+    async function crashedThenRevoked(
+      revoke: (orch: RoomOrchestrator, roomId: string) => Promise<unknown>
+    ) {
+      const ctx = setup()
+      const { orch, backend, gateway, seedRoute } = ctx
+      const relay = await listeningPort()
+      const room = makeRoom({
+        sourceType: 'empty',
+        sourceRef: '',
+        workspaceMode: 'empty',
+        syncStatus: 'empty',
+        status: 'ready',
+        hostPort: relay.port
+      })
+      orch.rooms.create(room)
+      seedRoute(room.domain, room.id)
+      backend.webStateValue = 'exited'
+      await revoke(orch, room.id)
+      // I2 revoked ingress; the record deliberately stays awake and entitled.
+      expect(gateway.routes.has(room.domain)).toBe(false)
+      expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: relay.port })
+      return { ...ctx, room, relay }
+    }
+
+    const observers = {
+      hotelStatus: (orch: RoomOrchestrator) => orch.hotelStatus(),
+      listRoomsRuntime: (orch: RoomOrchestrator) => orch.listRoomsRuntime(),
+      inspectRoomRuntime: (orch: RoomOrchestrator, roomId: string) => orch.inspectRoomRuntime(roomId)
+    }
+
+    for (const [name, revoke] of Object.entries(observers)) {
+      it(`T14 restart_web after ${name} revoked the route restores ingress before returning`, async () => {
+        const { orch, backend, gateway, room, relay } = await crashedThenRevoked(revoke)
+        try {
+          backend.restartWeb = async (roomId) => {
+            backend.calls.push(`restartWeb:${roomId}`)
+            backend.webStateValue = 'running'
+          }
+          const entry = await orch.restartWeb(room.id, 'user')
+          expect(entry.verify).toMatchObject({ ok: true })
+          expect(gateway.routes.get(room.domain)).toMatchObject({ roomId: room.id, targetPort: relay.port })
+          const inspection = await orch.inspectRoomRuntime(room.id)
+          expect(inspection.runtimeStatus.state).toBe('running')
+          expect(inspection.urls.app).toBe(`http://${room.domain}`)
+          expect(gateway.status().routes.some((r) => r.domain === room.domain)).toBe(true)
+        } finally {
+          relay.close()
+        }
+      })
+    }
+
+    it('T15 start_room on an already-running runtime re-derives the route instead of skipping unrouted', async () => {
+      const { orch, backend, gateway, room, relay } = await crashedThenRevoked(observers.hotelStatus)
+      try {
+        // The web process came back on its own (or via a path that never synced).
+        backend.webStateValue = 'running'
+        const callsBefore = backend.calls.length
+        await orch.startRoom(room.id, 'user')
+        expect(backend.calls.slice(callsBefore).some((call) => /resumeRoomPod|recreate|createRoomPod/.test(call))).toBe(false)
+        expect(gateway.routes.get(room.domain)).toMatchObject({ roomId: room.id, targetPort: relay.port })
+        expect(orch.rooms.get(room.id)).toMatchObject({ status: 'ready', hostPort: relay.port })
+      } finally {
+        relay.close()
+      }
+    })
+
+    it('T16 a running but unrouted Room never advertises urls.app', async () => {
+      const { orch, backend, gateway, room, relay } = await crashedThenRevoked(observers.hotelStatus)
+      try {
+        backend.webStateValue = 'running'
+        expect(gateway.routes.has(room.domain)).toBe(false)
+        const inspection = await orch.inspectRoomRuntime(room.id)
+        expect(inspection.runtimeStatus.state).toBe('running')
+        expect(inspection.urls.app).toBeNull()
+        const status = await orch.hotelStatus()
+        expect(status.rooms[0]).toMatchObject({ status: 'ready', url: null, runtimeStatus: { state: 'running' } })
+      } finally {
+        relay.close()
+      }
+    })
+
+    it('T17 revalidation defers to a lifecycle operation that was in flight when the observation started', async () => {
+      const { orch, backend, gateway, internals, seedRoute } = setup()
+      const room = makeRoom({ status: 'ready', hostPort: 45000 })
+      orch.rooms.create(room)
+      seedRoute(room.domain, room.id)
+      backend.webStateValue = 'exited'
+      // The lock is held at observation start and released while the probe is awaited.
+      internals.activeRoomLocks.add(room.id)
+      backend.webState = async () => {
+        internals.activeRoomLocks.delete(room.id)
+        return backend.webStateValue
+      }
+      await orch.hotelStatus()
+      expect(gateway.routes.has(room.domain)).toBe(true)
+    })
+  })
 })
