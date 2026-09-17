@@ -14,7 +14,13 @@ export interface RunDockerOpts {
   maxStderrBytes?: number
   /** Keep draining but never kill a definitive-create critical section on overflow. */
   killOnOutputLimit?: boolean
-  /** Caller-owned, identity-safe cleanup invoked when timeout/output caps abort `docker run`. */
+  /**
+   * Caller-owned, identity-safe cleanup invoked whenever the CLI is aborted:
+   * timeout, output cap or signal. It runs after the CLI process closed and
+   * before the call settles, so a caller that reaps what the CLI left behind
+   * in the engine (a one-shot job, an exec's guest process group) can prove
+   * the abort finished rather than only that the local process died.
+   */
   onAbort?: () => Promise<void>
   onLine?: (line: string) => void
   input?: string

@@ -99,6 +99,71 @@ function fenceTiming(): ((phase: string, ms: number, detail?: string) => void) |
 }
 
 const LONG_TIMEOUT_MS = 600_000
+/**
+ * Every `execInRoom` entry process carries this variable with a per-call
+ * random token. It is the only identity the abort path trusts: a guest
+ * process is reaped because it inherited the token, never because of its
+ * name, its PID or its position in the tree. The Room's own start command,
+ * PID 1 and any other command's tree never carry it.
+ */
+export const EXEC_OWNER_ENV = 'DEVHOTEL_EXEC_TOKEN'
+const EXEC_REAP_TIMEOUT_MS = 15_000
+/**
+ * Runs inside the Room's web container as `sh -c SCRIPT sh <token>`.
+ *
+ * Finds every live process whose environment carries the token, then
+ * terminates the process groups those processes lead (the `docker exec`
+ * entry process is a session leader, so its whole tree is one group) plus
+ * the processes themselves for anything that left the group. A group is only
+ * signalled when its leader is itself token-tagged, so a workload that joined
+ * a foreign group cannot make the reap touch shared processes. SIGTERM first,
+ * a short grace, then SIGKILL; exit 0 only when nothing tagged is left alive.
+ */
+export const EXEC_OWNED_PROCESS_REAP_SCRIPT = `token="$1"
+[ -n "$token" ] || exit 64
+self=$$
+tagged=""
+for d in /proc/[0-9]*; do
+  pid="\${d#/proc/}"
+  [ "$pid" = "$self" ] && continue
+  [ "$pid" = "1" ] && continue
+  if tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qxF "${EXEC_OWNER_ENV}=$token"; then
+    tagged="$tagged $pid"
+  fi
+done
+[ -n "$tagged" ] || { echo "owned=0 groups=0 left=0"; exit 0; }
+groups=""
+for pid in $tagged; do
+  pgrp="$(cut -d')' -f2 "/proc/$pid/stat" 2>/dev/null | awk '{print $3}')"
+  [ -n "$pgrp" ] || continue
+  case " $tagged " in *" $pgrp "*) ;; *) continue ;; esac
+  case " $groups " in *" $pgrp "*) ;; *) groups="$groups $pgrp" ;; esac
+done
+for pgrp in $groups; do kill -TERM -- "-$pgrp" 2>/dev/null; done
+for pid in $tagged; do kill -TERM "$pid" 2>/dev/null; done
+i=0
+while [ $i -lt 20 ]; do
+  alive=0
+  for pid in $tagged; do [ -d "/proc/$pid" ] && alive=1; done
+  [ $alive -eq 0 ] && break
+  sleep 0.1
+  i=$((i+1))
+done
+for pgrp in $groups; do kill -KILL -- "-$pgrp" 2>/dev/null; done
+for pid in $tagged; do kill -KILL "$pid" 2>/dev/null; done
+left=0
+for pid in $tagged; do
+  if [ -d "/proc/$pid" ] && [ "$(cut -d')' -f2 "/proc/$pid/stat" 2>/dev/null | awk '{print $1}')" != "Z" ]; then left=$((left+1)); fi
+done
+echo "owned=$(echo $tagged | wc -w) groups=$(echo $groups | wc -w) left=$left"
+[ $left -eq 0 ]
+`
+
+/** The engine invocation that reaps one exec's owned guest process group. */
+export function execOwnedProcessReapArgs(containerId: string, token: string): string[] {
+  return ['exec', containerId, 'sh', '-c', EXEC_OWNED_PROCESS_REAP_SCRIPT, 'sh', token]
+}
+
 const ONE_SHOT_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 const ONE_SHOT_MAX_STDERR_BYTES = 4 * 1024 * 1024
 const SCREENSHOT_MAX_BASE64_BYTES = Math.ceil(SCREENSHOT_ARTIFACT_MAX_BYTES / 3) * 4
@@ -2209,14 +2274,41 @@ export class OciCliBackend implements IsolationBackend {
   async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return this.engine.run(['exec', exactContainerId(container, roomId), ...cmd], {
+    const containerId = exactContainerId(container, roomId)
+    // Killing the local CLI on timeout/abort leaves the guest process running;
+    // the token lets the abort path reap exactly that tree and nothing else.
+    const token = randomUUID()
+    return this.engine.run(['exec', '-e', `${EXEC_OWNER_ENV}=${token}`, containerId, ...cmd], {
       timeoutMs: opts?.timeoutMs,
       ...(opts?.signal ? { signal: opts.signal } : {}),
       ...(opts?.maxStdoutBytes !== undefined ? { maxStdoutBytes: opts.maxStdoutBytes } : {}),
       ...(opts?.maxStderrBytes !== undefined ? { maxStderrBytes: opts.maxStderrBytes } : {}),
       ...(opts?.onStdout ? { onStdout: opts.onStdout } : {}),
-      ...(opts?.onStderr ? { onStderr: opts.onStderr } : {})
+      ...(opts?.onStderr ? { onStderr: opts.onStderr } : {}),
+      onAbort: () => this.reapOwnedExecProcesses(roomId, containerId, token)
     })
+  }
+
+  /**
+   * Prove an aborted exec's guest process group ended. A container that is no
+   * longer running has already taken every process with it, so that counts as
+   * reaped; anything else that leaves a tagged process alive is an error the
+   * caller must see instead of a silent leak.
+   */
+  private async reapOwnedExecProcesses(roomId: string, containerId: string, token: string): Promise<void> {
+    const result = await this.engine.run(execOwnedProcessReapArgs(containerId, token), {
+      timeoutMs: EXEC_REAP_TIMEOUT_MS,
+      maxStdoutBytes: 1024,
+      maxStderrBytes: 4096
+    })
+    if (result.code === 0) return
+    const container = await this.inspectContainer(containerId).catch(() => null)
+    // A paused container still holds the frozen tree, so only a stopped or
+    // removed container counts as having reaped it.
+    const status = container?.State?.Status
+    if (!container || (status !== 'running' && status !== 'paused')) return
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+    throw new Error(`Room ${roomId} cancelled command left owned guest processes running: ${detail}`)
   }
 
   async spawnInteractiveExec(roomId: string, cmd: string[]) {

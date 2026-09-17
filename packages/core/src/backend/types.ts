@@ -59,7 +59,11 @@ export type ExecOutputChunk = string | Uint8Array
 
 export interface ExecOpts {
   timeoutMs?: number
-  /** Cancel the command and complete its mandatory ownership-safe cleanup. */
+  /**
+   * Cancel the command and complete its mandatory ownership-safe cleanup. For
+   * `execInRoom` that cleanup reaps the guest process group the command owns,
+   * so an abort proves the workload ended instead of only ending the CLI.
+   */
   signal?: AbortSignal
   /** Hard disposable helper container lifecycle (e.g. streaming readers or disposable tests). */
   disposableHelper?: boolean
