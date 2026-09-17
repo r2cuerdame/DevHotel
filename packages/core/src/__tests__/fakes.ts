@@ -297,11 +297,39 @@ export class FakeBackend implements IsolationBackend {
   }
   /** Chunks to emit instead of `execResult`, so streaming callers can be tested. */
   execChunks: { stdout?: string[]; stderr?: string[] } | null = null
+  /** Guest process groups the real backend would have reaped on abort, by reason. */
+  reapedExecs: { roomId: string; cmd: string[]; reason: unknown }[] = []
   async execInRoom(roomId: string, cmd: string[], opts?: ExecOpts): Promise<ExecResult> {
     this.execInRoomCalls.push({ roomId, cmd, ...(opts ? { opts } : {}) })
-    const result = this.execInRoomHandler
-      ? await this.execInRoomHandler(roomId, cmd, opts)
+    const signal = opts?.signal
+    if (signal?.aborted) {
+      this.reapedExecs.push({ roomId, cmd, reason: signal.reason })
+      throw signal.reason
+    }
+    const pending = this.execInRoomHandler
+      ? this.execInRoomHandler(roomId, cmd, opts)
       : (this.execHandler?.(cmd) ?? this.execResult)
+    // Like runDocker: an abort ends the call and completes the owned-process
+    // reap before it settles, whatever the handler was still doing.
+    const result = signal
+      ? await new Promise<ExecResult>((resolve, reject) => {
+          const onAbort = (): void => {
+            this.reapedExecs.push({ roomId, cmd, reason: signal.reason })
+            reject(signal.reason)
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+          Promise.resolve(pending).then(
+            (value) => {
+              signal.removeEventListener('abort', onAbort)
+              resolve(value)
+            },
+            (error: unknown) => {
+              signal.removeEventListener('abort', onAbort)
+              reject(error)
+            }
+          )
+        })
+      : await pending
     if (!opts?.onStdout && !opts?.onStderr) return result
     const stdout = this.execChunks?.stdout ?? (result.stdout ? [result.stdout] : [])
     const stderr = this.execChunks?.stderr ?? (result.stderr ? [result.stderr] : [])

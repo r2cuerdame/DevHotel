@@ -55,6 +55,7 @@ import type {
   BackupInfo,
   ChangeEntry,
   CheckReport,
+  ComponentInfo,
   CheckResult,
   CheckStatus,
   CloneRoomInput,
@@ -262,6 +263,13 @@ const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 // proofs can complete on a cold managed emulator without weakening any fence.
 const ANDROID_LOCALE_RECOVERY_TIMEOUT_MS = 120_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
+/**
+ * How old a live component observation may be when it is replayed instead of
+ * probing a Room whose workload slot is busy. Versions inside a Room change
+ * only through tracked changes, so a few minutes is far inside their real
+ * validity; the bound exists so a stale reading can never masquerade as live.
+ */
+const COMPONENT_OBSERVATION_MAX_AGE_MS = 5 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
 const ANDROID_ACCEPTANCE_RESTORE_PENDING_PREFIX = 'androidAcceptanceRestorePending:'
@@ -1280,6 +1288,11 @@ type ExactRoomRuntimeFenceBackend = IsolationBackend & {
   restoreRoomArtifactWeb(spec: WebSpec, fence: RoomArtifactWebRuntimeFence): Promise<void>
 }
 
+/** One admitted Room command: its lifecycle-driven cancellation handle. */
+interface RoomWorkload {
+  controller: AbortController
+}
+
 interface PendingHostResyncConfirmation {
   token: string
   actor: Actor
@@ -1310,6 +1323,15 @@ export class RoomOrchestrator {
   private readonly emitter = new EventEmitter()
   private readonly roomOps = new Map<string, Promise<unknown>>()
   private readonly activeRoomLocks = new Set<string>()
+  /**
+   * The per-Room workload slot. Commands an agent runs in a Room queue here,
+   * not in `roomOps`, so a long build cannot hold the control plane: sleep,
+   * delete and reads take the lifecycle lock while the workload keeps running,
+   * and lifecycle work that ends the runtime cancels the slot first.
+   */
+  private readonly workloadSlots = new Map<string, Promise<unknown>>()
+  private readonly activeWorkloads = new Map<string, Set<RoomWorkload>>()
+  private readonly componentObservations = new Map<string, { observedAt: string; components: ComponentInfo[] }>()
   private readonly activeMutations = new Set<Promise<unknown>>()
   private readonly deletingRooms = new Set<string>()
   private readonly materializingRooms = new Set<string>()
@@ -2386,6 +2408,56 @@ export class RoomOrchestrator {
       next.catch(() => undefined)
     )
     return next
+  }
+
+  /**
+   * Serializes Room workloads (agent commands) among themselves without
+   * touching the lifecycle lock. Admission checks run under `withRoomLock`
+   * before a caller enters here; the slot only orders the guest work.
+   */
+  private withWorkloadSlot<T>(roomId: string, workload: RoomWorkload, fn: () => Promise<T>): Promise<T> {
+    let active = this.activeWorkloads.get(roomId)
+    if (!active) {
+      active = new Set()
+      this.activeWorkloads.set(roomId, active)
+    }
+    active.add(workload)
+    const prev = this.workloadSlots.get(roomId) ?? Promise.resolve()
+    const next = prev.catch(() => undefined).then(fn)
+    const settled = next.catch(() => undefined).then(() => {
+      const current = this.activeWorkloads.get(roomId)
+      current?.delete(workload)
+      if (current && current.size === 0) this.activeWorkloads.delete(roomId)
+      if (this.workloadSlots.get(roomId) === settled) this.workloadSlots.delete(roomId)
+    })
+    this.workloadSlots.set(roomId, settled)
+    return next
+  }
+
+  private workloadSlotBusy(roomId: string): boolean {
+    return (this.activeWorkloads.get(roomId)?.size ?? 0) > 0
+  }
+
+  /**
+   * Cancel every queued or running workload of a Room and wait until each has
+   * settled, i.e. until the backend proved the owned guest process group
+   * ended (or the runtime that held it is gone). Lifecycle work that stops or
+   * removes the runtime calls this first so the workload never outlives the
+   * control-plane decision that ended it.
+   */
+  private async cancelRoomWorkloads(roomId: string, reason: string): Promise<void> {
+    const active = this.activeWorkloads.get(roomId)
+    if (!active || active.size === 0) return
+    for (const workload of [...active]) {
+      workload.controller.abort(
+        new DevHotelError('ROOM_COMMAND_CANCELLED', `The command was cancelled: ${reason}.`, {
+          recoveryHint: 'Wake the Room and run the command again.',
+          httpStatus: 409
+        })
+      )
+    }
+    const settled = this.workloadSlots.get(roomId)
+    if (settled) await settled
   }
 
   private assertNoPendingArtifactExport(roomId: string): void {
@@ -4070,6 +4142,9 @@ export class RoomOrchestrator {
     }
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
+    // A running agent command must not outlive the runtime that hosts it, and
+    // sleep must not queue behind it either: cancel the workload slot, then stop.
+    await this.cancelRoomWorkloads(roomId, 'the Room went to sleep')
     await this.backend.stopRoomPod(roomId)
     this.rooms.update(roomId, {
       status: artifactRecoveryPending ? 'broken' : 'sleeping',
@@ -4401,6 +4476,7 @@ export class RoomOrchestrator {
     this.rooms.update(roomId, { status: 'deleting' })
     this.logs.detach(roomId)
     this.gateway.removeRoute(room.domain)
+    await this.cancelRoomWorkloads(roomId, 'the Room was deleted')
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
     this.operations.forgetRoom(roomId)
@@ -8909,71 +8985,116 @@ export class RoomOrchestrator {
     })
   }
 
+  /**
+   * Run one command in the Room. Admission (fences, policy, activity) takes
+   * the lifecycle lock briefly; the command itself runs in the Room's workload
+   * slot so control-plane work is never queued behind it. `opts.signal` lets
+   * the caller cancel (a closed HTTP response, for instance); sleep and delete
+   * cancel on their own. Either way the backend reaps the owned guest process
+   * group before the call settles.
+   */
   async execInRoom(
     roomId: string,
     cmd: string[],
-    opts?: { timeoutMs?: number; output?: OutputSelection },
+    opts?: { timeoutMs?: number; output?: OutputSelection; signal?: AbortSignal },
     actor: Actor = 'agent'
   ): Promise<RoomExecResult> {
     const beforeUse = this.mustGet(roomId)
     if (beforeUse.status === 'sleeping' && beforeUse.lifecycle?.autoSleptAt) {
       await this.startRoom(roomId, actor)
     }
-    return this.withRoomLock(roomId, async () => {
+    await this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
       if (actor === 'agent' && room.workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent commands are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
       }
       if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
-      const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
-      if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
       this.recordRoomActivity(roomId)
       this.advanceStateRevision(roomId)
-      const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
-      let sawStdout = false
-      let sawStderr = false
-      let result: ExecResult
+    })
+    const workload: RoomWorkload = { controller: new AbortController() }
+    const external = opts?.signal
+    const forward = (): void => workload.controller.abort(external?.reason)
+    if (external) {
+      if (external.aborted) forward()
+      else external.addEventListener('abort', forward, { once: true })
+    }
+    return this.withWorkloadSlot(roomId, workload, async () => {
       try {
-        result = await this.backend.execInRoom(roomId, cmd, {
-          timeoutMs: opts?.timeoutMs,
-          onStdout: (chunk) => {
-            sawStdout = true
-            run.push('stdout', chunk)
-          },
-          onStderr: (chunk) => {
-            sawStderr = true
-            run.push('stderr', chunk)
-          }
-        })
-      } catch (error) {
-        this.runs.complete(run, -1)
-        if (error instanceof DevHotelError) throw error
-        const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
-        if (after !== 'running') throw this.runtimeNotRunningError(room, after, error)
-        throw error
-      }
-      // A backend that buffers instead of streaming still gets bounded here.
-      if (!sawStdout && result.stdout) run.push('stdout', result.stdout)
-      if (!sawStderr && result.stderr) run.push('stderr', result.stderr)
-      const outcome = this.runs.complete(run, result.code)
-      if (result.code !== 0) {
-        const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
-        if (after !== 'running') throw this.runtimeNotRunningError(room, after)
-      }
-      return {
-        code: result.code,
-        stdout: outcome.stdout.text,
-        stderr: outcome.stderr.text,
-        output: {
-          runId: outcome.runId,
-          retained: outcome.retained,
-          stdout: outcome.stdout.report,
-          stderr: outcome.stderr.report,
-          notes: outcome.notes
-        }
+        return await this.execInWorkloadSlot(roomId, cmd, opts, actor, workload.controller.signal)
+      } finally {
+        external?.removeEventListener('abort', forward)
       }
     })
+  }
+
+  private async execInWorkloadSlot(
+    roomId: string,
+    cmd: string[],
+    opts: { timeoutMs?: number; output?: OutputSelection } | undefined,
+    actor: Actor,
+    signal: AbortSignal
+  ): Promise<RoomExecResult> {
+    // Re-read after queueing: a sleep or delete may have won the lifecycle
+    // lock while this command waited for an earlier one to finish.
+    if (signal.aborted) throw signal.reason
+    const room = this.mustGet(roomId)
+    if (this.runtimeExpectation(room) !== 'running') throw this.runtimeNotRunningError(room, 'stopped')
+    const runtimeState = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+    if (runtimeState !== 'running') throw this.runtimeNotRunningError(room, runtimeState)
+    if (signal.aborted) throw signal.reason
+    const run = this.runs.begin(roomId, cmd, actor, opts?.output ?? {})
+    let sawStdout = false
+    let sawStderr = false
+    let result: ExecResult
+    try {
+      result = await this.backend.execInRoom(roomId, cmd, {
+        timeoutMs: opts?.timeoutMs,
+        signal,
+        onStdout: (chunk) => {
+          sawStdout = true
+          run.push('stdout', chunk)
+        },
+        onStderr: (chunk) => {
+          sawStderr = true
+          run.push('stderr', chunk)
+        }
+      })
+    } catch (error) {
+      this.runs.complete(run, -1)
+      if (error instanceof DevHotelError) throw error
+      if (signal.aborted && signal.reason instanceof DevHotelError) {
+        throw new DevHotelError(signal.reason.code, signal.reason.message, {
+          recoveryHint: signal.reason.recoveryHint ?? undefined,
+          httpStatus: signal.reason.httpStatus,
+          cause: error
+        })
+      }
+      const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+      if (after !== 'running') throw this.runtimeNotRunningError(room, after, error)
+      throw error
+    }
+    // A backend that buffers instead of streaming still gets bounded here.
+    if (!sawStdout && result.stdout) run.push('stdout', result.stdout)
+    if (!sawStderr && result.stderr) run.push('stderr', result.stderr)
+    const outcome = this.runs.complete(run, result.code)
+    if (result.code !== 0) {
+      const after = await this.backend.webState(roomId).catch(() => 'unknown' as const)
+      if (after !== 'running') throw this.runtimeNotRunningError(room, after)
+    }
+    return {
+      code: result.code,
+      stdout: outcome.stdout.text,
+      stderr: outcome.stderr.text,
+      output: {
+        runId: outcome.runId,
+        retained: outcome.retained,
+        stdout: outcome.stdout.report,
+        stderr: outcome.stderr.report,
+        notes: outcome.notes
+      }
+    }
   }
 
   private runtimeNotRunningError(room: RoomRecord, state: string, cause?: unknown): DevHotelError {
@@ -9038,16 +9159,34 @@ export class RoomOrchestrator {
     })
   }
 
-  /** Installed programs of a room with live versions (read from inside the room when awake). */
-  async components(roomId: string): Promise<
-    { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
-  > {
-    return this.withRoomLock(roomId, () => this.componentsLocked(roomId))
+  /**
+   * Installed programs of a room with live versions (read from inside the room
+   * when awake). While the Room's workload slot is busy the guest is not
+   * probed: the last live observation is replayed when it is younger than
+   * {@link COMPONENT_OBSERVATION_MAX_AGE_MS}, marked `recorded` with its
+   * `observedAt`, and otherwise the Room record answers.
+   */
+  async components(roomId: string): Promise<ComponentInfo[]> {
+    if (this.workloadSlotBusy(roomId)) {
+      const observed = this.componentObservations.get(roomId)
+      const ageMs = observed ? Date.now() - Date.parse(observed.observedAt) : Number.POSITIVE_INFINITY
+      if (observed && ageMs >= 0 && ageMs <= COMPONENT_OBSERVATION_MAX_AGE_MS) {
+        return observed.components.map((component) => ({
+          ...component,
+          source: 'recorded',
+          observedAt: observed.observedAt
+        }))
+      }
+      return this.withRoomLock(roomId, () => this.componentsLocked(roomId, { probe: false }))
+    }
+    const components = await this.withRoomLock(roomId, () => this.componentsLocked(roomId, { probe: true }))
+    if (components.some((component) => component.source === 'live')) {
+      this.componentObservations.set(roomId, { observedAt: new Date().toISOString(), components })
+    }
+    return components
   }
 
-  private async componentsLocked(roomId: string): Promise<
-    { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[]
-  > {
+  private async componentsLocked(roomId: string, mode: { probe: boolean }): Promise<ComponentInfo[]> {
     const room = this.mustGet(roomId)
     if (room.provider === 'windows') {
       return [
@@ -9062,6 +9201,7 @@ export class RoomOrchestrator {
       ]
     }
     const awake =
+      mode.probe &&
       (room.status === 'running' || room.status === 'ready' || room.status === 'attention') &&
       (await this.backend.webState(roomId)) === 'running'
     const liveWeb = async (cmd: string): Promise<string | null> => {
@@ -9070,7 +9210,7 @@ export class RoomOrchestrator {
       const line = res.stdout.trim().split(/\r?\n/)[0] ?? ''
       return res.code === 0 && line ? line : null
     }
-    const out: { id: string; label: string; version: string; source: 'live' | 'recorded'; changeKind?: string; options?: string[] }[] = []
+    const out: ComponentInfo[] = []
 
     if (room.provider === 'android') {
       const jdk = await liveWeb('java -version 2>&1 | head -1')

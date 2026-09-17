@@ -587,10 +587,28 @@ export async function startControlApi(
           }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
+            // A caller that stops waiting must not leave its command running in
+            // the Room: closing the response before it was sent cancels the
+            // command, and the backend reaps the guest process group it owned.
+            const cancel = new AbortController()
+            res.once('close', () => {
+              if (res.writableEnded) return
+              cancel.abort(
+                new DevHotelError('ROOM_COMMAND_CANCELLED', 'The command was cancelled: the caller closed the response.', {
+                  recoveryHint: 'Run the command again and keep the request open until it answers.',
+                  httpStatus: 409
+                })
+              )
+            })
             sendJson(
               res,
               200,
-              await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs, output: body.output }, 'agent')
+              await orch.execInRoom(
+                safeRoomId,
+                body.cmd,
+                { timeoutMs: body.timeoutMs, output: body.output, signal: cancel.signal },
+                'agent'
+              )
             )
             return
           }

@@ -92,8 +92,13 @@ export interface ComponentInfo {
   id: string
   label: string
   version: string
-  /** 'live' = read from inside the room just now; 'recorded' = from the room record */
+  /** 'live' = read from inside the room just now; 'recorded' = from the room record or a replayed observation */
   source: 'live' | 'recorded'
+  /**
+   * When a busy Room answers with its last live reading instead of probing
+   * again, the time that reading was taken. Absent for live and record values.
+   */
+  observedAt?: string
   /** the change kind that switches this component's version, when switchable */
   changeKind?: string
   options?: string[]
