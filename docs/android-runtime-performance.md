@@ -66,30 +66,6 @@ llvmpipe and Vulkan then fails with `VK_ERROR_INCOMPATIBLE_DRIVER`; forcing Mesa
 d3d12 fails emulator startup outright. `-gpu` stays at the image's
 `swiftshader_indirect`, and `-accel on` (KVM) is what keeps the CPU fast.
 
-## A retained emulator container cannot be restarted
-
-This is why Android Rooms refuse the warm wake path and recreate their emulator
-instead (see `docs/room-lifecycle.md`).
-
-- `docker stop -t 5` always exits **137**. The image's PID 1 does not forward
-  SIGTERM, so every stop is a SIGKILL.
-- Xvfb therefore never releases `:0` and leaves a read-only `/tmp/.X0-lock`.
-- The image also deletes the root `/etc/passwd` entry its bootstrap needs for
-  `sudo chown /dev/kvm`. DevHotel repairs that identity, and with it repaired
-  qemu does relaunch and reports `CPU Acceleration: working`. It then dies
-  anyway:
-
-```
-INFO | Warning: could not connect to display :0 (:0, )
-INFO | Fatal: This application failed to start because no Qt platform plugin
-       could be initialized.
-```
-
-No Docker CLI operation can delete a file inside a stopped container, so the
-stale lock cannot be cleared from outside, and the image offers no way to shut
-the emulator down cleanly first. Owning the emulator process directly
-([#108](https://github.com/r2cuerdame/DevHotel/issues/108)) is what removes this.
-
 ## Reproducing
 
 Run a disposable emulator container with the same wiring `buildEmulatorArgs`

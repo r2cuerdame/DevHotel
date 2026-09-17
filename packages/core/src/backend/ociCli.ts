@@ -1987,28 +1987,20 @@ export class OciCliBackend implements IsolationBackend {
     if (!relayToken) return { reused: false, reason: 'the Room relay credential was not retained' }
 
     const android = spec.androidRuntimeIsolation === true
-    if (android) {
-      // Measured, not assumed (docs/android-runtime-performance.md): a retained
-      // docker-android emulator cannot be restarted. Stopping the container is
-      // always a SIGKILL — its PID 1 does not forward SIGTERM — so Xvfb leaves a
-      // read-only /tmp/.X0-lock behind, never reacquires :0 on the next start,
-      // and the emulator dies with "no Qt platform plugin could be initialized"
-      // even once its one-shot KVM bootstrap identity has been repaired. No
-      // Docker CLI operation can delete a file inside a stopped container, so
-      // there is nothing to repair from out here. Refuse before starting
-      // anything rather than spend a doomed boot on every Android wake; the
-      // warm Android path belongs to the managed runtime (#108), which owns the
-      // emulator process directly and can shut it down cleanly.
-      return { reused: false, reason: 'a retained Android emulator container cannot be restarted' }
-    }
     const services = opts.services ?? []
     // Start order is dependency order: a container joining another container's
     // network namespace can only start once that leader is running again.
     const startPlan: Array<{ name: string; role: string }> = [
-      { name: anchorName(roomId), role: 'anchor' },
-      ...services.map((svc) => ({ name: svcName(roomId, svc.kind), role: `svc-${svc.kind}` })),
-      { name: webName(roomId), role: 'web' }
+      { name: anchorName(roomId), role: 'anchor' }
     ]
+    if (android) {
+      startPlan.push({ name: androidRuntimeAnchorName(roomId), role: 'android-runtime-anchor' })
+    }
+    startPlan.push(...services.map((svc) => ({ name: svcName(roomId, svc.kind), role: `svc-${svc.kind}` })))
+    if (android) {
+      startPlan.push({ name: emulatorName(roomId), role: 'svc-emulator' })
+    }
+    startPlan.push({ name: webName(roomId), role: 'web' })
 
     const retained: Array<{ name: string; role: string; id: string }> = []
     for (const participant of startPlan) {
