@@ -260,6 +260,10 @@ const EMULATOR_ADB_PROBE_TIMEOUT_MS = 5_000
 // screen witness. Keep the same public ceiling as locale acceptance so those
 // proofs can complete on a cold managed emulator without weakening any fence.
 const ANDROID_LOCALE_RECOVERY_TIMEOUT_MS = 120_000
+// A restarted managed emulator needs a cold Android boot before any exact
+// proof can run. This is one bounded wait, the same budget android_run gives a
+// fresh boot; it is never retried inside one startup pass.
+const ANDROID_LOCALE_RECOVERY_BOOT_TIMEOUT_MS = 5 * 60_000
 const HOST_RESYNC_CONFIRMATION_TTL_MS = 10 * 60 * 1000
 const ARTIFACT_EXPORT_PENDING_PREFIX = 'artifactExportPending:'
 const ANDROID_LOCALE_RESTORE_PENDING_PREFIX = 'androidLocaleRestorePending:'
@@ -446,6 +450,7 @@ function pendingAndroidLocaleOwnsCurrent(
 
 type AndroidLocaleRecoveryInvariantClass =
   | 'target-unavailable'
+  | 'workload-not-booted'
   | 'install-mismatch'
   | 'user-mismatch'
   | 'api-mismatch'
@@ -488,6 +493,21 @@ function parsePendingAndroidLocaleRecoveryDiagnostic(raw: string | null): Androi
     return null
   }
   return null
+}
+
+const ANDROID_LOCALE_RECOVERY_BOOT_ADB_STATES = new Set(['device', 'offline', 'unauthorized', 'missing', 'unknown'])
+const ANDROID_LOCALE_RECOVERY_BOOT_PROPERTIES = new Set(['1', 'empty', 'other'])
+
+/** Only the fixed enum states survive into a diagnostic; anything else reads as unknown. */
+function androidLocaleRecoveryBootEvidence(evidence: unknown): { adbState: string; bootProperty: string } {
+  const record = typeof evidence === 'object' && evidence !== null ? evidence as Record<string, unknown> : {}
+  const adbState = typeof record['adbState'] === 'string' && ANDROID_LOCALE_RECOVERY_BOOT_ADB_STATES.has(record['adbState'])
+    ? record['adbState']
+    : 'unknown'
+  const bootProperty = typeof record['bootProperty'] === 'string' && ANDROID_LOCALE_RECOVERY_BOOT_PROPERTIES.has(record['bootProperty'])
+    ? record['bootProperty']
+    : 'other'
+  return { adbState, bootProperty }
 }
 
 function classifyAndroidLocaleRecoveryFailure(
@@ -583,6 +603,18 @@ function classifyAndroidLocaleRecoveryFailure(
           reason: 'Managed emulator target is unavailable or could not be started',
           operatorAction: 'Verify emulator container health and isolation backend status, then restart DevHotel.'
         }
+      case 'ANDROID_LOCALE_TARGET_NOT_BOOTED': {
+        // The container topology was proved and the exact container is
+        // running; only the Android workload inside it failed to boot. The
+        // ADB state and boot property are DevHotel's own bounded enums, never
+        // guest output, so they can name which liveness invariant failed.
+        const boot = androidLocaleRecoveryBootEvidence(error.evidence)
+        return {
+          invariantClass: 'workload-not-booted',
+          reason: `Retained emulator container is running but its Android workload did not reach a booted ADB device state (adb: ${boot.adbState}, boot: ${boot.bootProperty})`,
+          operatorAction: 'Keep the exact emulator container; inspect its container logs for the emulator process, repair the isolation backend (for example a stale emulator lock or missing KVM), then restart DevHotel. Do not recreate the emulator: that discards the retained install/user/target fence.'
+        }
+      }
     }
   }
   if (error instanceof Error) {
@@ -1519,6 +1551,22 @@ export class RoomOrchestrator {
               this.rooms.update(room.id, { status: 'attention' })
             }
             await this.backend.startExistingEmulatorForRecovery(room.id)
+            // A proved container topology is not a live emulator. After an
+            // unclean stop the exact container can be running while the
+            // emulator process inside never reaches ADB `device` with
+            // sys.boot_completed=1; every session probe below would then fail
+            // and be misread as a user/install invariant. Prove the workload
+            // once, bounded, before any ADB proof runs.
+            const boot = await this.backend.waitForFencedEmulatorRecoveryBoot(room.id, {
+              timeoutMs: ANDROID_LOCALE_RECOVERY_BOOT_TIMEOUT_MS
+            })
+            if (!boot.booted) {
+              throw new DevHotelError(
+                'ANDROID_LOCALE_TARGET_NOT_BOOTED',
+                'Retained emulator workload did not boot within the recovery budget',
+                { evidence: { adbState: boot.adbState, bootProperty: boot.bootProperty } }
+              )
+            }
             const session = await this.openAndroidAutomationSessionLocked(
               room.id,
               selector,

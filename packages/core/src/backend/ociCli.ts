@@ -3807,6 +3807,29 @@ export class OciCliBackend implements IsolationBackend {
     return this.runFencedEmulatorAdb(roomId, args, opts, undefined, true)
   }
 
+  async waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts: Pick<ExecOpts, 'timeoutMs' | 'signal'> = {}
+  ): Promise<FencedEmulatorBootResult> {
+    throwIfAborted(opts.signal)
+    // Same one-shot boot helper as the live path, proved against the recovery
+    // topology: the web/runtime workload stays exited and untouched.
+    const result = await this.runFencedEmulatorAdb(
+      roomId,
+      [],
+      {
+        ...opts,
+        timeoutMs: opts.timeoutMs ?? FENCED_EMULATOR_BOOT_TIMEOUT_MS,
+        maxStdoutBytes: FENCED_EMULATOR_BOOT_STDOUT_BYTES,
+        maxStderrBytes: FENCED_EMULATOR_BOOT_STDERR_BYTES
+      },
+      undefined,
+      true,
+      'wait-for-boot'
+    )
+    return parseFencedEmulatorBootResult(result)
+  }
+
   async installFencedEmulatorApk(roomId: string, hostApkPath: string, opts: ExecOpts = {}): Promise<ExecResult> {
     let canonicalApk: string | undefined
     try {

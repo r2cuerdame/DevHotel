@@ -600,6 +600,22 @@ export class FakeBackend implements IsolationBackend {
       helperCode: 0
     }
   }
+  async waitForFencedEmulatorRecoveryBoot(
+    roomId: string,
+    opts?: Pick<ExecOpts, 'timeoutMs' | 'signal'>
+  ): Promise<FencedEmulatorBootResult> {
+    this.calls.push(`waitForFencedEmulatorRecoveryBoot:${roomId}`)
+    this.fencedEmulatorBootCalls.push({ opts })
+    if (opts?.signal?.aborted) throw opts.signal.reason
+    if (this.fencedEmulatorBootHandler) return await this.fencedEmulatorBootHandler(opts)
+    return {
+      booted: true,
+      adbState: 'device',
+      bootProperty: '1',
+      lastAdbCode: 0,
+      helperCode: 0
+    }
+  }
   async execFencedEmulatorRecoveryAdb(_roomId: string, args: string[], opts?: ExecOpts): Promise<ExecResult> {
     this.calls.push(`execFencedEmulatorRecoveryAdb:${args.join(' ')}`)
     this.fencedEmulatorExecCalls.push({ args, opts })
