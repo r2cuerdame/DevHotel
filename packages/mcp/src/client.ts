@@ -31,6 +31,7 @@ import {
   type AndroidWaitForTextResult,
   type ArtifactExportBody,
   type ArtifactExportResult,
+  type BuildIdentity,
   type CaptureScreenshotArtifactBody,
   type CreateAndroidAcceptanceReportInput,
   type ControlInfo,
@@ -273,7 +274,7 @@ export class ControlClient {
   }
 
   ping() {
-    return this.req<{ version: string }>('GET', '/v1/ping')
+    return this.req<BuildIdentity>('GET', '/v1/ping')
   }
   listRooms() {
     return this.req<unknown[]>('GET', '/v1/rooms')

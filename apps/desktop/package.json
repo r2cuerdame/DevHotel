@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "prepare:github": "node scripts/prepare-github-service.mjs",
+    "verify:installed-build": "node scripts/verify-installed-build.mjs",
     "build:installer": "pnpm prepare:github && electron-vite build && electron-builder --win nsis"
   },
   "dependencies": {
