@@ -167,6 +167,7 @@ packages/shared   Shared schemas, contracts, and host input boundary definitions
 - [Android Locale Matrix](./docs/android-locale-matrix.md) — App-scoped locale testing and recovery contract.
 - [Host Input Isolation](./docs/host-input-isolation.md) — Desktop cursor and window protection contract.
 - [The Host Footprint](./docs/host-footprint.md) — What DevHotel owns on a machine, and the proofs required to reclaim any of it.
+- [Room-aware volume GC](./docs/volume-gc.md) — Why `docker volume prune` is never the answer, and how a bounded pass proves each volume orphaned first.
 - [Releasing](./docs/releasing.md) — Release packaging, checksum verification, and update process.
 - [Changelog](./CHANGELOG.md) — Detailed version history and release notes.
 - [Product Definition (`goal.md`)](./goal.md) — Original product specification (Korean).
