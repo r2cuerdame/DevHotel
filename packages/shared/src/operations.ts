@@ -5,7 +5,39 @@
  * still running, finished, or failed.
  */
 
-export type OperationKind = 'room-start' | 'android-run'
+export type OperationKind =
+  | 'room-start'
+  | 'android-run'
+  | 'room-create'
+  | 'room-clone'
+  | 'room-delete'
+  | 'room-sleep'
+  | 'room-restart-web'
+  | 'room-sync-from-host'
+  | 'room-safe-resync'
+  | 'room-checks'
+  | 'room-change'
+  | 'room-undo'
+
+/**
+ * Mutating Room routes whose durable record is the answer: each persists its
+ * operation before the first side effect, so a caller that lost the response
+ * polls the ID instead of repeating the mutation.
+ */
+export const ROOM_MUTATION_KINDS = [
+  'room-create',
+  'room-clone',
+  'room-delete',
+  'room-sleep',
+  'room-restart-web',
+  'room-sync-from-host',
+  'room-safe-resync',
+  'room-checks',
+  'room-change',
+  'room-undo'
+] as const
+
+export type RoomMutationKind = (typeof ROOM_MUTATION_KINDS)[number]
 
 /** `running` is not an outcome — poll until `succeeded` or `failed`. */
 export type OperationStatus = 'running' | 'succeeded' | 'failed'
@@ -20,6 +52,7 @@ export type OperationStageStatus = 'running' | 'done' | 'skipped' | 'failed'
 /** Stage keys an operation can report. */
 export const OPERATION_STAGES = [
   'preparing',
+  'mutate',
   'container-start',
   'emulator-boot',
   'services-start',
@@ -94,6 +127,14 @@ export interface OperationRecord {
   stages: OperationStage[]
   /** Terminal error details; null while running and on success. */
   error: OperationError | null
+  /**
+   * The answer the original call would have returned, stored with the terminal
+   * record. This is what makes a lost response recoverable: the caller polls
+   * the operation ID and reads the outcome it never received, instead of
+   * repeating a mutation that already happened. Absent while running, and for
+   * operations whose only outcome is the status itself.
+   */
+  result?: unknown
   startedAt: string
   updatedAt: string
   finishedAt: string | null

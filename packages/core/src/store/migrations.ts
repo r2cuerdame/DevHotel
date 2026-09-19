@@ -467,6 +467,16 @@ export const migrations: Migration[] = [
       CREATE INDEX idx_client_browser_sessions_room ON client_browser_sessions(room_id);
       CREATE INDEX idx_client_browser_sessions_status ON client_browser_sessions(status);
     `
+  },
+  {
+    // A caller that lost its response needs the answer, not just the status:
+    // the terminal payload the original call would have returned is stored
+    // with the operation so polling recovers it instead of repeating the
+    // mutation.
+    version: 14,
+    sql: `
+      ALTER TABLE operations ADD COLUMN result_json TEXT;
+    `
   }
 ]
 
