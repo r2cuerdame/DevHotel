@@ -47,6 +47,9 @@ describe('Room wake Docker budget', () => {
     const engine = mockedRunDocker.getMockImplementation()!
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'info') return { code: 0, stdout: ENGINE_INFO, stderr: '' }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:00 node index.js\n', stderr: '' }
+      }
       return engine(args, opts)
     })
     const roomId = 'wake0001'
@@ -81,6 +84,9 @@ describe('Room wake Docker budget', () => {
     const engine = mockedRunDocker.getMockImplementation()!
     mockedRunDocker.mockImplementation(async (args, opts) => {
       if (args[0] === 'info') return { code: 0, stdout: ENGINE_INFO, stderr: '' }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:00 node index.js\n', stderr: '' }
+      }
       return engine(args, opts)
     })
     const roomId = 'wake0002'

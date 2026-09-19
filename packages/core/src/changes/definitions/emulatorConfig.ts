@@ -89,7 +89,7 @@ export const emulatorConfigChange: ChangeDefinition<{
     for (let i = 0; i < 10; i++) {
       const state = await ctx.backend.emulatorState(ctx.roomId)
       if (state === 'running') return { ok: true, detail: 'emulator container running — the screen appears on the site view as it boots' }
-      if (state === 'missing') return { ok: false, detail: 'emulator container missing' }
+      if (state === 'missing' || state === 'degraded') return { ok: false, detail: state === 'missing' ? 'emulator container missing' : 'emulator container degraded' }
       await sleep(2000)
     }
     return { ok: false, detail: 'emulator container did not stay up' }

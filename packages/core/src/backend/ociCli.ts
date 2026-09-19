@@ -3074,10 +3074,31 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  async webState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
+  async webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
+    const topResult = await this.docker(['top', webName(roomId)])
+    if (topResult.code === 0) {
+      const lines = topResult.stdout.trim().split(/\r?\n/).filter((l) => l.trim().length > 0)
+      if (lines.length <= 1) return 'degraded'
+      const headerLine = lines[0]?.trim() ?? ''
+      const headers = headerLine.split(/\s+/)
+      const statIndex = headers.findIndex((h) => h.toUpperCase() === 'STAT' || h.toUpperCase() === 'S')
+      const processLines = lines.slice(1)
+      const allDefunct = processLines.every((line) => {
+        if (line.includes('<defunct>')) return true
+        if (statIndex !== -1) {
+          const cols = line.trim().split(/\s+/)
+          if (cols[statIndex] && cols[statIndex].startsWith('Z')) return true
+        }
+        return false
+      })
+      return allDefunct ? 'degraded' : 'running'
+    }
+
+    // `docker top` is the fast path for a live workload. Only a failed probe
+    // needs an inspect to distinguish a stopped container from a missing one.
     const result = await this.docker(['inspect', '--format', '{{.State.Status}}', webName(roomId)])
     if (result.code !== 0) return 'missing'
-    return result.stdout.trim() === 'running' ? 'running' : 'exited'
+    return result.stdout.trim() === 'running' ? 'degraded' : 'exited'
   }
 
   async observeRoomRuntimes(roomIds: readonly string[]): Promise<Map<string, RoomRuntimeObservation>> {
@@ -5506,7 +5527,7 @@ export class OciCliBackend implements IsolationBackend {
     await this.removeRoomContainer(roomId, emulatorName(roomId), 'svc-emulator')
   }
 
-  async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'> {
+  async emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
     await this.assertPinnedEngineIdentity()
     // One inspect reads the emulator together with the rest of its topology,
     // so a running answer costs one process instead of two; the proof below
@@ -5520,10 +5541,18 @@ export class OciCliBackend implements IsolationBackend {
     // Docker lists every target that exists in one answer; the fallback read
     // only ever confirms a genuinely missing emulator.
     const existing = prefetched.get(emulatorName(roomId)) ?? (await this.inspectContainer(emulatorName(roomId)))
-    if (!existing) return 'missing'
+    if (!existing) {
+      const anchor = prefetched.get(anchorName(roomId))
+      if (anchor && anchor.State?.Status === 'running') return 'degraded'
+      return 'missing'
+    }
     const owned = await this.assertRoomContainer(roomId, emulatorName(roomId), 'svc-emulator', existing)
     exactContainerId(owned, roomId)
-    if (owned.State?.Status !== 'running') return 'exited'
+    if (owned.State?.Status !== 'running') {
+      const anchor = prefetched.get(anchorName(roomId))
+      if (anchor && anchor.State?.Status === 'running') return 'degraded'
+      return 'exited'
+    }
     await this.assertFencedEmulatorTopology(roomId, undefined, prefetched)
     return 'running'
   }
