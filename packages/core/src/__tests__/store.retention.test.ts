@@ -95,6 +95,27 @@ function makeReport(i: number): CheckReport {
   }
 }
 
+/**
+ * Runs `n` retention writes as one durable commit. Each retention writer
+ * prunes on every call and joins an enclosing transaction when one is open,
+ * so the window assertions below see exactly the per-write behaviour; what
+ * this removes is one WAL fsync per write. That fsync is runner-speed, not
+ * retention: the same 2,250-event soak costs ~0.5 ms per commit on a dev NVMe
+ * and 16-22 ms on a loaded windows-latest runner, which is what blew the 20 s
+ * budget for unrelated PRs (#154). Callers commit their final write on its
+ * own so the self-owned transaction path stays covered.
+ */
+function soak(n: number, write: (i: number) => void): void {
+  db.sqlite.exec('BEGIN')
+  try {
+    for (let i = 0; i < n; i++) write(i)
+    db.sqlite.exec('COMMIT')
+  } catch (error) {
+    db.sqlite.exec('ROLLBACK')
+    throw error
+  }
+}
+
 function count(table: string, where = '1=1', ...params: (string | number)[]): number {
   return (db.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).get(...params) as { n: number }).n
 }
@@ -152,9 +173,11 @@ describe('openDb contention budget', () => {
 describe('checks retention', () => {
   it('keeps only the newest per-Room window under a repeated-check soak', () => {
     const checks = checksRepo(db)
-    const soak = CHECKS_RETAINED_PER_ROOM * 10
-    const maxReportBytes = Buffer.byteLength(JSON.stringify(makeReport(soak)))
-    for (let i = 0; i < soak; i++) checks.saveReport(makeReport(i))
+    const writes = CHECKS_RETAINED_PER_ROOM * 10
+    const maxReportBytes = Buffer.byteLength(JSON.stringify(makeReport(writes)))
+    soak(writes - 1, (i) => checks.saveReport(makeReport(i)))
+    // The newest report commits on its own: the self-owned path prunes too.
+    checks.saveReport(makeReport(writes - 1))
     // Another Room's history is not consumed by this Room's window.
     checks.saveReport({ ...makeReport(0), roomId: 'room-2' })
 
@@ -163,15 +186,15 @@ describe('checks retention', () => {
       CHECKS_RETAINED_PER_ROOM * maxReportBytes
     )
     expect(count('checks', 'room_id = ?', 'room-2')).toBe(1)
-    expect(checks.latest('room-1')?.ranAt).toBe(makeReport(soak - 1).ranAt)
+    expect(checks.latest('room-1')?.ranAt).toBe(makeReport(writes - 1).ranAt)
   })
 })
 
 describe('android device events retention', () => {
   it('keeps the newest global window and caps detail bytes under an event soak', () => {
     const devices = androidDevicesRepo(db)
-    const soak = ANDROID_DEVICE_EVENTS_RETAINED + 250
-    for (let i = 0; i < soak; i++) {
+    const writes = ANDROID_DEVICE_EVENTS_RETAINED + 250
+    const record = (i: number) =>
       devices.recordEvent({
         deviceId: null,
         roomId: 'room-1',
@@ -179,17 +202,19 @@ describe('android device events retention', () => {
         detail: `event ${i} ${'x'.repeat(ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS * 2)}`,
         at: new Date(Date.UTC(2026, 7, 10) + i * 1000).toISOString()
       })
-    }
+    soak(writes - 1, record)
+    // The newest event commits on its own: the self-owned path prunes too.
+    record(writes - 1)
 
     expect(count('android_device_events')).toBe(ANDROID_DEVICE_EVENTS_RETAINED)
     expect(bytes('android_device_events', 'detail')).toBeLessThanOrEqual(
       ANDROID_DEVICE_EVENTS_RETAINED * ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS * 4
     )
     const newest = devices.recentEvents(1)[0]!
-    expect(newest.detail.startsWith(`event ${soak - 1} `)).toBe(true)
+    expect(newest.detail.startsWith(`event ${writes - 1} `)).toBe(true)
     expect(newest.detail.length).toBeLessThanOrEqual(ANDROID_DEVICE_EVENT_DETAIL_MAX_CHARS)
     const oldest = db.sqlite.prepare('SELECT detail FROM android_device_events ORDER BY at ASC LIMIT 1').get() as { detail: string }
-    expect(oldest.detail.startsWith(`event ${soak - ANDROID_DEVICE_EVENTS_RETAINED} `)).toBe(true)
+    expect(oldest.detail.startsWith(`event ${writes - ANDROID_DEVICE_EVENTS_RETAINED} `)).toBe(true)
   })
 })
 
@@ -214,8 +239,11 @@ describe('changes retention', () => {
     })
     const evicted = changes.append(makeChange({ id: 'chg-evicted' }))
 
-    const soak = CHANGES_RETAINED_PER_ROOM + 50
-    for (let i = 0; i < soak; i++) changes.append(makeChange({ createdAt: new Date(Date.UTC(2026, 7, 11) + i * 1000).toISOString() }))
+    const writes = CHANGES_RETAINED_PER_ROOM + 50
+    const append = (i: number) => changes.append(makeChange({ createdAt: new Date(Date.UTC(2026, 7, 11) + i * 1000).toISOString() }))
+    soak(writes - 1, append)
+    // The newest entry commits on its own: the self-owned path prunes too.
+    append(writes - 1)
     changes.append(makeChange({ roomId: 'room-2', id: 'chg-other-room' }))
 
     // Window plus the two protected rows, nothing beyond.
@@ -226,8 +254,8 @@ describe('changes retention', () => {
     expect(changes.get('chg-other-room')).not.toBeNull()
     // Sequence numbers keep advancing past the pruned prefix.
     const newest = changes.list('room-1')[0]!
-    expect(newest.seq).toBe(soak + 3)
+    expect(newest.seq).toBe(writes + 3)
     const next = changes.append(makeChange())
-    expect(next.seq).toBe(soak + 4)
+    expect(next.seq).toBe(writes + 4)
   })
 })
