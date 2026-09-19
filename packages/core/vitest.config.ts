@@ -4,13 +4,14 @@ export default defineConfig({
   test: {
     // Every file gets its own process and module registry, so a test-only
     // environment stub or a memoised runtime never leaks between files. The
-    // Keep the default at the concurrency proven by the issue #77 gate.
-    // Using every advertised CPU on hosted Windows overloads the SQLite-heavy
-    // tests and makes their execution time depend on runner contention. A CLI
-    // `--maxWorkers=N` still overrides this when a different lane needs it.
+    // Keep local runs at the concurrency proven by the issue #77 gate. Hosted
+    // Windows runners need spare capacity for Vitest's coordinator: four busy
+    // forks can delay worker RPC replies past Vitest's fixed 60-second limit
+    // even after every assertion passed. A CLI `--maxWorkers=N` still
+    // overrides this when a different lane needs it.
     pool: 'forks',
     isolate: true,
-    maxWorkers: 4,
+    maxWorkers: process.env.CI ? 2 : 4,
     testTimeout: 20_000,
     hookTimeout: 20_000
   }
