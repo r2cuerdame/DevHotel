@@ -9026,6 +9026,10 @@ export class RoomOrchestrator {
     waitMs?: number
   ): Promise<ChangeEntry | { operation: OperationRecord }> {
     const room = this.mustGet(roomId)
+    // The durable `deleting` row is the tombstone; it must gate a fresh
+    // process exactly as the in-memory reservation gates this one, or a
+    // change could rebuild the runtime of a Room whose pod is half removed.
+    this.assertNotDeleting(roomId, room)
     if (room.provider === 'windows') {
       throw new Error(`'${change.kind}' is not available until the Windows guest agent is installed`)
     }
@@ -9084,9 +9088,7 @@ export class RoomOrchestrator {
           joinRunningByRoom: false,
           beforeStart: () => {
             if (this.mutationGate !== 'open') throw this.mutationGateError()
-            if (this.deletingRooms.has(roomId)) {
-              throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
-            }
+            this.assertNotDeleting(roomId, this.rooms.get(roomId))
             this.assertNoPendingArtifactExport(roomId)
             if (this.materializingRooms.has(roomId)) {
               throw new Error(`Room ${roomId} is still being created and cannot be modified`)
@@ -9156,7 +9158,9 @@ export class RoomOrchestrator {
   }
 
   undoChange(roomId: string, changeId: string, actor: Actor): Promise<ChangeEntry> {
-    if (this.mustGet(roomId).provider === 'windows') throw new Error('Windows VM lifecycle actions are not undoable')
+    const room = this.mustGet(roomId)
+    this.assertNotDeleting(roomId, room)
+    if (room.provider === 'windows') throw new Error('Windows VM lifecycle actions are not undoable')
     return this.withRoomLock(roomId, async () => {
       if (actor === 'agent' && this.mustGet(roomId).workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
@@ -10317,6 +10321,13 @@ export class RoomOrchestrator {
     const room = this.rooms.get(roomId)
     if (!room) throw new Error(`Room not found: ${roomId}`)
     return room
+  }
+
+  /** Both the live reservation and the durable tombstone refuse mutation. */
+  private assertNotDeleting(roomId: string, room: RoomRecord | null | undefined): void {
+    if (this.deletingRooms.has(roomId) || room?.status === 'deleting') {
+      throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
+    }
   }
 
   private olog(roomId: string, line: string): void {
