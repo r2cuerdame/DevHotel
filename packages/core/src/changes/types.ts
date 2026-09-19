@@ -121,12 +121,16 @@ export async function verifyWebUp(ctx: ChangeCtx, opts?: { timeoutMs?: number })
   const deadline = Date.now() + timeoutMs
   let lastState = 'unknown'
   let consecutiveExited = 0
+  // The relay credential is proven against the exact anchor once per verify;
+  // re-proving it on every poll costs Docker processes and proves nothing new,
+  // because a replaced anchor simply stops answering the old token.
+  let relayToken: string | null = null
   while (Date.now() < deadline) {
     const state = await ctx.backend.webState(room.id)
     lastState = state
     if (state === 'running' && room.hostPort) {
       consecutiveExited = 0
-      const relayToken = await ctx.backend.relayToken(room.id)
+      relayToken ??= await ctx.backend.relayToken(room.id)
       if (await tcpAnswers(room.hostPort, 1500, relayToken)) {
         return { ok: true, detail: `web process running, port ${room.internalPort} answering` }
       }

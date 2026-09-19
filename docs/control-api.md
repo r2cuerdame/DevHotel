@@ -43,8 +43,13 @@ Mutations through this API run as actor `agent` and appear (undoably) in the
 room's Changes list. Host boundaries hold:
 
 - Linked-folder rooms: `sourceRef` reads as `[Host folder hidden]`, inspection
-  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms
-  or delete Host-linked ones.
+  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms.
+  Agents may delete a Host-linked room (`linked-folder` source or
+  `legacy-host-bind` workspace) only while it is `sleeping` and holds no
+  pending Room-owned edits (`syncStatus` is `synced` or `legacy`); an awake or
+  `modified` room answers `403`. Deletion tears down the Room's guest
+  containers, networks and internal volumes only — the Host folder is never
+  deleted or modified.
 - Agent mutations on `legacy-host-bind` rooms are refused until the user moves
   the room into the Hotel.
 - `safe-resync-from-host` (and the lower-level `sync-from-host`) runs under the Room's **inbound-sync grant**: the human
@@ -132,7 +137,7 @@ can drive the whole thing by polling.
 |---|---|
 | `GET /v1/ping` | `{ version, commit, buildTime, sourceVerified }` |
 | `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
-| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, runtime: { mode, managed }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. `runtime.mode` is the backend-neutral `managed` or `compatibility` selection. `runtime.managed` reports the managed-runtime provisioning state/phase, support result, opaque runtime ID, version and verified artifact digests without returning native VM identifiers or Host paths; support distinguishes a provider that is ready, needs Windows provisioning, or needs explicit elevation. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
+| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, runtime: { mode, managed }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices, budget: { dockerSpawns, elapsedMs } }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. `runtime.mode` is the backend-neutral `managed` or `compatibility` selection. `runtime.managed` reports the managed-runtime provisioning state/phase, support result, opaque runtime ID, version and verified artifact digests without returning native VM identifiers or Host paths; support distinguishes a provider that is ready, needs Windows provisioning, or needs explicit elevation. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. `budget` is the call's own cost: one engine health read plus one bulk owned-container inventory answer every Room, and each awake Android Room adds one topology proof; `dockerSpawns` is a process-wide delta, so it is exact only when no Room mutation runs concurrently. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
 | `GET /v1/storage/volumes` | Every Docker volume reconciled against the Room registry: totals, per-class bytes, and for each volume its class, `safeToDelete` and the reason. Read-only. See [volume-gc.md](volume-gc.md). |
@@ -173,6 +178,30 @@ one-time code out of application state. Agents cannot provide an endpoint,
 port, token or pairing code. All JSON responses pass through the same
 structured secret-redaction boundary used by diagnostics, logs and device
 events.
+
+### Client Browsers
+
+An isolated Chromium an agent borrows for web automation — the thing that
+visits a site, as opposed to the Web Server Room that hosts one. See
+[Client Browser](./client-browser.md). Sessions are addressed by session ID
+and proven by the token returned once at allocation; the Room in the path
+only says who owns the browser.
+
+| Method & path | Body | Result |
+|---|---|---|
+| `POST /v1/rooms/:id/browsers` | `{ profileMode?: 'ephemeral'\|'persistent', headless? }` | `{ session, token, endpoint: { http, ws } }` — a fresh process and profile for this Room. `endpoint.http` is a Playwright `connectOverCDP` / puppeteer `browserURL` target (it serves `/json/version` and friends); `endpoint.ws` is the browser-level CDP WebSocket. Both embed the token. The Room must be awake. `503 CLIENT_BROWSER_NOT_FOUND` when no Chromium is installed on the Host. |
+| `GET /v1/rooms/:id/browsers` | | this Room's sessions — IDs, status, PID, profile mode, timestamps; never tokens |
+| `GET /v1/browsers` | | `{ runtime, sessions[] }` across the Hotel, same fields |
+| `POST /v1/browsers/:sessionId/attach` | `{ token }` | the allocation again (session + endpoint) for a session you own |
+| `POST /v1/browsers/:sessionId/inspect` | `{ token }` | `{ session, owner: { roomId, project, nickname }, liveness: { processAlive, cdpReachable, browserVersion }, connection: { endpoint, activeClients }, targets[] }` |
+| `POST /v1/browsers/:sessionId/navigate` | `{ token, url, timeoutMs? }` | `{ sessionId, url, finalUrl, title, loaded }` — `http`, `https` or `about:blank` only; other schemes are `400 CLIENT_BROWSER_URL_REFUSED` |
+| `POST /v1/browsers/:sessionId/screenshot` | `{ token, format?: 'png'\|'jpeg', fullPage? }` | `{ sessionId, mimeType, contentBase64, sizeBytes }` — not stored |
+| `POST /v1/browsers/:sessionId/release` | `{ token }` | `{ sessionId, roomId, released, processStopped, profileRemoved }` — closes the process, drops tunnelled clients, deletes an ephemeral profile |
+
+A wrong token is `403 CLIENT_BROWSER_FORBIDDEN`; an unknown session is
+`404 CLIENT_BROWSER_NOT_FOUND`; a malformed ID or token is `400`. A Room
+going to sleep or being deleted releases its browsers, and a DevHotel restart
+reconciles whatever an earlier process left running.
 
 ### Tracked Android automation
 
@@ -290,7 +319,7 @@ credential connected to the GitHub Service even when the URL carries none.
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
 | `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
 | `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
-| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
+| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms unless they are `sleeping` with `syncStatus` `synced` or `legacy` (the Host folder itself is never touched) |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
 | `POST /v1/rooms/:id/sleep` | | `204` |
 | `POST /v1/rooms/:id/restart-web` | | change entry |

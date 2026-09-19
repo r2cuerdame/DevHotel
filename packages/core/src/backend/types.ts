@@ -219,6 +219,14 @@ export interface GitCredential {
 /** Answers "which credential clones this URL", or null when the clone should stay anonymous. */
 export type GitCredentialResolver = (gitUrl: string) => Promise<GitCredential | null>
 
+export type RuntimeContainerState = 'running' | 'exited' | 'missing' | 'degraded' | 'unknown'
+
+/** Liveness of one Room's owned web and emulator containers, from one bulk inventory read. */
+export interface RoomRuntimeObservation {
+  main: RuntimeContainerState
+  emulator: RuntimeContainerState
+}
+
 export interface ResumeServiceSpec {
   kind: 'postgres' | 'redis'
   version: string
@@ -315,6 +323,14 @@ export interface IsolationBackend {
     stageToken: string
   ): Promise<RoomArtifactRecoveryOutcome>
   webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
+  /**
+   * One bulk `docker ps` over DevHotel-owned containers answering, for every
+   * listed Room, whether its web and emulator containers are live. Status
+   * reads use this instead of inspecting Rooms one by one; it never starts or
+   * repairs anything. A same-name container without exact ownership metadata
+   * reports `unknown` rather than being trusted or ignored.
+   */
+  observeRoomRuntimes(roomIds: readonly string[]): Promise<Map<string, RoomRuntimeObservation>>
   /** Proven owned containers only; malformed labeled rows are dropped (see `listManagedContainerInventory`). */
   listManagedContainers(): Promise<ManagedContainer[]>
   /** Owned rows plus the labeled rows whose ownership could not be proved. */

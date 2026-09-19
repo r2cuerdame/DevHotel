@@ -105,6 +105,10 @@ import {
 import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
 import type { HostFootprint, HostGcResult, LifecycleQuotas, QuotaVerdict } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
+import { ClientBrowserManager } from './browser/clientBrowserManager'
+import { HostChromiumRuntime } from './browser/hostChromiumRuntime'
+import type { ClientBrowserRuntime } from './browser/runtime'
+import { clientBrowserRepo } from './store/clientBrowserRepo'
 import { SpawnedAdbHost, type AdbHost } from './devices/adbHost'
 import { androidDevicesRepo } from './store/androidDevicesRepo'
 import { androidAppInstallsRepo, type AndroidAppInstallsRepo, type AndroidInstallTarget } from './store/androidAppInstallsRepo'
@@ -131,6 +135,7 @@ import { RoomArtifactStore } from './artifacts/store'
 import { validateAndSanitizeScreenshotPng } from './artifacts/png'
 import { getProvider } from './providers/index'
 import { ANDROID_IMAGE } from './providers/androidProvider'
+import { dockerSpawnCount } from './backend/dockerBudget'
 import { splitGitCredential } from './backend/gitClone'
 import type { ManagedRuntimeObservation } from './backend/managedRuntime'
 import {
@@ -153,6 +158,7 @@ import {
   type RoomArtifactWebRuntimeFence,
   type WebSpec
 } from './backend/types'
+import type { RoomRuntimeObservation } from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
@@ -1285,6 +1291,11 @@ export interface OrchestratorOptions {
   gitCredential?: GitCredentialResolver
   /** Host-side adb owning the shared physical phones; defaults to a resolved system adb. */
   adb?: AdbHost
+  /**
+   * Where Client Browsers run. Defaults to host-side Chromium, which is what
+   * the Docker path can offer; a managed runtime supplies its own.
+   */
+  clientBrowserRuntime?: ClientBrowserRuntime
   lifecyclePolicy?: Partial<RoomLifecyclePolicy>
   /**
    * Durable record of the Host ingress ports this install opened. Supplied when
@@ -1418,6 +1429,8 @@ export class RoomOrchestrator {
   private readonly clearBrowserData?: (roomId: string) => Promise<void>
   /** The shared Android phones are Hotel-owned, so the broker sits beside the Rooms, not inside one. */
   readonly devices: AndroidDeviceBroker
+  /** Isolated automation browsers agents borrow per Room; separate from the Room's hosted web server. */
+  readonly clientBrowsers: ClientBrowserManager
   private readonly gitCredential?: GitCredentialResolver
   private readonly lifecyclePolicy: RoomLifecyclePolicy
   private readonly ingressLedger: IngressLedger | null
@@ -1504,6 +1517,20 @@ export class RoomOrchestrator {
         return room !== null && room.status !== 'sleeping' && room.status !== 'broken'
       }
     })
+    this.clientBrowsers = new ClientBrowserManager({
+      userData: opts.userData,
+      repo: clientBrowserRepo(opts.db),
+      settings: this.settings,
+      runtime: opts.clientBrowserRuntime ?? new HostChromiumRuntime(),
+      generation: randomUUID(),
+      rooms: {
+        get: (roomId) => {
+          const room = this.rooms.get(roomId)
+          return room ? { id: room.id, project: room.project, nickname: room.nickname, status: room.status } : null
+        }
+      },
+      log: (line) => this.olog('system', line)
+    })
     registerQuickChanges(this.engine)
   }
 
@@ -1579,6 +1606,15 @@ export class RoomOrchestrator {
       }
     }
     await this.gateway.start()
+    // Browsers from the previous process are unreachable through their
+    // endpoints; stop what is provably ours and forget the rest. Fail-soft:
+    // a stuck browser must not keep Rooms from reconciling.
+    try {
+      await this.clientBrowsers.reconcile()
+      await this.clientBrowsers.start()
+    } catch (error) {
+      this.olog('system', `client browser reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
     if (health.ok) {
@@ -2565,6 +2601,13 @@ export class RoomOrchestrator {
       }
     }))
     failures.push(...roomFailures.filter((error): error is Error => error !== null))
+    // Sleeping a Room already released its browsers; this catches the rest
+    // (broken Rooms, fenced Rooms) and closes the endpoint.
+    try {
+      await bounded('Client Browsers stop', () => this.clientBrowsers.shutdown())
+    } catch (error) {
+      failures.push(asShutdownError('Client Browsers could not be stopped', error))
+    }
     try {
       this.logs.dispose()
     } catch (error) {
@@ -3303,12 +3346,53 @@ export class RoomOrchestrator {
     } catch {
       // Each OCI Room reports unknown below; Windows Rooms use their own provider probe.
     }
-    const rooms: RuntimeRoomRecord[] = []
-    for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backendAvailable)
-      rooms.push({ ...this.effectiveRoom(room, runtimeStatus), runtimeStatus })
+    const rooms = this.rooms.list()
+    const observations = await this.inventoryRoomRuntimes(rooms, backendAvailable)
+    return mapWithConcurrency(rooms, STATUS_PROBE_CONCURRENCY, async (room) => {
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backendAvailable, observations?.get(room.id))
+      return { ...this.effectiveRoom(room, runtimeStatus), runtimeStatus }
+    })
+  }
+
+  /**
+   * One bulk owned-container inventory for every Room whose record expects a
+   * running OCI runtime, plus sleeping Rooms that must be checked for strays,
+   * so a status read costs one `docker ps` rather than one inspect per Room.
+   * `null` means the inventory itself failed and callers fall back to per-Room
+   * probes; an empty map means nothing needed probing.
+   */
+  private async inventoryRoomRuntimes(
+    rooms: readonly RoomRecord[],
+    backendAvailable: boolean
+  ): Promise<Map<string, RoomRuntimeObservation> | null> {
+    const roomIds = rooms
+      .filter((room) =>
+        room.provider !== 'windows' &&
+        (this.runtimeExpectation(room) === 'running' || room.status === 'sleeping')
+      )
+      .map((room) => room.id)
+    if (!backendAvailable || roomIds.length === 0) return new Map()
+    try {
+      return await this.backend.observeRoomRuntimes(roomIds)
+    } catch {
+      return null
     }
-    return rooms
+  }
+
+  /**
+   * The inventory already proved container liveness; a running Android
+   * emulator still gets the fenced topology proof, exactly as the per-Room
+   * probe gives it.
+   */
+  private async componentStatesFromObservation(
+    room: RoomRecord,
+    observation: RoomRuntimeObservation
+  ): Promise<[RoomRuntimeStatus['main'], RoomRuntimeStatus['emulator']]> {
+    if (room.provider !== 'android') return [observation.main, null]
+    const emulator = observation.emulator === 'running'
+      ? await this.backend.emulatorState(room.id).catch(() => 'degraded' as const)
+      : observation.emulator
+    return [observation.main, emulator]
   }
 
   backendHealth(): Promise<{ ok: boolean; detail: string }> {
@@ -3327,7 +3411,11 @@ export class RoomOrchestrator {
       : 'Start or restart the Room, then retry.'
   }
 
-  private async observeRuntimeStatus(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+  private async observeRuntimeStatus(
+    room: RoomRecord,
+    backendAvailable?: boolean,
+    observation?: RoomRuntimeObservation
+  ): Promise<RoomRuntimeStatus> {
     const observedAt = new Date().toISOString()
     const expected = this.runtimeExpectation(room)
     if (expected === 'stopped') {
@@ -3340,20 +3428,22 @@ export class RoomOrchestrator {
         }
       }
       if (room.status === 'sleeping' && available && room.provider !== 'windows') {
-        const [main, emulator] = await Promise.all([
-          this.backend.webState(room.id).catch(() => 'unknown' as const),
-          room.provider === 'android'
-            ? this.backend.emulatorState(room.id).catch(async () => {
-                try {
-                  const h = await this.backend.health()
-                  if (h.ok) return 'degraded' as const
-                } catch {
-                  // backend unreachable
-                }
-                return 'unknown' as const
-              })
-            : Promise.resolve(null)
-        ])
+        const [main, emulator] = observation
+          ? await this.componentStatesFromObservation(room, observation)
+          : await Promise.all([
+              this.backend.webState(room.id).catch(() => 'unknown' as const),
+              room.provider === 'android'
+                ? this.backend.emulatorState(room.id).catch(async () => {
+                    try {
+                      const h = await this.backend.health()
+                      if (h.ok) return 'degraded' as const
+                    } catch {
+                      // backend unreachable
+                    }
+                    return 'unknown' as const
+                  })
+                : Promise.resolve(null)
+            ])
         const hasStray = main === 'running' || main === 'degraded' || emulator === 'running' || emulator === 'degraded'
         if (hasStray) {
           return {
@@ -3463,20 +3553,22 @@ export class RoomOrchestrator {
       }
     }
 
-    const [main, emulator] = await Promise.all([
-      this.backend.webState(room.id).catch(() => 'unknown' as const),
-      room.provider === 'android'
-        ? this.backend.emulatorState(room.id).catch(async () => {
-            try {
-              const h = await this.backend.health()
-              if (h.ok) return 'degraded' as const
-            } catch {
-              // backend unreachable
-            }
-            return 'unknown' as const
-          })
-        : Promise.resolve(null)
-    ])
+    const [main, emulator] = observation
+      ? await this.componentStatesFromObservation(room, observation)
+      : await Promise.all([
+          this.backend.webState(room.id).catch(() => 'unknown' as const),
+          room.provider === 'android'
+            ? this.backend.emulatorState(room.id).catch(async () => {
+                try {
+                  const h = await this.backend.health()
+                  if (h.ok) return 'degraded' as const
+                } catch {
+                  // backend unreachable
+                }
+                return 'unknown' as const
+              })
+            : Promise.resolve(null)
+        ])
     if (room.provider !== 'android') {
       const running = main === 'running'
       const degraded = main === 'degraded'
@@ -3553,9 +3645,13 @@ export class RoomOrchestrator {
   }
 
   /** Runtime revalidation plus invariant I2: a proven-dead workload loses ingress on observation. */
-  private async observeRuntimeStatusForIngress(room: RoomRecord, backendAvailable?: boolean): Promise<RoomRuntimeStatus> {
+  private async observeRuntimeStatusForIngress(
+    room: RoomRecord,
+    backendAvailable?: boolean,
+    observation?: RoomRuntimeObservation
+  ): Promise<RoomRuntimeStatus> {
     const opsBefore = this.roomOps.get(room.id)
-    const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable)
+    const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable, observation)
     if (
       runtimeStatus.expected === 'running' &&
       runtimeStatus.state === 'dead' &&
@@ -4302,6 +4398,10 @@ export class RoomOrchestrator {
     this.rooms.update(roomId, { status: 'preparing' })
     this.emit(roomId, 'status')
     this.olog(roomId, 'wake room')
+    // Process-wide delta: exact when this wake is the only Docker work running.
+    const dockerSpawnsBefore = dockerSpawnCount()
+    const logWakeBudget = (): void =>
+      this.olog(roomId, `wake used ${dockerSpawnCount() - dockerSpawnsBefore} docker processes`)
     try {
       // Recreate containers from the current record so changes made while
       // asleep are materialized on wake.
@@ -4378,6 +4478,7 @@ export class RoomOrchestrator {
       })
       this.olog(roomId, `wake: ${verify.detail}`)
       report.detail(verify.detail)
+      logWakeBudget()
       if (!verify.ok) {
         // The Room is left in `attention`, exactly as before — but the caller
         // now gets a terminal answer instead of a call that merely returned.
@@ -4387,6 +4488,7 @@ export class RoomOrchestrator {
       }
       if (emulatorStarted) await this.reportEmulatorReady(roomId, report)
     } catch (err) {
+      logWakeBudget()
       this.olog(roomId, `wake failed: ${err instanceof Error ? err.message : String(err)}`)
       this.rooms.update(roomId, { status: 'broken' })
       this.revokeRouteFor(roomId, 'wake failed')
@@ -4439,6 +4541,7 @@ export class RoomOrchestrator {
     this.olog(roomId, 'sleep room')
     this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
+    await this.releaseClientBrowsersLocked(roomId, 'Room went to sleep')
     if (room.provider === 'windows') {
       await this.mustWindowsVm().sleep(roomId)
       this.rooms.update(roomId, {
@@ -4781,6 +4884,7 @@ export class RoomOrchestrator {
     this.olog(roomId, 'delete room')
     this.gateway.removeRoute(room.domain)
     await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
+    await this.releaseClientBrowsersLocked(roomId, 'Room was deleted')
     if (room.provider === 'windows') {
       const windowsVm = this.mustWindowsVm()
       this.rooms.update(roomId, { status: 'deleting' })
@@ -7639,6 +7743,19 @@ export class RoomOrchestrator {
     return this.devices.refreshInventory()
   }
 
+  /**
+   * A Room's browsers end with the Room's runtime. Fail-soft: a browser that
+   * will not die is logged and left for the next reconcile, never a reason to
+   * keep a Room awake or undeleted.
+   */
+  private async releaseClientBrowsersLocked(roomId: string, reason: string): Promise<void> {
+    try {
+      await this.clientBrowsers.releaseRoom(roomId, reason)
+    } catch (error) {
+      this.olog(roomId, `client browser release failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   androidDeviceStatus(): DeviceBrokerStatus {
     return this.devices.status()
   }
@@ -8336,7 +8453,12 @@ export class RoomOrchestrator {
     }
   }
 
-  /** One-call answer to "is DevHotel ready and what is running" for agents. */
+  /**
+   * One-call answer to "is DevHotel ready and what is running" for agents.
+   * `budget` reports how many Docker processes the call started and how long
+   * it took; the spawn count is a process-wide delta, so it is exact only when
+   * no Room mutation runs concurrently.
+   */
   async hotelStatus(): Promise<{
     backend: { ok: boolean; detail: string }
     startup: StartupStatus
@@ -8344,18 +8466,22 @@ export class RoomOrchestrator {
     gateway: ReturnType<Gateway['status']>
     rooms: { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
     devices: DeviceBrokerStatus
+    budget: { dockerSpawns: number; elapsedMs: number }
   }> {
+    const startedAt = performance.now()
+    const spawnsBefore = dockerSpawnCount()
     const backend = await this.backend.health()
     const managedRuntime = this.managedRuntimeStatus ? await this.managedRuntimeStatus() : null
-    const rooms = [] as { id: string; project: string; nickname: string; provider: string; status: string; domain: string; url: string | null; emulator: 'running' | 'exited' | 'missing' | 'degraded' | null; runtimeStatus: RoomRuntimeStatus }[]
-    for (const room of this.rooms.list()) {
-      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backend.ok)
+    const recorded = this.rooms.list()
+    const observations = await this.inventoryRoomRuntimes(recorded, backend.ok)
+    const rooms = await mapWithConcurrency(recorded, STATUS_PROBE_CONCURRENCY, async (room) => {
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backend.ok, observations?.get(room.id))
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing' | 'degraded'
         : null
       const url = runtimeStatus.state === 'running' ? this.inspectRoom(room.id).urls.app : null
-      rooms.push({
+      return {
         id: room.id,
         project: room.project,
         nickname: room.nickname,
@@ -8365,15 +8491,19 @@ export class RoomOrchestrator {
         url,
         emulator,
         runtimeStatus
-      })
-    }
+      }
+    })
     return {
       backend,
       startup: this.startupStatus(),
       runtime: { mode: this.runtimeMode, managed: managedRuntime },
       gateway: this.gateway.status(),
       rooms,
-      devices: this.devices.status()
+      devices: this.devices.status(),
+      budget: {
+        dockerSpawns: dockerSpawnCount() - spawnsBefore,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      }
     }
   }
 
@@ -8415,7 +8545,10 @@ export class RoomOrchestrator {
   /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
   async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
     const recorded = this.mustGet(roomId)
-    const runtimeStatus = await this.observeRuntimeStatusForIngress(recorded)
+    // A Room-scoped inventory is one process; when it answered, the backend
+    // evidently did too, so only the fallback path needs its own health read.
+    const observation = (await this.inventoryRoomRuntimes([recorded], true))?.get(roomId)
+    const runtimeStatus = await this.observeRuntimeStatusForIngress(recorded, observation ? true : undefined, observation)
     const inspection = this.inspectRoom(roomId)
     return {
       ...inspection,
@@ -10287,6 +10420,26 @@ export class RoomOrchestrator {
   private emit(roomId: string, kind: OrchestratorEvent['kind'], detail?: string): void {
     this.emitter.emit('event', { roomId, kind, detail } satisfies OrchestratorEvent)
   }
+}
+
+/** Status reads probe Rooms concurrently, but never more Docker processes at once than this. */
+const STATUS_PROBE_CONCURRENCY = 4
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 function deriveProjectName(sourceType: SourceType, sourceRef: string): string {

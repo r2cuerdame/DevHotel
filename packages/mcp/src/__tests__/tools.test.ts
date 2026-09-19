@@ -25,6 +25,13 @@ const ARTIFACT_PNG = Buffer.concat([
 ])
 const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
 const ACCEPTANCE_REPORT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const BROWSER_SESSION = 'cbr_0123456789abcdef'
+const BROWSER_TOKEN = 'cbt_0123456789abcdef0123456789abcdef'
+const browserAllocation = {
+  session: { id: BROWSER_SESSION, roomId: 'abc12345', status: 'ready', pid: 4242, browserKind: 'chrome', headless: true, profileMode: 'ephemeral', createdAt: '2026-09-18T00:00:00.000Z', lastActiveAt: '2026-09-18T00:00:00.000Z' },
+  token: BROWSER_TOKEN,
+  endpoint: { http: `http://127.0.0.1:5555/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}`, ws: `ws://127.0.0.1:5555/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}` }
+}
 const APPLIED_CHANGE = {
   id: '11111111-2222-4333-8444-555555555555',
   roomId: 'abc12345',
@@ -263,6 +270,32 @@ beforeAll(async () => {
           confirmation: { required: true, provided: false, token: RESYNC_TOKEN },
           recoveryGuidance: ['export or commit first']
         }))
+      }
+      if (req.url === '/v1/rooms/abc12345/browsers' && req.method === 'POST') {
+        return void res.end(JSON.stringify(browserAllocation))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/inspect` && req.method === 'POST') {
+        const body = JSON.parse(raw)
+        if (body.token !== BROWSER_TOKEN) {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          return void res.end(JSON.stringify({ error: 'The token presented does not own this session.', code: 'CLIENT_BROWSER_FORBIDDEN' }))
+        }
+        return void res.end(JSON.stringify({
+          session: browserAllocation.session,
+          owner: { roomId: 'abc12345', project: 'demo', nickname: 'dev' },
+          liveness: { processAlive: true, cdpReachable: true, browserVersion: 'Chrome/140' },
+          connection: { endpoint: browserAllocation.endpoint, activeClients: 0 },
+          targets: [{ targetId: 't1', type: 'page', url: 'about:blank', title: '' }]
+        }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/navigate` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, url: 'http://127.0.0.1:1/', finalUrl: 'http://127.0.0.1:1/', title: 'demo', loaded: true }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/screenshot` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, mimeType: 'image/png', contentBase64: ARTIFACT_PNG.toString('base64'), sizeBytes: ARTIFACT_PNG.byteLength }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/release` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, roomId: 'abc12345', released: true, processStopped: true, profileRemoved: true }))
       }
       res.writeHead(404).end('not found')
     })
@@ -547,7 +580,13 @@ describe('makeTools', () => {
         'start_room',
         'sync_from_host',
         'undo_change',
-        'export_room_artifact'
+        'export_room_artifact',
+        'allocate_client_browser',
+        'attach_client_browser',
+        'inspect_client_browser',
+        'navigate_client_browser',
+        'screenshot_client_browser',
+        'release_client_browser'
       ].sort()
     )
   })
@@ -601,6 +640,35 @@ describe('makeTools', () => {
         association: { changeId: '11111111-2222-4333-8444-555555555555' }
       }
     })
+  })
+
+  it('allocates, drives, inspects and releases a Client Browser by session and token', async () => {
+    const allocated = await byName.allocate_client_browser!.handler({ roomId: 'abc12345', headless: true })
+    expect(allocated.isError).toBeUndefined()
+    expect(firstText(allocated)).toContain(BROWSER_TOKEN)
+    expect(firstText(allocated)).toContain(`/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}`)
+    expect(seen.findLast((request) => request.url === '/v1/rooms/abc12345/browsers')).toMatchObject({ body: { headless: true } })
+
+    const inspected = await byName.inspect_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(inspected.isError).toBeUndefined()
+    expect(firstText(inspected)).toContain('"cdpReachable": true')
+    expect(firstText(inspected)).toContain('"roomId": "abc12345"')
+
+    const stolen = await byName.inspect_client_browser!.handler({ sessionId: BROWSER_SESSION, token: 'cbt_ffffffffffffffffffffffffffffffff' })
+    expect(stolen.isError).toBe(true)
+    expect(firstText(stolen)).toContain('does not own')
+
+    const navigated = await byName.navigate_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN, url: 'http://127.0.0.1:1/' })
+    expect(navigated.isError).toBeUndefined()
+    expect(seen.findLast((request) => request.url === `/v1/browsers/${BROWSER_SESSION}/navigate`)).toMatchObject({ body: { token: BROWSER_TOKEN, url: 'http://127.0.0.1:1/' } })
+
+    const shot = await byName.screenshot_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(shot.isError).toBeUndefined()
+    expect(shot.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png', data: ARTIFACT_PNG.toString('base64') })
+
+    const released = await byName.release_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(released.isError).toBeUndefined()
+    expect(firstText(released)).toContain('"profileRemoved": true')
   })
 
   it('runs the locale matrix as a receipts-only composite tool', async () => {
