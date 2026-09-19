@@ -51,7 +51,6 @@
   `synced` or `legacy`; awake Rooms and Rooms holding unsynced Room-owned edits
   stay a human decision. Deleting never touches the Host folder, so disposable
   test Rooms stop piling up bridge networks and volumes on the host.
-
 ### Gateway routes are revoked for dead, broken, and sleeping Rooms (#87)
 
 - The Gateway drops a Room's route as soon as its hostPort is cleared, when a
