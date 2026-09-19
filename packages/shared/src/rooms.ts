@@ -91,6 +91,25 @@ export interface AcquireRoomResult {
   reason: string
   /** Existing Room source state is preserved, including unsynced modifications. */
   modified: boolean
+  /** Benchmark phases from API admission through runtime and application readiness. */
+  telemetry: RoomAcquisitionTelemetry
+}
+
+export type RoomAcquisitionPath = 'reuse' | 'warm' | 'cold'
+
+export interface RoomAcquisitionTelemetry {
+  path: RoomAcquisitionPath
+  /** Stable runtime profile identity; source/project/task data is deliberately excluded. */
+  profileKey: string
+  /** Explicit invalidation fence over schema, DevHotel runtime version, and full profile. */
+  snapshotVersion: string
+  cloneStrategy: 'existing-room' | 'retained-runtime' | 'oci-layer-cow' | 'oci-layer-cow+avd-quickboot' | 'cold-provision'
+  acquireStartedAt: string
+  bootReadyAt: string
+  appReadyAt: string
+  acquireToBootReadyMs: number
+  bootReadyToAppReadyMs: number
+  acquireToAppReadyMs: number
 }
 
 export interface RoomRecord extends RoomTaskIdentity {

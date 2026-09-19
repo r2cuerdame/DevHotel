@@ -167,7 +167,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'acquire_room',
       description:
-        'Default agent entry point: reuse a compatible Room by canonical source, project, provider, runtime profile and task identity, waking sleeping Rooms. Existing modified state is preserved and reported. Nicknames do not affect matching. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the selected room, disposition, reuse reason and modified flag.',
+        'Default agent entry point: reuse a compatible Room by canonical source, project, provider, runtime profile and task identity, waking sleeping Rooms. Existing modified state is preserved and reported. Nicknames do not affect matching. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the selected room, disposition, reuse reason, modified flag, and cold/warm/reuse acquire-to-boot-ready-to-app-ready telemetry.',
       schema: {
         sourceType: z.enum(['managed-git', 'empty']),
         sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),

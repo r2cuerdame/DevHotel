@@ -68,6 +68,7 @@ import type {
   ProviderKind,
   QuickChange,
   RoomInspection,
+  RoomAcquisitionTelemetry,
   RoomPlan,
   RoomRecord,
   RoomRuntimeStatus,
@@ -160,6 +161,13 @@ import {
 } from './backend/types'
 import type { RoomRuntimeObservation } from './backend/types'
 import type { WindowsVmBackend } from './backend/windowsVm'
+import {
+  WarmRoomPool,
+  type WarmRoomPoolEntry,
+  type WarmRoomPoolPolicy,
+  type WarmRoomProfile,
+  type WarmSnapshotLease
+} from './lifecycle/warmRoomPool'
 import { ChangeEngine } from './changes/engine'
 import { registerQuickChanges, depsVolumeForGen, pmInstallCommand } from './changes/definitions/index'
 import {
@@ -1297,6 +1305,8 @@ export interface OrchestratorOptions {
    */
   clientBrowserRuntime?: ClientBrowserRuntime
   lifecyclePolicy?: Partial<RoomLifecyclePolicy>
+  /** Bounded immutable-runtime readiness inventory and expiration policy. */
+  warmPoolPolicy?: Partial<WarmRoomPoolPolicy>
   /**
    * Durable record of the Host ingress ports this install opened. Supplied when
    * the Room executor publishes Host-side ports of its own; without it an
@@ -1433,6 +1443,15 @@ export class RoomOrchestrator {
   readonly clientBrowsers: ClientBrowserManager
   private readonly gitCredential?: GitCredentialResolver
   private readonly lifecyclePolicy: RoomLifecyclePolicy
+  private readonly warmPool: WarmRoomPool
+  private readonly readinessMilestones = new Map<string, {
+    path: 'warm' | 'cold'
+    profile: WarmRoomProfile
+    lease: WarmSnapshotLease | null
+    bootReadyAtMs: number
+    appReadyAtMs: number
+  }>()
+  private readonly acquisitionTelemetry: RoomAcquisitionTelemetry[] = []
   private readonly ingressLedger: IngressLedger | null
   private readonly revokeIngressRoute: ((roomId: string) => Promise<void>) | null
   private readonly runtimeId: string | null
@@ -1457,6 +1476,7 @@ export class RoomOrchestrator {
     this.clearBrowserData = opts.clearBrowserData
     this.gitCredential = opts.gitCredential
     this.lifecyclePolicy = { ...DEFAULT_ROOM_LIFECYCLE_POLICY, ...opts.lifecyclePolicy }
+    this.warmPool = new WarmRoomPool(opts.appVersion, opts.warmPoolPolicy)
     this.ingressLedger = opts.ingressLedger ?? null
     this.revokeIngressRoute = opts.revokeIngress ?? null
     this.runtimeId = opts.runtimeId ?? null
@@ -3616,6 +3636,84 @@ export class RoomOrchestrator {
 
   private readonly roomAdmissions = new Map<string, Promise<unknown>>()
 
+  private warmProfile(room: Pick<RoomRecord, 'provider' | 'runtime' | 'packageManager' | 'startCommand' | 'internalPort' | 'os' | 'android'>): WarmRoomProfile | null {
+    if (room.provider === 'windows') return null
+    return {
+      provider: room.provider,
+      runtime: { ...room.runtime },
+      packageManager: { ...room.packageManager },
+      startCommand: room.startCommand,
+      internalPort: room.internalPort,
+      os: { ...room.os, env: { ...room.os.env } },
+      ...(room.provider === 'android'
+        ? {
+            android: {
+              device: room.android?.device ?? EMULATOR_DEFAULT_DEVICE,
+              version: room.android?.version ?? EMULATOR_DEFAULT_VERSION,
+              resolution: room.android?.resolution ?? 'fast',
+              orientation: room.android?.orientation ?? 'portrait'
+            }
+          }
+        : {})
+    }
+  }
+
+  private buildAcquisitionTelemetry(
+    room: RoomRecord,
+    acquireStartedAtMs: number,
+    disposition: AcquireRoomResult['disposition']
+  ): RoomAcquisitionTelemetry {
+    const profile = this.warmProfile(room)
+    if (!profile) {
+      const at = Date.now()
+      return {
+        path: disposition === 'reused' ? 'reuse' : 'cold',
+        profileKey: `windows:${room.windows?.templateId ?? 'unknown'}`,
+        snapshotVersion: room.windows?.snapshot ?? 'unknown',
+        cloneStrategy: disposition === 'reused' ? 'existing-room' : 'cold-provision',
+        acquireStartedAt: new Date(acquireStartedAtMs).toISOString(),
+        bootReadyAt: new Date(at).toISOString(),
+        appReadyAt: new Date(at).toISOString(),
+        acquireToBootReadyMs: Math.max(0, at - acquireStartedAtMs),
+        bootReadyToAppReadyMs: 0,
+        acquireToAppReadyMs: Math.max(0, at - acquireStartedAtMs)
+      }
+    }
+
+    const milestone = disposition === 'reused' ? undefined : this.readinessMilestones.get(room.id)
+    const now = Date.now()
+    const bootReadyAtMs = Math.max(acquireStartedAtMs, milestone?.bootReadyAtMs ?? now)
+    const appReadyAtMs = Math.max(bootReadyAtMs, milestone?.appReadyAtMs ?? now)
+    const path = disposition === 'reused' ? 'reuse' : (milestone?.path ?? 'cold')
+    return {
+      path,
+      profileKey: this.warmPool.profileKey(profile),
+      snapshotVersion: milestone?.lease?.snapshotVersion ?? this.warmPool.snapshotVersion(profile),
+      cloneStrategy: disposition === 'reused'
+        ? 'existing-room'
+        : disposition === 'woken'
+          ? milestone?.path === 'warm' ? 'retained-runtime' : 'cold-provision'
+          : milestone?.lease?.strategy ?? 'cold-provision',
+      acquireStartedAt: new Date(acquireStartedAtMs).toISOString(),
+      bootReadyAt: new Date(bootReadyAtMs).toISOString(),
+      appReadyAt: new Date(appReadyAtMs).toISOString(),
+      acquireToBootReadyMs: bootReadyAtMs - acquireStartedAtMs,
+      bootReadyToAppReadyMs: appReadyAtMs - bootReadyAtMs,
+      acquireToAppReadyMs: appReadyAtMs - acquireStartedAtMs
+    }
+  }
+
+  /** Current bounded pool state for diagnostics and repeatable acquisition benchmarks. */
+  warmRoomPoolStatus(): WarmRoomPoolEntry[] {
+    return this.warmPool.status()
+  }
+
+  /** Newest-first acquisition samples. The in-memory ring intentionally contains no source URL. */
+  listAcquisitionTelemetry(limit = 100): RoomAcquisitionTelemetry[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('acquisition telemetry limit must be 1..200')
+    return this.acquisitionTelemetry.slice(-limit).reverse().map((entry) => ({ ...entry }))
+  }
+
   /** Match and create share a source-level queue, including differing profiles and task IDs. */
   private admitRoom<T>(input: CreateRoomInput, fn: () => Promise<T>): Promise<T> {
     return this.trackMutation(async () => {
@@ -3645,6 +3743,7 @@ export class RoomOrchestrator {
   }
 
   acquireRoom(input: CreateRoomInput): Promise<AcquireRoomResult> {
+    const acquireStartedAtMs = Date.now()
     return this.admitRoom(input, async () => {
       const candidate = this.rooms.findCompatible(input)
       let room: RoomRecord
@@ -3671,9 +3770,12 @@ export class RoomOrchestrator {
       const reason = disposition === 'created'
         ? 'No compatible Room exists for this source, project, provider, profile and task identity.'
         : 'Matched canonical source, project, provider, requested profile and task identity; existing state preserved.'
+      const telemetry = this.buildAcquisitionTelemetry(room, acquireStartedAtMs, disposition)
+      this.acquisitionTelemetry.push(telemetry)
+      if (this.acquisitionTelemetry.length > 200) this.acquisitionTelemetry.shift()
       this.appendJournal(room.id, 'acquire-room', `Room ${disposition}: ${room.id}`, input.actor, 'Room', null,
-        { roomId: room.id, disposition, reason, modified })
-      return { room, disposition, reason, modified }
+        { roomId: room.id, disposition, reason, modified, telemetry })
+      return { room, disposition, reason, modified, telemetry }
     })
   }
 
@@ -3755,6 +3857,17 @@ export class RoomOrchestrator {
       `create room ${record.project}/${record.nickname} (${record.runtime.kind} ${record.runtime.version}, ${record.packageManager.kind})`
     )
 
+    const warmProfile = this.warmProfile(record)!
+    const warmLease = this.warmPool.claim(warmProfile)
+    let bootReadyAtMs = Date.now()
+    let allocationCompleted = false
+    this.olog(
+      id,
+      warmLease
+        ? `allocate from warm profile ${warmLease.profileKey} (${warmLease.strategy}, snapshot ${warmLease.snapshotVersion.slice(0, 12)})`
+        : `cold allocate profile ${this.warmPool.profileKey(warmProfile)}`
+    )
+
     await this.withRoomLock(id, async () => {
       try {
         if (record.sourceType === 'linked-folder') {
@@ -3775,6 +3888,8 @@ export class RoomOrchestrator {
           status: 'running',
           ...(record.sourceType === 'managed-git' ? { lastSyncedAt: new Date().toISOString() } : {})
         })
+        bootReadyAtMs = Date.now()
+        allocationCompleted = true
         this.logs.attach(id)
 
         if (providerKind === 'web' && record.sourceType !== 'empty') {
@@ -3792,9 +3907,19 @@ export class RoomOrchestrator {
         }
         await this.syncRouteFor(id)
         const verify = await verifyWebUp(this.ctxFor(id), { timeoutMs: 90_000 })
+        const appReadyAtMs = Date.now()
         this.rooms.update(id, { status: verify.ok ? 'ready' : 'attention', lastUsedAt: new Date().toISOString() })
+        this.readinessMilestones.set(id, {
+          path: warmLease ? 'warm' : 'cold',
+          profile: warmProfile,
+          lease: warmLease,
+          bootReadyAtMs,
+          appReadyAtMs
+        })
+        if (verify.ok) this.warmPool.observeReady(warmProfile)
         this.olog(id, `room up: ${verify.detail}`)
       } catch (err) {
+        if (!allocationCompleted && warmLease) this.warmPool.release(warmLease)
         this.olog(id, `create failed: ${err instanceof Error ? err.message : String(err)}`)
         this.logs.detach(id)
         this.gateway.removeRoute(record.domain)
@@ -3804,6 +3929,7 @@ export class RoomOrchestrator {
           rmSync(join(this.userData, 'rooms', id), { recursive: true, force: true })
           this.rooms.delete(id)
           this.operations.forgetRoom(id)
+          this.readinessMilestones.delete(id)
           this.pendingHostResyncConfirmations.delete(id)
           this.emit(id, 'deleted')
         } catch (cleanupError) {
@@ -4333,6 +4459,8 @@ export class RoomOrchestrator {
     const dockerSpawnsBefore = dockerSpawnCount()
     const logWakeBudget = (): void =>
       this.olog(roomId, `wake used ${dockerSpawnCount() - dockerSpawnsBefore} docker processes`)
+    let bootReadyAtMs = Date.now()
+    let wakePath: 'warm' | 'cold' = 'cold'
     try {
       // Recreate containers from the current record so changes made while
       // asleep are materialized on wake.
@@ -4353,6 +4481,7 @@ export class RoomOrchestrator {
       })
       let emulatorStarted = false
       if (resume.reused) {
+        wakePath = 'warm'
         this.rooms.update(roomId, { hostPort: resume.hostPort, status: 'running' })
         this.olog(roomId, 'wake reused the retained Room runtime')
         report.detail('reused the retained Room runtime')
@@ -4399,14 +4528,27 @@ export class RoomOrchestrator {
         report.begin('web-start', 'Start the Room web process')
         await this.backend.recreateWeb(this.webSpecFor(this.mustGet(roomId)))
       }
+      bootReadyAtMs = Date.now()
       this.logs.attach(roomId)
       await this.syncRouteFor(roomId)
       report.begin('verify', 'Verify the Room answers')
       const verify = await verifyWebUp(this.ctxFor(roomId), { timeoutMs: 90_000 })
+      const appReadyAtMs = Date.now()
       this.rooms.update(roomId, {
         status: verify.ok ? 'ready' : 'attention',
         lastUsedAt: new Date().toISOString()
       })
+      const profile = this.warmProfile(this.mustGet(roomId))
+      if (profile) {
+        this.readinessMilestones.set(roomId, {
+          path: wakePath,
+          profile,
+          lease: null,
+          bootReadyAtMs,
+          appReadyAtMs
+        })
+        if (verify.ok) this.warmPool.observeReady(profile)
+      }
       this.olog(roomId, `wake: ${verify.detail}`)
       report.detail(verify.detail)
       logWakeBudget()
@@ -4822,6 +4964,7 @@ export class RoomOrchestrator {
       const { reclaimedBytes } = await windowsVm.delete(roomId)
       this.rooms.delete(roomId)
       this.operations.forgetRoom(roomId)
+      this.readinessMilestones.delete(roomId)
       this.pendingHostResyncConfirmations.delete(roomId)
       rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
       this.emit(roomId, 'deleted')
@@ -4833,6 +4976,7 @@ export class RoomOrchestrator {
     const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
     this.rooms.delete(roomId)
     this.operations.forgetRoom(roomId)
+    this.readinessMilestones.delete(roomId)
     this.pendingHostResyncConfirmations.delete(roomId)
     rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
     this.emit(roomId, 'deleted')
