@@ -3340,9 +3340,16 @@ export class RoomOrchestrator {
       // Each OCI Room reports unknown below; Windows Rooms use their own provider probe.
     }
     const rooms = this.rooms.list()
+    const lockedAtStart = new Set(this.activeRoomLocks)
+    const opsAtStart = new Map(this.roomOps)
     const observations = await this.inventoryRoomRuntimes(rooms, backendAvailable)
     return mapWithConcurrency(rooms, STATUS_PROBE_CONCURRENCY, async (room) => {
-      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backendAvailable, observations?.get(room.id))
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(
+        room,
+        backendAvailable,
+        observations?.get(room.id),
+        { locked: lockedAtStart.has(room.id), op: opsAtStart.get(room.id) }
+      )
       return { ...this.effectiveRoom(room, runtimeStatus), runtimeStatus }
     })
   }
@@ -3564,12 +3571,13 @@ export class RoomOrchestrator {
   private async observeRuntimeStatusForIngress(
     room: RoomRecord,
     backendAvailable?: boolean,
-    observation?: RoomRuntimeObservation
+    observation?: RoomRuntimeObservation,
+    observationStart?: { locked: boolean; op: Promise<unknown> | undefined }
   ): Promise<RoomRuntimeStatus> {
-    const opsBefore = this.roomOps.get(room.id)
+    const opsBefore = observationStart ? observationStart.op : this.roomOps.get(room.id)
     // A lifecycle operation in flight at observation start may finish (and
     // route the Room) during the probe; its outcome, not this snapshot, wins.
-    const lockedBefore = this.activeRoomLocks.has(room.id)
+    const lockedBefore = observationStart ? observationStart.locked : this.activeRoomLocks.has(room.id)
     const runtimeStatus = await this.observeRuntimeStatus(room, backendAvailable, observation)
     if (
       runtimeStatus.expected === 'running' &&
@@ -8396,9 +8404,16 @@ export class RoomOrchestrator {
     const backend = await this.backend.health()
     const managedRuntime = this.managedRuntimeStatus ? await this.managedRuntimeStatus() : null
     const recorded = this.rooms.list()
+    const lockedAtStart = new Set(this.activeRoomLocks)
+    const opsAtStart = new Map(this.roomOps)
     const observations = await this.inventoryRoomRuntimes(recorded, backend.ok)
     const rooms = await mapWithConcurrency(recorded, STATUS_PROBE_CONCURRENCY, async (room) => {
-      const runtimeStatus = await this.observeRuntimeStatusForIngress(room, backend.ok, observations?.get(room.id))
+      const runtimeStatus = await this.observeRuntimeStatusForIngress(
+        room,
+        backend.ok,
+        observations?.get(room.id),
+        { locked: lockedAtStart.has(room.id), op: opsAtStart.get(room.id) }
+      )
       const effective = this.effectiveRoom(room, runtimeStatus)
       const emulator = room.provider === 'android' && runtimeStatus.emulator !== 'unknown' && runtimeStatus.emulator !== 'not-checked'
         ? runtimeStatus.emulator as 'running' | 'exited' | 'missing'
@@ -8468,10 +8483,17 @@ export class RoomOrchestrator {
   /** Agent/user inspection with a live, non-mutating runtime observation over the persisted Room record. */
   async inspectRoomRuntime(roomId: string): Promise<RoomInspection & { runtimeStatus: RoomRuntimeStatus }> {
     const recorded = this.mustGet(roomId)
+    const lockedBefore = this.activeRoomLocks.has(roomId)
+    const opsBefore = this.roomOps.get(roomId)
     // A Room-scoped inventory is one process; when it answered, the backend
     // evidently did too, so only the fallback path needs its own health read.
     const observation = (await this.inventoryRoomRuntimes([recorded], true))?.get(roomId)
-    const runtimeStatus = await this.observeRuntimeStatusForIngress(recorded, observation ? true : undefined, observation)
+    const runtimeStatus = await this.observeRuntimeStatusForIngress(
+      recorded,
+      observation ? true : undefined,
+      observation,
+      { locked: lockedBefore, op: opsBefore }
+    )
     const inspection = this.inspectRoom(roomId)
     return {
       ...inspection,
