@@ -58,6 +58,9 @@
   wake or check fails, and when runtime observation proves the workload is
   dead, so a stopped Room answers with the 404 page instead of trapping the
   browser in the 502 reload loop.
+- `restart_web` and `start_room` on an already-running Room re-derive the
+  gateway route after an observation-driven or check-driven revocation, and
+  inspections omit `urls.app` until ingress is restored (#94).
 
 ### Volume GC proves its work in one pass, on a clock (#63)
 

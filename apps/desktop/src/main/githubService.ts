@@ -74,6 +74,13 @@ const CREDENTIAL_ARTIFACT = new RegExp(`^credential-${UUID_V4}\\.(tmp|previous)$
 const STAGE_ARTIFACT = new RegExp(`^stage-${UUID_V4}$`)
 const MAX_GC_ENTRIES = 128
 const MAX_GC_DEPTH = 8
+/**
+ * Windows releases a just-executed gh.exe (and Defender's post-exec scan of it)
+ * slightly after the child's stdio closes, so an immediate unlink can see EBUSY.
+ * These are the codes Node itself retries for rm on Windows.
+ */
+const STAGE_REMOVE_RETRIES = { maxRetries: 5, retryDelay: 100 } as const
+const TRANSIENT_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'])
 
 export function validateExpectedContentLength(value: string | null, expected: number): void {
   if (value === null) return
@@ -261,6 +268,18 @@ export class GitHubService {
     }
   }
 
+  /** Removes a staging tree; a lock that outlives the retries leaves it for the next sweep. */
+  private removeStageTree(path: string): boolean {
+    try {
+      rmSync(path, { recursive: true, force: true, ...STAGE_REMOVE_RETRIES })
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== undefined && TRANSIENT_LOCK_CODES.has(code)) return false
+      throw error
+    }
+  }
+
   private cleanupStaleStages(): void {
     const canonicalRoot = this.canonicalRoot()
     for (const entry of readdirSync(this.root, { withFileTypes: true })) {
@@ -274,7 +293,7 @@ export class GitHubService {
       }
       if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error('GitHub Service stale stage is not a regular directory')
       this.assertRemovableTree(path, canonicalRoot, { entries: 0 })
-      rmSync(path, { recursive: true, force: true })
+      this.removeStageTree(path)
     }
   }
 
@@ -570,7 +589,7 @@ export class GitHubService {
       throw error
     } finally {
       this.installing = false
-      rmSync(stage, { recursive: true, force: true })
+      this.removeStageTree(stage)
       this.activeStage = null
     }
   }

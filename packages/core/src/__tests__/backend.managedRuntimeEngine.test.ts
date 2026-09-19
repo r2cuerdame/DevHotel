@@ -10,6 +10,7 @@ import {
   GUEST_FRAME_MAX_PAYLOAD_BYTES
 } from '../backend/managedRuntimeGuestProtocol'
 import { ManagedRuntimeEngine, type ManagedRuntimeChannel } from '../backend/managedRuntimeEngine'
+import { until } from './timing'
 
 /**
  * A guest agent that runs entirely in this process.
@@ -343,11 +344,11 @@ describe('ManagedRuntimeEngine', () => {
     const child = engine.spawn(['logs', '-f', 'dh-r1-web'])
     const chunks: string[] = []
     child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk.toString()))
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    await until(() => chunks.join('') === 'log line\n', { what: 'the streamed log line' })
     expect(chunks.join('')).toBe('log line\n')
 
     expect(child.kill()).toBe(true)
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await until(() => guest.cancelled.length === 1, { what: 'the guest cancel frame' })
     expect(guest.cancelled).toHaveLength(1)
   })
 
