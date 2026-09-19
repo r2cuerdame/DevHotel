@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import path from 'node:path'
+import { recordDockerSpawn } from './dockerBudget'
 import type { ExecOutputChunk, ExecResult } from './types'
 
 export interface RunDockerOpts {
@@ -165,9 +166,20 @@ export function getPinnedDockerRuntime(): PinnedDockerRuntime {
   return pinnedDockerRuntime
 }
 
+/**
+ * Test seam only. The pinned runtime is resolved once per process on purpose,
+ * so a test that points `DEVHOTEL_DOCKER_PATH` at a stand-in executable must
+ * be able to drop the memo before and restore the real one after, instead of
+ * relying on being the first import in its worker.
+ */
+export function resetPinnedDockerRuntimeForTests(): void {
+  pinnedDockerRuntime = null
+}
+
 /** All long-lived and buffered Docker processes share the same pinned runtime. */
 export function spawnDockerProcess(args: string[]): ChildProcessWithoutNullStreams {
   const runtime = getPinnedDockerRuntime()
+  recordDockerSpawn()
   return spawn(runtime.executable, args, { windowsHide: true, env: runtime.env })
 }
 

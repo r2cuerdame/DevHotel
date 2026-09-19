@@ -1,11 +1,19 @@
-import { beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { getPinnedDockerRuntime, resetPinnedDockerRuntimeForTests, runDocker } from '../backend/cli'
 
-// The pinned runtime is resolved once per module registry: point it at this
-// Node binary before the first call so runDocker drives a real child process
-// instead of needing Docker.
-process.env.DEVHOTEL_DOCKER_PATH = process.execPath
+// Point the pinned runtime at this Node binary so runDocker drives a real
+// child process instead of needing Docker. The stub is scoped to this file
+// and the memo is dropped on both sides, so no other file inherits it and
+// this one does not depend on being the first import in its worker.
+beforeAll(() => {
+  vi.stubEnv('DEVHOTEL_DOCKER_PATH', process.execPath)
+  resetPinnedDockerRuntimeForTests()
+})
 
-const { runDocker } = await import('../backend/cli')
+afterAll(() => {
+  vi.unstubAllEnvs()
+  resetPinnedDockerRuntimeForTests()
+})
 
 /** Emit `lines` lines to stdout and, optionally, to stderr. */
 function emitScript(lines: number, stream: 'out' | 'both' = 'out'): string[] {
@@ -19,7 +27,7 @@ function emitScript(lines: number, stream: 'out' | 'both' = 'out'): string[] {
 
 describe('runDocker output sinks', () => {
   beforeAll(() => {
-    expect(process.env.DEVHOTEL_DOCKER_PATH).toBe(process.execPath)
+    expect(getPinnedDockerRuntime().executable).toBe(process.execPath)
   })
 
   it('streams both streams to the sinks and buffers neither', async () => {

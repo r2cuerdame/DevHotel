@@ -1,5 +1,5 @@
 import { rmSync } from 'node:fs'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
 import { FakeAdbHost, FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir } from './fakes'
@@ -257,11 +257,19 @@ describe('RoomOrchestrator shutdown gate', () => {
       gatewayStopped = true
     }
 
-    const startedAt = Date.now()
-    const failure = await orch.shutdown({ deadlineMs: 300 }).catch((error: unknown) => error)
-    const elapsed = Date.now() - startedAt
+    // The deadline is proved on a controlled clock: the engine hang never
+    // resolves, so the only thing that can settle this shutdown is its own
+    // deadline timer firing at exactly 300 virtual milliseconds.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    let failure: unknown
+    try {
+      const pending = orch.shutdown({ deadlineMs: 300 }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(300)
+      failure = await pending
+    } finally {
+      vi.useRealTimers()
+    }
 
-    expect(elapsed).toBeLessThan(2_000)
     expect(failure).toBeInstanceOf(AggregateError)
     const codes = (failure as AggregateError).errors.map((error) => (error as { code?: string }).code)
     expect(codes).toContain('SHUTDOWN_DEADLINE_EXCEEDED')

@@ -27,6 +27,11 @@ import {
   zArtifactExportBody,
   zRoomArtifact,
   zAttachDeviceBody,
+  zAllocateClientBrowserBody,
+  zClientBrowserAuthBody,
+  zClientBrowserSessionId,
+  zNavigateClientBrowserBody,
+  zScreenshotClientBrowserBody,
   zCancelRequestBody,
   zCaptureScreenshotArtifactBody,
   zExecBody,
@@ -111,6 +116,14 @@ function parseAndroidBody<T>(schema: InputSchema<T>, input: unknown): T {
     code: 'INVALID_ANDROID_REQUEST',
     message: 'Android automation request fields are invalid.',
     recoveryHint: 'Use only the documented bounded Android operation fields and value formats.'
+  })
+}
+
+function parseClientBrowserInput<T>(schema: InputSchema<T>, input: unknown): T {
+  return parseRequestInput(schema, input, {
+    code: 'INVALID_CLIENT_BROWSER_REQUEST',
+    message: 'Client Browser request fields are invalid.',
+    recoveryHint: 'Send the session ID and token exactly as allocate_client_browser returned them, plus only the documented fields.'
   })
 }
 
@@ -278,6 +291,46 @@ export async function startControlApi(
       }
     }
 
+    // Client Browsers are addressed by session, not Room: the token, not the
+    // caller's Room, is what proves ownership, so two agents in one Room are
+    // as separate as two agents in different Rooms.
+    if (parts[1] === 'browsers') {
+      if (!parts[2] && req.method === 'GET') {
+        sendJson(res, 200, { runtime: orch.clientBrowsers.runtimeKind, sessions: orch.clientBrowsers.listAll() })
+        return
+      }
+      const sessionId = parseClientBrowserInput(zClientBrowserSessionId, parts[2])
+      const action = parts[3]
+      if (req.method === 'POST' && action) {
+        const rawBody = await readBody(req)
+        if (action === 'attach') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, orch.clientBrowsers.attach(sessionId, body.token))
+          return
+        }
+        if (action === 'inspect') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.inspect(sessionId, body.token))
+          return
+        }
+        if (action === 'navigate') {
+          const body = parseClientBrowserInput(zNavigateClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.navigate(sessionId, body.token, body.url, body.timeoutMs))
+          return
+        }
+        if (action === 'screenshot') {
+          const body = parseClientBrowserInput(zScreenshotClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.screenshot(sessionId, body.token, { format: body.format, fullPage: body.fullPage }))
+          return
+        }
+        if (action === 'release') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.release(sessionId, body.token))
+          return
+        }
+      }
+    }
+
     if (parts[1] === 'rooms' && parts[2] === 'acquire' && parts.length === 3 && req.method === 'POST') {
       const body = zAgentAcquireRoomInput.parse(await readBody(req))
       const result = await orch.acquireRoom({ ...body, actor: 'agent' })
@@ -312,12 +365,23 @@ export async function startControlApi(
         return
       }
       if (safeRoomId && !op && req.method === 'DELETE') {
-        // Deletion is irreversible: rooms holding Host-linked working state
-        // (possibly with edits never synced back) stay a human decision.
+        // Deletion is irreversible, but it never touches the Host folder:
+        // only the Room's guest containers, networks and internal volumes go.
+        // What is at stake for a Host-linked Room is Room-owned working state
+        // never synced back, so the human decision is reserved for Rooms that
+        // are awake or hold pending edits; a sleeping, fully-synced Room is a
+        // disposable test fixture agents may tear down themselves (#90).
         const room = orch.rooms.get(safeRoomId)
         if (room && (room.sourceType === 'linked-folder' || room.workspaceMode === 'legacy-host-bind')) {
-          sendJson(res, 403, { error: 'Agents cannot delete Host-linked Rooms. Delete it in the DevHotel app.' })
-          return
+          const safeHostLinkedDeletion =
+            room.status === 'sleeping' && (room.syncStatus === 'synced' || room.syncStatus === 'legacy')
+          if (!safeHostLinkedDeletion) {
+            sendJson(res, 403, {
+              error:
+                'Agents can delete Host-linked Rooms only while sleeping with no pending Room-owned edits. Sleep the Room and sync it back first, or delete it in the DevHotel app.'
+            })
+            return
+          }
         }
         sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
         return
@@ -456,6 +520,20 @@ export async function startControlApi(
         if (action === 'adb') {
           const body = zAgentAdbBody.parse(await readBody(req))
           sendJson(res, 200, await orch.adbOnDevice(safeRoomId, body.args, { timeoutMs: body.timeoutMs }))
+          return
+        }
+      }
+
+      // /v1/rooms/:id/browsers — allocate an isolated automation browser for
+      // this Room, or see which ones it holds. The secret is returned once.
+      if (safeRoomId && op === 'browsers' && !parts[4]) {
+        if (req.method === 'GET') {
+          sendJson(res, 200, orch.clientBrowsers.listForRoom(safeRoomId))
+          return
+        }
+        if (req.method === 'POST') {
+          const body = parseClientBrowserInput(zAllocateClientBrowserBody, (await readBody(req)) ?? {})
+          sendJson(res, 200, await orch.clientBrowsers.allocate(safeRoomId, body))
           return
         }
       }
