@@ -3807,13 +3807,16 @@ export class RoomOrchestrator {
    * response can poll instead of creating a second Room.
    */
   createRoomOperation(input: CreateRoomInput, request: RoomMutationRequest = {}): Promise<RoomMutationOutcome<RoomRecord>> {
-    const roomId = this.freshRoomId()
+    // A retry must use the Room ID recorded by the first request. Minting a
+    // fresh one here makes OperationTracker reject the same operation ID as a
+    // different request before it can replay the terminal answer.
+    const roomId = (request.operationId && this.operations.get(request.operationId)?.roomId) || this.freshRoomId()
     return this.runRoomMutation(
       'room-create',
       roomId,
       input.actor,
       `Create Room ${input.project}/${input.nickname}`,
-      { ...request, identity: `${input.sourceType}\u0000${input.sourceRef}\u0000${input.project}\u0000${input.nickname}` },
+      { ...request, identity: JSON.stringify(input) },
       () => this.createRoom(input, roomId),
       // There is no Room-scoped queue to extend yet; `trackMutation` already
       // drains room creation for shutdown and delete-all.
@@ -4130,7 +4133,7 @@ export class RoomOrchestrator {
       input.sourceRoomId,
       input.actor,
       `Clone the Room as ${input.nickname}`,
-      { ...request, identity: `${input.sourceRoomId}\u0000${input.nickname}` },
+      { ...request, identity: JSON.stringify(input) },
       () => this.cloneRoom(input)
     )
   }

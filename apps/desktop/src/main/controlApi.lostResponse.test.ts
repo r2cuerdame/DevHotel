@@ -194,6 +194,41 @@ const MUTATIONS: MutationCase[] = [
       deleteRoomOperation: (roomId: string, _actor: string, request: OperationRequest) =>
         state.run('room-delete', roomId, request, 'delete', { reclaimedBytes: 4 })
     })
+  },
+  {
+    name: 'sync-from-host',
+    method: 'POST',
+    path: () => '/v1/rooms/room1abc/sync-from-host',
+    body: (operationId) => JSON.stringify({ operationId }),
+    wire: (state) => ({
+      rooms: { get: () => ({ sourceType: 'linked-folder', hostSyncEnabled: true }) },
+      agentHostSyncAllowed: () => true,
+      syncFromHostOperation: (roomId: string, _actor: string, request: OperationRequest) =>
+        state.run('room-sync-from-host', roomId, request, 'sync-from-host', { id: roomId })
+    })
+  },
+  {
+    name: 'safe-resync-from-host',
+    method: 'POST',
+    path: () => '/v1/rooms/room1abc/safe-resync-from-host',
+    body: (operationId) => JSON.stringify({ operationId }),
+    wire: (state) => ({
+      rooms: { get: () => ({ sourceType: 'linked-folder', hostSyncEnabled: true }) },
+      agentHostSyncAllowed: () => true,
+      safeResyncFromHostOperation: (roomId: string, _actor: string, _token: string | undefined, request: OperationRequest) =>
+        state.run('room-safe-resync', roomId, request, 'safe-resync-from-host', { status: 'synced' })
+    })
+  },
+  {
+    name: 'change',
+    method: 'POST',
+    path: () => '/v1/rooms/room1abc/changes',
+    body: (operationId) => JSON.stringify({ change: { kind: 'domain', domain: 'changed.localhost' }, operationId }),
+    wire: (state) => ({
+      applyChange: (roomId: string, _change: unknown, _actor: string, operationId: string) =>
+        state.run('room-change', roomId, { operationId }, 'change', { id: operationId, kind: 'domain' })
+          .then((outcome) => outcome.result ?? { operation: outcome.operation })
+    })
   }
 ]
 

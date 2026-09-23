@@ -172,6 +172,27 @@ describe('long Room mutations as pollable operations', () => {
     expect(orch.rooms.list()).toHaveLength(1)
   })
 
+  it('replays a successful create with the caller ID and refuses changed create inputs', async () => {
+    const { orch } = await setup()
+    const input = {
+      sourceType: 'empty' as const,
+      sourceRef: '',
+      project: 'new-project',
+      nickname: 'first',
+      actor: 'agent' as const
+    }
+
+    const first = await orch.createRoomOperation(input, { operationId: CALLER_ID })
+    const retry = await orch.createRoomOperation(input, { operationId: CALLER_ID })
+    expect(retry.operation.id).toBe(CALLER_ID)
+    expect(retry.result?.id).toBe(first.result?.id)
+    expect(orch.rooms.list().filter((room) => room.project === input.project)).toHaveLength(1)
+
+    await expect(
+      orch.createRoomOperation({ ...input, sourceRef: 'different' }, { operationId: CALLER_ID })
+    ).rejects.toThrow(/different request/)
+  })
+
   it('leaves the delete receipt pollable after the Room it removed is gone', async () => {
     const { orch, room } = await setup()
 
