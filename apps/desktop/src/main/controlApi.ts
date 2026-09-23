@@ -38,6 +38,8 @@ import {
   zHeartbeatBody,
   zLogKind,
   zOperationId,
+  zOperationOnlyBody,
+  zOperationRequestQuery,
   zOperationWaitMs,
   zReleaseDeviceBody,
   zRoomId,
@@ -64,6 +66,7 @@ import {
   redactStructuredSecrets,
   sanitizeAndroidScreenshotArtifactMetadata,
   WorkspaceDriftError,
+  type RoomMutationOutcome,
   type RoomOrchestrator
 } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
@@ -132,6 +135,34 @@ function parseArtifactInput<T>(schema: InputSchema<T>, input: unknown): T {
     code: 'INVALID_ARTIFACT_REQUEST',
     message: 'Screenshot artifact request fields are invalid.',
     recoveryHint: 'Use only the documented bounded screenshot artifact fields and value formats.'
+  })
+}
+
+/**
+ * One answer shape for every tracked mutation. When the work settled inside
+ * this call the route replies exactly as it always did; when the caller's own
+ * bounded `waitMs` ran out first, the durable operation is the answer, and its
+ * ID is what turns a lost response into a poll instead of a second mutation.
+ */
+function sendMutationOutcome<T>(
+  res: ServerResponse,
+  outcome: RoomMutationOutcome<T>,
+  sendResult: (value: T) => void
+): void {
+  if (outcome.result === undefined) {
+    // 202 while the work is still going; a terminal operation with no stored
+    // answer (a record written before results existed) is a finished 200.
+    sendJson(res, outcome.operation.status === 'running' ? 202 : 200, { operation: outcome.operation })
+    return
+  }
+  sendResult(outcome.result)
+}
+
+function parseOperationRequest(input: unknown): { operationId?: string; waitMs?: number } {
+  return parseRequestInput(zOperationOnlyBody, input, {
+    code: 'INVALID_OPERATION_REQUEST',
+    message: 'The operation identity or bounded wait is invalid.',
+    recoveryHint: 'Pass operationId as a UUID and waitMs as a whole number of milliseconds up to 600000.'
   })
 }
 
@@ -354,9 +385,9 @@ export async function startControlApi(
         return
       }
       if (!roomId && req.method === 'POST') {
-        const body = zAgentCreateRoomInput.parse(await readBody(req))
-        const room = await orch.createRoom({ ...body, actor: 'agent' })
-        sendJson(res, 200, room)
+        const { operationId, waitMs, ...input } = zAgentCreateRoomInput.parse(await readBody(req))
+        const outcome = await orch.createRoomOperation({ ...input, actor: 'agent' }, { operationId, waitMs })
+        sendMutationOutcome(res, outcome, (room) => sendJson(res, 200, room))
         return
       }
       if (safeRoomId && !op && req.method === 'GET') {
@@ -383,7 +414,19 @@ export async function startControlApi(
             return
           }
         }
-        sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
+        // No body on DELETE, so the operation identity and bounded wait arrive
+        // as query text.
+        const request = parseRequestInput(
+          zOperationRequestQuery,
+          Object.fromEntries(url.searchParams),
+          {
+            code: 'INVALID_OPERATION_REQUEST',
+            message: 'The delete operation identity or bounded wait is invalid.',
+            recoveryHint: 'Pass operationId as a UUID and waitMs as a whole number of milliseconds up to 600000.'
+          }
+        )
+        const outcome = await orch.deleteRoomOperation(safeRoomId, 'agent', request)
+        sendMutationOutcome(res, outcome, (reclaimed) => sendJson(res, 200, reclaimed))
         return
       }
       // High-level Android automation. Every body is strict and small, every
@@ -603,17 +646,25 @@ export async function startControlApi(
             sendJson(res, 200, { operation: operation ?? started })
             return
           }
-          case 'sleep':
-            await orch.sleepRoom(safeRoomId, 'agent')
-            res.writeHead(204).end()
+          case 'sleep': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.sleepRoomOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, () => res.writeHead(204).end())
             return
-          case 'restart-web':
-            sendJson(res, 200, await orch.restartWeb(safeRoomId, 'agent'))
+          }
+          case 'restart-web': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.restartWebOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, (entry) => sendJson(res, 200, entry))
             return
+          }
           case 'clone': {
-            const body = zAgentCloneBody.parse(await readBody(req))
-            const room = await orch.cloneRoom({ sourceRoomId: safeRoomId, ...body, actor: 'agent' })
-            sendJson(res, 200, roomForAgent(room))
+            const { operationId, waitMs, ...body } = zAgentCloneBody.parse(await readBody(req))
+            const outcome = await orch.cloneRoomOperation(
+              { sourceRoomId: safeRoomId, ...body, actor: 'agent' },
+              { operationId, waitMs }
+            )
+            sendMutationOutcome(res, outcome, (room) => sendJson(res, 200, roomForAgent(room)))
             return
           }
           case 'rename': {
@@ -641,8 +692,10 @@ export async function startControlApi(
               })
               return
             }
+            const request = parseOperationRequest(await readBody(req))
             try {
-              sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'agent')))
+              const outcome = await orch.syncFromHostOperation(safeRoomId, 'agent', request)
+              sendMutationOutcome(res, outcome, (synced) => sendJson(res, 200, roomForAgent(synced)))
             } catch (error) {
               if (error instanceof WorkspaceDriftError) {
                 sendJson(res, 409, error.toResponse())
@@ -670,12 +723,15 @@ export async function startControlApi(
             }
             const body = zSafeHostResyncBody.parse(await readBody(req))
             try {
-              const outcome = await orch.safeResyncFromHost(
+              const outcome = await orch.safeResyncFromHostOperation(
                 safeRoomId,
                 'agent',
-                body.confirmationToken
+                body.confirmationToken,
+                { operationId: body.operationId, waitMs: body.waitMs }
               )
-              sendJson(res, outcome.status === 'confirmation-required' ? 409 : 200, outcome)
+              sendMutationOutcome(res, outcome, (resync) =>
+                sendJson(res, resync.status === 'confirmation-required' ? 409 : 200, resync)
+              )
             } catch (error) {
               if (error instanceof WorkspaceDriftError) {
                 sendJson(res, 409, error.toResponse())
@@ -697,31 +753,45 @@ export async function startControlApi(
             // A caller that stops waiting must not leave its command running in
             // the Room: closing the response before it was sent cancels the
             // command, and the backend reaps the guest process group it owned.
+            // The same close also means the bounded window in this response is
+            // lost, so whatever output the command produced is retained in full
+            // instead of deleted, and list_room_runs can still find it by run ID.
             const cancel = new AbortController()
-            res.once('close', () => {
+            let closedEarly = false
+            const onClose = (): void => {
               if (res.writableEnded) return
+              closedEarly = true
               cancel.abort(
                 new DevHotelError('ROOM_COMMAND_CANCELLED', 'The command was cancelled: the caller closed the response.', {
                   recoveryHint: 'Run the command again and keep the request open until it answers.',
                   httpStatus: 409
                 })
               )
-            })
-            sendJson(
-              res,
-              200,
-              await orch.execInRoom(
+            }
+            res.once('close', onClose)
+            // Both the event and the current socket state, because the two can
+            // be observed in either order relative to the command finishing.
+            const responseLost = (): boolean =>
+              closedEarly || res.destroyed || res.socket?.destroyed === true
+            try {
+              const result = await orch.execInRoom(
                 safeRoomId,
                 body.cmd,
-                { timeoutMs: body.timeoutMs, output: body.output, signal: cancel.signal },
+                { timeoutMs: body.timeoutMs, output: body.output, signal: cancel.signal, responseLost },
                 'agent'
               )
-            )
+              sendJson(res, 200, result)
+            } finally {
+              res.off('close', onClose)
+            }
             return
           }
-          case 'checks':
-            sendJson(res, 200, await orch.runChecks(safeRoomId))
+          case 'checks': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.runChecksOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, (report) => sendJson(res, 200, report))
             return
+          }
           case 'changes': {
             const body = zApplyChangeBody.parse(await readBody(req))
             sendJson(res, 200, await orch.applyChange(safeRoomId, body.change, 'agent', body.operationId, body.waitMs))
@@ -729,7 +799,11 @@ export async function startControlApi(
           }
           case 'undo': {
             const body = zUndoChangeBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.undoChange(safeRoomId, body.changeId, 'agent'))
+            const outcome = await orch.undoChangeOperation(safeRoomId, body.changeId, 'agent', {
+              operationId: body.operationId,
+              waitMs: body.waitMs
+            })
+            sendMutationOutcome(res, outcome, (entry) => sendJson(res, 200, entry))
             return
           }
         }

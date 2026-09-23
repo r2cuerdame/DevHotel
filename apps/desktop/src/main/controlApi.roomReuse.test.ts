@@ -10,8 +10,10 @@ describe('Room acquisition API', () => {
     const userData = mkdtempSync(join(tmpdir(), 'dh-reuse-api-'))
     const result = { room: { id: 'room1abc', sourceType: 'empty', sourceRef: '', workspaceMode: 'empty' }, disposition: 'reused', reason: 'compatible', modified: true }
     const acquireRoom = vi.fn(async () => result)
-    const createRoom = vi.fn(async () => { throw new DevHotelError('ROOM_REUSE_REQUIRED', 'Reuse existing Room', { evidence: { roomId: 'room1abc' } }) })
-    const control = await startControlApi({ acquireRoom, createRoom } as unknown as RoomOrchestrator, userData, 'test')
+    // Creation is a tracked operation; the reuse refusal must still reach the
+    // caller with its code and evidence intact.
+    const createRoomOperation = vi.fn(async () => { throw new DevHotelError('ROOM_REUSE_REQUIRED', 'Reuse existing Room', { evidence: { roomId: 'room1abc' } }) })
+    const control = await startControlApi({ acquireRoom, createRoomOperation } as unknown as RoomOrchestrator, userData, 'test')
     const base = { sourceType: 'empty', sourceRef: '', project: 'demo', nickname: 'new', taskId: 'task-97' }
     const post = (path: string, body: unknown) => fetch(`http://127.0.0.1:${control.info.port}/v1/rooms${path}`, {
       method: 'POST', headers: { authorization: `Bearer ${control.info.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body)
