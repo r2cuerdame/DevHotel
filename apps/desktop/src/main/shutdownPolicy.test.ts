@@ -54,3 +54,56 @@ describe('update shutdown policy', () => {
     expect(exit).toHaveBeenCalledWith(1)
   })
 })
+
+describe('shutdown deadline', () => {
+  it('reports a terminal bounded failure and exits non-zero when shutdown never settles', async () => {
+    vi.useFakeTimers()
+    try {
+      const exit = vi.fn()
+      const reportFailure = vi.fn()
+      const installUpdate = vi.fn()
+      const policy = executeShutdownPolicy('install-update', {
+        shutdown: () => new Promise<void>(() => undefined),
+        installUpdate,
+        relaunch: vi.fn(),
+        exit,
+        reportFailure,
+        deadlineMs: 45_000
+      })
+      await vi.advanceTimersByTimeAsync(44_999)
+      expect(exit).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      await policy
+      expect(reportFailure).toHaveBeenCalledWith(
+        'install-update',
+        expect.objectContaining({ code: 'SHUTDOWN_DEADLINE_EXCEEDED' })
+      )
+      expect(installUpdate).not.toHaveBeenCalled()
+      expect(exit).toHaveBeenCalledWith(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not fire the deadline after a shutdown that finished in time', async () => {
+    vi.useFakeTimers()
+    try {
+      const exit = vi.fn()
+      const reportFailure = vi.fn()
+      await executeShutdownPolicy('quit', {
+        shutdown: async () => undefined,
+        installUpdate: vi.fn(),
+        relaunch: vi.fn(),
+        exit,
+        reportFailure,
+        deadlineMs: 1_000
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(reportFailure).not.toHaveBeenCalled()
+      expect(exit).toHaveBeenCalledTimes(1)
+      expect(exit).toHaveBeenCalledWith(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

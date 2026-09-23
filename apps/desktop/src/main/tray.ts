@@ -1,6 +1,7 @@
 import { app, Menu, nativeImage, Tray, type BrowserWindow } from 'electron'
 import type { RoomOrchestrator } from '@devhotel/core'
 import type { UpdateStatusInfo } from '@devhotel/shared'
+import { TRAY_REBUILD_EVENT_KINDS, createRebuildScheduler } from './trayRebuildScheduler'
 import { updateTrayMenuItem } from './updateTrayMenu'
 
 /** 16×16 brass key-plate tray icon, generated in code (no asset pipeline needed). */
@@ -48,6 +49,9 @@ export function createTray(opts: {
     const rooms = orch.listRooms()
     const running = rooms.filter((r) => r.status === 'running' || r.status === 'ready' || r.status === 'attention')
     const health = await orch.backendHealth().catch(() => ({ ok: false, detail: 'unreachable' }))
+    // A half-started Hotel must say so where the human looks first; the same
+    // code is what /v1/status carries for agents.
+    const startup = orch.startupStatus()
 
     const menu = Menu.buildFromTemplate([
       { label: 'Open DevHotel', click: show },
@@ -66,6 +70,9 @@ export function createTray(opts: {
         }
       },
       { type: 'separator' },
+      ...(startup.state === 'failed'
+        ? [{ label: `Startup failed (${startup.code}) · open DevHotel for details`, click: show }]
+        : []),
       { label: health.ok ? 'Backend: healthy' : 'Backend: not available', enabled: false },
       {
         label: 'Start with Windows',
@@ -82,9 +89,14 @@ export function createTray(opts: {
     tray.setContextMenu(menu)
   }
 
-  void rebuild()
-  orch.onEvent(() => void rebuild())
-  opts.onUpdateStatusChange(() => void rebuild())
+  // Every rebuild probes the backend once; a wake emits several events in a
+  // row, so they are debounced into one rebuild instead of one probe each.
+  const scheduler = createRebuildScheduler(rebuild)
+  void scheduler.now()
+  orch.onEvent((e) => {
+    if (TRAY_REBUILD_EVENT_KINDS.has(e.kind)) scheduler.request()
+  })
+  opts.onUpdateStatusChange(() => scheduler.request())
   tray.on('click', show)
   return tray
 }

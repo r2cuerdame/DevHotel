@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { BuildIdentity } from './buildIdentity'
 
 /** Zod schemas shared by the loopback control API (main process) and the MCP server. */
 
@@ -7,6 +8,18 @@ export const zActor = z.enum(['user', 'devhotel', 'agent'])
 export const zPmKind = z.enum(['npm', 'pnpm'])
 export const zProviderKind = z.enum(['web', 'android', 'windows'])
 export const zServiceKind = z.enum(['postgres', 'redis'])
+/**
+ * The Android emulator versions a Room may be configured for.
+ *
+ * Named rather than inlined so there is exactly one list. The Stack tab renders
+ * it, this schema validates against it, and `ANDROID_API_LEVELS` in
+ * `@devhotel/core` maps it to API levels — and a version present here with no
+ * pinned system image silently routes a managed Room back to
+ * `budtmo/docker-android`, which is the regression #111's Android claim turns on.
+ * `backend.androidSdkPin.test.ts` asserts the two agree.
+ */
+export const zAndroidEmulatorVersion = z.enum(['14.0', '13.0', '12.0', '11.0'])
+export const ANDROID_EMULATOR_VERSIONS = zAndroidEmulatorVersion.options
 export const zRoomId = z.string().regex(/^[a-z0-9]{8}$/, 'valid Room ID')
 export const zChangeId = z.string().uuid()
 export const zOperationId = z.string().uuid()
@@ -15,7 +28,25 @@ export const zOperationId = z.string().uuid()
  * Bounded so a client's own timeout is always the shorter one — the caller
  * gets an answer (`status: 'running'`) rather than a dropped connection.
  */
-export const zOperationWaitMs = z.number().int().min(0).max(600_000)
+export const MAX_OPERATION_WAIT_MS = 600_000
+export const zOperationWaitMs = z.number().int().min(0).max(MAX_OPERATION_WAIT_MS)
+/**
+ * The two fields every long mutation accepts. `operationId` is the caller's
+ * idempotency key: repeating a request with the same ID joins or replays the
+ * one operation instead of mutating twice. `waitMs` only decides how long this
+ * call holds before answering with the operation record either way.
+ */
+export const zOperationRequestFields = {
+  operationId: zOperationId.optional(),
+  waitMs: zOperationWaitMs.optional()
+}
+/** Same two fields arriving as query text, for mutations that carry no body. */
+export const zOperationRequestQuery = z
+  .object({
+    operationId: zOperationId.optional(),
+    waitMs: z.coerce.number().int().min(0).max(MAX_OPERATION_WAIT_MS).optional()
+  })
+  .strict()
 export const zTermId = z.string().uuid()
 export const zNickname = z.string().trim().min(1).max(60)
 export const zLocalDomain = z.string().regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$/)
@@ -88,7 +119,7 @@ export const zQuickChange = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('emulator-config'),
     device: z.string().regex(/^[A-Za-z0-9 ().-]{2,40}$/),
-    version: z.enum(['14.0', '13.0', '12.0', '11.0']),
+    version: zAndroidEmulatorVersion,
     resolution: z.enum(['native', 'balanced', 'fast']).optional(),
     orientation: z.enum(['portrait', 'landscape']).optional()
   }).strict(),
@@ -132,7 +163,13 @@ export const zRendererPlanRoomInput = zPlanRoomInput.superRefine((input, ctx) =>
 })
 export type RendererPlanRoomInput = z.infer<typeof zRendererPlanRoomInput>
 
+export const zRoomTaskIdentity = z.object({
+  taskId: z.string().trim().min(1).max(200).optional(),
+  issueRef: z.string().trim().min(1).max(500).optional()
+}).strict()
+
 export const zCreateRoomInput = z.object({
+  ...zRoomTaskIdentity.shape,
   sourceType: zSourceType,
   sourceRef: z.string().max(4096),
   project: z.string().trim().min(1).max(100),
@@ -165,21 +202,28 @@ const zPublicCreateRoomInput = zCreateRoomInput
 
 /** Agent calls cannot create a host bind mount until a future explicit grant API exists. */
 export const zAgentCreateRoomInput = zPublicCreateRoomInput
+  .extend(zOperationRequestFields)
+  .strict()
   .refine((input) => input.sourceType !== 'linked-folder', {
     message: 'Agents cannot create linked-folder Rooms without a user-approved host-folder grant',
     path: ['sourceType']
   })
+/** Acquisition uses the same strict agent source and provider boundary. */
+export const zAgentAcquireRoomInput = zAgentCreateRoomInput
+export type AgentAcquireRoomInput = z.infer<typeof zAgentAcquireRoomInput>
 export type AgentCreateRoomInput = z.infer<typeof zAgentCreateRoomInput>
 
 /** Room mutations agents may request through the control API, beyond create/change. */
 export const zAgentCloneBody = z.object({
   nickname: zNickname,
   copyDependencies: z.boolean(),
-  services: z.enum(['copy', 'empty', 'exclude'])
+  services: z.enum(['copy', 'empty', 'exclude']),
+  ...zOperationRequestFields
 }).strict()
 export const zAgentRenameBody = z.object({ nickname: zNickname }).strict()
 export const zSafeHostResyncBody = z.object({
-  confirmationToken: z.string().uuid().optional()
+  confirmationToken: z.string().uuid().optional(),
+  ...zOperationRequestFields
 }).strict()
 
 /** Phone controls the Android preview strip can drive on the emulator. */
@@ -232,11 +276,10 @@ export const zRunInRoomInput = z.object({
   timeoutMs: z.number().int().positive().max(600_000).optional()
 }).strict()
 
-export interface ControlInfo {
+export interface ControlInfo extends BuildIdentity {
   port: number
   token: string
   pid: number
-  version: string
 }
 
 /**
@@ -248,6 +291,7 @@ export const CONTROL_ROUTES = {
   ping: { method: 'GET', path: '/v1/ping' },
   listRooms: { method: 'GET', path: '/v1/rooms' },
   createRoom: { method: 'POST', path: '/v1/rooms' },
+  acquireRoom: { method: 'POST', path: '/v1/rooms/acquire' },
   inspectRoom: { method: 'GET', path: '/v1/rooms/:id' },
   startRoom: { method: 'POST', path: '/v1/rooms/:id/start' },
   getOperation: { method: 'GET', path: '/v1/operations/:operationId' },
@@ -277,11 +321,13 @@ export const zRoomOperationsLimit = z.number().int().min(1).max(200)
 export const zApplyChangeBody = z
   .object({
     change: zQuickChange,
-    operationId: zOperationId.optional(),
-    waitMs: zOperationWaitMs.optional()
+    ...zOperationRequestFields
   })
   .strict()
-export const zUndoChangeBody = z.object({ changeId: zChangeId }).strict()
+export const zUndoChangeBody = z.object({ changeId: zChangeId, ...zOperationRequestFields }).strict()
+
+/** Bodies whose only fields are the operation identity and the bounded wait. */
+export const zOperationOnlyBody = z.object(zOperationRequestFields).strict()
 /**
  * How much of a command's output the caller wants inline, and which part.
  * Limits mirror packages/core `runOutput.ts`; anything the response cannot
@@ -298,9 +344,11 @@ export const zOutputSelection = z
   })
   .strict()
 
+/** The longest command timeout the control API accepts, mirrored by clients. */
+export const MAX_EXEC_TIMEOUT_MS = 600_000
 export const zExecBody = z.object({
   cmd: z.array(z.string().max(16_384)).min(1).max(256),
-  timeoutMs: z.number().int().positive().max(600_000).optional(),
+  timeoutMs: z.number().int().positive().max(MAX_EXEC_TIMEOUT_MS).optional(),
   output: zOutputSelection.optional()
 }).strict()
 

@@ -10,7 +10,15 @@ changes bump the path version (`/v1/`).
 While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
 
 ```json
-{ "port": 6084, "token": "…48 hex chars…", "pid": 12345, "version": "0.5.2" }
+{
+  "port": 6084,
+  "token": "…48 hex chars…",
+  "pid": 12345,
+  "version": "0.5.4",
+  "commit": "98a292c82209eb586409ceec1ea27b5fe21ccf0b",
+  "buildTime": "2026-09-08T12:34:56.789Z",
+  "sourceVerified": true
+}
 ```
 
 - Base URL: `http://127.0.0.1:<port>` — loopback only, never remote.
@@ -19,6 +27,12 @@ While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
   when it can reclaim it and otherwise falls back to a new loopback port, so
   re-read the file on connection or authorization errors; treat a missing file
   as "DevHotel is not running".
+- `version`, `commit`, and `buildTime` are compile-time literals for the exact
+  packaged source. `sourceVerified` is true only when the embedded commit is
+  `HEAD` and the source tree was clean; dirty development builds expose false
+  and cannot pass installed-artifact verification. The fields are identical in
+  discovery, `/v1/ping`, `/v1/status`, MCP `hotel_status`, and new Android
+  acceptance reports.
 - Errors are JSON `{ "error": "…" }` with 4xx/5xx status. Stable DevHotel
   contract failures also include `code` and `recoveryHint`; engine-specific
   diagnostics are not exposed as the public error contract.
@@ -29,8 +43,13 @@ Mutations through this API run as actor `agent` and appear (undoably) in the
 room's Changes list. Host boundaries hold:
 
 - Linked-folder rooms: `sourceRef` reads as `[Host folder hidden]`, inspection
-  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms
-  or delete Host-linked ones.
+  `dataDir` as `[Hotel data hidden]`; agents cannot create linked-folder rooms.
+  Agents may delete a Host-linked room (`linked-folder` source or
+  `legacy-host-bind` workspace) only while it is `sleeping` and holds no
+  pending Room-owned edits (`syncStatus` is `synced` or `legacy`); an awake or
+  `modified` room answers `403`. Deletion tears down the Room's guest
+  containers, networks and internal volumes only — the Host folder is never
+  deleted or modified.
 - Agent mutations on `legacy-host-bind` rooms are refused until the user moves
   the room into the Hotel.
 - `safe-resync-from-host` (and the lower-level `sync-from-host`) runs under the Room's **inbound-sync grant**: the human
@@ -110,17 +129,52 @@ than being polled forever.
 `waitMs` is a convenience, not a requirement: with `waitMs=0` on both calls you
 can drive the whole thing by polling.
 
+### Every long mutation, not only the wake
+
+Creating, cloning, deleting, sleeping, restarting the web process, syncing from
+the Host, running checks, applying a change and undoing one are all tracked the
+same way. Each of them accepts two optional fields — in the JSON body, or as
+query text on `DELETE /v1/rooms/:id`:
+
+| Field | Meaning |
+|---|---|
+| `operationId` | A UUID **you** choose. The operation is created under it before the first side effect, and repeating the request with the same ID replays that one operation instead of mutating a second time. |
+| `waitMs` | How long this call may hold before answering, `0`–`600000`. **Omit it and nothing changes**: the call waits for the work and returns exactly what it always returned. |
+
+When a bounded `waitMs` runs out first, the reply is `202` with
+`{ operation }` — `status: "running"`, and the ID is how you finish the story.
+
+A terminal record carries `result`: the value the original response would have
+had. That is what makes a lost response recoverable —
+
+```
+POST /v1/rooms/room1abc/sleep   { "operationId": "b1c2…", "waitMs": 0 }
+  → 202 { "operation": { "id": "b1c2…", "status": "running" } }
+    (connection dies here)
+GET  /v1/operations/b1c2…
+  → 200 { "operation": { "id": "b1c2…", "status": "succeeded", "result": null } }
+```
+
+— and it is why a retry is safe: with the same `operationId`, the second call
+returns the first call's answer without sleeping the Room again. Reusing an ID
+for a *different* request is refused rather than silently aliased.
+
+A Room's deletion receipt deliberately outlives the Room: it is the only way a
+caller who lost that response can learn the Room is gone.
+
 ## Endpoints
 
 ### Hotel
 
 | Method & path | Result |
 |---|---|
-| `GET /v1/ping` | `{ version }` |
+| `GET /v1/ping` | `{ version, commit, buildTime, sourceVerified }` |
 | `GET /v1/operations/:operationId` | `{ operation }` — see [Long operations](#long-operations) |
-| `GET /v1/status` | `{ version, backend: { ok, detail }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices }` — each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. |
+| `GET /v1/status` | `{ version, commit, buildTime, sourceVerified, update: { state, targetVersion }, backend: { ok, detail }, runtime: { mode, managed }, gateway: { running, httpPort, httpsPort, routes[] }, rooms: [{ id, project, nickname, provider, status, domain, url, emulator, runtimeStatus }], devices, budget: { dockerSpawns, elapsedMs } }` — `targetVersion` is populated only while an update is available, downloading, or ready. Updater URLs, local paths, and error detail are never exposed. `runtime.mode` is the backend-neutral `managed` or `compatibility` selection. `runtime.managed` reports the managed-runtime provisioning state/phase, support result, opaque runtime ID, version and verified artifact digests without returning native VM identifiers or Host paths; support distinguishes a provider that is ready, needs Windows provisioning, or needs explicit elevation. Each Room is revalidated without starting or repairing it. `runtimeStatus` keeps the recorded lifecycle status beside live `main`/`emulator` component states and reports `running`, `degraded`, `dead`, `stopped`, or `unknown`. A recorded-ready dead Room is returned as `broken`; a partially available or unknown Room is returned as `attention`. `devices` is the shared-phone broker status below. `budget` is the call's own cost: one engine health read plus one bulk owned-container inventory answer every Room, and each awake Android Room adds one topology proof; `dockerSpawns` is a process-wide delta, so it is exact only when no Room mutation runs concurrently. |
 | `GET /v1/hotel/github` | GitHub Service status (provision + credential state) |
 | `POST /v1/hotel/github/install` | Provision the pinned `gh` build (no credentials) |
+| `GET /v1/storage/volumes` | Every Docker volume reconciled against the Room registry: totals, per-class bytes, and for each volume its class, `safeToDelete` and the reason. Read-only. See [volume-gc.md](volume-gc.md). |
+| `POST /v1/storage/volumes/gc` | `{ dryRun?, maxVolumes?, maxBytes?, deadlineMs? }` — dry by default. A real pass (`dryRun: false`) must give `maxVolumes` (attempts, ≤ 500) and `maxBytes`; `deadlineMs` defaults to 5 minutes (≤ 1 h). Returns the report plus `deletedVolumes`, `errors`, `attemptedCount`, `deadlineReached` and `skipped[]`. Only positively orphaned, exactly owned, unattached, size-known volumes are ever attempted, each re-proved under its Room lock first. |
 
 ### Shared Android devices
 
@@ -157,6 +211,30 @@ one-time code out of application state. Agents cannot provide an endpoint,
 port, token or pairing code. All JSON responses pass through the same
 structured secret-redaction boundary used by diagnostics, logs and device
 events.
+
+### Client Browsers
+
+An isolated Chromium an agent borrows for web automation — the thing that
+visits a site, as opposed to the Web Server Room that hosts one. See
+[Client Browser](./client-browser.md). Sessions are addressed by session ID
+and proven by the token returned once at allocation; the Room in the path
+only says who owns the browser.
+
+| Method & path | Body | Result |
+|---|---|---|
+| `POST /v1/rooms/:id/browsers` | `{ profileMode?: 'ephemeral'\|'persistent', headless? }` | `{ session, token, endpoint: { http, ws } }` — a fresh process and profile for this Room. `endpoint.http` is a Playwright `connectOverCDP` / puppeteer `browserURL` target (it serves `/json/version` and friends); `endpoint.ws` is the browser-level CDP WebSocket. Both embed the token. The Room must be awake. `503 CLIENT_BROWSER_NOT_FOUND` when no Chromium is installed on the Host. |
+| `GET /v1/rooms/:id/browsers` | | this Room's sessions — IDs, status, PID, profile mode, timestamps; never tokens |
+| `GET /v1/browsers` | | `{ runtime, sessions[] }` across the Hotel, same fields |
+| `POST /v1/browsers/:sessionId/attach` | `{ token }` | the allocation again (session + endpoint) for a session you own |
+| `POST /v1/browsers/:sessionId/inspect` | `{ token }` | `{ session, owner: { roomId, project, nickname }, liveness: { processAlive, cdpReachable, browserVersion }, connection: { endpoint, activeClients }, targets[] }` |
+| `POST /v1/browsers/:sessionId/navigate` | `{ token, url, timeoutMs? }` | `{ sessionId, url, finalUrl, title, loaded }` — `http`, `https` or `about:blank` only; other schemes are `400 CLIENT_BROWSER_URL_REFUSED` |
+| `POST /v1/browsers/:sessionId/screenshot` | `{ token, format?: 'png'\|'jpeg', fullPage? }` | `{ sessionId, mimeType, contentBase64, sizeBytes }` — not stored |
+| `POST /v1/browsers/:sessionId/release` | `{ token }` | `{ sessionId, roomId, released, processStopped, profileRemoved }` — closes the process, drops tunnelled clients, deletes an ephemeral profile |
+
+A wrong token is `403 CLIENT_BROWSER_FORBIDDEN`; an unknown session is
+`404 CLIENT_BROWSER_NOT_FOUND`; a malformed ID or token is `400`. A Room
+going to sleep or being deleted releases its browsers, and a DevHotel restart
+reconciles whatever an earlier process left running.
 
 ### Tracked Android automation
 
@@ -272,22 +350,22 @@ credential connected to the GitHub Service even when the URL carries none.
 | Method & path | Body / query | Result |
 |---|---|---|
 | `GET /v1/rooms` | | `RoomRecord[]` with the same read-only `runtimeStatus` overlay and effective status used by Room inspection |
-| `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides? }` | created `RoomRecord` |
+| `POST /v1/rooms` | `{ sourceType: 'managed-git'\|'empty', sourceRef, project, nickname, provider?: 'web'\|'android', planOverrides?, operationId?, waitMs? }` | created `RoomRecord` |
 | `GET /v1/rooms/:id` | | inspection: room, `runtimeStatus`, urls, backups, stack line, latest check, recent changes, and a non-capability device summary when attached. Runtime liveness is revalidated read-only; dead/degraded runtimes do not expose an app URL. Lease/request IDs and worker/run identifiers are never returned by inspection. |
-| `DELETE /v1/rooms/:id` | | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms |
+| `DELETE /v1/rooms/:id` | `?operationId=&waitMs=` | `{ reclaimedBytes }` — irreversible; `403` for Host-linked rooms unless they are `sleeping` with `syncStatus` `synced` or `legacy` (the Host folder itself is never touched) |
 | `POST /v1/rooms/:id/start` | `{ waitMs? }` | `{ operation }` — see [Long operations](#long-operations) |
-| `POST /v1/rooms/:id/sleep` | | `204` |
-| `POST /v1/rooms/:id/restart-web` | | change entry |
-| `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude' }` | cloned `RoomRecord` |
+| `POST /v1/rooms/:id/sleep` | `{ operationId?, waitMs? }` | `204` |
+| `POST /v1/rooms/:id/restart-web` | `{ operationId?, waitMs? }` | change entry |
+| `POST /v1/rooms/:id/clone` | `{ nickname, copyDependencies, services: 'copy'\|'empty'\|'exclude', operationId?, waitMs? }` | cloned `RoomRecord` |
 | `POST /v1/rooms/:id/rename` | `{ nickname }` | `204` |
-| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs?, output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
+| `POST /v1/rooms/:id/exec` | `{ cmd: string[], timeoutMs? (max 600000), output? }` | `{ code, stdout, stderr, output }` — bounded; see [Command output](#command-output). A dead runtime is rejected before exec with HTTP 409, `code: "ROOM_RUNTIME_NOT_RUNNING"`, and a recovery hint. If liveness cannot be verified, HTTP 503 uses `code: "ROOM_RUNTIME_STATUS_UNAVAILABLE"`. |
 | `GET /v1/rooms/:id/runs` | | `{ runs[] }` — commands running now, plus finished runs whose full output the Room still holds |
 | `GET /v1/rooms/:id/runs/:runId/output` | `?stream=&offsetBytes=&encoding=&maxBytes=&maxLines=&mode=&include=&exclude=&ignoreCase=` | a window of one retained stream, with `nextOffset`/`eof` for paging |
-| `POST /v1/rooms/:id/checks` | | 15-step check report (includes `line-endings`) |
-| `POST /v1/rooms/:id/changes` | `{ change: QuickChange }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …) |
-| `POST /v1/rooms/:id/undo` | `{ changeId }` | change entry |
-| `POST /v1/rooms/:id/sync-from-host` | | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
-| `POST /v1/rooms/:id/safe-resync-from-host` | `{ confirmationToken?: uuid }` | preferred inspect/refuse-or-confirm/reset/resync operation. With meaningful or unprovable drift and no token, returns `409` with `status: 'confirmation-required'`, exact Room-relative paths when available, before facts, recovery guidance, and an opaque single-use token without importing or persisting anything. Repeat with that token only after review. A stale, wrong, cross-Room, or replayed token returns a fresh non-mutating preview; a later edit aborts the staged import. Success returns structured before/after facts and the retained recovery generation. |
+| `POST /v1/rooms/:id/checks` | `{ operationId?, waitMs? }` | 15-step check report (includes `line-endings`) |
+| `POST /v1/rooms/:id/changes` | `{ change: QuickChange, operationId?, waitMs? }` | verified/undoable change entry (`node-version`, `deps-install`, `normalize-line-endings`, `service-*`, `android-build`, `android-run`, `emulator-config`, …). The change entry's `id` is the operation ID. |
+| `POST /v1/rooms/:id/undo` | `{ changeId, operationId?, waitMs? }` | change entry |
+| `POST /v1/rooms/:id/sync-from-host` | `{ operationId?, waitMs? }` | human-approved inbound sync; `403` if declined; common generated outputs are ignored and real drift returns `409` with `conflictReason` plus exact `changedPaths` |
+| `POST /v1/rooms/:id/safe-resync-from-host` | `{ confirmationToken?: uuid, operationId?, waitMs? }` | preferred inspect/refuse-or-confirm/reset/resync operation. With meaningful or unprovable drift and no token, returns `409` with `status: 'confirmation-required'`, exact Room-relative paths when available, before facts, recovery guidance, and an opaque single-use token without importing or persisting anything. Repeat with that token only after review. A stale, wrong, cross-Room, or replayed token returns a fresh non-mutating preview; a later edit aborts the staged import. Success returns structured before/after facts and the retained recovery generation. |
 | `POST /v1/rooms/:id/sync-baseline` | | accept the Room's current files as the sync baseline (no copy, journaled) — clears a `modified` state that would otherwise refuse every sync |
 | `GET /v1/rooms/:id/changes` | | full change journal |
 | `GET /v1/rooms/:id/components` | | installed programs with live versions |
@@ -386,6 +464,15 @@ filter — the **complete raw output is retained under the Room** and read back
 by run id. When the response did carry everything, nothing is retained and
 `runId` refers to a run that is already gone: there is nothing left to fetch.
 
+There is one more case where everything is retained: **the response was never
+delivered.** If the connection closes before the reply is written, "the caller
+already has every byte" is false no matter how small the output was, so the
+complete raw output is kept. Closing the response also cancels the command
+(`ROOM_COMMAND_CANCELLED`) and reaps its guest process group, so what is kept
+is everything the command produced up to that point. Find it again with
+`GET /v1/rooms/:id/runs`, which lists the command, when it started, and its
+run id.
+
 Retention lives in Hotel storage beside the Room's logs and artifacts, is
 deleted with the Room, and is bounded — a Room keeps its most recent 20
 retained runs, up to 256MB. The just-finished run named by an exec response is
@@ -437,3 +524,23 @@ claude mcp add devhotel -s user -e ELECTRON_RUN_AS_NODE=1 -- "C:\…\DevHotel.ex
 
 `-s user` registers it once for every project. Registration only takes effect
 for agent sessions started afterwards — a running session must reconnect.
+
+### Room acquisition
+
+`POST /v1/rooms/acquire` is the default agent entry point (`acquire_room` in MCP).
+It accepts the same strict agent body as `POST /v1/rooms`, including optional
+`taskId` and `issueRef`. It returns `{ room, disposition, reason, modified }`,
+where disposition is `created`, `reused`, or `woken`. Sleeping Rooms are woken;
+existing source state is preserved, with no automatic resync or reset. A failed
+wake returns `ROOM_WAKE_FAILED` with the existing Room ID. Other Room states
+are surfaced in `room.status` for inspection/recovery.
+
+Matching uses canonical source identity, case-insensitive project, provider,
+and explicit plan overrides; nickname is only a display label. With no task
+identity supplied, compatible task-bound Rooms are also candidates. A distinct
+`taskId` or `issueRef` selects a separate parallel lane; repeating that identity
+reuses its existing Room. Direct agent creation returns HTTP 409,
+`ROOM_REUSE_REQUIRED`, and `evidence.roomId` when a candidate exists. Neither a
+nickname change nor a force flag grants an exception. User/manual creation is
+unchanged. Selection, disposition and preservation reason are journaled on the
+selected Room as `acquire-room`.

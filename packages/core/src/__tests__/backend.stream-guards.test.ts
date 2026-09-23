@@ -58,6 +58,9 @@ describe('streaming Room process guards', () => {
     const backend = new OciCliBackend({ identityFile: join(root, 'engine.json') })
     await backend.health()
     engineId = 'engine-two'
+    // Drift is observed by the next health read; streaming then refuses to
+    // start until a fresh identity read proves the pinned engine again.
+    await expect(backend.health()).resolves.toMatchObject({ ok: false })
 
     await expect(backend.spawnInteractiveExec('room1abc', ['sh', '-li'])).rejects.toThrow(/engine identity changed/)
     await expect(backend.followRoomLogs('room1abc')).rejects.toThrow(/engine identity changed/)
@@ -111,14 +114,15 @@ describe('streaming Room process guards', () => {
     })
 
     expect(mockedRunDocker).toHaveBeenCalledWith(
-      ['exec', id, 'sh', '-lc', 'bounded'],
+      ['exec', '-e', expect.stringMatching(/^DEVHOTEL_EXEC_TOKEN=[0-9a-f-]{36}$/), id, 'sh', '-lc', 'bounded'],
       {
         timeoutMs: 30_000,
         signal: controller.signal,
         maxStdoutBytes: 1234,
         maxStderrBytes: 5678,
         onStdout,
-        onStderr
+        onStderr,
+        onAbort: expect.any(Function)
       }
     )
   })

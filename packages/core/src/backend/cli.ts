@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import path from 'node:path'
+import { recordDockerSpawn } from './dockerBudget'
 import type { ExecOutputChunk, ExecResult } from './types'
 
 export interface RunDockerOpts {
@@ -14,7 +15,13 @@ export interface RunDockerOpts {
   maxStderrBytes?: number
   /** Keep draining but never kill a definitive-create critical section on overflow. */
   killOnOutputLimit?: boolean
-  /** Caller-owned, identity-safe cleanup invoked when timeout/output caps abort `docker run`. */
+  /**
+   * Caller-owned, identity-safe cleanup invoked whenever the CLI is aborted:
+   * timeout, output cap or signal. It runs after the CLI process closed and
+   * before the call settles, so a caller that reaps what the CLI left behind
+   * in the engine (a one-shot job, an exec's guest process group) can prove
+   * the abort finished rather than only that the local process died.
+   */
   onAbort?: () => Promise<void>
   onLine?: (line: string) => void
   input?: string
@@ -159,9 +166,20 @@ export function getPinnedDockerRuntime(): PinnedDockerRuntime {
   return pinnedDockerRuntime
 }
 
+/**
+ * Test seam only. The pinned runtime is resolved once per process on purpose,
+ * so a test that points `DEVHOTEL_DOCKER_PATH` at a stand-in executable must
+ * be able to drop the memo before and restore the real one after, instead of
+ * relying on being the first import in its worker.
+ */
+export function resetPinnedDockerRuntimeForTests(): void {
+  pinnedDockerRuntime = null
+}
+
 /** All long-lived and buffered Docker processes share the same pinned runtime. */
 export function spawnDockerProcess(args: string[]): ChildProcessWithoutNullStreams {
   const runtime = getPinnedDockerRuntime()
+  recordDockerSpawn()
   return spawn(runtime.executable, args, { windowsHide: true, env: runtime.env })
 }
 
@@ -367,4 +385,33 @@ export function runDocker(args: string[], opts: RunDockerOpts = {}): Promise<Exe
       }
     }
   })
+}
+
+/**
+ * The single seam through which Room work reaches a container engine.
+ *
+ * The managed-runtime design forbids core code from spawning a globally
+ * resolved `docker`: the engine may be the Host's Docker CLI today and a
+ * DevHotel-owned Linux runtime tomorrow, and the Room semantics above must not
+ * be able to tell. Everything `OciCliBackend` does therefore goes through an
+ * executor rather than through this module's functions directly.
+ *
+ * The contract is deliberately only what the Room code already needs —
+ * buffered/streamed invocations, long-lived processes, and a name for the
+ * endpoint so engine-identity pinning has something stable to compare. Guest
+ * path mapping and runtime storage inventory, which the design also names, are
+ * omitted until the executor that can actually implement them exists; a second
+ * implementation is what turns an interface into a contract rather than a
+ * guess.
+ */
+export interface OciEngineExecutor {
+  /**
+   * Stable, non-secret identity of the engine endpoint. It is durably recorded
+   * and compared before destructive Room operations, so it must not change for
+   * the same engine across process restarts.
+   */
+  readonly endpoint: string
+  run(args: string[], opts?: RunDockerOpts): Promise<ExecResult>
+  /** A long-lived engine process the caller owns (interactive exec, log follow). */
+  spawn(args: string[]): ChildProcessWithoutNullStreams
 }

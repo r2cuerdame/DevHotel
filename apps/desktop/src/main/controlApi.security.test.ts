@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DevHotelError, WorkspaceDriftError, type RoomOrchestrator } from '@devhotel/core'
+import type { OperationRecord } from '@devhotel/shared'
 import { startControlApi } from './controlApi'
 
 const roots: string[] = []
@@ -10,6 +11,24 @@ const roots: string[] = []
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
+
+/** The record every tracked mutation now returns alongside its answer. */
+function trackedOperation(kind: OperationRecord['kind']): OperationRecord {
+  const at = '2026-09-08T00:00:00.000Z'
+  return {
+    id: 'c4a1b2d3-e4f5-4061-8273-8495a6b7c8d9',
+    kind,
+    roomId: 'room1abc',
+    actor: 'agent',
+    status: 'succeeded',
+    stage: 'complete',
+    stages: [],
+    error: null,
+    startedAt: at,
+    updatedAt: at,
+    finishedAt: at
+  }
+}
 
 describe('agent control API host boundary', () => {
   it('redacts Host paths from list and inspect responses', async () => {
@@ -101,8 +120,16 @@ describe('agent control API host boundary', () => {
     roots.push(userData)
     mkdirSync(userData, { recursive: true })
     const createRoom = vi.fn(async (input: Record<string, unknown>) => ({ id: 'room9xyz', ...input }))
+    const createRoomOperation = vi.fn(async (input: Record<string, unknown>) => ({
+      operation: trackedOperation('room-create'),
+      result: await createRoom(input)
+    }))
     const applyChange = vi.fn()
-    const control = await startControlApi({ createRoom, applyChange } as unknown as RoomOrchestrator, userData, 'test')
+    const control = await startControlApi(
+      { createRoomOperation, applyChange } as unknown as RoomOrchestrator,
+      userData,
+      'test'
+    )
 
     try {
       const response = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms`, {
@@ -180,13 +207,17 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-sync-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\code\\demo' }
-    const syncFromHost = vi.fn(async () => ({ ...room, syncStatus: 'synced' }))
+    const syncFromHost = vi.fn(async (_roomId: string, _actor: string) => ({ ...room, syncStatus: 'synced' }))
+    const syncFromHostOperation = vi.fn(async (roomId: string, actor: string) => ({
+      operation: trackedOperation('room-sync-from-host'),
+      result: await syncFromHost(roomId, actor)
+    }))
     let granted = true
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => granted,
-        syncFromHost
+        syncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -216,14 +247,14 @@ describe('agent control API host boundary', () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-drift-'))
     roots.push(userData)
     const room = { id: 'room1abc', sourceType: 'linked-folder', hostSyncEnabled: true, sourceRef: 'C:\\private\\project' }
-    const syncFromHost = vi.fn(async () => {
+    const syncFromHostOperation = vi.fn(async () => {
       throw new WorkspaceDriftError([{ path: 'app/src/main/java/App.kt', reason: 'modified' }])
     })
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => true,
-        syncFromHost
+        syncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -277,11 +308,17 @@ describe('agent control API host boundary', () => {
             recoveryGuidance: ['export or commit first']
           }
     )
+    const safeResyncFromHostOperation = vi.fn(
+      async (roomId: string, actor: string, token: string | undefined) => ({
+        operation: trackedOperation('room-safe-resync'),
+        result: await safeResyncFromHost(roomId, actor, token)
+      })
+    )
     const control = await startControlApi(
       {
         rooms: { get: () => room },
         agentHostSyncAllowed: () => true,
-        safeResyncFromHost
+        safeResyncFromHostOperation
       } as unknown as RoomOrchestrator,
       userData,
       'test'
@@ -327,28 +364,49 @@ describe('agent control API host boundary', () => {
     }
   })
 
-  it('refuses agent deletion of Host-linked rooms but allows Hotel-owned ones', async () => {
+  it('lets agents delete Host-linked rooms only while sleeping with nothing left to sync back', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-delete-'))
     roots.push(userData)
     const rooms = new Map([
-      ['room1abc', { id: 'room1abc', sourceType: 'linked-folder', workspaceMode: 'hotel' }],
-      ['room2def', { id: 'room2def', sourceType: 'managed-git', workspaceMode: 'hotel' }]
+      // Awake, or holding Room-owned edits never synced back: still a human decision.
+      ['lnkrun01', { id: 'lnkrun01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'running', syncStatus: 'synced' }],
+      ['lnkrdy01', { id: 'lnkrdy01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'ready', syncStatus: 'synced' }],
+      ['lnkatt01', { id: 'lnkatt01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'attention', syncStatus: 'synced' }],
+      ['lnkmod01', { id: 'lnkmod01', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'sleeping', syncStatus: 'modified' }],
+      ['lgcrun01', { id: 'lgcrun01', sourceType: 'linked-folder', workspaceMode: 'legacy-host-bind', status: 'running', syncStatus: 'legacy' }],
+      // Sleeping with no pending Room-owned edits: disposable, the Host folder is never touched.
+      ['lnkokay1', { id: 'lnkokay1', sourceType: 'linked-folder', workspaceMode: 'hotel', status: 'sleeping', syncStatus: 'synced' }],
+      ['lgcokay1', { id: 'lgcokay1', sourceType: 'linked-folder', workspaceMode: 'legacy-host-bind', status: 'sleeping', syncStatus: 'legacy' }],
+      ['htlokay1', { id: 'htlokay1', sourceType: 'managed-git', workspaceMode: 'hotel', status: 'running', syncStatus: 'synced' }]
     ])
-    const deleteRoom = vi.fn(async () => ({ reclaimedBytes: 42 }))
+    const deleteRoom = vi.fn(async (_roomId: string, _actor: string) => ({ reclaimedBytes: 42 }))
+    const deleteRoomOperation = vi.fn(async (roomId: string, actor: string) => ({
+      operation: trackedOperation('room-delete'),
+      result: await deleteRoom(roomId, actor)
+    }))
     const control = await startControlApi(
-      { rooms: { get: (id: string) => rooms.get(id) }, deleteRoom } as unknown as RoomOrchestrator,
+      { rooms: { get: (id: string) => rooms.get(id) }, deleteRoomOperation } as unknown as RoomOrchestrator,
       userData,
       'test'
     )
     try {
       const headers = { authorization: `Bearer ${control.info.token}` }
-      const linked = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room1abc`, { method: 'DELETE', headers })
-      expect(linked.status).toBe(403)
+      const del = (id: string) => fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/${id}`, { method: 'DELETE', headers })
+
+      for (const id of ['lnkrun01', 'lnkrdy01', 'lnkatt01', 'lnkmod01', 'lgcrun01']) {
+        const res = await del(id)
+        expect(res.status, id).toBe(403)
+        const body = (await res.json()) as { error: string }
+        expect(body.error, id).toMatch(/only while sleeping with no pending Room-owned edits/)
+      }
       expect(deleteRoom).not.toHaveBeenCalled()
 
-      const hotel = await fetch(`http://127.0.0.1:${control.info.port}/v1/rooms/room2def`, { method: 'DELETE', headers })
-      expect(hotel.status).toBe(200)
-      expect(deleteRoom).toHaveBeenCalledWith('room2def', 'agent')
+      for (const id of ['lnkokay1', 'lgcokay1', 'htlokay1']) {
+        const res = await del(id)
+        expect(res.status, id).toBe(200)
+        expect(deleteRoom).toHaveBeenCalledWith(id, 'agent')
+      }
+      expect(deleteRoom).toHaveBeenCalledTimes(3)
     } finally {
       control.stop()
     }

@@ -13,6 +13,7 @@ import { z } from 'zod'
 import { MCP_METADATA } from '../metadata'
 
 const TOKEN = 'test-token'
+const CONTROL_BUILD = { version: '0.4.1', commit: 'a'.repeat(40), buildTime: '2026-08-25T00:00:00.000Z', sourceVerified: true }
 const RUN_ID = '11111111-2222-3333-4444-555555555555'
 const OPERATION_ID = '2f1c8f5e-0d2b-4f0a-9b9e-7c4c1c3b8a11'
 const RESYNC_TOKEN = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -24,6 +25,13 @@ const ARTIFACT_PNG = Buffer.concat([
 ])
 const ARTIFACT_SHA256 = createHash('sha256').update(ARTIFACT_PNG).digest('hex')
 const ACCEPTANCE_REPORT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const BROWSER_SESSION = 'cbr_0123456789abcdef'
+const BROWSER_TOKEN = 'cbt_0123456789abcdef0123456789abcdef'
+const browserAllocation = {
+  session: { id: BROWSER_SESSION, roomId: 'abc12345', status: 'ready', pid: 4242, browserKind: 'chrome', headless: true, profileMode: 'ephemeral', createdAt: '2026-09-18T00:00:00.000Z', lastActiveAt: '2026-09-18T00:00:00.000Z' },
+  token: BROWSER_TOKEN,
+  endpoint: { http: `http://127.0.0.1:5555/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}`, ws: `ws://127.0.0.1:5555/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}` }
+}
 const APPLIED_CHANGE = {
   id: '11111111-2222-4333-8444-555555555555',
   roomId: 'abc12345',
@@ -79,9 +87,26 @@ beforeAll(async () => {
     req.on('data', (c) => (raw += c))
     req.on('end', () => {
       seen.push({ method: req.method!, url: req.url!, body: raw ? JSON.parse(raw) : null })
-      if (req.url === '/v1/ping') return void res.end(JSON.stringify({ version: '0.4.1' }))
+      if (req.url === '/v1/ping') return void res.end(JSON.stringify(CONTROL_BUILD))
+      if (req.url === '/v1/status') {
+        return void res.end(JSON.stringify({
+          ...CONTROL_BUILD,
+          update: { state: 'ready', targetVersion: '0.5.0' },
+          backend: { ok: true, detail: 'ready' },
+          gateway: { running: true, httpPort: 80, httpsPort: 443, routes: [] },
+          rooms: [],
+          devices: { available: true, detail: 'ready', devices: [], recentEvents: [] }
+        }))
+      }
       if (req.url === '/v1/rooms' && req.method === 'GET') {
         return void res.end(JSON.stringify([{ id: 'abc12345', project: 'demo', nickname: 'dev', status: 'ready' }]))
+      }
+      if (req.url === '/v1/rooms/acquire' && req.method === 'POST') {
+        return void res.end(JSON.stringify({ room: { id: 'abc12345' }, disposition: 'reused', reason: 'compatible Room; state preserved', modified: true }))
+      }
+      if (req.url === '/v1/rooms' && req.method === 'POST') {
+        res.writeHead(409)
+        return void res.end(JSON.stringify({ code: 'ROOM_REUSE_REQUIRED', evidence: { roomId: 'abc12345' } }))
       }
       if (req.url === '/v1/rooms/abc12345/changes' && req.method === 'POST') {
         const body = JSON.parse(raw)
@@ -246,6 +271,32 @@ beforeAll(async () => {
           recoveryGuidance: ['export or commit first']
         }))
       }
+      if (req.url === '/v1/rooms/abc12345/browsers' && req.method === 'POST') {
+        return void res.end(JSON.stringify(browserAllocation))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/inspect` && req.method === 'POST') {
+        const body = JSON.parse(raw)
+        if (body.token !== BROWSER_TOKEN) {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          return void res.end(JSON.stringify({ error: 'The token presented does not own this session.', code: 'CLIENT_BROWSER_FORBIDDEN' }))
+        }
+        return void res.end(JSON.stringify({
+          session: browserAllocation.session,
+          owner: { roomId: 'abc12345', project: 'demo', nickname: 'dev' },
+          liveness: { processAlive: true, cdpReachable: true, browserVersion: 'Chrome/140' },
+          connection: { endpoint: browserAllocation.endpoint, activeClients: 0 },
+          targets: [{ targetId: 't1', type: 'page', url: 'about:blank', title: '' }]
+        }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/navigate` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, url: 'http://127.0.0.1:1/', finalUrl: 'http://127.0.0.1:1/', title: 'demo', loaded: true }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/screenshot` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, mimeType: 'image/png', contentBase64: ARTIFACT_PNG.toString('base64'), sizeBytes: ARTIFACT_PNG.byteLength }))
+      }
+      if (req.url === `/v1/browsers/${BROWSER_SESSION}/release` && req.method === 'POST') {
+        return void res.end(JSON.stringify({ sessionId: BROWSER_SESSION, roomId: 'abc12345', released: true, processStopped: true, profileRemoved: true }))
+      }
       res.writeHead(404).end('not found')
     })
   })
@@ -256,7 +307,7 @@ beforeAll(async () => {
 afterAll(() => server.close())
 
 function client(): ControlClient {
-  return new ControlClient({ port, token: TOKEN, pid: 0, version: '0.4.1' })
+  return new ControlClient({ port, token: TOKEN, pid: 0, ...CONTROL_BUILD })
 }
 
 async function closedLoopbackPort(): Promise<number> {
@@ -278,7 +329,7 @@ describe('ControlClient', () => {
   })
 
   it('sends bearer token (401 without)', async () => {
-    const bad = new ControlClient({ port, token: 'wrong', pid: 0, version: '0.4.1' })
+    const bad = new ControlClient({ port, token: 'wrong', pid: 0, ...CONTROL_BUILD })
     await expect(bad.listRooms()).rejects.toThrow(/401/)
   })
 
@@ -298,7 +349,7 @@ describe('ControlClient', () => {
 describe('resilientClient', () => {
   it('re-reads control info and retries a read-only request once when DevHotel restarted', async () => {
     let connects = 0
-    const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, version: 'x' })
+    const stale = new ControlClient({ port: 1, token: 'dead', pid: 0, ...CONTROL_BUILD })
     const wrapped = resilientClient(async () => (connects++ === 0 ? stale : client()))
     const rooms = await wrapped.listRooms()
     expect(rooms).toHaveLength(1)
@@ -308,7 +359,7 @@ describe('resilientClient', () => {
   it('retries a mutation only when ECONNREFUSED proves the first request never connected', async () => {
     let connects = 0
     const closedPort = await closedLoopbackPort()
-    const unavailable = new ControlClient({ port: closedPort, token: TOKEN, pid: 0, version: 'x' })
+    const unavailable = new ControlClient({ port: closedPort, token: TOKEN, pid: 0, ...CONTROL_BUILD })
     const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
     const wrapped = resilientClient(async () => (connects++ === 0 ? unavailable : client()))
 
@@ -382,7 +433,7 @@ describe('resilientClient', () => {
   it('reconnects and retries a mutation rejected with 401 before routing', async () => {
     let connects = 0
     const before = seen.filter((request) => request.url === '/v1/rooms/abc12345/changes').length
-    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, ...CONTROL_BUILD })
     const wrapped = resilientClient(async () => (connects++ === 0 ? unauthorized : client()))
 
     await expect(wrapped.applyChange('abc12345', { kind: 'node-version', version: '24' })).resolves.toEqual(
@@ -395,7 +446,7 @@ describe('resilientClient', () => {
   it('reports a transport failure on the safe 401 replay as an ambiguous mutation', async () => {
     let connects = 0
     let replayCalls = 0
-    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, version: 'x' })
+    const unauthorized = new ControlClient({ port, token: 'stale-token', pid: 0, ...CONTROL_BUILD })
     const disconnected = {
       async applyChange() {
         replayCalls++
@@ -433,7 +484,7 @@ describe('resilientClient', () => {
     // not attempt to resolve it as a promise (this crashed the stdio server)
     const returned = await (async () => wrapped)()
     expect(returned).toBe(wrapped)
-    await expect(returned.ping()).resolves.toEqual({ version: '0.4.1' })
+    await expect(returned.ping()).resolves.toEqual(CONTROL_BUILD)
   })
 
   it('does not mask real API errors with a reconnect', async () => {
@@ -459,6 +510,21 @@ describe('makeTools', () => {
   const tools = makeTools(async () => client())
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
 
+  it('sends acquire/create task identities through their respective client routes', async () => {
+    for (const [name, route] of [['acquire_room', '/v1/rooms/acquire'], ['create_room', '/v1/rooms']]) {
+      const result = await byName[name!]!.handler({ sourceType: 'empty', sourceRef: '', project: 'demo', nickname: 'dev', taskId: 'task-97', issueRef: 'issue-97', runtimeVersion: '22' })
+      expect(seen.at(-1)).toMatchObject({ method: 'POST', url: route, body: { taskId: 'task-97', issueRef: 'issue-97', planOverrides: { runtimeVersion: '22' } } })
+      if (name === 'acquire_room') {
+        expect(result.isError).not.toBe(true)
+        expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({ room: { id: 'abc12345' }, disposition: 'reused', modified: true })
+      } else {
+        expect(result.isError).toBe(true)
+        expect(JSON.stringify(result.content)).toContain('ROOM_REUSE_REQUIRED')
+        expect(JSON.stringify(result.content)).toContain('abc12345')
+      }
+    }
+  })
+
   it('exposes the full room-operations tool set', () => {
     expect(Object.keys(byName).sort()).toEqual(
       [
@@ -483,6 +549,7 @@ describe('makeTools', () => {
         'check_room',
         'clone_room',
         'copy_diagnostic',
+        'acquire_room',
         'create_room',
         'delete_room',
         'hotel_github_install',
@@ -513,13 +580,19 @@ describe('makeTools', () => {
         'start_room',
         'sync_from_host',
         'undo_change',
-        'export_room_artifact'
+        'export_room_artifact',
+        'allocate_client_browser',
+        'attach_client_browser',
+        'inspect_client_browser',
+        'navigate_client_browser',
+        'screenshot_client_browser',
+        'release_client_browser'
       ].sort()
     )
   })
 
   it('reports the package release metadata', () => {
-    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.2' })
+    expect(MCP_METADATA).toEqual({ name: 'devhotel', version: '0.5.4' })
   })
 
   function firstText(res: { content: ({ type: string } & Record<string, unknown>)[] }): string {
@@ -532,6 +605,15 @@ describe('makeTools', () => {
     const res = await byName.list_rooms!.handler({})
     expect(res.isError).toBeUndefined()
     expect(firstText(res)).toContain('abc12345')
+  })
+
+  it('hotel_status returns the exact build and sanitized update target', async () => {
+    const res = await byName.hotel_status!.handler({})
+    const status = JSON.parse(firstText(res))
+    expect(status).toMatchObject({
+      ...CONTROL_BUILD,
+      update: { state: 'ready', targetVersion: '0.5.0' }
+    })
   })
 
   it('run_in_room forwards argv and returns exec result', async () => {
@@ -558,6 +640,35 @@ describe('makeTools', () => {
         association: { changeId: '11111111-2222-4333-8444-555555555555' }
       }
     })
+  })
+
+  it('allocates, drives, inspects and releases a Client Browser by session and token', async () => {
+    const allocated = await byName.allocate_client_browser!.handler({ roomId: 'abc12345', headless: true })
+    expect(allocated.isError).toBeUndefined()
+    expect(firstText(allocated)).toContain(BROWSER_TOKEN)
+    expect(firstText(allocated)).toContain(`/cdp/${BROWSER_SESSION}/${BROWSER_TOKEN}`)
+    expect(seen.findLast((request) => request.url === '/v1/rooms/abc12345/browsers')).toMatchObject({ body: { headless: true } })
+
+    const inspected = await byName.inspect_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(inspected.isError).toBeUndefined()
+    expect(firstText(inspected)).toContain('"cdpReachable": true')
+    expect(firstText(inspected)).toContain('"roomId": "abc12345"')
+
+    const stolen = await byName.inspect_client_browser!.handler({ sessionId: BROWSER_SESSION, token: 'cbt_ffffffffffffffffffffffffffffffff' })
+    expect(stolen.isError).toBe(true)
+    expect(firstText(stolen)).toContain('does not own')
+
+    const navigated = await byName.navigate_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN, url: 'http://127.0.0.1:1/' })
+    expect(navigated.isError).toBeUndefined()
+    expect(seen.findLast((request) => request.url === `/v1/browsers/${BROWSER_SESSION}/navigate`)).toMatchObject({ body: { token: BROWSER_TOKEN, url: 'http://127.0.0.1:1/' } })
+
+    const shot = await byName.screenshot_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(shot.isError).toBeUndefined()
+    expect(shot.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png', data: ARTIFACT_PNG.toString('base64') })
+
+    const released = await byName.release_client_browser!.handler({ sessionId: BROWSER_SESSION, token: BROWSER_TOKEN })
+    expect(released.isError).toBeUndefined()
+    expect(firstText(released)).toContain('"profileRemoved": true')
   })
 
   it('runs the locale matrix as a receipts-only composite tool', async () => {

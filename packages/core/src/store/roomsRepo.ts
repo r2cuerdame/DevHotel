@@ -1,8 +1,10 @@
 import type {
+  CreateRoomInput,
   PmKind,
   ProviderKind,
   RuntimeKind,
   RoomOsSettings,
+  RoomLifecycleMetadata,
   RoomRecord,
   RoomServices,
   RoomStatus,
@@ -11,6 +13,7 @@ import type {
   WorkspaceSyncStatus
 } from '@devhotel/shared'
 import type { Db } from './db'
+import { isCompatibleRoom } from '../roomIdentity'
 
 interface RoomRow {
   id: string
@@ -44,6 +47,8 @@ interface RoomRow {
 }
 
 interface ExtraJson {
+  taskId?: string
+  issueRef?: string
   services?: RoomServices
   os?: RoomOsSettings
   agentHostSync?: boolean
@@ -54,6 +59,9 @@ interface ExtraJson {
     orientation?: 'portrait' | 'landscape'
   }
   windows?: unknown
+  lastActivityAt?: string
+  pinned?: boolean
+  lifecycle?: RoomLifecycleMetadata
 }
 
 function parseExtra(extra: string): unknown {
@@ -72,6 +80,8 @@ function rowToRoom(row: RoomRow): RoomRecord {
 
   return {
     id: row.id,
+    ...(extra.taskId ? { taskId: extra.taskId } : {}),
+    ...(extra.issueRef ? { issueRef: extra.issueRef } : {}),
     project: row.project,
     nickname: row.nickname,
     roomNumber: row.room_number,
@@ -105,6 +115,9 @@ function rowToRoom(row: RoomRow): RoomRecord {
     hostPort: row.host_port,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
+    ...(extra.lastActivityAt !== undefined ? { lastActivityAt: extra.lastActivityAt } : {}),
+    ...(extra.pinned !== undefined ? { pinned: extra.pinned } : {}),
+    ...(extra.lifecycle !== undefined ? { lifecycle: extra.lifecycle } : {}),
     thumbPath: row.thumb_path,
   }
 }
@@ -218,6 +231,7 @@ export interface RoomsRepo {
   create(r: RoomRecord): void
   get(id: string): RoomRecord | null
   list(): RoomRecord[]
+  findCompatible(input: CreateRoomInput): RoomRecord | null
   update(id: string, patch: Partial<RoomRecord>): void
   /** Atomically publish the Room workspace pointer and its matching dependency pointer. */
   publishWorkingState(input: {
@@ -238,7 +252,12 @@ export interface RoomsRepo {
     expectedWorkspaceVolumeRevision: number
     expectedStateRevision: number
   }): boolean
-  delete(id: string): void
+  /**
+   * `keepOperationId` survives the cascade. Exactly one operation ever needs
+   * that: the tracked deletion doing the cascading, whose record is the only
+   * answer a caller who lost the response can still read.
+   */
+  delete(id: string, keepOperationId?: string): void
   nextRoomNumber(): number
 }
 
@@ -286,11 +305,16 @@ export function roomsRepo(db: Db): RoomsRepo {
           r.lastUsedAt,
           r.thumbPath,
           JSON.stringify({
+            taskId: r.taskId,
+            issueRef: r.issueRef,
             services: r.services ?? {},
             os: r.os ?? { env: {} },
             ...(r.agentHostSync !== undefined ? { agentHostSync: r.agentHostSync } : {}),
             ...(r.android ? { android: r.android } : {}),
-            ...(r.windows ? { windows: r.windows } : {})
+            ...(r.windows ? { windows: r.windows } : {}),
+            ...(r.lastActivityAt !== undefined ? { lastActivityAt: r.lastActivityAt } : {}),
+            ...(r.pinned !== undefined ? { pinned: r.pinned } : {}),
+            ...(r.lifecycle !== undefined ? { lifecycle: r.lifecycle } : {})
           }),
         )
     },
@@ -304,23 +328,36 @@ export function roomsRepo(db: Db): RoomsRepo {
         .all() as unknown as RoomRow[]
       return rows.map(rowToRoom)
     },
+    findCompatible(input) {
+      return this.list().find((room) => isCompatibleRoom(room, input)) ?? null
+    },
     update(id, patch) {
       const cols = patchToColumns(patch)
       if (
+        patch.taskId !== undefined ||
+        patch.issueRef !== undefined ||
         patch.services !== undefined ||
         patch.os !== undefined ||
         patch.android !== undefined ||
         patch.agentHostSync !== undefined ||
-        patch.windows !== undefined
+        patch.windows !== undefined ||
+        patch.lastActivityAt !== undefined ||
+        patch.pinned !== undefined ||
+        patch.lifecycle !== undefined
       ) {
         const row = sqlite.prepare('SELECT extra FROM rooms WHERE id = ?').get(id) as { extra: string } | undefined
         const parsedExtra = parseExtra(row?.extra ?? '{}')
         const extra = isRecord(parsedExtra) ? parsedExtra as ExtraJson : {}
+        if (patch.taskId !== undefined) extra.taskId = patch.taskId
+        if (patch.issueRef !== undefined) extra.issueRef = patch.issueRef
         if (patch.services !== undefined) extra.services = patch.services
         if (patch.os !== undefined) extra.os = patch.os
         if (patch.android !== undefined) extra.android = patch.android
         if (patch.agentHostSync !== undefined) extra.agentHostSync = patch.agentHostSync
         if (patch.windows !== undefined) extra.windows = patch.windows
+        if (patch.lastActivityAt !== undefined) extra.lastActivityAt = patch.lastActivityAt
+        if (patch.pinned !== undefined) extra.pinned = patch.pinned
+        if (patch.lifecycle !== undefined) extra.lifecycle = patch.lifecycle
         cols['extra'] = JSON.stringify(extra)
       }
       const names = Object.keys(cols)
@@ -382,12 +419,17 @@ export function roomsRepo(db: Db): RoomsRepo {
       )
       return updated.changes === 1
     },
-    delete(id) {
+    delete(id, keepOperationId) {
       sqlite.exec('BEGIN IMMEDIATE')
       try {
         sqlite.prepare('DELETE FROM changes WHERE room_id = ?').run(id)
         sqlite.prepare('DELETE FROM checks WHERE room_id = ?').run(id)
-        sqlite.prepare('DELETE FROM operations WHERE room_id = ?').run(id)
+        // The deletion itself runs as a tracked operation, and its record is
+        // the only way a caller who lost the response learns that the Room is
+        // gone. Cascading that one row away would delete the receipt for the
+        // very mutation performing the cascade; every other operation of this
+        // Room still goes with it.
+        sqlite.prepare('DELETE FROM operations WHERE room_id = ? AND id IS NOT ?').run(id, keepOperationId ?? null)
         sqlite
           .prepare(
             `DELETE FROM settings

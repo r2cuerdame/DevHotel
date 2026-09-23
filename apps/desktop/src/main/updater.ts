@@ -19,6 +19,7 @@ export interface UpdaterController {
 
 export function setupUpdater(win: BrowserWindow): UpdaterController {
   let currentStatus: UpdateStatusInfo = { state: 'idle' }
+  let targetVersion: string | undefined
   const statusListeners = new Set<() => void>()
 
   const publish = (info: UpdateStatusInfo): void => {
@@ -44,11 +45,22 @@ export function setupUpdater(win: BrowserWindow): UpdaterController {
   // every Room and stopped the gateway; a normal app quit must not bypass it.
   autoUpdater.autoInstallOnAppQuit = false
   autoUpdater.on('checking-for-update', () => publish({ state: 'checking' }))
-  autoUpdater.on('update-not-available', () => publish({ state: 'up-to-date' }))
-  autoUpdater.on('update-available', (info) => publish({ state: 'available', version: info.version }))
-  autoUpdater.on('download-progress', (p) => publish({ state: 'downloading', detail: `${Math.round(p.percent)}%` }))
+  autoUpdater.on('update-not-available', () => {
+    targetVersion = undefined
+    publish({ state: 'up-to-date' })
+  })
+  autoUpdater.on('update-available', (info) => {
+    targetVersion = info.version
+    publish({ state: 'available', version: targetVersion })
+  })
+  autoUpdater.on('download-progress', (p) => publish({
+    state: 'downloading',
+    version: targetVersion,
+    detail: `${Math.round(p.percent)}%`
+  }))
   autoUpdater.on('update-downloaded', (info) => {
-    publish({ state: 'ready', version: info.version })
+    targetVersion = info.version
+    publish({ state: 'ready', version: targetVersion })
   })
   autoUpdater.on('error', (err) => publish({ state: 'error', detail: err.message }))
 

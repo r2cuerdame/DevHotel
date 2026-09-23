@@ -1,5 +1,215 @@
 # Changelog
 
+## Unreleased
+
+### Status and wake stay inside a Docker-process budget
+
+- `hotel_status`, the Room list, and Room inspection answer from one engine
+  health read plus one bulk owned-container inventory instead of inspecting
+  Rooms one at a time, and report their own `budget` (Docker processes started,
+  elapsed time). A running Android emulator still gets its fenced topology
+  proof, now from a single inspect.
+- The pinned Docker engine identity is proven once per process and reused by
+  Room operations; every health read re-proves it from the same `docker info`,
+  and any transport or context failure drops the proof so the next operation
+  must re-prove the endpoint before touching anything.
+- Wake re-proves the relay credential once per verification instead of on every
+  poll, reads the published relay port from the anchor it already inspected,
+  inspects only the network the anchor is attached to, and settles already
+  labelled volumes from the volume listing. Room logs record the Docker
+  processes each wake used.
+- One Room event now triggers at most one renderer refresh of each kind and one
+  debounced tray rebuild, instead of duplicate refreshes and a tray rebuild
+  with its own health probe per event.
+
+### Isolated Client Browsers for agent web automation (#114)
+
+- Agents can borrow a DevHotel-owned Chromium per Room with
+  `allocate_client_browser` (`POST /v1/rooms/:id/browsers`). Every session is
+  its own process and profile — cookies, localStorage, sessionStorage, tabs —
+  and is reachable only through a token-gated loopback endpoint
+  (`/cdp/<sessionId>/<token>`) that Playwright's `connectOverCDP`, puppeteer
+  and raw CDP clients consume unchanged. Two Rooms, or two agents, never share
+  login state and cannot attach to each other's browser without the token.
+- `attach_client_browser`, `inspect_client_browser` (owner, liveness,
+  tunnelled client count, page targets), `navigate_client_browser`,
+  `screenshot_client_browser` and `release_client_browser` complete the
+  surface; fifty-nine MCP tools are now available.
+- A Room's browsers are released when the Room sleeps or is deleted and on
+  DevHotel shutdown; startup stops and cleans browsers and profiles a previous
+  process left behind, only after proving the process owns that profile.
+- Only the token's SHA-256 digest is stored. Tokens never appear in listings,
+  inspection or logs.
+- `docs/client-browser.md` explains how the Client Browser capability differs
+  from the Web Server Room capability.
+
+### Agents can tear down sleeping, fully-synced Host-linked Rooms (#90)
+
+- `DELETE /v1/rooms/:id` (and the `delete_room` MCP tool) no longer answers
+  `403` for every Host-linked Room. A `linked-folder` or `legacy-host-bind`
+  Room may be deleted by an agent while it is `sleeping` with `syncStatus`
+  `synced` or `legacy`; awake Rooms and Rooms holding unsynced Room-owned edits
+  stay a human decision. Deleting never touches the Host folder, so disposable
+  test Rooms stop piling up bridge networks and volumes on the host.
+
+### Gateway routes are revoked for dead, broken, and sleeping Rooms (#87)
+
+- The Gateway drops a Room's route as soon as its hostPort is cleared, when a
+  wake or check fails, and when runtime observation proves the workload is
+  dead, so a stopped Room answers with the 404 page instead of trapping the
+  browser in the 502 reload loop.
+- `restart_web` and `start_room` on an already-running Room re-derive the
+  gateway route after an observation-driven or check-driven revocation, and
+  inspections omit `urls.app` until ingress is restored (#94).
+
+### Volume GC proves its work in one pass, on a clock (#63)
+
+- A real volume GC pass now runs one `docker system df` inventory and re-proves
+  each candidate from a single-volume inspection under its Room lock, finishes
+  within an explicit wall-clock deadline, and counts every removal attempt —
+  failed ones included — against `maxVolumes`; `maxBytes` stays fail-closed.
+  Every candidate it did not reach is reported with the bound that stopped it.
+- Rooms are fenced by durable recovery intents (pending restores and exports,
+  recovery diagnostics, explicit fences), not by the generic `attention` status.
+  The #61 recovery Rooms remain fenced through their pending-restore records.
+- Dependencies for a Node major the Room no longer runs, and data for a service
+  the Room no longer declares, are classified positively stale — only with exact
+  ownership, known size, zero attachments and no undo reference.
+- Superseded package-install history no longer pins generations forever: a row
+  retains its previous generations only while its staged generation is the
+  published one, which is exactly when it can still be undone.
+- Clean dependency reinstalls and Room resets reserve the next dependency
+  generation durably before creating any volume, so a crash can never reuse a
+  half-written generation name.
+- `pnpm --filter @devhotel/core report:volume-gc` prints the read-only host
+  dry-run: every volume, its class, its bytes and the reason it is safe or held.
+
+### The managed runtime updates, rolls back and uninstalls on its own terms
+
+- The runtime is now a versioned product component. Every release this build can
+  stand up is listed with its pinned artifacts and digests, and older releases
+  stay listed so an update that fails can re-fetch and re-verify exactly the one
+  the install came from.
+- An install on an older runtime is updated once per launch, journal first: the
+  update record lands on disk before the download, the manifest adopts the new
+  version only once an apply is in flight, and the runtime has to produce an
+  exact healthy identity proof before anything commits. No crash or reboot can
+  leave a runtime whose version nobody can name.
+- Room data survives an update and a rollback. The VM is proved owned at the old
+  version, de-registered and rebuilt at the new one, while the state disk the
+  Rooms live on is never named by the teardown, detached or recreated.
+- A target that cannot be made healthy is rolled back to the version that worked,
+  by the same migration run backwards. The rolled-back update stays on disk as a
+  barrier, so the next launch keeps the working runtime instead of walking back
+  into the update that just broke — and says which runtime the user is on and
+  why.
+- An update interrupted by a crash or a reboot is recovered by rule rather than
+  guess: nothing applied is retried, a migration that already landed is finished
+  forward, and an update that has burned two attempts is put back.
+- Uninstall now asks which promise you meant. **Uninstall app only** removes the
+  application, DevHotel CA trust and autostart, leaving Rooms, their disks and
+  the runtime in place for a reinstall to pick up. **Delete everything** also
+  deletes Rooms, app data and the runtime virtual machine with its disks. Cancel
+  stays the default.
+- Neither scope touches WSL distributions, virtual machines, switches or images
+  DevHotel did not create, and superseded boot images are pruned only by the
+  digest names this provider itself wrote.
+  ([#110](https://github.com/r2cuerdame/DevHotel/issues/110))
+
+### Web Rooms can run without an external Docker Engine
+
+- Web Rooms now run inside the DevHotel-managed Linux runtime when it is
+  healthy, and fall back to the clearly labelled external compatibility engine
+  when it is not. Which one a launch got is reported rather than assumed, because
+  it is the only thing that explains a Room's behaviour.
+  ([#107](https://github.com/r2cuerdame/DevHotel/issues/107))
+- The Room model itself is unchanged: the same anchor/namespace layout, per-Room
+  networks, owned volume generations, ownership labels and relay-token ingress.
+  Two Rooms still serve one internal port, and Control API and MCP responses stay
+  backend-neutral.
+- Managed runtime `0.2.0` adds a container engine, a persistent state disk and a
+  Room command channel to the guest. Guest packages are resolved once and served
+  from a cache on that disk afterwards, so only the first provision needs the
+  network.
+- Host paths never cross into the guest implicitly. A Room file transfer is
+  staged explicitly both ways, because a Host-path bind against an engine inside
+  a VM does not fail — it resolves against the wrong filesystem.
+- Not yet accepted: the guest half has not been booted, because this Host has
+  Hyper-V uninstalled and Docker Desktop present. See
+  `docs/verification/issue-107-managed-web-rooms.md` for the exact live gate.
+
+### Rooms wake warm instead of being rebuilt
+
+- Waking a sleeping Room now restarts its retained containers in place when
+  every one of them is still the exact owned container the Room slept with and
+  its configuration still matches the Room record. A warm Web Room answers again
+  in about 4 seconds and keeps its Room Services' data and cache volume, because
+  nothing is removed and recreated. Reuse is fail-closed: anything unprovable —
+  a missing or unclean container, a changed image, start command, environment,
+  relayed port, volume set or service version, or a relay credential lost to an
+  app restart — falls back to the existing recreation path and records why on
+  the wake's `container-start` stage. ([#78](https://github.com/r2cuerdame/DevHotel/issues/78))
+- Playwright browser downloads and XDG caches now live on the Room cache volume
+  instead of the container's writable layer, so they survive a Room recreate
+  rather than being re-fetched. ([#78](https://github.com/r2cuerdame/DevHotel/issues/78))
+- Android Rooms deliberately keep recreating their emulator on wake. A retained
+  docker-android container cannot be restarted: the stop is always a SIGKILL, so
+  Xvfb leaves a read-only `/tmp/.X0-lock` behind and the emulator then fails with
+  "no Qt platform plugin could be initialized" even after its one-shot KVM
+  bootstrap identity is repaired. They refuse the warm path immediately rather
+  than spending a doomed emulator boot on every wake, and the warm Android path
+  is tracked with [#108](https://github.com/r2cuerdame/DevHotel/issues/108).
+
+
+## 0.5.4 - 2026-09-15
+
+### Android Rooms are materially faster in use
+
+- New Android Rooms default to the fast software-rendering profile, matching the
+  normal 540x1140 Room preview instead of spending SwiftShader work on pixels
+  that are immediately downscaled. The balanced profile is also reduced from
+  75% to 50%, so existing balanced Rooms become lighter on their next emulator
+  recreation without changing their saved profile choice.
+- Measured on the same KVM-backed Room, guest screen capture dropped from about
+  919 ms at 1080x2280 to about 298 ms at 540x1140, while repeated Settings
+  launches also became consistently faster.
+- Retained docker-android emulator containers now repair the image's one-shot
+  KVM bootstrap identity before restart. This prevents a sleep/recovery cycle
+  from leaving the container running while qemu never relaunches because
+  `/dev/kvm` ownership could no longer be repaired.
+- PurplePulse startup telemetry now sends schema v2, uses a UTC daily boundary,
+  preserves existing installation identity/state across the upgrade, and keeps
+  the request bounded to a short no-retry timeout.
+
+## 0.5.3 — 2026-09-14
+
+### Agents acquire and reuse compatible Rooms
+
+- `acquire_room` now selects an existing Room for the same canonical source,
+  project, provider, and runtime settings, wakes it when needed, and preserves
+  its working state. Task and issue identities still allow intentional parallel
+  work without creating accidental duplicates. ([#98](https://github.com/r2cuerdame/DevHotel/pull/98))
+- Direct agent creation now fails with `ROOM_REUSE_REQUIRED` when a compatible
+  Room already exists, and concurrent acquisition is serialized per source so
+  two requests cannot race into duplicate Rooms.
+
+### Idle Rooms follow a safe automatic lifecycle
+
+- Desktop lifecycle sweeps can sleep idle Rooms after one hour and mark them
+  for expiry after seven days, with a 24-hour grace period before deletion.
+  Valid command use wakes lifecycle-slept Rooms and records every transition.
+- Automatic deletion fails closed for pinned, modified, database-bearing,
+  non-Web, or otherwise unsafe Rooms, so activity management cannot discard
+  valuable working state. ([#99](https://github.com/r2cuerdame/DevHotel/pull/99))
+
+### Anonymous daily startup telemetry
+
+- Packaged builds now send one privacy-safe PurplePulse startup ping per local
+  day with an anonymous install ID, app version, normalized OS, and Electron
+  platform metadata; test builds are isolated from production telemetry and
+  failures remain silent. ([#103](https://github.com/r2cuerdame/DevHotel/pull/103),
+  [#102](https://github.com/r2cuerdame/DevHotel/issues/102))
+
 ## 0.5.2 — 2026-09-07
 
 ### Interrupted Android locale runs recover after a restart

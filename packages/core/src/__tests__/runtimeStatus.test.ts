@@ -1,5 +1,6 @@
 import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { RoomRuntimeObservation } from '../backend/types'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
@@ -28,6 +29,54 @@ describe('Room runtime status', () => {
     })
     return { backend, orch }
   }
+
+  it('reports managed-runtime readiness separately from the selected backend mode', async () => {
+    const userData = tempDir()
+    dirs.push(userData)
+    const db = testDb()
+    dbs.push(db)
+    const managedRuntimeStatus = vi.fn(async () => ({
+      state: 'preparing' as const,
+      phase: 'provisioning-runtime-provider' as const,
+      detail: 'The DevHotel-managed runtime is preparing.',
+      support: {
+        supported: true,
+        code: 'ready' as const,
+        detail: 'Windows hypervisor is active.',
+        hypervisorPresent: true,
+        virtualizationFirmwareEnabled: true,
+        slat: true,
+        hyperVPowerShellAvailable: true,
+        hyperVManagementAccessible: true
+      },
+      runtimeId: 'runtime-observed',
+      runtimeVersion: '0.1.0',
+      artifactDigests: { 'linux-runtime': 'a'.repeat(64) }
+    }))
+    const orch = new RoomOrchestrator({
+      userData,
+      backend: new FakeBackend(),
+      gateway: new FakeGateway().asGateway(),
+      db,
+      appVersion: 'test',
+      managedRuntimeStatus,
+      runtimeMode: 'compatibility'
+    })
+
+    expect(await orch.hotelStatus()).toMatchObject({
+      runtime: {
+        mode: 'compatibility',
+        managed: {
+          state: 'preparing',
+          phase: 'provisioning-runtime-provider',
+          runtimeId: 'runtime-observed',
+          runtimeVersion: '0.1.0',
+          artifactDigests: { 'linux-runtime': 'a'.repeat(64) }
+        }
+      }
+    })
+    expect(managedRuntimeStatus).toHaveBeenCalledOnce()
+  })
 
   it('does not report a recorded-ready Room as ready when its runtime stopped', async () => {
     const { backend, orch } = setup()
@@ -186,5 +235,111 @@ describe('Room runtime status', () => {
       code: 'ROOM_RUNTIME_NOT_RUNNING'
     })
     expect(backend.execInRoom).not.toHaveBeenCalled()
+  })
+
+  it('drives status from one bulk owned-container inventory instead of per-Room probes', async () => {
+    const { backend, orch } = setup()
+    const awake = Array.from({ length: 4 }, (_, i) =>
+      makeRoom({ id: `awake00${i}`, roomNumber: 300 + i, domain: `awake00${i}.localhost`, status: 'ready' })
+    )
+    const asleep = Array.from({ length: 16 }, (_, i) => {
+      const id = `sleep0${String(i).padStart(2, '0')}`
+      return makeRoom({ id, roomNumber: 400 + i, domain: `${id}.localhost`, status: 'sleeping', hostPort: null })
+    })
+    for (const room of [...awake, ...asleep]) orch.rooms.create(room)
+    backend.webStateValue = 'running'
+    const inventory = vi.fn(async (roomIds: readonly string[]) => {
+      const out = new Map<string, RoomRuntimeObservation>()
+      for (const id of roomIds) out.set(id, { main: id === 'awake001' ? 'exited' : 'running', emulator: 'missing' })
+      return out
+    })
+    backend.observeRoomRuntimes = inventory
+    const webState = vi.spyOn(backend, 'webState')
+
+    const hotel = await orch.hotelStatus()
+    const listed = await orch.listRoomsRuntime()
+
+    expect(inventory).toHaveBeenCalledTimes(2)
+    expect(inventory.mock.calls[0]?.[0]).toEqual(awake.map((room) => room.id))
+    expect(webState).not.toHaveBeenCalled()
+    expect(hotel.rooms.find((room) => room.id === 'awake001')).toMatchObject({
+      status: 'broken',
+      runtimeStatus: { state: 'dead', main: 'exited' }
+    })
+    expect(hotel.rooms.filter((room) => room.runtimeStatus.state === 'running')).toHaveLength(3)
+    expect(hotel.rooms.filter((room) => room.runtimeStatus.state === 'stopped')).toHaveLength(16)
+    expect(listed.find((room) => room.id === 'awake001')?.status).toBe('broken')
+    expect(hotel.budget).toEqual({ dockerSpawns: expect.any(Number), elapsedMs: expect.any(Number) })
+  })
+
+  it('proves a running Android emulator topology per Room and trusts the inventory for the rest', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      internalPort: 6080,
+      android: { device: 'Pixel 6', version: '11.0' },
+      status: 'ready'
+    })
+    orch.rooms.create(room)
+    backend.observeRoomRuntimes = async (roomIds) =>
+      new Map(roomIds.map((id) => [id, { main: 'running', emulator: 'running' } as RoomRuntimeObservation]))
+    const emulatorState = vi.fn(async () => {
+      throw new Error('Android execution topology participant disappeared')
+    })
+    backend.emulatorState = emulatorState
+
+    const unproven = await orch.inspectRoomRuntime(room.id)
+
+    expect(emulatorState).toHaveBeenCalledOnce()
+    expect(unproven.room.status).toBe('attention')
+    expect(unproven.runtimeStatus).toMatchObject({ state: 'degraded', main: 'running', emulator: 'unknown' })
+
+    backend.observeRoomRuntimes = async (roomIds) =>
+      new Map(roomIds.map((id) => [id, { main: 'running', emulator: 'exited' } as RoomRuntimeObservation]))
+    emulatorState.mockClear()
+    const exited = await orch.inspectRoomRuntime(room.id)
+
+    expect(emulatorState).not.toHaveBeenCalled()
+    expect(exited.runtimeStatus).toMatchObject({ state: 'degraded', main: 'running', emulator: 'exited' })
+  })
+
+  it('inspects one Room through a Room-scoped inventory without a separate health read', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({ status: 'ready' })
+    orch.rooms.create(room)
+    backend.webStateValue = 'running'
+    const health = vi.spyOn(backend, 'health')
+
+    const inspection = await orch.inspectRoomRuntime(room.id)
+
+    expect(backend.observeRoomRuntimesCalls).toEqual([[room.id]])
+    expect(health).not.toHaveBeenCalled()
+    expect(inspection.runtimeStatus.state).toBe('running')
+  })
+
+  it('falls back to per-Room probes when the bulk inventory itself fails', async () => {
+    const { backend, orch } = setup()
+    const room = makeRoom({ status: 'ready' })
+    orch.rooms.create(room)
+    backend.webStateValue = 'exited'
+    backend.observeRoomRuntimes = async () => {
+      throw new Error('inventory Room runtimes failed (exit 1): boom')
+    }
+
+    const hotel = await orch.hotelStatus()
+
+    expect(hotel.rooms[0]).toMatchObject({ status: 'broken', runtimeStatus: { state: 'dead', main: 'exited' } })
+  })
+
+  it('skips the inventory entirely when no Room expects a running runtime', async () => {
+    const { backend, orch } = setup()
+    orch.rooms.create(makeRoom({ status: 'sleeping', hostPort: null }))
+
+    const hotel = await orch.hotelStatus()
+
+    expect(backend.observeRoomRuntimesCalls).toEqual([])
+    expect(hotel.rooms[0]?.runtimeStatus.state).toBe('stopped')
   })
 })

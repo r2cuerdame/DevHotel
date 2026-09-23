@@ -121,6 +121,49 @@ describe('OciCliBackend.deleteRoomPod', () => {
     expect(mockedRunDocker.mock.calls.some(([args]) => args[0] === 'network' && args[1] === 'rm')).toBe(false)
   })
 
+  it('stops running services and leaves gracefully before any forced removal', async () => {
+    let listed = false
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'ps') {
+        if (listed) return ok
+        listed = true
+        return {
+          code: 0,
+          stdout: [
+            containerRow('aaa111', 'dh-r1-web', 'web', 'running'),
+            containerRow('ccc111', 'dh-r1-svc-postgres', 'svc-postgres', 'running'),
+            containerRow('ddd111', 'dh-r1-svc-redis', 'svc-redis', 'exited'),
+            containerRow('bbb222', 'dh-r1-anchor', 'anchor', 'running')
+          ].join('\n') + '\n',
+          stderr: ''
+        }
+      }
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        return { code: 1, stdout: '', stderr: 'Error: No such network' }
+      }
+      // A wedged web must not block the delete; the forced boundary follows.
+      if (args[0] === 'stop' && args.includes('aaa111')) return { code: 1, stdout: '', stderr: 'web is wedged' }
+      return ok
+    })
+
+    await expect(new OciCliBackend().deleteRoomPod(ROOM_ID, { volumes: false })).resolves.toEqual({
+      reclaimedBytes: 0
+    })
+    const commands = mockedRunDocker.mock.calls.map(([args]) => args)
+    const firstRemove = commands.findIndex((args) => args[0] === 'rm')
+    const stops = commands.filter((args) => args[0] === 'stop')
+    expect(stops).toEqual([
+      ['stop', '-t', '8', 'aaa111'],
+      ['stop', '-t', '5', 'ccc111'],
+      ['stop', '-t', '5', 'bbb222']
+    ])
+    expect(commands.findLastIndex((args) => args[0] === 'stop')).toBeLessThan(firstRemove)
+    expect(commands.filter((args) => args[0] === 'rm')).toEqual([
+      ['rm', '-f', 'aaa111', 'ccc111', 'ddd111'],
+      ['rm', '-f', 'bbb222']
+    ])
+  })
+
   it('throws when an owned volume cannot be removed', async () => {
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'ps') return ok

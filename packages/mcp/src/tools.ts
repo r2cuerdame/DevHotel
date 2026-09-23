@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
+  MAX_ADB_TIMEOUT_MS,
+  MAX_EXEC_TIMEOUT_MS,
   type OperationRecord,
   zAndroidActivityName,
   zAndroidAcceptanceReportId,
@@ -19,6 +21,9 @@ import {
   zArtifactId,
   zArtifactListLimit,
   zChangeId,
+  zClientBrowserProfileMode,
+  zClientBrowserSessionId,
+  zClientBrowserToken,
   zLeasePurpose,
   zPmKind,
   zQuickChange,
@@ -162,14 +167,56 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       handler: wrap(async () => (await getClient()).listRooms())
     },
     {
-      name: 'create_room',
+      name: 'acquire_room',
       description:
-        'Create a new isolated room from a git URL or as an empty Room. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the created room.',
+        'Default agent entry point: reuse a compatible Room by canonical source, project, provider, runtime profile and task identity, waking sleeping Rooms. Existing modified state is preserved and reported. Nicknames do not affect matching. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the selected room, disposition, reuse reason, modified flag, and cold/warm/reuse acquire-to-boot-ready-to-app-ready telemetry.',
       schema: {
         sourceType: z.enum(['managed-git', 'empty']),
         sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
         project: z.string().describe('project name, e.g. the repo name'),
         nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
+        taskId: z.string().trim().min(1).max(200).optional().describe('stable distinct task identity for parallel work'),
+        issueRef: z.string().trim().min(1).max(500).optional().describe('stable distinct issue identity for parallel work'),
+        provider: z
+          .enum(['web', 'android'])
+          .optional()
+          .describe("'web' (default) serves the site; 'android' builds APKs and previews the room-owned emulator screen"),
+        runtimeVersion: z.string().regex(/^\d+$/).optional().describe('Node major version override, e.g. "22"'),
+        pmKind: zPmKind.optional(),
+        startCommand: z.string().optional(),
+        internalPort: z.number().int().optional(),
+        https: z.boolean().optional()
+      },
+      handler: wrap(async (a) =>
+        (await getClient()).acquireRoom({
+          sourceType: a.sourceType,
+          sourceRef: a.sourceRef,
+          project: a.project,
+          nickname: a.nickname,
+          provider: a.provider,
+          taskId: a.taskId,
+          issueRef: a.issueRef,
+          planOverrides: {
+            runtimeVersion: a.runtimeVersion,
+            pmKind: a.pmKind,
+            startCommand: a.startCommand,
+            internalPort: a.internalPort,
+            https: a.https
+          }
+        })
+      )
+    },
+    {
+      name: 'create_room',
+      description:
+        'Exceptional low-level creation. Prefer acquire_room. A compatible duplicate is rejected with ROOM_REUSE_REQUIRED and candidate roomId unless a distinct taskId or issueRef is supplied. Local folders require an explicit human grant in the DevHotel app and are unavailable to agents. Returns the created room.',
+      schema: {
+        sourceType: z.enum(['managed-git', 'empty']),
+        sourceRef: z.string().describe('git URL for managed-git, empty string for empty'),
+        project: z.string().describe('project name, e.g. the repo name'),
+        nickname: z.string().describe('room nickname, e.g. "dev", "stage", "claude"'),
+        taskId: z.string().trim().min(1).max(200).optional().describe('stable distinct task identity for parallel work'),
+        issueRef: z.string().trim().min(1).max(500).optional().describe('stable distinct issue identity for parallel work'),
         provider: z
           .enum(['web', 'android'])
           .optional()
@@ -187,6 +234,8 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
           project: a.project,
           nickname: a.nickname,
           provider: a.provider,
+          taskId: a.taskId,
+          issueRef: a.issueRef,
           planOverrides: {
             runtimeVersion: a.runtimeVersion,
             pmKind: a.pmKind,
@@ -264,7 +313,10 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       schema: {
         roomId: zRoomId,
         cmd: z.array(z.string()).min(1).describe('argv array, e.g. ["pnpm","install"]'),
-        timeoutMs: z.number().int().positive().optional(),
+        // Capped at the control API's own maximum so an over-long request is
+        // refused here, with the real bound in the schema, instead of becoming
+        // a 400 the caller has to decode.
+        timeoutMs: z.number().int().positive().max(MAX_EXEC_TIMEOUT_MS).optional(),
         ...outputControls
       },
       handler: wrap(async (a) => (await getClient()).execInRoom(a.roomId, a.cmd, a.timeoutMs, outputSelection(a)))
@@ -396,7 +448,7 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
     {
       name: 'hotel_status',
       description:
-        'One read-only call answering "is DevHotel ready and what is actually running": app version, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
+        'One read-only call answering "is DevHotel ready and what is actually running": exact app build identity, durable startup state (startup.code = STARTUP_INIT_FAILED when initialization did not finish), pending/ready update target version, selected runtime mode, managed-runtime provisioning/identity/digests, isolation backend health, gateway ports/routes, and every room with recorded status plus live running/degraded/dead component state. It never starts or repairs a Room.',
       schema: {},
       handler: wrap(async () => (await getClient()).hotelStatus())
     },
@@ -942,9 +994,83 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       schema: {
         roomId: zRoomId,
         args: z.array(z.string()).min(1).describe('adb argv without the leading adb, e.g. ["install","-r","/workspace/app.apk"]'),
-        timeoutMs: z.number().int().positive().optional()
+        timeoutMs: z.number().int().positive().max(MAX_ADB_TIMEOUT_MS).optional()
       },
       handler: wrap(async (a) => (await getClient()).adbOnDevice(a.roomId, a.args, a.timeoutMs))
+    },
+    {
+      name: 'allocate_client_browser',
+      description:
+        "Borrow an isolated Chromium for web automation on behalf of this Room. This is the Client Browser capability — the thing that visits a site — and is separate from the Web Server Room that hosts one. Each allocation is its own process, profile, cookie jar, storage and tab set; nothing is shared with the Host's Chrome, other Rooms, or other agents. Returns the session, a secret token and a stable CDP endpoint: pass `endpoint.http` to Playwright's chromium.connectOverCDP (or `endpoint.ws` to any raw CDP client). Keep the token: every later call needs it and nobody without it can reach this browser. Ephemeral by default — the profile is deleted on release, Room sleep, Room delete and DevHotel restart. The Room must be awake.",
+      schema: {
+        roomId: zRoomId,
+        profileMode: zClientBrowserProfileMode.optional().describe("'ephemeral' (default) is wiped on release; 'persistent' keeps one Room-owned profile across sessions"),
+        headless: z.boolean().optional().describe('default true; false opens a visible window on the Host desktop')
+      },
+      handler: wrap(async (a) => {
+        const { roomId, ...body } = a
+        return (await getClient()).allocateClientBrowser(roomId, body)
+      })
+    },
+    {
+      name: 'attach_client_browser',
+      description:
+        'Re-fetch the CDP endpoint of a Client Browser session you already own. Requires the exact session ID and token from allocate_client_browser; any other token is refused, so two agents on the same Host cannot pick up each other’s browser by accident.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).attachClientBrowser(a.sessionId, a.token))
+    },
+    {
+      name: 'inspect_client_browser',
+      description:
+        'Status of one Client Browser session: which Room owns it, whether its process is alive and its CDP listener answers, the browser version, how many automation clients are tunnelled through its endpoint right now, and its open page targets. Call this when a Playwright/CDP connection misbehaves before allocating another browser.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).inspectClientBrowser(a.sessionId, a.token))
+    },
+    {
+      name: 'navigate_client_browser',
+      description:
+        'Navigate the session’s page to an http(s) URL (or about:blank) and wait for it to load; returns the final URL and title. Convenient for a quick check without wiring a CDP client; full automation belongs on the endpoint. Non-web schemes such as file: are refused.',
+      schema: {
+        sessionId: zClientBrowserSessionId,
+        token: zClientBrowserToken,
+        url: z.string().min(1).max(4096).describe('absolute http:// or https:// URL, or about:blank'),
+        timeoutMs: z.number().int().min(100).max(120_000).optional().describe('load wait budget, default 15000')
+      },
+      handler: wrap(async (a) => {
+        const { sessionId, ...body } = a
+        return (await getClient()).navigateClientBrowser(sessionId, body)
+      })
+    },
+    {
+      name: 'screenshot_client_browser',
+      description: 'Capture the session’s current page as an image and return it directly for review. Nothing is stored; use Room artifacts for durable evidence.',
+      schema: {
+        sessionId: zClientBrowserSessionId,
+        token: zClientBrowserToken,
+        format: z.enum(['png', 'jpeg']).optional(),
+        fullPage: z.boolean().optional().describe('capture beyond the viewport')
+      },
+      handler: async (a: { sessionId: string; token: string; format?: 'png' | 'jpeg'; fullPage?: boolean }): Promise<ToolResult> => {
+        try {
+          const { sessionId, ...body } = a
+          const shot = await (await getClient()).screenshotClientBrowser(sessionId, body)
+          return {
+            content: [
+              { type: 'text', text: JSON.stringify({ sessionId: shot.sessionId, mimeType: shot.mimeType, sizeBytes: shot.sizeBytes }, null, 2) },
+              { type: 'image', data: shot.contentBase64, mimeType: shot.mimeType }
+            ]
+          }
+        } catch (err) {
+          return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true }
+        }
+      }
+    },
+    {
+      name: 'release_client_browser',
+      description:
+        'Close the browser process and delete its ephemeral profile, dropping any client still tunnelled to it. No other Room or session is touched. Always release when your automation is done; a Room going to sleep or being deleted releases its browsers too.',
+      schema: { sessionId: zClientBrowserSessionId, token: zClientBrowserToken },
+      handler: wrap(async (a) => (await getClient()).releaseClientBrowser(a.sessionId, a.token))
     },
     {
       name: 'hotel_github_status',

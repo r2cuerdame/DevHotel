@@ -11,6 +11,7 @@ interface OperationRow {
   stage: string
   stages_json: string
   error_json: string | null
+  result_json: string | null
   started_at: string
   updated_at: string
   finished_at: string | null
@@ -27,9 +28,25 @@ function rowToRecord(row: OperationRow): OperationRecord {
     stage: row.stage as OperationStageKey,
     stages: JSON.parse(row.stages_json) as OperationStage[],
     error: row.error_json === null ? null : (JSON.parse(row.error_json) as OperationError),
+    ...(row.result_json === null ? {} : { result: JSON.parse(row.result_json) as unknown }),
     startedAt: row.started_at,
     updatedAt: row.updated_at,
     finishedAt: row.finished_at,
+  }
+}
+
+/**
+ * A result must never be the reason a terminal record cannot be saved. Anything
+ * that will not serialize is replaced by a note, so the caller still learns the
+ * outcome even when the payload itself is unrepresentable.
+ */
+function serializeResult(record: OperationRecord): string | null {
+  if (record.result === undefined) return null
+  try {
+    const json = JSON.stringify(record.result)
+    return json === undefined ? null : json
+  } catch {
+    return JSON.stringify({ unavailable: 'the operation result could not be stored as JSON' })
   }
 }
 
@@ -55,13 +72,15 @@ export function operationsRepo(db: Db): OperationsRepo {
       sqlite
         .prepare(
           `INSERT INTO operations (
-             id, kind, room_id, actor, request_key, status, stage, stages_json, error_json, started_at, updated_at, finished_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             id, kind, room_id, actor, request_key, status, stage, stages_json, error_json, result_json,
+             started_at, updated_at, finished_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              stage = excluded.stage,
              stages_json = excluded.stages_json,
              error_json = excluded.error_json,
+             result_json = excluded.result_json,
              updated_at = excluded.updated_at,
              finished_at = excluded.finished_at`
         )
@@ -75,6 +94,7 @@ export function operationsRepo(db: Db): OperationsRepo {
           record.stage,
           JSON.stringify(record.stages),
           record.error === null ? null : JSON.stringify(record.error),
+          serializeResult(record),
           record.startedAt,
           record.updatedAt,
           record.finishedAt

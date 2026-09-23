@@ -20,18 +20,26 @@ import {
   zAgentRenameBody,
   zApplyChangeBody,
   zAgentCreateRoomInput,
+  zAgentAcquireRoomInput,
   zAgentAdbBody,
   zArtifactId,
   zArtifactListLimit,
   zArtifactExportBody,
   zRoomArtifact,
   zAttachDeviceBody,
+  zAllocateClientBrowserBody,
+  zClientBrowserAuthBody,
+  zClientBrowserSessionId,
+  zNavigateClientBrowserBody,
+  zScreenshotClientBrowserBody,
   zCancelRequestBody,
   zCaptureScreenshotArtifactBody,
   zExecBody,
   zHeartbeatBody,
   zLogKind,
   zOperationId,
+  zOperationOnlyBody,
+  zOperationRequestQuery,
   zOperationWaitMs,
   zReleaseDeviceBody,
   zRoomId,
@@ -42,9 +50,14 @@ import {
   zSafeHostResyncBody,
   zUndoChangeBody,
   zVolumeGcBody,
+  zBuildIdentity,
+  zSemanticVersion,
   DeviceLeaseError,
   type ArtifactExportResult,
+  type BuildIdentity,
   type ControlInfo,
+  type PublicUpdateStatus,
+  type UpdateStatusInfo,
   type RoomArtifact
 } from '@devhotel/shared'
 import {
@@ -53,6 +66,7 @@ import {
   redactStructuredSecrets,
   sanitizeAndroidScreenshotArtifactMetadata,
   WorkspaceDriftError,
+  type RoomMutationOutcome,
   type RoomOrchestrator
 } from '@devhotel/core'
 import type { GitHubServiceStatus, RoomInspection, RoomRecord } from '@devhotel/shared'
@@ -108,11 +122,47 @@ function parseAndroidBody<T>(schema: InputSchema<T>, input: unknown): T {
   })
 }
 
+function parseClientBrowserInput<T>(schema: InputSchema<T>, input: unknown): T {
+  return parseRequestInput(schema, input, {
+    code: 'INVALID_CLIENT_BROWSER_REQUEST',
+    message: 'Client Browser request fields are invalid.',
+    recoveryHint: 'Send the session ID and token exactly as allocate_client_browser returned them, plus only the documented fields.'
+  })
+}
+
 function parseArtifactInput<T>(schema: InputSchema<T>, input: unknown): T {
   return parseRequestInput(schema, input, {
     code: 'INVALID_ARTIFACT_REQUEST',
     message: 'Screenshot artifact request fields are invalid.',
     recoveryHint: 'Use only the documented bounded screenshot artifact fields and value formats.'
+  })
+}
+
+/**
+ * One answer shape for every tracked mutation. When the work settled inside
+ * this call the route replies exactly as it always did; when the caller's own
+ * bounded `waitMs` ran out first, the durable operation is the answer, and its
+ * ID is what turns a lost response into a poll instead of a second mutation.
+ */
+function sendMutationOutcome<T>(
+  res: ServerResponse,
+  outcome: RoomMutationOutcome<T>,
+  sendResult: (value: T) => void
+): void {
+  if (outcome.result === undefined) {
+    // 202 while the work is still going; a terminal operation with no stored
+    // answer (a record written before results existed) is a finished 200.
+    sendJson(res, outcome.operation.status === 'running' ? 202 : 200, { operation: outcome.operation })
+    return
+  }
+  sendResult(outcome.result)
+}
+
+function parseOperationRequest(input: unknown): { operationId?: string; waitMs?: number } {
+  return parseRequestInput(zOperationOnlyBody, input, {
+    code: 'INVALID_OPERATION_REQUEST',
+    message: 'The operation identity or bounded wait is invalid.',
+    recoveryHint: 'Pass operationId as a UUID and waitMs as a whole number of milliseconds up to 600000.'
   })
 }
 
@@ -126,6 +176,25 @@ function parseWaitMs(raw: string | null): number {
 /** Hotel Services reachable by agents; populated after app startup wiring. */
 export interface HotelServicesRef {
   github: { status(): Promise<GitHubServiceStatus>; install(): Promise<GitHubServiceStatus> } | null
+  updateStatus?: () => UpdateStatusInfo
+}
+
+function buildIdentityFrom(input: BuildIdentity | string): BuildIdentity {
+  return zBuildIdentity.parse(typeof input === 'string'
+    ? {
+        version: zSemanticVersion.safeParse(input).success ? input : '0.0.0-dev',
+        commit: '0'.repeat(40),
+        buildTime: '1970-01-01T00:00:00.000Z',
+        sourceVerified: false
+      }
+    : input)
+}
+
+/** Keep updater failures and implementation detail private while exposing the target agents need. */
+export function publicUpdateStatus(status: UpdateStatusInfo): PublicUpdateStatus {
+  const pending = status.state === 'available' || status.state === 'downloading' || status.state === 'ready'
+  const target = pending ? zSemanticVersion.safeParse(status.version) : null
+  return { state: status.state, targetVersion: target?.success ? target.data : null }
 }
 
 /**
@@ -135,10 +204,11 @@ export interface HotelServicesRef {
 export async function startControlApi(
   orch: RoomOrchestrator,
   userData: string,
-  version: string,
+  build: BuildIdentity | string,
   hotel: HotelServicesRef = { github: null }
 ): Promise<{ server: Server; info: ControlInfo; stop: () => void }> {
   const token = randomBytes(24).toString('hex')
+  const buildIdentity = buildIdentityFrom(build)
 
   const server = createServer((req, res) => {
     req.on('error', () => {})
@@ -174,13 +244,17 @@ export async function startControlApi(
     }
 
     if (parts[1] === 'ping' && req.method === 'GET') {
-      sendJson(res, 200, { version })
+      sendJson(res, 200, buildIdentity)
       return
     }
 
     if (parts[1] === 'status' && req.method === 'GET') {
       const status = await orch.hotelStatus()
-      sendJson(res, 200, { version, ...status })
+      sendJson(res, 200, {
+        ...status,
+        ...buildIdentity,
+        update: publicUpdateStatus(hotel.updateStatus?.() ?? { state: 'idle' })
+      })
       return
     }
 
@@ -248,6 +322,53 @@ export async function startControlApi(
       }
     }
 
+    // Client Browsers are addressed by session, not Room: the token, not the
+    // caller's Room, is what proves ownership, so two agents in one Room are
+    // as separate as two agents in different Rooms.
+    if (parts[1] === 'browsers') {
+      if (!parts[2] && req.method === 'GET') {
+        sendJson(res, 200, { runtime: orch.clientBrowsers.runtimeKind, sessions: orch.clientBrowsers.listAll() })
+        return
+      }
+      const sessionId = parseClientBrowserInput(zClientBrowserSessionId, parts[2])
+      const action = parts[3]
+      if (req.method === 'POST' && action) {
+        const rawBody = await readBody(req)
+        if (action === 'attach') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, orch.clientBrowsers.attach(sessionId, body.token))
+          return
+        }
+        if (action === 'inspect') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.inspect(sessionId, body.token))
+          return
+        }
+        if (action === 'navigate') {
+          const body = parseClientBrowserInput(zNavigateClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.navigate(sessionId, body.token, body.url, body.timeoutMs))
+          return
+        }
+        if (action === 'screenshot') {
+          const body = parseClientBrowserInput(zScreenshotClientBrowserBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.screenshot(sessionId, body.token, { format: body.format, fullPage: body.fullPage }))
+          return
+        }
+        if (action === 'release') {
+          const body = parseClientBrowserInput(zClientBrowserAuthBody, rawBody)
+          sendJson(res, 200, await orch.clientBrowsers.release(sessionId, body.token))
+          return
+        }
+      }
+    }
+
+    if (parts[1] === 'rooms' && parts[2] === 'acquire' && parts.length === 3 && req.method === 'POST') {
+      const body = zAgentAcquireRoomInput.parse(await readBody(req))
+      const result = await orch.acquireRoom({ ...body, actor: 'agent' })
+      sendJson(res, 200, { ...result, room: roomForAgent(result.room) })
+      return
+    }
+
     if (parts[1] === 'rooms') {
       const roomId = parts[2]
       const safeRoomId = roomId
@@ -264,9 +385,9 @@ export async function startControlApi(
         return
       }
       if (!roomId && req.method === 'POST') {
-        const body = zAgentCreateRoomInput.parse(await readBody(req))
-        const room = await orch.createRoom({ ...body, actor: 'agent' })
-        sendJson(res, 200, room)
+        const { operationId, waitMs, ...input } = zAgentCreateRoomInput.parse(await readBody(req))
+        const outcome = await orch.createRoomOperation({ ...input, actor: 'agent' }, { operationId, waitMs })
+        sendMutationOutcome(res, outcome, (room) => sendJson(res, 200, room))
         return
       }
       if (safeRoomId && !op && req.method === 'GET') {
@@ -275,14 +396,37 @@ export async function startControlApi(
         return
       }
       if (safeRoomId && !op && req.method === 'DELETE') {
-        // Deletion is irreversible: rooms holding Host-linked working state
-        // (possibly with edits never synced back) stay a human decision.
+        // Deletion is irreversible, but it never touches the Host folder:
+        // only the Room's guest containers, networks and internal volumes go.
+        // What is at stake for a Host-linked Room is Room-owned working state
+        // never synced back, so the human decision is reserved for Rooms that
+        // are awake or hold pending edits; a sleeping, fully-synced Room is a
+        // disposable test fixture agents may tear down themselves (#90).
         const room = orch.rooms.get(safeRoomId)
         if (room && (room.sourceType === 'linked-folder' || room.workspaceMode === 'legacy-host-bind')) {
-          sendJson(res, 403, { error: 'Agents cannot delete Host-linked Rooms. Delete it in the DevHotel app.' })
-          return
+          const safeHostLinkedDeletion =
+            room.status === 'sleeping' && (room.syncStatus === 'synced' || room.syncStatus === 'legacy')
+          if (!safeHostLinkedDeletion) {
+            sendJson(res, 403, {
+              error:
+                'Agents can delete Host-linked Rooms only while sleeping with no pending Room-owned edits. Sleep the Room and sync it back first, or delete it in the DevHotel app.'
+            })
+            return
+          }
         }
-        sendJson(res, 200, await orch.deleteRoom(safeRoomId, 'agent'))
+        // No body on DELETE, so the operation identity and bounded wait arrive
+        // as query text.
+        const request = parseRequestInput(
+          zOperationRequestQuery,
+          Object.fromEntries(url.searchParams),
+          {
+            code: 'INVALID_OPERATION_REQUEST',
+            message: 'The delete operation identity or bounded wait is invalid.',
+            recoveryHint: 'Pass operationId as a UUID and waitMs as a whole number of milliseconds up to 600000.'
+          }
+        )
+        const outcome = await orch.deleteRoomOperation(safeRoomId, 'agent', request)
+        sendMutationOutcome(res, outcome, (reclaimed) => sendJson(res, 200, reclaimed))
         return
       }
       // High-level Android automation. Every body is strict and small, every
@@ -423,6 +567,20 @@ export async function startControlApi(
         }
       }
 
+      // /v1/rooms/:id/browsers — allocate an isolated automation browser for
+      // this Room, or see which ones it holds. The secret is returned once.
+      if (safeRoomId && op === 'browsers' && !parts[4]) {
+        if (req.method === 'GET') {
+          sendJson(res, 200, orch.clientBrowsers.listForRoom(safeRoomId))
+          return
+        }
+        if (req.method === 'POST') {
+          const body = parseClientBrowserInput(zAllocateClientBrowserBody, (await readBody(req)) ?? {})
+          sendJson(res, 200, await orch.clientBrowsers.allocate(safeRoomId, body))
+          return
+        }
+      }
+
       // Durable screenshots are addressed by both Room and artifact ID. Every
       // lookup keeps the Room predicate, so an ID learned in one Room cannot
       // read or export another Room's content.
@@ -488,17 +646,25 @@ export async function startControlApi(
             sendJson(res, 200, { operation: operation ?? started })
             return
           }
-          case 'sleep':
-            await orch.sleepRoom(safeRoomId, 'agent')
-            res.writeHead(204).end()
+          case 'sleep': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.sleepRoomOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, () => res.writeHead(204).end())
             return
-          case 'restart-web':
-            sendJson(res, 200, await orch.restartWeb(safeRoomId, 'agent'))
+          }
+          case 'restart-web': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.restartWebOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, (entry) => sendJson(res, 200, entry))
             return
+          }
           case 'clone': {
-            const body = zAgentCloneBody.parse(await readBody(req))
-            const room = await orch.cloneRoom({ sourceRoomId: safeRoomId, ...body, actor: 'agent' })
-            sendJson(res, 200, roomForAgent(room))
+            const { operationId, waitMs, ...body } = zAgentCloneBody.parse(await readBody(req))
+            const outcome = await orch.cloneRoomOperation(
+              { sourceRoomId: safeRoomId, ...body, actor: 'agent' },
+              { operationId, waitMs }
+            )
+            sendMutationOutcome(res, outcome, (room) => sendJson(res, 200, roomForAgent(room)))
             return
           }
           case 'rename': {
@@ -526,8 +692,10 @@ export async function startControlApi(
               })
               return
             }
+            const request = parseOperationRequest(await readBody(req))
             try {
-              sendJson(res, 200, roomForAgent(await orch.syncFromHost(safeRoomId, 'agent')))
+              const outcome = await orch.syncFromHostOperation(safeRoomId, 'agent', request)
+              sendMutationOutcome(res, outcome, (synced) => sendJson(res, 200, roomForAgent(synced)))
             } catch (error) {
               if (error instanceof WorkspaceDriftError) {
                 sendJson(res, 409, error.toResponse())
@@ -555,12 +723,15 @@ export async function startControlApi(
             }
             const body = zSafeHostResyncBody.parse(await readBody(req))
             try {
-              const outcome = await orch.safeResyncFromHost(
+              const outcome = await orch.safeResyncFromHostOperation(
                 safeRoomId,
                 'agent',
-                body.confirmationToken
+                body.confirmationToken,
+                { operationId: body.operationId, waitMs: body.waitMs }
               )
-              sendJson(res, outcome.status === 'confirmation-required' ? 409 : 200, outcome)
+              sendMutationOutcome(res, outcome, (resync) =>
+                sendJson(res, resync.status === 'confirmation-required' ? 409 : 200, resync)
+              )
             } catch (error) {
               if (error instanceof WorkspaceDriftError) {
                 sendJson(res, 409, error.toResponse())
@@ -579,16 +750,48 @@ export async function startControlApi(
           }
           case 'exec': {
             const body = zExecBody.parse(await readBody(req))
-            sendJson(
-              res,
-              200,
-              await orch.execInRoom(safeRoomId, body.cmd, { timeoutMs: body.timeoutMs, output: body.output }, 'agent')
-            )
+            // A caller that stops waiting must not leave its command running in
+            // the Room: closing the response before it was sent cancels the
+            // command, and the backend reaps the guest process group it owned.
+            // The same close also means the bounded window in this response is
+            // lost, so whatever output the command produced is retained in full
+            // instead of deleted, and list_room_runs can still find it by run ID.
+            const cancel = new AbortController()
+            let closedEarly = false
+            const onClose = (): void => {
+              if (res.writableEnded) return
+              closedEarly = true
+              cancel.abort(
+                new DevHotelError('ROOM_COMMAND_CANCELLED', 'The command was cancelled: the caller closed the response.', {
+                  recoveryHint: 'Run the command again and keep the request open until it answers.',
+                  httpStatus: 409
+                })
+              )
+            }
+            res.once('close', onClose)
+            // Both the event and the current socket state, because the two can
+            // be observed in either order relative to the command finishing.
+            const responseLost = (): boolean =>
+              closedEarly || res.destroyed || res.socket?.destroyed === true
+            try {
+              const result = await orch.execInRoom(
+                safeRoomId,
+                body.cmd,
+                { timeoutMs: body.timeoutMs, output: body.output, signal: cancel.signal, responseLost },
+                'agent'
+              )
+              sendJson(res, 200, result)
+            } finally {
+              res.off('close', onClose)
+            }
             return
           }
-          case 'checks':
-            sendJson(res, 200, await orch.runChecks(safeRoomId))
+          case 'checks': {
+            const request = parseOperationRequest(await readBody(req))
+            const outcome = await orch.runChecksOperation(safeRoomId, 'agent', request)
+            sendMutationOutcome(res, outcome, (report) => sendJson(res, 200, report))
             return
+          }
           case 'changes': {
             const body = zApplyChangeBody.parse(await readBody(req))
             sendJson(res, 200, await orch.applyChange(safeRoomId, body.change, 'agent', body.operationId, body.waitMs))
@@ -596,7 +799,11 @@ export async function startControlApi(
           }
           case 'undo': {
             const body = zUndoChangeBody.parse(await readBody(req))
-            sendJson(res, 200, await orch.undoChange(safeRoomId, body.changeId, 'agent'))
+            const outcome = await orch.undoChangeOperation(safeRoomId, body.changeId, 'agent', {
+              operationId: body.operationId,
+              waitMs: body.waitMs
+            })
+            sendMutationOutcome(res, outcome, (entry) => sendJson(res, 200, entry))
             return
           }
         }
@@ -719,7 +926,7 @@ export async function startControlApi(
   }
 
   const port = (server.address() as { port: number }).port
-  const info: ControlInfo = { port, token, pid: process.pid, version }
+  const info: ControlInfo = { port, token, pid: process.pid, ...buildIdentity }
   // Keep the non-secret port preference across graceful relaunches while the
   // token-bearing control file remains a live-process signal and is removed on
   // shutdown. Falling back to control.json also preserves crash-upgrade reuse.

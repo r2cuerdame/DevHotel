@@ -441,6 +441,42 @@ export const migrations: Migration[] = [
     sql: `
       ALTER TABLE operations ADD COLUMN request_key TEXT;
     `
+  },
+  {
+    // Client Browser sessions: one isolated Chromium per allocation, owned by a
+    // Room. Only the token digest is stored, so the row can prove a presented
+    // token without ever being able to reproduce it; the runtime generation
+    // lets startup tell an orphan of a dead DevHotel from a live session.
+    version: 13,
+    sql: `
+      CREATE TABLE client_browser_sessions (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        pid INTEGER,
+        devtools_port INTEGER,
+        browser_kind TEXT,
+        headless INTEGER NOT NULL DEFAULT 1,
+        profile_mode TEXT NOT NULL,
+        profile_path TEXT NOT NULL,
+        runtime_generation TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_active_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_client_browser_sessions_room ON client_browser_sessions(room_id);
+      CREATE INDEX idx_client_browser_sessions_status ON client_browser_sessions(status);
+    `
+  },
+  {
+    // A caller that lost its response needs the answer, not just the status:
+    // the terminal payload the original call would have returned is stored
+    // with the operation so polling recovers it instead of repeating the
+    // mutation.
+    version: 14,
+    sql: `
+      ALTER TABLE operations ADD COLUMN result_json TEXT;
+    `
   }
 ]
 

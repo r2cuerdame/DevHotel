@@ -1,5 +1,5 @@
 import { rmSync } from 'node:fs'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import { openDb, type Db } from '../store/db'
 import { FakeAdbHost, FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir } from './fakes'
@@ -199,6 +199,131 @@ describe('RoomOrchestrator shutdown gate', () => {
     expect(backend.calls).toContain(`attemptStop:${second.id}`)
     expect(orch.rooms.get(second.id)?.status).toBe('sleeping')
     expect(gatewayStopped).toBe(true)
+  })
+
+  it('sleeps every unrelated Room and reports a fenced Android Room as untouched', async () => {
+    const fenced = makeRoom({
+      id: 'fenced01',
+      project: 'android-fenced',
+      nickname: 'dev',
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      startCommand: 'gradle assembleDebug --no-daemon',
+      internalPort: 6080,
+      status: 'attention',
+      domain: 'fenced.localhost'
+    })
+    const web = makeRoom({ id: 'plainweb', project: 'web', nickname: 'dev', roomNumber: 203, domain: 'web.localhost' })
+    orch.rooms.create(fenced)
+    orch.rooms.create(web)
+    const fenceKey = `androidLocaleRestorePending:${fenced.id}`
+    orch.settings.set(fenceKey, '{"retained":"fence"}')
+    let gatewayStopped = false
+    gateway.stop = async () => {
+      gatewayStopped = true
+    }
+
+    const failure = await orch.shutdown().catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).message).toMatch(/shutdown blocked/i)
+    const codes = (failure as AggregateError).errors.map((error) => (error as { code?: string }).code)
+    expect(codes).toEqual(['SHUTDOWN_ROOM_FENCED'])
+    expect((failure as AggregateError).errors[0]?.message).toContain(fenced.id)
+    // The fence is the authority: its key and its runtime are exactly as before.
+    expect(orch.settings.get(fenceKey)).toBe('{"retained":"fence"}')
+    expect(backend.calls).not.toContain(`stopRoomPod:${fenced.id}`)
+    expect(orch.rooms.get(fenced.id)?.status).toBe('attention')
+    // The unrelated Room is not held hostage by it.
+    expect(backend.calls).toContain(`stopRoomPod:${web.id}`)
+    expect(orch.rooms.get(web.id)?.status).toBe('sleeping')
+    expect(gatewayStopped).toBe(true)
+  })
+
+  it('reports a terminal bounded failure inside the deadline when the engine hangs', async () => {
+    const hung = makeRoom({ id: 'hungroom', project: 'hung', nickname: 'dev', roomNumber: 204, domain: 'hung.localhost' })
+    const fine = makeRoom({ id: 'fineroom', project: 'fine', nickname: 'dev', roomNumber: 205, domain: 'fine.localhost' })
+    orch.rooms.create(hung)
+    orch.rooms.create(fine)
+    const stopRoomPod = backend.stopRoomPod.bind(backend)
+    backend.stopRoomPod = async (roomId) => {
+      backend.calls.push(`attemptStop:${roomId}`)
+      if (roomId === hung.id) await new Promise<never>(() => undefined)
+      await stopRoomPod(roomId)
+    }
+    let gatewayStopped = false
+    gateway.stop = async () => {
+      gatewayStopped = true
+    }
+
+    // The deadline is proved on a controlled clock: the engine hang never
+    // resolves, so the only thing that can settle this shutdown is its own
+    // deadline timer firing at exactly 300 virtual milliseconds.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    let failure: unknown
+    try {
+      const pending = orch.shutdown({ deadlineMs: 300 }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(300)
+      failure = await pending
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    const codes = (failure as AggregateError).errors.map((error) => (error as { code?: string }).code)
+    expect(codes).toContain('SHUTDOWN_DEADLINE_EXCEEDED')
+    expect(backend.calls).toContain(`attemptStop:${hung.id}`)
+    expect(backend.calls).toContain(`attemptStop:${fine.id}`)
+    expect(orch.rooms.get(hung.id)?.status).not.toBe('sleeping')
+    expect(gatewayStopped).toBe(true)
+  })
+
+  it('reports a Room whose admitted work hangs as busy without interleaving with it', async () => {
+    const busy = makeRoom({ id: 'busyroom', project: 'busy', nickname: 'dev', roomNumber: 206, domain: 'busy.localhost', status: 'sleeping' })
+    const idle = makeRoom({ id: 'idleroom', project: 'idle', nickname: 'dev', roomNumber: 207, domain: 'idle.localhost' })
+    orch.rooms.create(busy)
+    orch.rooms.create(idle)
+    const entered = deferred()
+    backend.resumeRoomPod = async () => {
+      entered.resolve()
+      return new Promise<never>(() => undefined)
+    }
+    const wake = orch.startRoom(busy.id, 'user').catch(() => undefined)
+    await entered.promise
+
+    const failure = await orch.shutdown({ deadlineMs: 300 }).catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    const codes = (failure as AggregateError).errors.map((error) => (error as { code?: string }).code)
+    expect(codes).toContain('SHUTDOWN_DEADLINE_EXCEEDED')
+    expect(codes).toContain('SHUTDOWN_ROOM_BUSY')
+    expect(backend.calls).not.toContain(`stopRoomPod:${busy.id}`)
+    expect(backend.calls).toContain(`stopRoomPod:${idle.id}`)
+    expect(orch.rooms.get(idle.id)?.status).toBe('sleeping')
+    void wake
+  })
+
+  it('records an init failure durably with a stable code', async () => {
+    gateway.start = async () => {
+      throw new Error('gateway port is taken')
+    }
+    expect(orch.startupStatus()).toMatchObject({ state: 'pending', code: null })
+
+    await expect(orch.init()).rejects.toThrow(/gateway port is taken/)
+
+    expect(orch.startupStatus()).toMatchObject({
+      state: 'failed',
+      code: 'STARTUP_INIT_FAILED',
+      detail: expect.stringContaining('gateway port is taken')
+    })
+    const status = await orch.hotelStatus()
+    expect(status.startup).toMatchObject({ state: 'failed', code: 'STARTUP_INIT_FAILED' })
+  })
+
+  it('records a successful init as ready', async () => {
+    await orch.init()
+    expect(orch.startupStatus()).toMatchObject({ state: 'ready', code: null, backendOk: true })
   })
 
   it('releases the physical-device lease when shutting down a broken Android Room', async () => {
