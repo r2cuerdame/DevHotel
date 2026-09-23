@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoomOrchestrator } from '../orchestrator'
 import type { Db } from '../store/db'
 import { FakeAdbHost, FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
+import { SCHEDULING_ALLOWANCE_MS } from './timing'
 
 const TEST_BASE_APK = '/data/app/base.apk'
 const TEST_BASE_STAT = '103:4242:123456:1788157200:1788157201'
@@ -1747,7 +1748,8 @@ describe('Android automation targets the attached device without a hand-written 
 
     await expect(operation).rejects.toMatchObject({ code: 'lease-expired' })
     expect(aborted).toBe(true)
-    expect(Date.now() - revokedAt).toBeLessThan(2_000)
+    // The revocation aborted the in-flight command; it did not wait it out.
+    expect(Date.now() - revokedAt).toBeLessThan(SCHEDULING_ALLOWANCE_MS)
     expect(adb.execs).toHaveLength(1)
   })
 

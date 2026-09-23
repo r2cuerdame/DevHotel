@@ -44,3 +44,42 @@ always gets back the same stopped pod it had.
 Because nothing is recreated on the warm path, an Android Room's tracked installs
 survive it. They are not trusted on that basis: every tracked install is
 re-proved against package, user and incarnation before it is used again.
+
+## Golden profiles and warm allocation
+
+Room acquisition is ordered deliberately: DevHotel first returns an existing
+compatible Room, then wakes a compatible hibernated Room, and allocates a new
+Room only when neither exists. A display nickname is not identity. Source,
+project, provider, requested runtime profile and task/issue identity are.
+
+For new Linux-backed Rooms, the immutable OCI image is the golden baseline and
+the engine's overlay/reflink snapshotter is the copy-on-write clone mechanism.
+DevHotel never copies an unpacked root filesystem in JavaScript. After an exact
+profile reaches app-ready, the process records bounded ready claims for that
+baseline. The default bounds are two claims per profile, four profiles globally,
+and 30 minutes idle. Claims are consumed before allocation, replenished only by
+a successful readiness proof, and least-recently-used profiles are evicted when
+the global bound is reached.
+
+A profile includes provider, runtime and package-manager versions, start command,
+internal port, OS resources/environment, and Android device/OS/display settings.
+Its snapshot version hashes that complete profile together with the Warm Room
+schema and DevHotel runtime version. Any change therefore takes the cold path
+until the new profile reaches ready; stale versions are never silently reused.
+
+Android stays on the Android-native path: KVM-backed AVD Quickboot plus the
+existing shared SDK/Gradle caches and immutable OCI layers. Firecracker is not
+introduced. Sleeping keeps the per-Room AVD snapshot, so a compatible Room wake
+reuses the booted emulator rather than provisioning it again. The pool never
+shares mutable AVD state between Rooms.
+
+Every `acquire_room` result contains benchmark telemetry with its `reuse`,
+`warm`, or `cold` path and three monotonic durations:
+
+- acquire to boot-ready;
+- boot-ready to app-ready;
+- acquire to app-ready.
+
+It also reports the profile key, explicit snapshot version, and clone strategy.
+The orchestrator retains the newest 200 samples in memory for local benchmark
+reporting; source URLs and workspace contents are not included.

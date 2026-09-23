@@ -1,16 +1,24 @@
-import { beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { getPinnedDockerRuntime, resetPinnedDockerRuntimeForTests, runDocker } from '../backend/cli'
 
 // Same trick as backend.exec-stream: point the pinned runtime at this Node
-// binary so runDocker drives a real child process without Docker.
-process.env.DEVHOTEL_DOCKER_PATH = process.execPath
+// binary so runDocker drives a real child process without Docker. Scoped to
+// this file and restored afterwards.
+beforeAll(() => {
+  vi.stubEnv('DEVHOTEL_DOCKER_PATH', process.execPath)
+  resetPinnedDockerRuntimeForTests()
+})
 
-const { runDocker } = await import('../backend/cli')
+afterAll(() => {
+  vi.unstubAllEnvs()
+  resetPinnedDockerRuntimeForTests()
+})
 
 const HANG = ['-e', 'setTimeout(() => {}, 60000)']
 
 describe('runDocker abort cleanup ordering', () => {
   beforeAll(() => {
-    expect(process.env.DEVHOTEL_DOCKER_PATH).toBe(process.execPath)
+    expect(getPinnedDockerRuntime().executable).toBe(process.execPath)
   })
 
   it('runs onAbort after the child closed and before a timed-out call settles', async () => {

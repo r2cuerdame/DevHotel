@@ -10,9 +10,27 @@ import {
   type CredentialVault
 } from './githubService'
 
+// rmSync is spied (call-through) so a test can inject the transient Windows
+// lock error that CI saw without depending on a real file lock.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, rmSync: vi.fn(actual.rmSync) }
+})
+const rmSyncSpy = vi.mocked(rmSync)
+const realRmSync = rmSyncSpy.getMockImplementation() as typeof rmSync
+const lockedError = (code: string, path: string): NodeJS.ErrnoException =>
+  Object.assign(new Error(`${code}: resource busy or locked, unlink '${path}'`), { code, syscall: 'unlink', path })
+const failNextRemovalOf = (target: string, code: string): void => {
+  rmSyncSpy.mockImplementationOnce((path, options) => {
+    if (path === target) throw lockedError(code, join(target, 'unpacked', 'bin', 'gh.exe'))
+    return realRmSync(path, options)
+  })
+}
+
 const dirs: string[] = []
 afterEach(() => {
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  // gh.exe was just executed; Windows may still hold its image briefly (see #82).
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_REPO', 'Gh_Pager', 'BROWSER']) delete process.env[key]
 })
 
@@ -357,6 +375,51 @@ describe('GitHub Hotel Service', () => {
 
     expect(existsSync(stale)).toBe(false)
     expect(readFileSync(join(lookalike, 'keep.txt'), 'utf8')).toBe('keep')
+  })
+
+  it('sweeps a stale stage that Windows briefly locks by retrying the removal', async () => {
+    const { root } = installedServiceRoot('devhotel-gh-stage-locked-')
+    const serviceRoot = join(root, 'hotel-services', 'github')
+    const stale = join(serviceRoot, 'stage-11111111-1111-4111-8111-111111111111')
+    mkdirSync(join(stale, 'unpacked', 'bin'), { recursive: true }); writeFileSync(join(stale, 'unpacked', 'bin', 'gh.exe'), '')
+    const runner = vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+    const service = new GitHubService(root, null, fetch, runner, new TestVault(), trustedDigest)
+    rmSyncSpy.mockClear()
+
+    await service.status()
+
+    const sweep = rmSyncSpy.mock.calls.find(([path]) => path === stale)
+    expect(sweep?.[1]).toMatchObject({ recursive: true, force: true, maxRetries: expect.any(Number), retryDelay: expect.any(Number) })
+    expect(sweep?.[1]?.maxRetries).toBeGreaterThanOrEqual(5)
+    expect(existsSync(stale)).toBe(false)
+  })
+
+  it('leaves a stale stage that stays locked for the next sweep instead of failing status', async () => {
+    const { root } = installedServiceRoot('devhotel-gh-stage-stuck-')
+    const serviceRoot = join(root, 'hotel-services', 'github')
+    const stale = join(serviceRoot, 'stage-11111111-1111-4111-8111-111111111111')
+    mkdirSync(join(stale, 'unpacked', 'bin'), { recursive: true }); writeFileSync(join(stale, 'unpacked', 'bin', 'gh.exe'), '')
+    const runner = vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+    const service = new GitHubService(root, null, fetch, runner, new TestVault(), trustedDigest)
+    failNextRemovalOf(stale, 'EBUSY')
+
+    await expect(service.status()).resolves.toMatchObject({ installed: true, version: PINNED_GH.version })
+    expect(existsSync(stale)).toBe(true)
+
+    await service.status()
+    expect(existsSync(stale)).toBe(false)
+  })
+
+  it('still surfaces a non-lock failure while sweeping a stale stage', async () => {
+    const { root } = installedServiceRoot('devhotel-gh-stage-broken-')
+    const serviceRoot = join(root, 'hotel-services', 'github')
+    const stale = join(serviceRoot, 'stage-11111111-1111-4111-8111-111111111111')
+    mkdirSync(stale, { recursive: true })
+    const runner = vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+    const service = new GitHubService(root, null, fetch, runner, new TestVault(), trustedDigest)
+    failNextRemovalOf(stale, 'EIO')
+
+    await expect(service.status()).rejects.toThrow(/EIO/)
   })
 
   it('rejects an exact stale stage junction without traversing or deleting its target', async () => {

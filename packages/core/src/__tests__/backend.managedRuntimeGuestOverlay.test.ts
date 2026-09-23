@@ -12,6 +12,7 @@ import {
   buildManagedRuntimeGuestOverlay,
   type ManagedRuntimeGuestIdentity
 } from '../backend/managedRuntimeGuestOverlay'
+import { until } from './timing'
 
 const run = promisify(execFile)
 const temps: string[] = []
@@ -239,9 +240,13 @@ describe('managed runtime guest overlay', () => {
       exited = code
     })
     try {
-      await new Promise((resolve) => setTimeout(resolve, 3_000))
-
-      const transcript = await readFile(path.join(dir, 'serial.txt'), 'utf8')
+      // The agent answers when the shell gets scheduled, not after a fixed
+      // delay; wait for the reply line itself, bounded by a deadline.
+      let transcript = ''
+      await until(async () => {
+        transcript = await readFile(path.join(dir, 'serial.txt'), 'utf8')
+        return transcript.split('\n').some((line) => line.startsWith('{'))
+      }, { timeoutMs: 15_000, intervalMs: 50, what: 'the agent reply on the serial line' })
       const reply = transcript.split('\n').find((line) => line.startsWith('{'))
       expect(reply, `agent wrote no reply: ${JSON.stringify(transcript)}`).toBeTruthy()
       expect(JSON.parse(reply ?? '{}')).toEqual({

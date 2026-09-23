@@ -67,15 +67,53 @@ describe('canonical Room reuse', () => {
     expect(orch.rooms.list()).toHaveLength(1)
   })
 
+  it('measures cold, warm-CoW and existing-room acquisitions separately', async () => {
+    const cold = await orch.acquireRoom({ ...input, taskId: 'cold-task' })
+    const warm = await orch.acquireRoom({ ...input, taskId: 'warm-task' })
+    const reused = await orch.acquireRoom({ ...input, taskId: 'warm-task', nickname: 'ignored' })
+
+    expect(cold.telemetry).toMatchObject({ path: 'cold', cloneStrategy: 'cold-provision' })
+    expect(warm.telemetry).toMatchObject({ path: 'warm', cloneStrategy: 'oci-layer-cow' })
+    expect(reused.telemetry).toMatchObject({ path: 'reuse', cloneStrategy: 'existing-room' })
+    for (const sample of [cold.telemetry, warm.telemetry, reused.telemetry]) {
+      expect(sample.acquireToBootReadyMs).toBeGreaterThanOrEqual(0)
+      expect(sample.bootReadyToAppReadyMs).toBeGreaterThanOrEqual(0)
+      expect(sample.acquireToAppReadyMs).toBe(sample.acquireToBootReadyMs + sample.bootReadyToAppReadyMs)
+    }
+    expect(orch.warmRoomPoolStatus()).toMatchObject([{ readySlots: 1 }])
+    expect(orch.listAcquisitionTelemetry(3).map((sample) => sample.path)).toEqual(['reuse', 'warm', 'cold'])
+  })
+
+  it('keeps Android on its AVD/KVM lifecycle while warming the exact profile', async () => {
+    const cold = await orch.acquireRoom({ ...input, provider: 'android', taskId: 'android-cold' })
+    const warm = await orch.acquireRoom({ ...input, provider: 'android', taskId: 'android-warm' })
+    expect(cold.telemetry).toMatchObject({ path: 'cold', cloneStrategy: 'cold-provision' })
+    expect(warm.telemetry).toMatchObject({ path: 'warm', cloneStrategy: 'oci-layer-cow+avd-quickboot' })
+    expect(backend.calls.filter((call) => call.startsWith('createEmulator:'))).toHaveLength(2)
+    expect(backend.calls.filter((call) => call.startsWith('removeEmulator:'))).toHaveLength(0)
+  })
+
   it('wakes a sleeping Room once and preserves modified workspace state and journal evidence', async () => {
     const room = existing({ status: 'sleeping', workspaceMode: 'hotel', syncStatus: 'modified', stateRevision: 7, workspaceVolumeRevision: 3, workspaceFingerprint: 'preserved' })
     const [result, retry] = await Promise.all([orch.acquireRoom(input), orch.acquireRoom(input)])
     expect(result).toMatchObject({ disposition: 'woken', modified: true, room: { id: room.id, stateRevision: 7, workspaceVolumeRevision: 3, workspaceFingerprint: 'preserved' } })
     expect(retry.disposition).toBe('reused')
+    expect(result.telemetry).toMatchObject({ path: 'cold', cloneStrategy: 'cold-provision' })
     expect(backend.calls.filter((call) => call.startsWith('recreateAnchor:'))).toHaveLength(1)
     expect(orch.changes.list(room.id).filter((entry) => entry.kind === 'acquire-room')).toEqual(expect.arrayContaining([
       expect.objectContaining({ actor: 'agent', after: expect.objectContaining({ roomId: room.id, modified: true, reason: expect.stringContaining('existing state preserved') }) })
     ]))
+  })
+
+  it('reports a retained-container wake as warm without allocating a pool clone', async () => {
+    const room = existing({ status: 'sleeping' })
+    backend.resumeResult = { reused: true, hostPort: backend.hostPort }
+    const result = await orch.acquireRoom(input)
+    expect(result).toMatchObject({
+      disposition: 'woken',
+      telemetry: { path: 'warm', cloneStrategy: 'retained-runtime' }
+    })
+    expect(result.room.id).toBe(room.id)
   })
 
   it('reports a failed wake without creating a replacement', async () => {

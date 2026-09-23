@@ -19,6 +19,7 @@ import { androidAppInstallsRepo } from '../store/androidAppInstallsRepo'
 import { roomsRepo } from '../store/roomsRepo'
 import type { Db } from '../store/db'
 import { makeRoom, testDb } from './fakes'
+import { SCHEDULING_ALLOWANCE_MS } from './timing'
 
 const APP_ID = 'com.example.app'
 const INSTALLED_AT = '2026-08-31T01:02:03.000Z'
@@ -1238,7 +1239,8 @@ describe('tracked Android automation session', () => {
     })
     const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
     expect(signals[readerIndex]?.aborted).toBe(true)
-    expect(Date.now() - started).toBeLessThan(2_000)
+    // Settled on the marker failure itself, not on the reader's lifetime.
+    expect(Date.now() - started).toBeLessThan(SCHEDULING_ALLOWANCE_MS)
   })
 
   it('derives the reader lifetime from the declared action window plus setup and close budgets', async () => {
@@ -1268,7 +1270,8 @@ describe('tracked Android automation session', () => {
     const readerIndex = calls.findIndex((args) => args[1] === 'sh' && args[3]?.includes('logcat -b main -b events'))
     expect(actionAborted).toBe(true)
     expect(signals[readerIndex]?.aborted).toBe(true)
-    expect(Date.now() - started).toBeLessThan(1_000)
+    // Settled on the declared 20ms action deadline, not the default window.
+    expect(Date.now() - started).toBeLessThan(20 + SCHEDULING_ALLOWANCE_MS)
   })
 
   it('aborts an action-aware callback when the live reader transport exits first', async () => {
