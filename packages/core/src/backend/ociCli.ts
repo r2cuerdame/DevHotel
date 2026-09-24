@@ -3074,25 +3074,28 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
+  private webWorkloadState(topResult: ExecResult): 'running' | 'degraded' {
+    if (topResult.code !== 0) return 'degraded'
+    const lines = topResult.stdout.trim().split(/\r?\n/).filter((l) => l.trim().length > 0)
+    if (lines.length <= 1) return 'degraded'
+    const headerLine = lines[0]?.trim() ?? ''
+    const headers = headerLine.split(/\s+/)
+    const statIndex = headers.findIndex((h) => h.toUpperCase() === 'STAT' || h.toUpperCase() === 'S')
+    const processLines = lines.slice(1)
+    const allDefunct = processLines.every((line) => {
+      if (line.includes('<defunct>')) return true
+      if (statIndex !== -1) {
+        const cols = line.trim().split(/\s+/)
+        if (cols[statIndex] && cols[statIndex].startsWith('Z')) return true
+      }
+      return false
+    })
+    return allDefunct ? 'degraded' : 'running'
+  }
+
   async webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
     const topResult = await this.docker(['top', webName(roomId)])
-    if (topResult.code === 0) {
-      const lines = topResult.stdout.trim().split(/\r?\n/).filter((l) => l.trim().length > 0)
-      if (lines.length <= 1) return 'degraded'
-      const headerLine = lines[0]?.trim() ?? ''
-      const headers = headerLine.split(/\s+/)
-      const statIndex = headers.findIndex((h) => h.toUpperCase() === 'STAT' || h.toUpperCase() === 'S')
-      const processLines = lines.slice(1)
-      const allDefunct = processLines.every((line) => {
-        if (line.includes('<defunct>')) return true
-        if (statIndex !== -1) {
-          const cols = line.trim().split(/\s+/)
-          if (cols[statIndex] && cols[statIndex].startsWith('Z')) return true
-        }
-        return false
-      })
-      return allDefunct ? 'degraded' : 'running'
-    }
+    if (topResult.code === 0) return this.webWorkloadState(topResult)
 
     // `docker top` is the fast path for a live workload. Only a failed probe
     // needs an inspect to distinguish a stopped container from a missing one.
@@ -3138,6 +3141,23 @@ export class OciCliBackend implements IsolationBackend {
       const state = row.State ?? ''
       observations.get(target.roomId)![target.slot] =
         !owned || !state ? 'unknown' : state === 'running' ? 'running' : 'exited'
+    }
+    // `docker ps` proves container state, not guest workload liveness. Probe
+    // only running, owned web slots; a stopped or foreign slot is never touched.
+    const runningWebRoomIds = [...observations]
+      .filter(([, observed]) => observed.main === 'running')
+      .map(([roomId]) => roomId)
+    for (let i = 0; i < runningWebRoomIds.length; i += 4) {
+      await Promise.all(runningWebRoomIds.slice(i, i + 4).map(async (roomId) => {
+        let state: RoomRuntimeObservation['main']
+        try {
+          const topResult = await this.docker(['top', webName(roomId)])
+          state = isDockerTransportFailure(topResult) ? 'unknown' : this.webWorkloadState(topResult)
+        } catch {
+          state = 'unknown'
+        }
+        observations.get(roomId)!.main = state
+      }))
     }
     return observations
   }

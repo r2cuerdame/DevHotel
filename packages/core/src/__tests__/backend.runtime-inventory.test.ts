@@ -38,13 +38,16 @@ describe('OciCliBackend Room runtime inventory', () => {
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'info') return { code: 0, stdout: ENGINE_INFO, stderr: '' }
       if (args[0] === 'ps') return { code: 0, stdout: rows.join('\n'), stderr: '' }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:00 node index.js\n', stderr: '' }
+      }
       return { code: 1, stdout: '', stderr: 'Error response from daemon: No such container' }
     })
   })
 
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
-  it('answers every listed Room from one docker ps over owned containers', async () => {
+  it('inventories owned containers and probes only running web workloads', async () => {
     rows = [
       psRow(webName('room0001'), 'room0001', 'web', 'running'),
       psRow(webName('room0002'), 'room0002', 'web', 'exited'),
@@ -58,7 +61,7 @@ describe('OciCliBackend Room runtime inventory', () => {
 
     const observed = await backend.observeRoomRuntimes(['room0001', 'room0002', 'room0003'])
 
-    expect(commands()).toEqual(['ps'])
+    expect(commands()).toEqual(['ps', 'top'])
     expect(mockedRunDocker.mock.calls[0]?.[0]).toEqual([
       'ps',
       '-a',
@@ -82,6 +85,39 @@ describe('OciCliBackend Room runtime inventory', () => {
       new Map([['room0001', { main: 'running', emulator: 'missing' }]])
     )
     expect(mockedRunDocker.mock.calls[0]?.[0]).toContain('label=devhotel.room=room0001')
+  })
+
+  it('marks a running container with no live workload as degraded in the inventory', async () => {
+    rows = [psRow(webName('room0001'), 'room0001', 'web', 'running')]
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'info') return { code: 0, stdout: ENGINE_INFO, stderr: '' }
+      if (args[0] === 'ps') return { code: 0, stdout: rows.join('\n'), stderr: '' }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1234 1 0 00:00 ? 00:00:00 [node] <defunct>\n', stderr: '' }
+      }
+      throw new Error(`unexpected Docker command: ${args.join(' ')}`)
+    })
+
+    const backend = new OciCliBackend()
+    const observed = await backend.observeRoomRuntimes(['room0001'])
+    expect(observed.get('room0001')).toEqual({ main: 'degraded', emulator: 'missing' })
+
+    const userData = tempDir()
+    const db = testDb()
+    try {
+      const orch = new RoomOrchestrator({ userData, backend, gateway: new FakeGateway().asGateway(), db, appVersion: 'test' })
+      orch.rooms.create(makeRoom({ id: 'room0001', status: 'ready' }))
+      const hotel = await orch.hotelStatus()
+      expect(hotel.rooms[0]).toMatchObject({
+        status: 'attention',
+        runtimeStatus: { state: 'degraded', recordedStatus: 'ready', main: 'degraded' }
+      })
+      expect(hotel.rooms[0]?.runtimeStatus.detail).toContain('web workload is degraded')
+    } finally {
+      db.close()
+      rmSync(userData, { recursive: true, force: true })
+    }
+    expect(commands()).toContain('top')
   })
 
   it('reports unknown, never running, for a same-name container without exact ownership metadata', async () => {
@@ -120,7 +156,7 @@ describe('hotel_status Docker budget with 20 Rooms and 4 awake', () => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
   })
 
-  it('costs one health read plus one inventory, never a process per Room', async () => {
+  it('costs one health read, one inventory, and probes only awake workloads', async () => {
     const awake = Array.from({ length: 4 }, (_, i) =>
       makeRoom({ id: `awake00${i}`, roomNumber: 300 + i, domain: `awake00${i}.localhost`, status: 'ready' })
     )
@@ -137,6 +173,9 @@ describe('hotel_status Docker budget with 20 Rooms and 4 awake', () => {
           stdout: awake.map((room, i) => psRow(webName(room.id), room.id, 'web', i === 3 ? 'exited' : 'running')).join('\n'),
           stderr: ''
         }
+      }
+      if (args[0] === 'top') {
+        return { code: 0, stdout: 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:00 node index.js\n', stderr: '' }
       }
       throw new Error(`unexpected docker command during status: ${args.join(' ')}`)
     })
@@ -161,7 +200,7 @@ describe('hotel_status Docker budget with 20 Rooms and 4 awake', () => {
     const second = await orch.hotelStatus()
 
     expect(first.backend.ok).toBe(true)
-    expect(commands()).toEqual(['info', 'ps'])
+    expect(commands()).toEqual(['info', 'ps', 'top', 'top', 'top'])
     expect(second.rooms.filter((room) => room.runtimeStatus.state === 'running')).toHaveLength(3)
     expect(second.rooms.find((room) => room.id === 'awake003')).toMatchObject({
       status: 'broken',
