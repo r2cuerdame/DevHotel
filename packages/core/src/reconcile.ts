@@ -168,7 +168,14 @@ export async function reconcile(
       }
       case 'stop-room': {
         // A broken Room can still own running containers — anchor up, web dead.
-        await backend.stopRoomPod(action.target)
+        // A sleeping Room can too, when the process died between stopping the
+        // pod and recording the sleep; either way the record keeps its status.
+        log(`reconcile: room ${action.target} — ${action.reason}`)
+        try {
+          await backend.stopRoomPod(action.target)
+        } catch (err) {
+          log(`reconcile: could not stop room ${action.target}: ${err instanceof Error ? err.message : String(err)}`)
+        }
         rooms.update(action.target, { hostPort: null })
         break
       }
@@ -180,6 +187,11 @@ export async function reconcile(
         break
       }
       case 'preserve':
+        // Room-level preservation behind a recovery fence is worth a line: it
+        // is the one case where a live runtime is deliberately left alone.
+        if (action.target === action.roomId && options.preserveAwakeRoomIds?.has(action.target)) {
+          log(`reconcile: preserving fenced Room ${action.target} — ${action.reason}`)
+        }
         break
     }
   }

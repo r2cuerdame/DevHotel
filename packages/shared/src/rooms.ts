@@ -27,7 +27,7 @@ export type ResetServiceMode = 'keep' | 'empty' | 'remove'
 /** Where `/workspace` actually lives. Legacy host binds are compatibility-only. */
 export type WorkspaceMode = 'hotel' | 'legacy-host-bind' | 'empty'
 export type WorkspaceSyncStatus = 'synced' | 'modified' | 'legacy' | 'empty'
-export type RuntimeComponentState = 'running' | 'exited' | 'stopped' | 'missing' | 'unknown' | 'not-checked'
+export type RuntimeComponentState = 'running' | 'exited' | 'stopped' | 'missing' | 'unknown' | 'not-checked' | 'degraded'
 export type RoomRuntimeState = 'running' | 'degraded' | 'dead' | 'stopped' | 'unknown'
 export type RoomLifecycleState = 'active' | 'expired'
 

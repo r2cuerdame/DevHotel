@@ -105,7 +105,7 @@ describe('OciCliBackend engine identity pin', () => {
     await backend.listManagedContainers()
     await backend.webState('r1')
 
-    expect(commands()).toEqual(['ps', 'ps', 'inspect'])
+    expect(commands()).toEqual(['ps', 'ps', 'top'])
   })
 
   it('coalesces concurrent first-use identity reads into one docker info', async () => {

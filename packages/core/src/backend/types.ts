@@ -219,7 +219,7 @@ export interface GitCredential {
 /** Answers "which credential clones this URL", or null when the clone should stay anonymous. */
 export type GitCredentialResolver = (gitUrl: string) => Promise<GitCredential | null>
 
-export type RuntimeContainerState = 'running' | 'exited' | 'missing' | 'unknown'
+export type RuntimeContainerState = 'running' | 'exited' | 'missing' | 'degraded' | 'unknown'
 
 /** Liveness of one Room's owned web and emulator containers, from one bulk inventory read. */
 export interface RoomRuntimeObservation {
@@ -322,7 +322,7 @@ export interface IsolationBackend {
     expected: RoomArtifactExpectation,
     stageToken: string
   ): Promise<RoomArtifactRecoveryOutcome>
-  webState(roomId: string): Promise<'running' | 'exited' | 'missing'>
+  webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
   /**
    * One bulk `docker ps` over DevHotel-owned containers answering, for every
    * listed Room, whether its web and emulator containers are live. Status
@@ -488,5 +488,5 @@ export interface IsolationBackend {
   /** X11 grab of the emulator screen (base64 PNG) — sees exactly what noVNC shows, FLAG_SECURE included */
   captureEmulatorScreen(roomId: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string>
   removeEmulator(roomId: string): Promise<void>
-  emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing'>
+  emulatorState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'>
 }
