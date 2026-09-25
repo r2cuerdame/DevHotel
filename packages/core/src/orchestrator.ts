@@ -3630,7 +3630,7 @@ export class RoomOrchestrator {
         detail: running
           ? 'The Room runtime is running.'
           : degraded
-            ? `The recorded Room is ${room.status}, but its web workload is degraded (main: ${main}).`
+            ? `The recorded Room is ${room.status}, but its web workload is degraded (main: ${main}): the app process or its network anchor is not running.`
             : main === 'unknown'
               ? 'Runtime liveness could not be determined.'
               : `The recorded Room is ${room.status}, but its runtime is ${main}.`,

@@ -18,7 +18,12 @@ const ENGINE_INFO = JSON.stringify({ ID: 'engine-one', ServerVersion: '28.0.0' }
  * #70 asks for at most 20 Docker processes per wake.
  */
 const ISSUE_70_WAKE_TARGET = 20
-const WAKE_RECREATE_CEILING = 20
+/**
+ * The recreate path spends one process more than the warm target: its first
+ * liveness probe also reads the Room network anchor (#12), because a live web
+ * process behind a stopped anchor is unreachable.
+ */
+const WAKE_RECREATE_CEILING = 21
 
 function histogram(calls: string[][]): string {
   const counts = new Map<string, number>()
