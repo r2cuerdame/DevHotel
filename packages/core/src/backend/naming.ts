@@ -585,6 +585,14 @@ function quoteShellWord(value: string): string {
  */
 export const WEB_STOP_TIMEOUT_SECONDS = 8
 
+/**
+ * The leading statements of the two shells `wrapStartCommand` emits. Workload
+ * liveness recognises these supervisor shells in `docker top` by them, so
+ * they must stay the exact first words of each shell program.
+ */
+export const START_COMMAND_WRAPPER_PRELUDE = 'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0'
+export const START_COMMAND_PROGRAM_PRELUDE = 'trap : TERM'
+
 export function wrapStartCommand(startCommand: string): string {
   // Room commands are shell programs and may begin with `if`, `for`,
   // assignments, or pipelines, so they run in an inner shell rather than an
@@ -602,9 +610,9 @@ export function wrapStartCommand(startCommand: string): string {
   // shell re-arms itself the same way before signalling so the copy it
   // receives cannot re-enter the handler. `wait` returns early when the trap
   // fires, so it is repeated while the child still exists.
-  const program = `trap : TERM; ${startCommand}`
+  const program = `${START_COMMAND_PROGRAM_PRELUDE}; ${startCommand}`
   return [
-    'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+    START_COMMAND_WRAPPER_PRELUDE,
     'command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1',
     `sh -lc ${quoteShellWord(program)} & child=$!`,
     `trap 'trap : TERM; kill -TERM -$$ 2>/dev/null' TERM`,
