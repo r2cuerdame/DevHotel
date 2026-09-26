@@ -91,10 +91,14 @@ Start-VM -Name DevHotel-Acceptance-106
 ```
 
 Generation 2, Secure Boot on, virtual TPM, static memory, nested
-virtualization exposed, and an unattended install that adds nothing beyond
-Windows. When Windows finishes installing and before DevHotel touches it:
+virtualization exposed, the adapter on `Default Switch` (override with
+`-SwitchName`) so the guest can fetch its runtime image, and an unattended
+install that adds nothing beyond Windows. When Windows finishes installing and
+before DevHotel touches it — powered off, because Hyper-V cannot checkpoint a
+running VM with nested virtualization exposed:
 
 ```powershell
+Stop-VM -Name DevHotel-Acceptance-106
 Checkpoint-VM -Name DevHotel-Acceptance-106 -SnapshotName clean
 ```
 

@@ -54,6 +54,7 @@ param(
     [int]    $MemoryGB = 8,
     [int]    $CpuCount = 4,
     [int]    $DiskGB = 100,
+    [string] $SwitchName = 'Default Switch',
     [switch] $Remove
 )
 
@@ -142,6 +143,13 @@ Write-Host "Media verified: SHA-256 $measured"
 
 if (Get-OwnedVm) { throw "$VmName already exists. Run with -Remove first." }
 
+# The guest's DevHotel fetches its managed runtime image, so a guest with a
+# disconnected adapter fails row 7 for a reason that has nothing to do with it.
+# 'Default Switch' is the NAT switch Windows client Hyper-V creates itself.
+if (-not (Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue)) {
+    throw "No Hyper-V switch named '$SwitchName'. Pass -SwitchName with a switch that reaches the internet."
+}
+
 New-Item -ItemType Directory -Force -Path $VmRoot | Out-Null
 $systemDisk = Join-Path $VmRoot "$VmName-system.vhdx"
 $answerDisk = Join-Path $VmRoot "$VmName-answer.vhdx"
@@ -172,11 +180,16 @@ Enable-VMTPM -VM $vm
 Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes ($MemoryGB * 1GB)
 Set-VMProcessor -VM $vm -Count $CpuCount -ExposeVirtualizationExtensions $true
 Set-VMNetworkAdapter -VM $vm -MacAddressSpoofing On
+Connect-VMNetworkAdapter -VM $vm -SwitchName $SwitchName
 
 # Boot the DVD first for the install; afterwards Windows' own boot entry wins.
 $dvd = Get-VMDvdDrive -VM $vm
 Set-VMFirmware -VM $vm -FirstBootDevice $dvd
-Set-VM -VM $vm -Notes $OwnerTag -AutomaticStartAction Nothing -AutomaticStopAction ShutDown -CheckpointType Disabled
+# Every attempt restores the 'clean' checkpoint, which Checkpoint-VM refuses to
+# take on a VM whose checkpoints are disabled. Standard rather than Production,
+# because the guest is checkpointed powered off: Hyper-V cannot checkpoint a
+# running VM with nested virtualization exposed.
+Set-VM -VM $vm -Notes $OwnerTag -AutomaticStartAction Nothing -AutomaticStopAction ShutDown -CheckpointType Standard
 
 Write-Host ''
 Write-Host "Created $VmName."
@@ -184,7 +197,8 @@ Write-Host "  media SHA-256 : $measured"
 Write-Host "  root          : $VmRoot"
 Write-Host "  memory/cpu    : ${MemoryGB}GB static / $CpuCount"
 Write-Host "  nested virt   : enabled (the guest runs Hyper-V)"
+Write-Host "  switch        : $SwitchName"
 Write-Host ''
 Write-Host "Start it with:  Start-VM -Name $VmName"
 Write-Host "Then follow docs/verification/issue-106-clean-windows-acceptance.md."
-Write-Host "Take a checkpoint named 'clean' once Windows is installed, before DevHotel touches the guest."
+Write-Host "Once Windows is installed, before DevHotel touches the guest, shut it down and take a checkpoint named 'clean'."

@@ -51,6 +51,27 @@ describe('#106 clean-Windows acceptance VM', () => {
     expect(source).toContain('-DynamicMemoryEnabled $false')
   })
 
+  it('connects the guest to a network', async () => {
+    const source = await script()
+    // New-VM without a switch leaves the adapter disconnected, and the guest
+    // then cannot fetch the managed runtime image that row 7 is about.
+    expect(source).toMatch(/Connect-VMNetworkAdapter -VM \$vm -SwitchName \$SwitchName/)
+    expect(source).toMatch(/Get-VMSwitch -Name \$SwitchName/)
+  })
+
+  it('allows the clean checkpoint every attempt restores', async () => {
+    const source = await script()
+    const procedure = await readFile(procedurePath, 'utf8')
+    // Checkpoint-VM refuses a VM whose checkpoints are disabled, so disabling
+    // them makes the procedure's first step after install fail.
+    expect(procedure).toContain('-SnapshotName clean')
+    expect(source).not.toMatch(/-CheckpointType Disabled/)
+    expect(source).toContain('-CheckpointType Standard')
+    // Hyper-V cannot checkpoint a running VM with nested virtualization
+    // exposed, so the procedure has to stop the guest first.
+    expect(procedure).toMatch(/Stop-VM -Name DevHotel-Acceptance-106[^\n]*\n\s*Checkpoint-VM -Name DevHotel-Acceptance-106 -SnapshotName clean/)
+  })
+
   it('never enables Host features or reboots the Host by itself', async () => {
     const source = await script()
     // Changing the Host is the operator's decision; this script only builds a
