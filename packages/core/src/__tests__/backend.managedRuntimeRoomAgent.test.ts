@@ -69,16 +69,29 @@ function members(bytes: Buffer): Map<string, { type: string; mode: string; link:
   return entries
 }
 
-async function python(): Promise<string | null> {
+/** A cold interpreter on a loaded Windows runner can take seconds to start. */
+const PYTHON_SPAWN_TIMEOUT_MS = 45_000
+
+/**
+ * Compiles `file` with the first Python found, in one spawn per candidate:
+ * probing with `--version` first doubled the cold starts that pushed this past
+ * the suite timeout on CI. `-I -S -B` skips site-packages and writes no .pyc.
+ * Returns false when no interpreter exists (ENOENT, or the Windows Store alias
+ * stub exiting 9009); a syntax error rejects.
+ */
+async function compilePython(file: string): Promise<boolean> {
+  const source = "import sys; compile(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1], 'exec')"
   for (const candidate of ['python3', 'python', 'py']) {
     try {
-      await run(candidate, ['--version'])
-      return candidate
-    } catch {
-      continue
+      await run(candidate, ['-I', '-S', '-B', '-c', source, file], { timeout: PYTHON_SPAWN_TIMEOUT_MS })
+      return true
+    } catch (error) {
+      const code = (error as { code?: unknown }).code
+      if (code === 'ENOENT' || code === 9009) continue
+      throw error
     }
   }
-  return null
+  return false
 }
 
 async function posixShell(): Promise<string | null> {
@@ -146,10 +159,7 @@ describe('managed runtime Room command agent', () => {
     expect(agent.indexOf('os.path.realpath')).toBeLessThan(agent.indexOf('candidate.startswith'))
   })
 
-  it('is syntactically valid Python', async (ctx) => {
-    const interpreter = await python()
-    if (!interpreter) return ctx.skip()
-
+  it('is syntactically valid Python', { timeout: PYTHON_SPAWN_TIMEOUT_MS + 5_000 }, async (ctx) => {
     // A syntax error here would surface only as a runtime that boots and never
     // accepts a Room command, so it is caught where the file is generated.
     const dir = await mkdtemp(path.join(os.tmpdir(), 'devhotel-room-agent-'))
@@ -157,7 +167,7 @@ describe('managed runtime Room command agent', () => {
     const file = path.join(dir, 'agent.py')
     await writeFile(file, buildManagedRuntimeGuestAgent({ installId: identity.installId, runtimeId: identity.runtimeId }))
 
-    await expect(run(interpreter, ['-m', 'py_compile', file])).resolves.toBeTruthy()
+    if (!(await compilePython(file))) return ctx.skip()
   })
 })
 

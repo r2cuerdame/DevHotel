@@ -10,7 +10,7 @@ import type { OciEngineExecutor, RunDockerOpts } from './cli'
 import { isDockerTransportFailure } from './dockerBudget'
 import { webWorkloadState } from './workloadLiveness'
 import { DevHotelError } from '../errors'
-import { RoomArtifactPublicationError, type RoomRuntimeObservation } from './types'
+import { RoomArtifactPublicationError, type RoomRuntimeObservation, type RuntimeContainerState } from './types'
 import {
   ANCHOR_IMAGE,
   EMULATOR_AVD_OVERRIDE_PATH,
@@ -3077,13 +3077,55 @@ export class OciCliBackend implements IsolationBackend {
 
   async webState(roomId: string): Promise<'running' | 'exited' | 'missing' | 'degraded'> {
     const topResult = await this.docker(['top', webName(roomId)])
-    if (topResult.code === 0) return webWorkloadState(topResult)
+    if (topResult.code === 0) {
+      const workload = webWorkloadState(topResult)
+      if (workload !== 'running') return workload
+      // A live process in a container whose network anchor has stopped is
+      // unreachable: the app lost its namespace and its published port.
+      return (await this.webNetworkAuthorityState(roomId)) === 'live' ? 'running' : 'degraded'
+    }
 
     // `docker top` is the fast path for a live workload. Only a failed probe
     // needs an inspect to distinguish a stopped container from a missing one.
     const result = await this.docker(['inspect', '--format', '{{.State.Status}}', webName(roomId)])
     if (result.code !== 0) return 'missing'
     return result.stdout.trim() === 'running' ? 'degraded' : 'exited'
+  }
+
+  /**
+   * The web container joins its Room's network authority (the Android runtime
+   * anchor when one exists, otherwise the Room anchor). One room-scoped
+   * listing reads both; a standalone Room has neither and is judged by its
+   * web container alone.
+   */
+  private async webNetworkAuthorityState(roomId: string): Promise<WebNetworkAuthorityVerdict> {
+    const result = must(
+      await this.docker([
+        'ps',
+        '-a',
+        '--filter',
+        'label=devhotel.managed=1',
+        '--filter',
+        `label=devhotel.room=${roomId}`,
+        '--format',
+        '{{json .}}'
+      ]),
+      'inventory Room network anchors'
+    )
+    const states: WebNetworkAuthorityStates = {}
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.length === 0) continue
+      let row: { Names?: string; State?: string; Labels?: string }
+      try {
+        row = JSON.parse(trimmed) as { Names?: string; State?: string; Labels?: string }
+      } catch {
+        throw new Error('Room network anchor inventory returned invalid JSON')
+      }
+      const authority = webNetworkAuthorityRow(row)
+      if (authority && authority.roomId === roomId) states[authority.slot] = authority.state
+    }
+    return webNetworkAuthorityVerdict(states)
   }
 
   async observeRoomRuntimes(roomIds: readonly string[]): Promise<Map<string, RoomRuntimeObservation>> {
@@ -3098,6 +3140,7 @@ export class OciCliBackend implements IsolationBackend {
       slots.set(webName(roomId), { roomId, slot: 'main', role: 'web' })
       slots.set(emulatorName(roomId), { roomId, slot: 'emulator', role: 'svc-emulator' })
     }
+    const authorities = new Map<string, WebNetworkAuthorityStates>()
     const args = ['ps', '-a', '--filter', 'label=devhotel.managed=1']
     if (roomIds.length === 1) args.push('--filter', `label=devhotel.room=${roomIds[0]}`)
     args.push('--format', '{{json .}}')
@@ -3112,6 +3155,13 @@ export class OciCliBackend implements IsolationBackend {
         throw new Error('Room runtime inventory returned invalid JSON')
       }
       const name = row.Names ?? ''
+      const authority = webNetworkAuthorityRow(row)
+      if (authority && observations.has(authority.roomId)) {
+        const states = authorities.get(authority.roomId) ?? {}
+        states[authority.slot] = authority.state
+        authorities.set(authority.roomId, states)
+        continue
+      }
       const target = slots.get(name)
       if (!target) continue
       const labels = parseDockerLabelList(row.Labels)
@@ -3135,6 +3185,10 @@ export class OciCliBackend implements IsolationBackend {
         try {
           const topResult = await this.docker(['top', webName(roomId)])
           state = isDockerTransportFailure(topResult) ? 'unknown' : webWorkloadState(topResult)
+          if (state === 'running') {
+            const authority = webNetworkAuthorityVerdict(authorities.get(roomId) ?? {})
+            state = authority === 'live' ? 'running' : authority === 'down' ? 'degraded' : 'unknown'
+          }
         } catch {
           state = 'unknown'
         }
@@ -8676,6 +8730,44 @@ function parseDockerLabelList(raw: string | undefined): Map<string, string> {
     if (eq > 0) labels.set(pair.slice(0, eq), pair.slice(eq + 1))
   }
   return labels
+}
+
+type WebNetworkAuthorityVerdict = 'live' | 'down' | 'unknown'
+type WebNetworkAuthorityStates = { anchor?: RuntimeContainerState; runtimeAnchor?: RuntimeContainerState }
+
+/**
+ * Classify one labelled `docker ps` row as a Room network authority. A row
+ * that claims the anchor name without exact ownership reads as `unknown`.
+ */
+function webNetworkAuthorityRow(row: {
+  Names?: string
+  State?: string
+  Labels?: string
+}): { roomId: string; slot: keyof WebNetworkAuthorityStates; state: RuntimeContainerState } | null {
+  const name = row.Names ?? ''
+  const match = /^dh-(.+?)-(android-runtime-anchor|anchor)$/.exec(name)
+  if (!match) return null
+  const roomId = match[1]!
+  const role = match[2]!
+  const labels = parseDockerLabelList(row.Labels)
+  const owned =
+    labels.get('devhotel.managed') === '1' &&
+    labels.get('devhotel.room') === roomId &&
+    labels.get('devhotel.role') === role &&
+    isExpectedRoomContainer(roomId, name, role)
+  const state = row.State ?? ''
+  return {
+    roomId,
+    slot: role === 'anchor' ? 'anchor' : 'runtimeAnchor',
+    state: !owned || !state ? 'unknown' : state === 'running' ? 'running' : 'exited'
+  }
+}
+
+function webNetworkAuthorityVerdict(states: WebNetworkAuthorityStates): WebNetworkAuthorityVerdict {
+  const authority = states.runtimeAnchor ?? states.anchor
+  if (authority === undefined) return 'live'
+  if (authority === 'running') return 'live'
+  return authority === 'unknown' ? 'unknown' : 'down'
 }
 
 function isExpectedRoomContainer(roomId: string, name: string, role: string): boolean {
