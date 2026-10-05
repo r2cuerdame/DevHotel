@@ -870,3 +870,26 @@ of which this dispatch can take:
 Every row of `issue-106-clean-windows-acceptance.md` and
 `issue-107-managed-web-rooms.md` is still blank. The blocker is now exactly one
 thing — an elevated, quiescent Host — where it used to be four.
+
+## Recheck on 2026-10-05 (branch `issue/111`)
+
+The four-attempt conclusion above is historical. The Host has since rebooted:
+`Microsoft-Hyper-V-All` now reports `InstallState=1`, `New-VM` is available,
+and `vmms` is running. The ISO remains cached. This narrows the Host prerequisite
+but does not establish that a clean guest exists or that any gate row passed.
+
+This worker's token is not elevated and is not in Hyper-V Administrators.
+`Get-VM` returns a Hyper-V authorization error. Running
+`New-CleanWindowsAcceptanceVm.ps1` with `-WhatIf` stops at
+`Hyper-V management requires an elevated session.` Consequently this worker
+cannot inspect an acceptance VM or its `clean` checkpoint, create the VM, or
+run the guest matrices. Their state is **unknown** from this session. The
+operator must either run the live gate in an elevated session or explicitly
+grant the worker the required Hyper-V management access.
+
+The branch fixes one acceptance-fixture defect: the VM script now allows a
+manual standard `clean` checkpoint while disabling automatic checkpoints.
+Its focused test passed (8/8), and `pnpm -r typecheck` passed. These are
+code checks, not clean-Windows release-gate evidence. The #106 and #107 matrix
+rows remain blank, as do #111's upgrade, rollback, Android, low-disk,
+offline/retry, isolation and uninstall observations.
