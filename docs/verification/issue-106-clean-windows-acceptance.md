@@ -92,9 +92,14 @@ Start-VM -Name DevHotel-Acceptance-106
 
 Generation 2, Secure Boot on, virtual TPM, static memory, nested
 virtualization exposed, and an unattended install that adds nothing beyond
-Windows. When Windows finishes installing and before DevHotel touches it:
+Windows. Automatic checkpoints are disabled; manual standard checkpoints are
+enabled. When Windows finishes installing and before DevHotel touches it, shut
+down Windows in the guest and confirm the VM is powered off:
 
 ```powershell
+if ((Get-VM -Name DevHotel-Acceptance-106).State -ne 'Off') {
+    throw 'Shut down the clean guest before taking its baseline checkpoint.'
+}
 Checkpoint-VM -Name DevHotel-Acceptance-106 -SnapshotName clean
 ```
 

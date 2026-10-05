@@ -176,7 +176,10 @@ Set-VMNetworkAdapter -VM $vm -MacAddressSpoofing On
 # Boot the DVD first for the install; afterwards Windows' own boot entry wins.
 $dvd = Get-VMDvdDrive -VM $vm
 Set-VMFirmware -VM $vm -FirstBootDevice $dvd
-Set-VM -VM $vm -Notes $OwnerTag -AutomaticStartAction Nothing -AutomaticStopAction ShutDown -CheckpointType Disabled
+# The acceptance procedure restores a deliberate, powered-off 'clean'
+# checkpoint before each attempt. Disable only automatic checkpoints; blocking
+# all checkpoints would make that required baseline impossible to create.
+Set-VM -VM $vm -Notes $OwnerTag -AutomaticStartAction Nothing -AutomaticStopAction ShutDown -AutomaticCheckpointsEnabled $false -CheckpointType Standard
 
 Write-Host ''
 Write-Host "Created $VmName."
@@ -187,4 +190,4 @@ Write-Host "  nested virt   : enabled (the guest runs Hyper-V)"
 Write-Host ''
 Write-Host "Start it with:  Start-VM -Name $VmName"
 Write-Host "Then follow docs/verification/issue-106-clean-windows-acceptance.md."
-Write-Host "Take a checkpoint named 'clean' once Windows is installed, before DevHotel touches the guest."
+Write-Host "Shut down Windows, verify the VM is Off, then take a checkpoint named 'clean' before DevHotel touches the guest."

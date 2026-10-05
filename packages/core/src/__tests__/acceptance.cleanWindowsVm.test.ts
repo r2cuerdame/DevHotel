@@ -51,6 +51,15 @@ describe('#106 clean-Windows acceptance VM', () => {
     expect(source).toContain('-DynamicMemoryEnabled $false')
   })
 
+  it('allows the powered-off clean checkpoint required before each acceptance run', async () => {
+    const source = await script()
+    const procedure = await readFile(procedurePath, 'utf8')
+    expect(source).toMatch(/Set-VM -VM \$vm .* -CheckpointType Standard/)
+    expect(source).toContain('-AutomaticCheckpointsEnabled $false')
+    expect(procedure).toContain(".State -ne 'Off'")
+    expect(procedure).toContain('Checkpoint-VM -Name DevHotel-Acceptance-106 -SnapshotName clean')
+  })
+
   it('never enables Host features or reboots the Host by itself', async () => {
     const source = await script()
     // Changing the Host is the operator's decision; this script only builds a
