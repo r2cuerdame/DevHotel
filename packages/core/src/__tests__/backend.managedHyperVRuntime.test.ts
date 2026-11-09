@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -53,8 +53,10 @@ interface FakeVm {
 }
 
 function decodeScript(args: readonly string[]): string {
-  expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'])
-  return Buffer.from(args[5]!, 'base64').toString('utf16le')
+  expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'])
+  expect(args[5]).toMatch(/\.ps1$/)
+  expect(args[5]!.length).toBeLessThan(32_000)
+  return readFileSync(args[5]!, 'utf8')
 }
 
 function readPowerShellLiteral(script: string, variable: string): string {
@@ -295,6 +297,22 @@ describe('ManagedHyperVRuntime', () => {
       expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
     }
     expect(fake.timeouts[fake.scripts.indexOf(createScript)]).toBe(600_000)
+  })
+
+  it('keeps long provisioning scripts out of the Windows process command line', async () => {
+    const fake = new FakeHyperV()
+    const userData = path.join(
+      await tempDir(), 'Users', 'Alice', 'AppData', 'Roaming', 'devhotel',
+      ...Array.from({ length: 28 }, (_, index) => `${index}-${'x'.repeat(80)}`)
+    )
+    const managed = runtimeAt(fake, userData, '0.1.0')
+
+    await managed.provision(await releaseImage())
+
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+    expect(createScript).toContain('$overlayB64=')
+    expect(createScript.length).toBeGreaterThan(24_000)
+    expect(fake.scripts.every((script) => script.length > 0)).toBe(true)
   })
 
   it.skipIf(process.platform !== 'win32')('parses the complete provisioning script without executing it', async () => {

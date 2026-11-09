@@ -126,7 +126,7 @@ interface HyperVInspection {
 }
 
 const MARKER_FILE = 'provider.json'
-const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'] as const
+const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'] as const
 
 function isDigest(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value)
@@ -140,8 +140,11 @@ function psLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-function encodedPowerShell(script: string): string[] {
-  return [...POWERSHELL_ARGS, Buffer.from(script, 'utf16le').toString('base64')]
+function powerShellFileArgs(file: string): string[] {
+  // PowerShell's encoded command duplicates the complete script in the
+  // CreateProcess command line. The provisioning script includes an apkovl
+  // payload, so pass it through an owner-only temporary file instead.
+  return [...POWERSHELL_ARGS, file]
 }
 
 /** `NT VIRTUAL MACHINE\Virtual Machines`, the group every VM worker account joins. */
@@ -946,11 +949,18 @@ export class ManagedHyperVRuntime {
   }
 
   private async runPowerShell(script: string, timeoutMs?: number): Promise<string> {
-    const result = await this.runner('powershell.exe', encodedPowerShell(script), { timeoutMs })
-    if (result.code !== 0) {
-      throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
+    const scriptFile = path.join(this.root, `.command-${randomUUID()}.ps1`)
+    await this.ensureRoot()
+    try {
+      await writeFile(scriptFile, script, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+      const result = await this.runner('powershell.exe', powerShellFileArgs(scriptFile), { timeoutMs })
+      if (result.code !== 0) {
+        throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
+      }
+      return result.stdout
+    } finally {
+      await rm(scriptFile, { force: true })
     }
-    return result.stdout
   }
 
   private async writeMarker(marker: ManagedHyperVRuntimeMarker): Promise<ManagedHyperVRuntimeMarker> {
