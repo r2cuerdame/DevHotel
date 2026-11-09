@@ -169,7 +169,7 @@ function ancestorChain(leaf: string): string[] {
   return chain.reverse()
 }
 
-function defaultRunner(executable: string, args: readonly string[]): Promise<ManagedRuntimeCommandResult> {
+function defaultRunner(executable: string, args: readonly string[], opts?: { timeoutMs?: number }): Promise<ManagedRuntimeCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, [...args], { windowsHide: true })
     let stdout = ''
@@ -184,7 +184,7 @@ function defaultRunner(executable: string, args: readonly string[]): Promise<Man
     const timer = setTimeout(() => {
       child.kill()
       finish({ code: -1, stdout, stderr: `${stderr}Managed Hyper-V command timed out.` })
-    }, 120_000)
+    }, opts?.timeoutMs ?? 120_000)
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk) => (stdout += chunk))
@@ -460,11 +460,23 @@ export class ManagedHyperVRuntime {
         // Traverse only, and never inherited: this lets a VM worker account
         // resolve a path down to its own attachments without being able to
         // list these directories or read anything else inside them.
-        `foreach ($dir in $traverse) { & icacls $dir /grant ${psLiteral(`*${HYPERV_VM_GROUP_SID}:(X)`)} | Out-Null }`,
+        // Use the PowerShell process's ACL API rather than spawning icacls for
+        // each ancestor. A timed-out PowerShell command otherwise leaves an
+        // elevated icacls child running after its parent is killed.
+        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: grant traversal')`,
+        `$vmWorkerSid=[System.Security.Principal.SecurityIdentifier]::new(${psLiteral(HYPERV_VM_GROUP_SID)})`,
+        '$traverseRight=[System.Security.AccessControl.FileSystemRights]::Traverse',
+        '$traverseRule=[System.Security.AccessControl.FileSystemAccessRule]::new($vmWorkerSid,$traverseRight,[System.Security.AccessControl.InheritanceFlags]::None,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow)',
+        'foreach ($dir in $traverse) {',
+        '  $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop',
+        '  $granted=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $vmWorkerSid.Value -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and (($_.FileSystemRights -band $traverseRight) -eq $traverseRight) }).Count -gt 0',
+        '  if (-not $granted) { $acl.AddAccessRule($traverseRule); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop }',
+        '}',
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a
         // power loss during first provision must not cost the user that.
+        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: create disks')`,
         'if (Test-Path -LiteralPath $seedPath) { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop }',
         'if (-not (Test-Path -LiteralPath $statePath)) { New-VHD -Path $statePath -Dynamic -SizeBytes 64GB | Out-Null }',
         'New-VHD -Path $seedPath -Dynamic -SizeBytes 64MB | Out-Null',
@@ -478,6 +490,7 @@ export class ManagedHyperVRuntime {
         '} finally { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue }',
         // The guest runs from the pinned read-only ISO, so the boot media can
         // never drift from its verified digest.
+        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: create VM')`,
         '$vm=New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 4GB -Path $vmPath -NoVHD',
         '$dvd=Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru',
         'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $statePath',
@@ -491,8 +504,7 @@ export class ManagedHyperVRuntime {
         // capability nobody recorded. Asking for it explicitly, and falling
         // back, makes both outcomes deliberate and observable.
         '$nested=$false',
-        'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true }',
-        'catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }',
+        'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true } catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }',
         'Set-VMFirmware -VM $vm -EnableSecureBoot Off -FirstBootDevice $dvd',
         'Set-VMComPort -VM $vm -Number 2 -Path $pipePath',
         // The runtime needs one network path, for two things it cannot do
@@ -510,7 +522,8 @@ export class ManagedHyperVRuntime {
         "Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -SwitchName 'Default Switch'",
         'Set-VM -VM $vm -Notes $notes -AutomaticStartAction StartIfRunning -AutomaticStopAction Save',
         '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State;Nested=$nested}|ConvertTo-Json -Compress'
-      ].join(';')
+      ].join(';'),
+      600_000
     )
     const created = parseJsonRecord(create, 'Managed Hyper-V provider returned invalid creation evidence')
     if (typeof created['Id'] !== 'string') throw new Error('Managed Hyper-V provider did not return a VM identity')
@@ -932,8 +945,8 @@ export class ManagedHyperVRuntime {
     return health
   }
 
-  private async runPowerShell(script: string): Promise<string> {
-    const result = await this.runner('powershell.exe', encodedPowerShell(script))
+  private async runPowerShell(script: string, timeoutMs?: number): Promise<string> {
+    const result = await this.runner('powershell.exe', encodedPowerShell(script), { timeoutMs })
     if (result.code !== 0) {
       throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
     }

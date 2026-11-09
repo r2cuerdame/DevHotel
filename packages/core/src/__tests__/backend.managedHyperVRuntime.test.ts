@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -65,14 +66,16 @@ function readPowerShellLiteral(script: string, variable: string): string {
 class FakeHyperV {
   vm: FakeVm | null = null
   readonly scripts: string[] = []
+  readonly timeouts: Array<number | undefined> = []
   readonly migrations: string[] = []
   /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
   grantsNested = true
 
-  readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
+  readonly runner: ManagedRuntimeCommandRunner = async (executable, args, opts) => {
     expect(executable).toBe('powershell.exe')
     const script = decodeScript(args)
     this.scripts.push(script)
+    this.timeouts.push(opts?.timeoutMs)
     if (script.includes('Migrated=$true')) {
       if (this.vm) {
         if (this.vm.notes !== readPowerShellLiteral(script, 'notes')) {
@@ -243,7 +246,7 @@ describe('ManagedHyperVRuntime', () => {
     // does not stack three levels deep -- and the runtime boots and serves Web
     // Rooms without it, so a refusal must not cost the user the whole VM.
     expect(createScript).toContain(
-      'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true }'
+      'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true } catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }'
     )
     // The fallback still has to set the processor count, or the VM keeps one.
     expect(createScript).toContain('catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }')
@@ -269,7 +272,11 @@ describe('ManagedHyperVRuntime', () => {
     // group, so it cannot traverse a user profile path. Hyper-V grants it the
     // attachment files themselves, but a file it cannot reach still fails the
     // start with "failed to open attachment ... Access is denied".
-    expect(createScript).toContain("/grant '*S-1-5-83-0:(X)'")
+    expect(createScript).toContain("[System.Security.Principal.SecurityIdentifier]::new('S-1-5-83-0')")
+    expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
+    expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
+    expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
+    expect(createScript).not.toContain('icacls')
 
     // (X) is traverse only, and carries no (OI)/(CI), so nothing below these
     // directories is listed, read or inherited.
@@ -287,6 +294,21 @@ describe('ManagedHyperVRuntime', () => {
     for (const attachment of [marker.seedPath, marker.statePath, marker.isoPath]) {
       expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
     }
+    expect(fake.timeouts[fake.scripts.indexOf(createScript)]).toBe(600_000)
+  })
+
+  it.skipIf(process.platform !== 'win32')('parses the complete provisioning script without executing it', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    await managed.provision(await releaseImage())
+    const script = fake.scripts.find((entry) => entry.includes('New-VM -Name'))!
+    const file = path.join(await tempDir(), 'provision.ps1')
+    await writeFile(file, script)
+    const quoted = file.replaceAll("'", "''")
+    const parsed = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile('${quoted}',[ref]$tokens,[ref]$errors);if($errors.Count){$errors|ForEach-Object Message;exit 1}`
+    ], { encoding: 'utf8' })
+    expect(parsed.status, `${parsed.stdout}\n${parsed.stderr}`).toBe(0)
   })
 
   it('keeps the runtime state disk out of the disposable seed rebuild', async () => {
