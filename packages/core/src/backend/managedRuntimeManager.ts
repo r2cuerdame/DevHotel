@@ -120,6 +120,7 @@ export interface ManagedRuntimeWindowsFeatureController {
 export interface ManagedRuntimeManagerOptions {
   userData: string
   installId: string
+  provisioningTimeoutMs?: number
   platform?: NodeJS.Platform
   runner?: ManagedRuntimeCommandRunner
   fetch?: ManagedRuntimeFetch
@@ -178,6 +179,7 @@ export class ManagedRuntimeManager {
           installId: manifest.installId,
           runtimeId: manifest.runtimeId,
           runtimeVersion: manifest.runtimeVersion,
+          provisioningTimeoutMs: opts.provisioningTimeoutMs,
           runner: opts.runner,
           guest: new NamedPipeHyperVGuestTransport()
         }))

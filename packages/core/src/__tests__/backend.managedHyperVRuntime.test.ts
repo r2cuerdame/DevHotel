@@ -61,12 +61,13 @@ class FakeHyperV {
   vm: FakeVm | null = null
   failNextVmCreation = false
   readonly scripts: string[] = []
+  readonly commandTimeouts: Array<number | undefined> = []
   readonly scriptFiles: Array<{ file: string; bytes: Buffer }> = []
   readonly migrations: string[] = []
   /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
   grantsNested = true
 
-  readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
+  readonly runner: ManagedRuntimeCommandRunner = async (executable, args, options) => {
     expect(executable).toBe('powershell.exe')
     expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'])
     const scriptFile = args[5]!
@@ -77,6 +78,7 @@ class FakeHyperV {
     const script = bytes.subarray(3).toString('utf8')
     expect(path.extname(scriptFile)).toBe('.ps1')
     this.scripts.push(script)
+    this.commandTimeouts.push(options?.timeoutMs)
     if (script.includes('Migrated=$true')) {
       if (this.vm) {
         if (this.vm.notes !== readPowerShellLiteral(script, 'notes')) {
@@ -157,12 +159,19 @@ async function runtime(fake: FakeHyperV, guest = health()) {
 }
 
 /** A provider pinned to one version over a chosen data root, as the real factory builds one. */
-function runtimeAt(fake: FakeHyperV, userData: string, runtimeVersion: string, guest = health({ runtimeVersion, daemonVersion: runtimeVersion })) {
+function runtimeAt(
+  fake: FakeHyperV,
+  userData: string,
+  runtimeVersion: string,
+  guest = health({ runtimeVersion, daemonVersion: runtimeVersion }),
+  provisioningTimeoutMs?: number
+) {
   return new ManagedHyperVRuntime({
     userData,
     installId: 'install-owned',
     runtimeId: 'runtime-owned',
     runtimeVersion,
+    provisioningTimeoutMs,
     runner: fake.runner,
     guest,
     now: () => new Date('2026-09-16T00:00:00Z')
@@ -295,11 +304,19 @@ describe('ManagedHyperVRuntime', () => {
     // group, so it cannot traverse a user profile path. Hyper-V grants it the
     // attachment files themselves, but a file it cannot reach still fails the
     // start with "failed to open attachment ... Access is denied".
-    expect(createScript).toContain("/grant '*S-1-5-83-0:(X)'")
+    expect(createScript).toContain("SecurityIdentifier]::new('S-1-5-83-0')")
+    expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
+    expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
+    expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
+    expect(createScript).toContain('$acl.Access')
+    expect(createScript).toContain('-not $rule.IsInherited')
+    expect(createScript).toContain('InheritanceFlags]::None')
+    expect(createScript).toContain('PropagationFlags]::None')
+    expect(createScript).not.toContain('icacls')
 
     // (X) is traverse only, and carries no (OI)/(CI), so nothing below these
     // directories is listed, read or inherited.
-    expect(createScript).not.toMatch(/S-1-5-83-0:\((OI|CI|F|M|R)/)
+    expect(createScript).not.toMatch(/FileSystemRights\]::(FullControl|Modify|Read)/)
 
     // Every ancestor has to be granted: one unreachable link breaks the whole
     // path, so granting only the leaf would still fail the start.
@@ -313,6 +330,30 @@ describe('ManagedHyperVRuntime', () => {
     for (const attachment of [marker.seedPath, marker.statePath, marker.isoPath]) {
       expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
     }
+  })
+
+  it('keeps the default VM creation timeout at two minutes and allows an explicit ten-minute ceiling', async () => {
+    const defaultFake = new FakeHyperV()
+    const defaultRuntime = await runtime(defaultFake)
+    await defaultRuntime.provision(await releaseImage())
+    const defaultCreateIndex = defaultFake.scripts.findIndex((script) => script.includes('New-VM -Name'))
+    expect(defaultFake.commandTimeouts[defaultCreateIndex]).toBe(120_000)
+
+    const extendedFake = new FakeHyperV()
+    const extendedRuntime = await runtimeAt(extendedFake, await tempDir(), '0.1.0', undefined, 600_000)
+    await extendedRuntime.provision(await releaseImage())
+    const extendedCreateIndex = extendedFake.scripts.findIndex((script) => script.includes('New-VM -Name'))
+    expect(extendedFake.commandTimeouts[extendedCreateIndex]).toBe(600_000)
+  })
+
+  it('rejects a VM creation timeout above ten minutes', async () => {
+    expect(() => new ManagedHyperVRuntime({
+      userData: path.join(os.tmpdir(), 'devhotel-runtime-timeout-test'),
+      installId: 'install-owned',
+      runtimeId: 'runtime-owned',
+      runtimeVersion: '0.1.0',
+      provisioningTimeoutMs: 600_001
+    })).toThrow('Managed Hyper-V provisioning timeout must be between 1 and 600000 milliseconds')
   })
 
   it('keeps the runtime state disk out of the disposable seed rebuild', async () => {
