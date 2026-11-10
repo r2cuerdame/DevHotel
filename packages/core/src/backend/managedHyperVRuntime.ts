@@ -776,6 +776,17 @@ export class ManagedHyperVRuntime {
         }
       }
       const inspection = await this.inspectVm()
+      if (!inspection.exists && marker.status === 'provisioning') {
+        return {
+          state: 'preparing',
+          runtimeId: marker.runtimeId,
+          runtimeVersion: marker.runtimeVersion,
+          daemonVersion: null,
+          baseImageDigest: marker.baseImageDigest,
+          nestedVirtualization: marker.nestedVirtualization ?? null,
+          detail: 'The DevHotel-managed Hyper-V runtime is being prepared.'
+        }
+      }
       this.assertOwnedVm(inspection, marker)
       if (inspection.state?.toLocaleLowerCase('en-US') !== 'running') {
         return {

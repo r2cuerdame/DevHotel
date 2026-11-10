@@ -59,6 +59,7 @@ function readPowerShellLiteral(script: string, variable: string): string {
 
 class FakeHyperV {
   vm: FakeVm | null = null
+  failNextVmCreation = false
   readonly scripts: string[] = []
   readonly scriptFiles: Array<{ file: string; bytes: Buffer }> = []
   readonly migrations: string[] = []
@@ -108,6 +109,10 @@ class FakeHyperV {
       }
     }
     if (script.includes('New-VM -Name')) {
+      if (this.failNextVmCreation) {
+        this.failNextVmCreation = false
+        return { code: 1, stdout: '', stderr: 'simulated VM creation failure' }
+      }
       this.vm = {
         id: '11111111-2222-3333-4444-555555555555',
         state: 'Off',
@@ -450,6 +455,21 @@ describe('ManagedHyperVRuntime', () => {
     const resumed = new ManagedHyperVRuntime(options)
     await expect(resumed.repair(image)).resolves.toMatchObject({ state: 'ready' })
     expect(fake.scripts.filter((script) => script.includes('New-VM -Name'))).toHaveLength(createCount)
+  })
+
+  it('reports preparing while the owned provisioning marker exists before VM creation', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    fake.failNextVmCreation = true
+
+    await expect(managed.provision(await releaseImage())).rejects.toThrow('simulated VM creation failure')
+
+    await expect(managed.observe()).resolves.toMatchObject({
+      state: 'preparing',
+      runtimeId: 'runtime-owned',
+      runtimeVersion: '0.1.0',
+      baseImageDigest: imageDigest
+    })
   })
 
   it('rebuilds only the exact owned disks when an interrupted provision left no VM', async () => {
