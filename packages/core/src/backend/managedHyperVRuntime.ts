@@ -481,8 +481,21 @@ export class ManagedHyperVRuntime {
         // the rule constructor adds Synchronize to every allow, so the rights
         // are tested for the Traverse bit rather than for equality. A rule that
         // is inherit-only does not apply to the directory itself.
-        '$grantsTraverse={ param($acl) foreach ($rule in $acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference -eq $identity -and $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and ([int]$rule.FileSystemRights -band [int]$traverseRight) -eq [int]$traverseRight -and ([int]$rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0) { return $true } }; return $false }',
-        'foreach ($dir in $traverse) { $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop; if (-not (& $grantsTraverse $acl)) { $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow)); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop } }',
+        //
+        // Only an explicit allow counts as the grant, but every deny that
+        // applies counts as a refusal, inherited or not. An explicit deny
+        // outranks the allow this would add, so the VM would only fail later at
+        // start; an inherited one would be silently overridden by it, widening
+        // what someone deliberately closed. Either way the deny is left alone
+        // and provisioning stops here.
+        '$traverseStatus={ param($acl) $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference -eq $identity -and ([int]$_.FileSystemRights -band [int]$traverseRight) -eq [int]$traverseRight -and ([int]$_.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 }; if ($rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny }) { return \'denied\' }; if ($rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and -not $_.IsInherited }) { return \'granted\' }; return \'missing\' }',
+        '$ensureTraverse={ param($acl) $status=& $traverseStatus $acl; if ($status -eq \'denied\') { throw \'Managed runtime VM account is denied traversal\' }; if ($status -eq \'missing\') { $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow)); return \'added\' }; return \'unchanged\' }',
+        // Every ancestor is judged before any is changed, so a deny anywhere on
+        // the path fails provisioning with no ACL written, and names where.
+        '$acls=@(foreach ($dir in $traverse) { Get-Acl -LiteralPath $dir -ErrorAction Stop })',
+        "$denied=@(for ($i=0; $i -lt $traverse.Count; $i++) { if ((& $traverseStatus $acls[$i]) -eq 'denied') { $traverse[$i] } })",
+        `if ($denied.Count -gt 0) { throw ('Managed runtime VM account (${HYPERV_VM_GROUP_SID}) is denied traversal of ' + ($denied -join ', ') + '; DevHotel does not override deny rules') }`,
+        "for ($i=0; $i -lt $traverse.Count; $i++) { if ((& $ensureTraverse $acls[$i]) -eq 'added') { Set-Acl -LiteralPath $traverse[$i] -AclObject $acls[$i] -ErrorAction Stop } }",
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a

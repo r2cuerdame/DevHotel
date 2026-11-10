@@ -60,6 +60,18 @@ function readPowerShellLiteral(script: string, variable: string): string {
   return match[1]!.replaceAll("''", "'")
 }
 
+/** Runs a generated fragment in real Windows PowerShell and reads back the JSON it prints. */
+async function runPowerShellProbe(script: string): Promise<Record<string, unknown>> {
+  const scriptFile = path.join(await tempDir(), 'traverse-probe.ps1')
+  await writeFile(scriptFile, Buffer.concat([Buffer.from('﻿', 'utf8'), Buffer.from(script, 'utf8')]))
+  const { stdout } = await runFile(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptFile],
+    { windowsHide: true, timeout: 60_000 }
+  )
+  return JSON.parse(stdout) as Record<string, unknown>
+}
+
 class FakeHyperV {
   vm: FakeVm | null = null
   failNextVmCreation = false
@@ -310,11 +322,20 @@ describe('ManagedHyperVRuntime', () => {
     expect(createScript).toContain("SecurityIdentifier]::new('S-1-5-83-0')")
     expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
     expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
-    expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
-    expect(createScript).toContain('if (-not (& $grantsTraverse $acl))')
-    // Explicit rules only, named by SID: `.Access` would name the group as an
-    // NTAccount that never equals the SID, so an existing grant goes unseen.
-    expect(createScript).toContain('$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])')
+    expect(createScript).toContain('Set-Acl -LiteralPath $traverse[$i] -AclObject $acls[$i] -ErrorAction Stop')
+    expect(createScript).toContain('$status=& $traverseStatus $acl')
+    expect(createScript).toContain('$ensureTraverse={ param($acl)')
+    expect(createScript).toContain("if ($status -eq 'denied') { throw")
+    expect(createScript).toContain("if ($status -eq 'missing') {")
+    expect(createScript.indexOf("if ($status -eq 'denied') { throw")).toBeLessThan(
+      createScript.indexOf('$acl.AddAccessRule(')
+    )
+    // Every ancestor is judged for a deny before the first ACL is written.
+    expect(createScript.indexOf('if ($denied.Count -gt 0) { throw')).toBeGreaterThan(-1)
+    expect(createScript.indexOf('if ($denied.Count -gt 0) { throw')).toBeLessThan(createScript.indexOf('Set-Acl'))
+    // Rules named by SID: `.Access` would name the group as an NTAccount that
+    // never equals the SID, so an existing grant or deny goes unseen.
+    expect(createScript).toContain('$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])')
     expect(createScript).not.toContain('$acl.Access')
     expect(createScript).toContain('InheritanceFlags]::None')
     expect(createScript).toContain('PropagationFlags]::None')
@@ -342,52 +363,124 @@ describe('ManagedHyperVRuntime', () => {
   // to a SID and Traverse to Traverse|Synchronize, so the generated predicate
   // is evaluated by real PowerShell here. It only ever sees in-memory ACLs:
   // nothing on disk is read or changed.
-  it.runIf(process.platform === 'win32')('recognises the traverse grant an earlier provision wrote', async () => {
+  it.runIf(process.platform === 'win32')('distinguishes denied, missing, and granted traverse access', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
     await managed.provision(await releaseImage())
     const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
-    const definitions = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('foreach ($dir in $traverse)'))
-    expect(definitions).toContain('$grantsTraverse=')
+    const definitions = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('$acls='))
+    expect(definitions).toContain('$traverseStatus=')
 
-    const cases: Record<string, [sddl: string, grants: boolean]> = {
+    const cases: Record<string, [sddl: string, status: string]> = {
       // icacls (X) and other tools may write the bare right.
-      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', true],
+      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', 'granted'],
       // A broader explicit grant already lets the VM through.
-      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', true],
-      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', false],
-      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', false],
-      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', false],
-      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', false],
-      otherGroup: ['D:(A;;0x100020;;;BU)', false]
+      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', 'granted'],
+      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', 'missing'],
+      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', 'missing'],
+      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', 'missing'],
+      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', 'denied'],
+      denyAndAllow: ['D:(D;;0x100020;;;S-1-5-83-0)(A;;0x100020;;;S-1-5-83-0)', 'denied'],
+      // An explicit allow would outrank this, so adding one would override it.
+      inheritedDeny: ['D:(D;ID;0x100020;;;S-1-5-83-0)', 'denied'],
+      broaderDeny: ['D:(D;;0x1f01ff;;;S-1-5-83-0)', 'denied'],
+      // Denies that do not stop the VM from passing through this directory.
+      denyWriteOnly: ['D:(D;;0x2;;;S-1-5-83-0)(A;;0x100020;;;S-1-5-83-0)', 'granted'],
+      denyInheritOnly: ['D:(D;OICIIO;0x100020;;;S-1-5-83-0)', 'missing'],
+      denyOtherGroup: ['D:(D;;0x100020;;;BU)', 'missing'],
+      otherGroup: ['D:(A;;0x100020;;;BU)', 'missing'],
+      noRules: ['D:', 'missing']
     }
     const probe = [
       definitions,
-      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [bool](& $grantsTraverse $acl) }',
+      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [string](& $traverseStatus $acl) }',
       // Exactly the rule the grant step adds, then the same rule read back from its persisted form.
       '$written=[System.Security.AccessControl.DirectorySecurity]::new()',
       '$written.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow))',
       '$writtenSddl=$written.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
-      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[bool](& $grantsTraverse $written); reread=(Probe $writtenSddl) }',
+      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[string](& $traverseStatus $written); reread=(Probe $writtenSddl) }',
       ...Object.entries(cases).map(([name, [sddl]]) => `$result['${name}']=(Probe '${sddl}')`),
+      '$denyAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $denyAcl.SetSecurityDescriptorSddlForm(\'D:(D;;0x100020;;;S-1-5-83-0)\'); $denyBefore=$denyAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); try { $denyAction=& $ensureTraverse $denyAcl } catch { $denyAction=\'denied\' }; $denyAfter=$denyAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$missingAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $missingAcl.SetSecurityDescriptorSddlForm(\'D:\'); $missingAction=& $ensureTraverse $missingAcl; $missingAfter=$missingAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); $repeatAction=& $ensureTraverse $missingAcl; $repeatAfter=$missingAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$allowAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $allowAcl.SetSecurityDescriptorSddlForm(\'D:(A;;0x100020;;;S-1-5-83-0)\'); $allowBefore=$allowAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); $allowAction=& $ensureTraverse $allowAcl; $allowAfter=$allowAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$result[\'actions\']=[ordered]@{ deny=$denyAction; denyUnchanged=($denyBefore -eq $denyAfter); missing=$missingAction; missingGranted=([string](& $traverseStatus $missingAcl) -eq \'granted\'); repeat=$repeatAction; repeatUnchanged=($missingAfter -eq $repeatAfter); existing=$allowAction; existingUnchanged=($allowBefore -eq $allowAfter) }',
       '$result|ConvertTo-Json -Compress'
     ].join('\n')
-    const scriptFile = path.join(await tempDir(), 'traverse-probe.ps1')
-    await writeFile(scriptFile, Buffer.concat([Buffer.from('﻿', 'utf8'), Buffer.from(probe, 'utf8')]))
-    const { stdout } = await runFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptFile],
-      { windowsHide: true, timeout: 60_000 }
-    )
-    const result = JSON.parse(stdout) as Record<string, unknown>
+    const result = await runPowerShellProbe(probe)
 
     // The constructor stores Traverse|Synchronize, which an equality test misses.
     expect(result['writtenSddl']).toBe('D:(A;;0x100020;;;S-1-5-83-0)')
-    expect(result['written']).toBe(true)
-    expect(result['reread']).toBe(true)
-    for (const [name, [, grants]] of Object.entries(cases)) {
-      expect({ [name]: result[name] }).toEqual({ [name]: grants })
+    expect(result['written']).toBe('granted')
+    expect(result['reread']).toBe('granted')
+    for (const [name, [, status]] of Object.entries(cases)) {
+      expect({ [name]: result[name] }).toEqual({ [name]: status })
     }
+    expect(result['actions']).toEqual({
+      deny: 'denied',
+      denyUnchanged: true,
+      missing: 'added',
+      missingGranted: true,
+      repeat: 'unchanged',
+      repeatUnchanged: true,
+      existing: 'unchanged',
+      existingUnchanged: true
+    })
+  }, 90_000)
+
+  // The whole grant step, not just its predicate, runs in real PowerShell with
+  // Get-Acl and Set-Acl shadowed by functions over in-memory ACLs, so what it
+  // writes -- and what it refuses to -- is observed rather than inferred. The
+  // paths are never created: nothing on disk is read or changed.
+  it.runIf(process.platform === 'win32')('fails before writing any ancestor ACL when one denies the VM account traversal', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+    const grantStep = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('if (Test-Path -LiteralPath $seedPath)'))
+    expect(grantStep).toContain('Set-Acl')
+
+    const psQuote = (value: string): string => `'${value.replaceAll("'", "''")}'`
+    const absent = path.join(await tempDir(), 'never-created')
+    const chain = [absent, path.join(absent, 'devhotel'), path.join(absent, 'devhotel', 'managed-linux')]
+    const allow = 'D:(A;;0x100020;;;S-1-5-83-0)'
+    const readAndExecute = 'D:(A;;0x1200a9;;;S-1-5-83-0)'
+    const scenarios: Record<string, string[]> = {
+      deniedMiddle: ['D:', 'D:(D;;0x100020;;;S-1-5-83-0)', 'D:'],
+      inheritedDenyLeaf: ['D:', 'D:', 'D:(D;ID;0x100020;;;S-1-5-83-0)'],
+      missingMiddle: [allow, 'D:', readAndExecute],
+      allGranted: [allow, allow, readAndExecute]
+    }
+    const probe = [
+      `$traverse=@(${chain.map(psQuote).join(',')})`,
+      'function Get-Acl { [CmdletBinding()] param([string]$LiteralPath) $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($script:store[$LiteralPath]); $acl }',
+      'function Set-Acl { [CmdletBinding()] param([string]$LiteralPath, $AclObject) $script:writes.Add($LiteralPath); $script:store[$LiteralPath]=$AclObject.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) }',
+      `$grant={ ${grantStep} }`,
+      'function Attempt([string[]]$sddls) { $script:store=@{}; for ($i=0; $i -lt $traverse.Count; $i++) { $script:store[$traverse[$i]]=$sddls[$i] }; $script:writes=[System.Collections.Generic.List[string]]::new(); $failure=$null; try { $null=& $grant } catch { $failure=$_.Exception.Message }; [ordered]@{ failure=$failure; writes=@($script:writes); after=@($traverse | ForEach-Object { $script:store[$_] }) } }',
+      '$result=[ordered]@{}',
+      ...Object.entries(scenarios).map(([name, sddls]) => `$result['${name}']=(Attempt @(${sddls.map(psQuote).join(',')}))`),
+      // A second provision over what the first one wrote.
+      "$result['repeat']=(Attempt $result['missingMiddle'].after)",
+      '$result|ConvertTo-Json -Compress -Depth 5'
+    ].join('\n')
+    type Outcome = { failure: string | null; writes: string[]; after: string[] }
+    const result = (await runPowerShellProbe(probe)) as Record<string, Outcome>
+
+    // A deny anywhere on the path, explicit or inherited, fails the step before
+    // the first write, leaves that deny as it was, and names the directory.
+    for (const [name, deniedAt] of [
+      ['deniedMiddle', 1],
+      ['inheritedDenyLeaf', 2]
+    ] as const) {
+      expect(result[name]!.writes).toEqual([])
+      expect(result[name]!.after).toEqual(scenarios[name])
+      expect(result[name]!.failure).toContain(`(S-1-5-83-0) is denied traversal of ${chain[deniedAt]};`)
+    }
+
+    // A missing grant is added, non-inherited, to that directory alone.
+    expect(result['missingMiddle']).toEqual({ failure: null, writes: [chain[1]], after: [allow, allow, readAndExecute] })
+    // Directories that already let the VM through are never rewritten.
+    expect(result['allGranted']).toEqual({ failure: null, writes: [], after: scenarios['allGranted'] })
+    expect(result['repeat']).toEqual({ failure: null, writes: [], after: [allow, allow, readAndExecute] })
   }, 90_000)
 
   it('keeps the default VM creation timeout at two minutes and allows an explicit ten-minute ceiling', async () => {
