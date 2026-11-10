@@ -311,7 +311,13 @@ describe('ManagedHyperVRuntime', () => {
     expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
     expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
     expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
-    expect(createScript).toContain('if (-not (& $grantsTraverse $acl))')
+    expect(createScript).toContain('$status=& $traverseStatus $acl')
+    expect(createScript).toContain('$ensureTraverse={ param($acl)')
+    expect(createScript).toContain("if ($status -eq 'denied') { throw")
+    expect(createScript).toContain("if ($status -eq 'missing') {")
+    expect(createScript.indexOf("if ($status -eq 'denied') { throw")).toBeLessThan(
+      createScript.indexOf('$acl.AddAccessRule(')
+    )
     // Explicit rules only, named by SID: `.Access` would name the group as an
     // NTAccount that never equals the SID, so an existing grant goes unseen.
     expect(createScript).toContain('$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])')
@@ -342,34 +348,40 @@ describe('ManagedHyperVRuntime', () => {
   // to a SID and Traverse to Traverse|Synchronize, so the generated predicate
   // is evaluated by real PowerShell here. It only ever sees in-memory ACLs:
   // nothing on disk is read or changed.
-  it.runIf(process.platform === 'win32')('recognises the traverse grant an earlier provision wrote', async () => {
+  it.runIf(process.platform === 'win32')('distinguishes denied, missing, and granted traverse access', async () => {
     const fake = new FakeHyperV()
     const managed = await runtime(fake)
     await managed.provision(await releaseImage())
     const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
     const definitions = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('foreach ($dir in $traverse)'))
-    expect(definitions).toContain('$grantsTraverse=')
+    expect(definitions).toContain('$traverseStatus=')
 
-    const cases: Record<string, [sddl: string, grants: boolean]> = {
+    const cases: Record<string, [sddl: string, status: string]> = {
       // icacls (X) and other tools may write the bare right.
-      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', true],
+      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', 'granted'],
       // A broader explicit grant already lets the VM through.
-      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', true],
-      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', false],
-      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', false],
-      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', false],
-      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', false],
-      otherGroup: ['D:(A;;0x100020;;;BU)', false]
+      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', 'granted'],
+      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', 'missing'],
+      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', 'missing'],
+      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', 'missing'],
+      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', 'denied'],
+      denyAndAllow: ['D:(D;;0x100020;;;S-1-5-83-0)(A;;0x100020;;;S-1-5-83-0)', 'denied'],
+      otherGroup: ['D:(A;;0x100020;;;BU)', 'missing'],
+      noRules: ['D:', 'missing']
     }
     const probe = [
       definitions,
-      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [bool](& $grantsTraverse $acl) }',
+      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [string](& $traverseStatus $acl) }',
       // Exactly the rule the grant step adds, then the same rule read back from its persisted form.
       '$written=[System.Security.AccessControl.DirectorySecurity]::new()',
       '$written.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow))',
       '$writtenSddl=$written.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
-      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[bool](& $grantsTraverse $written); reread=(Probe $writtenSddl) }',
+      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[string](& $traverseStatus $written); reread=(Probe $writtenSddl) }',
       ...Object.entries(cases).map(([name, [sddl]]) => `$result['${name}']=(Probe '${sddl}')`),
+      '$denyAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $denyAcl.SetSecurityDescriptorSddlForm(\'D:(D;;0x100020;;;S-1-5-83-0)\'); $denyBefore=$denyAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); try { $denyAction=& $ensureTraverse $denyAcl } catch { $denyAction=\'denied\' }; $denyAfter=$denyAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$missingAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $missingAcl.SetSecurityDescriptorSddlForm(\'D:\'); $missingAction=& $ensureTraverse $missingAcl; $missingAfter=$missingAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); $repeatAction=& $ensureTraverse $missingAcl; $repeatAfter=$missingAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$allowAcl=[System.Security.AccessControl.DirectorySecurity]::new(); $allowAcl.SetSecurityDescriptorSddlForm(\'D:(A;;0x100020;;;S-1-5-83-0)\'); $allowBefore=$allowAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access); $allowAction=& $ensureTraverse $allowAcl; $allowAfter=$allowAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$result[\'actions\']=[ordered]@{ deny=$denyAction; denyUnchanged=($denyBefore -eq $denyAfter); missing=$missingAction; missingGranted=([string](& $traverseStatus $missingAcl) -eq \'granted\'); repeat=$repeatAction; repeatUnchanged=($missingAfter -eq $repeatAfter); existing=$allowAction; existingUnchanged=($allowBefore -eq $allowAfter) }',
       '$result|ConvertTo-Json -Compress'
     ].join('\n')
     const scriptFile = path.join(await tempDir(), 'traverse-probe.ps1')
@@ -383,11 +395,21 @@ describe('ManagedHyperVRuntime', () => {
 
     // The constructor stores Traverse|Synchronize, which an equality test misses.
     expect(result['writtenSddl']).toBe('D:(A;;0x100020;;;S-1-5-83-0)')
-    expect(result['written']).toBe(true)
-    expect(result['reread']).toBe(true)
-    for (const [name, [, grants]] of Object.entries(cases)) {
-      expect({ [name]: result[name] }).toEqual({ [name]: grants })
+    expect(result['written']).toBe('granted')
+    expect(result['reread']).toBe('granted')
+    for (const [name, [, status]] of Object.entries(cases)) {
+      expect({ [name]: result[name] }).toEqual({ [name]: status })
     }
+    expect(result['actions']).toEqual({
+      deny: 'denied',
+      denyUnchanged: true,
+      missing: 'added',
+      missingGranted: true,
+      repeat: 'unchanged',
+      repeatUnchanged: true,
+      existing: 'unchanged',
+      existingUnchanged: true
+    })
   }, 90_000)
 
   it('keeps the default VM creation timeout at two minutes and allows an explicit ten-minute ceiling', async () => {
