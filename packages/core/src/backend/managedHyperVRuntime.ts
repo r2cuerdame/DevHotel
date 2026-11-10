@@ -16,6 +16,8 @@ export interface ManagedHyperVRuntimeOptions {
   installId: string
   runtimeId: string
   runtimeVersion: string
+  /** Upper bound for the one PowerShell command that creates the runtime VM. */
+  provisioningTimeoutMs?: number
   runner?: ManagedRuntimeCommandRunner
   guest?: ManagedHyperVGuestTransport
   now?: () => Date
@@ -142,6 +144,8 @@ function psLiteral(value: string): string {
 
 /** `NT VIRTUAL MACHINE\Virtual Machines`, the group every VM worker account joins. */
 const HYPERV_VM_GROUP_SID = 'S-1-5-83-0'
+const DEFAULT_PROVISIONING_TIMEOUT_MS = 120_000
+const MAX_PROVISIONING_TIMEOUT_MS = 600_000
 
 /**
  * Every directory from the volume root down to `leaf`, outermost first.
@@ -165,7 +169,11 @@ function ancestorChain(leaf: string): string[] {
   return chain.reverse()
 }
 
-function defaultRunner(executable: string, args: readonly string[]): Promise<ManagedRuntimeCommandResult> {
+function defaultRunner(
+  executable: string,
+  args: readonly string[],
+  options?: { timeoutMs?: number }
+): Promise<ManagedRuntimeCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, [...args], { windowsHide: true })
     let stdout = ''
@@ -180,7 +188,7 @@ function defaultRunner(executable: string, args: readonly string[]): Promise<Man
     const timer = setTimeout(() => {
       child.kill()
       finish({ code: -1, stdout, stderr: `${stderr}Managed Hyper-V command timed out.` })
-    }, 120_000)
+    }, options?.timeoutMs ?? DEFAULT_PROVISIONING_TIMEOUT_MS)
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk) => (stdout += chunk))
@@ -309,6 +317,7 @@ export class ManagedHyperVRuntime {
   private readonly installId: string
   private readonly runtimeId: string
   private readonly runtimeVersion: string
+  private readonly provisioningTimeoutMs: number
   private readonly runner: ManagedRuntimeCommandRunner
   private readonly guest?: ManagedHyperVGuestTransport
   private readonly now: () => Date
@@ -323,11 +332,16 @@ export class ManagedHyperVRuntime {
     if (!isOpaqueId(opts.installId) || !isOpaqueId(opts.runtimeId) || !/^[0-9A-Za-z._-]{1,64}$/.test(opts.runtimeVersion)) {
       throw new Error('Managed Hyper-V identity is invalid')
     }
+    const provisioningTimeoutMs = opts.provisioningTimeoutMs ?? DEFAULT_PROVISIONING_TIMEOUT_MS
+    if (!Number.isInteger(provisioningTimeoutMs) || provisioningTimeoutMs < 1 || provisioningTimeoutMs > MAX_PROVISIONING_TIMEOUT_MS) {
+      throw new Error('Managed Hyper-V provisioning timeout must be between 1 and 600000 milliseconds')
+    }
     this.root = path.resolve(opts.userData, 'runtime', 'managed-linux', 'hyperv')
     this.markerPath = path.join(this.root, MARKER_FILE)
     this.installId = opts.installId
     this.runtimeId = opts.runtimeId
     this.runtimeVersion = opts.runtimeVersion
+    this.provisioningTimeoutMs = provisioningTimeoutMs
     this.runner = opts.runner ?? defaultRunner
     this.guest = opts.guest
     this.now = opts.now ?? (() => new Date())
@@ -456,7 +470,19 @@ export class ManagedHyperVRuntime {
         // Traverse only, and never inherited: this lets a VM worker account
         // resolve a path down to its own attachments without being able to
         // list these directories or read anything else inside them.
-        `foreach ($dir in $traverse) { & icacls $dir /grant ${psLiteral(`*${HYPERV_VM_GROUP_SID}:(X)`)} | Out-Null }`,
+        `$identity=[System.Security.Principal.SecurityIdentifier]::new(${psLiteral(HYPERV_VM_GROUP_SID)})`,
+        '$traverseRight=[System.Security.AccessControl.FileSystemRights]::Traverse',
+        '$noInheritance=[System.Security.AccessControl.InheritanceFlags]::None',
+        '$noPropagation=[System.Security.AccessControl.PropagationFlags]::None',
+        // A retry or migration must recognise the grant an earlier run wrote,
+        // or it rewrites every ancestor and fails where an ancestor still lets
+        // the VM through but no longer lets this user change its ACL. `.Access`
+        // names the group as an NTAccount, so rules are read back as SIDs, and
+        // the rule constructor adds Synchronize to every allow, so the rights
+        // are tested for the Traverse bit rather than for equality. A rule that
+        // is inherit-only does not apply to the directory itself.
+        '$grantsTraverse={ param($acl) foreach ($rule in $acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference -eq $identity -and $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and ([int]$rule.FileSystemRights -band [int]$traverseRight) -eq [int]$traverseRight -and ([int]$rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0) { return $true } }; return $false }',
+        'foreach ($dir in $traverse) { $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop; if (-not (& $grantsTraverse $acl)) { $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow)); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop } }',
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a
@@ -506,7 +532,8 @@ export class ManagedHyperVRuntime {
         "Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -SwitchName 'Default Switch'",
         'Set-VM -VM $vm -Notes $notes -AutomaticStartAction StartIfRunning -AutomaticStopAction Save',
         '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State;Nested=$nested}|ConvertTo-Json -Compress'
-      ].join(';')
+      ].join(';'),
+      this.provisioningTimeoutMs
     )
     const created = parseJsonRecord(create, 'Managed Hyper-V provider returned invalid creation evidence')
     if (typeof created['Id'] !== 'string') throw new Error('Managed Hyper-V provider did not return a VM identity')
@@ -943,12 +970,12 @@ export class ManagedHyperVRuntime {
     return health
   }
 
-  private async runPowerShell(script: string): Promise<string> {
+  private async runPowerShell(script: string, timeoutMs?: number): Promise<string> {
     const scriptFile = path.join(this.root, `.provider-${randomUUID()}.ps1`)
     await this.ensureRoot()
     try {
       await writeFile(scriptFile, Buffer.concat([Buffer.from('\uFEFF', 'utf8'), Buffer.from(script, 'utf8')]), { flag: 'wx' })
-      const result = await this.runner('powershell.exe', [...POWERSHELL_ARGS, scriptFile])
+      const result = await this.runner('powershell.exe', [...POWERSHELL_ARGS, scriptFile], timeoutMs ? { timeoutMs } : undefined)
       if (result.code !== 0) {
         throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
       }

@@ -1,9 +1,11 @@
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import { promisify } from 'node:util'
 import { gunzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -14,6 +16,7 @@ import {
 } from '../backend/managedHyperVRuntime'
 import type { ManagedRuntimeCommandRunner } from '../backend/managedRuntime'
 
+const runFile = promisify(execFile)
 const temps: string[] = []
 
 async function tempDir(): Promise<string> {
@@ -61,12 +64,13 @@ class FakeHyperV {
   vm: FakeVm | null = null
   failNextVmCreation = false
   readonly scripts: string[] = []
+  readonly commandTimeouts: Array<number | undefined> = []
   readonly scriptFiles: Array<{ file: string; bytes: Buffer }> = []
   readonly migrations: string[] = []
   /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
   grantsNested = true
 
-  readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
+  readonly runner: ManagedRuntimeCommandRunner = async (executable, args, options) => {
     expect(executable).toBe('powershell.exe')
     expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'])
     const scriptFile = args[5]!
@@ -77,6 +81,7 @@ class FakeHyperV {
     const script = bytes.subarray(3).toString('utf8')
     expect(path.extname(scriptFile)).toBe('.ps1')
     this.scripts.push(script)
+    this.commandTimeouts.push(options?.timeoutMs)
     if (script.includes('Migrated=$true')) {
       if (this.vm) {
         if (this.vm.notes !== readPowerShellLiteral(script, 'notes')) {
@@ -157,12 +162,19 @@ async function runtime(fake: FakeHyperV, guest = health()) {
 }
 
 /** A provider pinned to one version over a chosen data root, as the real factory builds one. */
-function runtimeAt(fake: FakeHyperV, userData: string, runtimeVersion: string, guest = health({ runtimeVersion, daemonVersion: runtimeVersion })) {
+function runtimeAt(
+  fake: FakeHyperV,
+  userData: string,
+  runtimeVersion: string,
+  guest = health({ runtimeVersion, daemonVersion: runtimeVersion }),
+  provisioningTimeoutMs?: number
+) {
   return new ManagedHyperVRuntime({
     userData,
     installId: 'install-owned',
     runtimeId: 'runtime-owned',
     runtimeVersion,
+    provisioningTimeoutMs,
     runner: fake.runner,
     guest,
     now: () => new Date('2026-09-16T00:00:00Z')
@@ -295,11 +307,22 @@ describe('ManagedHyperVRuntime', () => {
     // group, so it cannot traverse a user profile path. Hyper-V grants it the
     // attachment files themselves, but a file it cannot reach still fails the
     // start with "failed to open attachment ... Access is denied".
-    expect(createScript).toContain("/grant '*S-1-5-83-0:(X)'")
+    expect(createScript).toContain("SecurityIdentifier]::new('S-1-5-83-0')")
+    expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
+    expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
+    expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
+    expect(createScript).toContain('if (-not (& $grantsTraverse $acl))')
+    // Explicit rules only, named by SID: `.Access` would name the group as an
+    // NTAccount that never equals the SID, so an existing grant goes unseen.
+    expect(createScript).toContain('$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])')
+    expect(createScript).not.toContain('$acl.Access')
+    expect(createScript).toContain('InheritanceFlags]::None')
+    expect(createScript).toContain('PropagationFlags]::None')
+    expect(createScript).not.toContain('icacls')
 
     // (X) is traverse only, and carries no (OI)/(CI), so nothing below these
     // directories is listed, read or inherited.
-    expect(createScript).not.toMatch(/S-1-5-83-0:\((OI|CI|F|M|R)/)
+    expect(createScript).not.toMatch(/FileSystemRights\]::(FullControl|Modify|Read)/)
 
     // Every ancestor has to be granted: one unreachable link breaks the whole
     // path, so granting only the leaf would still fail the start.
@@ -313,6 +336,82 @@ describe('ManagedHyperVRuntime', () => {
     for (const attachment of [marker.seedPath, marker.statePath, marker.isoPath]) {
       expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
     }
+  })
+
+  // String checks are what let the first version ship comparing an NTAccount
+  // to a SID and Traverse to Traverse|Synchronize, so the generated predicate
+  // is evaluated by real PowerShell here. It only ever sees in-memory ACLs:
+  // nothing on disk is read or changed.
+  it.runIf(process.platform === 'win32')('recognises the traverse grant an earlier provision wrote', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+    const definitions = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('foreach ($dir in $traverse)'))
+    expect(definitions).toContain('$grantsTraverse=')
+
+    const cases: Record<string, [sddl: string, grants: boolean]> = {
+      // icacls (X) and other tools may write the bare right.
+      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', true],
+      // A broader explicit grant already lets the VM through.
+      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', true],
+      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', false],
+      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', false],
+      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', false],
+      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', false],
+      otherGroup: ['D:(A;;0x100020;;;BU)', false]
+    }
+    const probe = [
+      definitions,
+      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [bool](& $grantsTraverse $acl) }',
+      // Exactly the rule the grant step adds, then the same rule read back from its persisted form.
+      '$written=[System.Security.AccessControl.DirectorySecurity]::new()',
+      '$written.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow))',
+      '$writtenSddl=$written.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[bool](& $grantsTraverse $written); reread=(Probe $writtenSddl) }',
+      ...Object.entries(cases).map(([name, [sddl]]) => `$result['${name}']=(Probe '${sddl}')`),
+      '$result|ConvertTo-Json -Compress'
+    ].join('\n')
+    const scriptFile = path.join(await tempDir(), 'traverse-probe.ps1')
+    await writeFile(scriptFile, Buffer.concat([Buffer.from('﻿', 'utf8'), Buffer.from(probe, 'utf8')]))
+    const { stdout } = await runFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptFile],
+      { windowsHide: true, timeout: 60_000 }
+    )
+    const result = JSON.parse(stdout) as Record<string, unknown>
+
+    // The constructor stores Traverse|Synchronize, which an equality test misses.
+    expect(result['writtenSddl']).toBe('D:(A;;0x100020;;;S-1-5-83-0)')
+    expect(result['written']).toBe(true)
+    expect(result['reread']).toBe(true)
+    for (const [name, [, grants]] of Object.entries(cases)) {
+      expect({ [name]: result[name] }).toEqual({ [name]: grants })
+    }
+  }, 90_000)
+
+  it('keeps the default VM creation timeout at two minutes and allows an explicit ten-minute ceiling', async () => {
+    const defaultFake = new FakeHyperV()
+    const defaultRuntime = await runtime(defaultFake)
+    await defaultRuntime.provision(await releaseImage())
+    const defaultCreateIndex = defaultFake.scripts.findIndex((script) => script.includes('New-VM -Name'))
+    expect(defaultFake.commandTimeouts[defaultCreateIndex]).toBe(120_000)
+
+    const extendedFake = new FakeHyperV()
+    const extendedRuntime = await runtimeAt(extendedFake, await tempDir(), '0.1.0', undefined, 600_000)
+    await extendedRuntime.provision(await releaseImage())
+    const extendedCreateIndex = extendedFake.scripts.findIndex((script) => script.includes('New-VM -Name'))
+    expect(extendedFake.commandTimeouts[extendedCreateIndex]).toBe(600_000)
+  })
+
+  it('rejects a VM creation timeout above ten minutes', async () => {
+    expect(() => new ManagedHyperVRuntime({
+      userData: path.join(os.tmpdir(), 'devhotel-runtime-timeout-test'),
+      installId: 'install-owned',
+      runtimeId: 'runtime-owned',
+      runtimeVersion: '0.1.0',
+      provisioningTimeoutMs: 600_001
+    })).toThrow('Managed Hyper-V provisioning timeout must be between 1 and 600000 milliseconds')
   })
 
   it('keeps the runtime state disk out of the disposable seed rebuild', async () => {
