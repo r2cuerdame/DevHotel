@@ -59,6 +59,7 @@ function readPowerShellLiteral(script: string, variable: string): string {
 
 class FakeHyperV {
   vm: FakeVm | null = null
+  failNextVmCreation = false
   readonly scripts: string[] = []
   readonly scriptFiles: Array<{ file: string; bytes: Buffer }> = []
   readonly migrations: string[] = []
@@ -108,6 +109,10 @@ class FakeHyperV {
       }
     }
     if (script.includes('New-VM -Name')) {
+      if (this.failNextVmCreation) {
+        this.failNextVmCreation = false
+        return { code: 1, stdout: '', stderr: 'simulated VM creation failure' }
+      }
       this.vm = {
         id: '11111111-2222-3333-4444-555555555555',
         state: 'Off',
@@ -450,6 +455,48 @@ describe('ManagedHyperVRuntime', () => {
     const resumed = new ManagedHyperVRuntime(options)
     await expect(resumed.repair(image)).resolves.toMatchObject({ state: 'ready' })
     expect(fake.scripts.filter((script) => script.includes('New-VM -Name'))).toHaveLength(createCount)
+  })
+
+  it('reports preparing while the owned provisioning marker exists before VM creation', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    fake.failNextVmCreation = true
+
+    await expect(managed.provision(await releaseImage())).rejects.toThrow('simulated VM creation failure')
+
+    await expect(managed.observe()).resolves.toMatchObject({
+      state: 'preparing',
+      runtimeId: 'runtime-owned',
+      runtimeVersion: '0.1.0',
+      baseImageDigest: imageDigest
+    })
+  })
+
+  it('still refuses a forged VM that appears under the name while provisioning', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    fake.failNextVmCreation = true
+    await expect(managed.provision(await releaseImage())).rejects.toThrow('simulated VM creation failure')
+
+    // The provisioning marker is not a pass for whatever now answers to the name.
+    fake.vm = {
+      id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      state: 'Running',
+      notes: JSON.stringify({ owner: 'someone-else' })
+    }
+
+    await expect(managed.observe()).resolves.toMatchObject({ state: 'broken', runtimeId: null, runtimeVersion: null })
+  })
+
+  it('reports a provisioning marker that already recorded its VM as broken once that VM is gone', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    const marker = await managed.provision(await releaseImage())
+    const markerFile = path.join(path.dirname(marker.vmPath), 'provider.json')
+    await writeFile(markerFile, JSON.stringify({ ...marker, status: 'provisioning' }))
+    fake.vm = null
+
+    await expect(managed.observe()).resolves.toMatchObject({ state: 'broken', runtimeId: null })
   })
 
   it('rebuilds only the exact owned disks when an interrupted provision left no VM', async () => {

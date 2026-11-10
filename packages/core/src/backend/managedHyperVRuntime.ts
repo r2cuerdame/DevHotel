@@ -776,6 +776,21 @@ export class ManagedHyperVRuntime {
         }
       }
       const inspection = await this.inspectVm()
+      // Before the first VM exists there is nothing for the Notes/ID proof to
+      // check, so an install still being provisioned is preparing, not broken.
+      // Only while the marker has never recorded a VM: once it has, a missing
+      // VM is a lost runtime, and any VM under the name must still prove itself.
+      if (!inspection.exists && marker.status === 'provisioning' && marker.vmId === null) {
+        return {
+          state: 'preparing',
+          runtimeId: marker.runtimeId,
+          runtimeVersion: marker.runtimeVersion,
+          daemonVersion: null,
+          baseImageDigest: marker.baseImageDigest,
+          nestedVirtualization: marker.nestedVirtualization ?? null,
+          detail: 'The DevHotel-managed Hyper-V runtime is being prepared.'
+        }
+      }
       this.assertOwnedVm(inspection, marker)
       if (inspection.state?.toLocaleLowerCase('en-US') !== 'running') {
         return {

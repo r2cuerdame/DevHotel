@@ -129,6 +129,14 @@ the VM's Hyper-V Notes must agree on installation ID, runtime ID, version,
 paths, pipe, base-image digest and overlay digest before any start, save or
 repair mutation occurs. A colliding VM is refused.
 
+Until first provisioning has created the VM there are no Notes to check, so an
+observation in that window — a `provisioning` marker that has never recorded a
+VM identity, and no VM under the derived name — reports `preparing` with the
+marker's runtime identity instead of `broken`. As soon as a VM answers to that
+name, or the marker has recorded one, the full ownership proof applies again: a
+VM someone else put under the name is still refused, and a recorded VM that has
+gone missing is reported as needing repair.
+
 The serial agent listens only on Hyper-V COM2 through a private named pipe.
 Every health response carries a fresh nonce plus the exact installation ID,
 runtime ID, runtime version and daemon version. Host readiness therefore
