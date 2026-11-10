@@ -1,9 +1,11 @@
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import { promisify } from 'node:util'
 import { gunzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -14,6 +16,7 @@ import {
 } from '../backend/managedHyperVRuntime'
 import type { ManagedRuntimeCommandRunner } from '../backend/managedRuntime'
 
+const runFile = promisify(execFile)
 const temps: string[] = []
 
 async function tempDir(): Promise<string> {
@@ -308,8 +311,11 @@ describe('ManagedHyperVRuntime', () => {
     expect(createScript).toContain('[System.Security.AccessControl.FileSystemRights]::Traverse')
     expect(createScript).toContain('Get-Acl -LiteralPath $dir -ErrorAction Stop')
     expect(createScript).toContain('Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop')
-    expect(createScript).toContain('$acl.Access')
-    expect(createScript).toContain('-not $rule.IsInherited')
+    expect(createScript).toContain('if (-not (& $grantsTraverse $acl))')
+    // Explicit rules only, named by SID: `.Access` would name the group as an
+    // NTAccount that never equals the SID, so an existing grant goes unseen.
+    expect(createScript).toContain('$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])')
+    expect(createScript).not.toContain('$acl.Access')
     expect(createScript).toContain('InheritanceFlags]::None')
     expect(createScript).toContain('PropagationFlags]::None')
     expect(createScript).not.toContain('icacls')
@@ -331,6 +337,58 @@ describe('ManagedHyperVRuntime', () => {
       expect(granted.some((dir) => attachment.startsWith(dir + path.sep))).toBe(true)
     }
   })
+
+  // String checks are what let the first version ship comparing an NTAccount
+  // to a SID and Traverse to Traverse|Synchronize, so the generated predicate
+  // is evaluated by real PowerShell here. It only ever sees in-memory ACLs:
+  // nothing on disk is read or changed.
+  it.runIf(process.platform === 'win32')('recognises the traverse grant an earlier provision wrote', async () => {
+    const fake = new FakeHyperV()
+    const managed = await runtime(fake)
+    await managed.provision(await releaseImage())
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+    const definitions = createScript.slice(createScript.indexOf('$identity='), createScript.indexOf('foreach ($dir in $traverse)'))
+    expect(definitions).toContain('$grantsTraverse=')
+
+    const cases: Record<string, [sddl: string, grants: boolean]> = {
+      // icacls (X) and other tools may write the bare right.
+      bareTraverse: ['D:(A;;0x20;;;S-1-5-83-0)', true],
+      // A broader explicit grant already lets the VM through.
+      readAndExecute: ['D:(A;;0x1200a9;;;S-1-5-83-0)', true],
+      readOnly: ['D:(A;;0x120089;;;S-1-5-83-0)', false],
+      inheritOnly: ['D:(A;OICIIO;0x100020;;;S-1-5-83-0)', false],
+      inherited: ['D:(A;ID;0x100020;;;S-1-5-83-0)', false],
+      deny: ['D:(D;;0x100020;;;S-1-5-83-0)', false],
+      otherGroup: ['D:(A;;0x100020;;;BU)', false]
+    }
+    const probe = [
+      definitions,
+      'function Probe([string]$sddl) { $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetSecurityDescriptorSddlForm($sddl); [bool](& $grantsTraverse $acl) }',
+      // Exactly the rule the grant step adds, then the same rule read back from its persisted form.
+      '$written=[System.Security.AccessControl.DirectorySecurity]::new()',
+      '$written.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow))',
+      '$writtenSddl=$written.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+      '$result=[ordered]@{ writtenSddl=$writtenSddl; written=[bool](& $grantsTraverse $written); reread=(Probe $writtenSddl) }',
+      ...Object.entries(cases).map(([name, [sddl]]) => `$result['${name}']=(Probe '${sddl}')`),
+      '$result|ConvertTo-Json -Compress'
+    ].join('\n')
+    const scriptFile = path.join(await tempDir(), 'traverse-probe.ps1')
+    await writeFile(scriptFile, Buffer.concat([Buffer.from('﻿', 'utf8'), Buffer.from(probe, 'utf8')]))
+    const { stdout } = await runFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptFile],
+      { windowsHide: true, timeout: 60_000 }
+    )
+    const result = JSON.parse(stdout) as Record<string, unknown>
+
+    // The constructor stores Traverse|Synchronize, which an equality test misses.
+    expect(result['writtenSddl']).toBe('D:(A;;0x100020;;;S-1-5-83-0)')
+    expect(result['written']).toBe(true)
+    expect(result['reread']).toBe(true)
+    for (const [name, [, grants]] of Object.entries(cases)) {
+      expect({ [name]: result[name] }).toEqual({ [name]: grants })
+    }
+  }, 90_000)
 
   it('keeps the default VM creation timeout at two minutes and allows an explicit ten-minute ceiling', async () => {
     const defaultFake = new FakeHyperV()

@@ -474,7 +474,15 @@ export class ManagedHyperVRuntime {
         '$traverseRight=[System.Security.AccessControl.FileSystemRights]::Traverse',
         '$noInheritance=[System.Security.AccessControl.InheritanceFlags]::None',
         '$noPropagation=[System.Security.AccessControl.PropagationFlags]::None',
-        'foreach ($dir in $traverse) { $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop; $hasTraverse=$false; foreach ($rule in $acl.Access) { if (-not $rule.IsInherited -and $rule.IdentityReference -eq $identity -and $rule.FileSystemRights -eq $traverseRight -and $rule.InheritanceFlags -eq $noInheritance -and $rule.PropagationFlags -eq $noPropagation -and $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) { $hasTraverse=$true; break } }; if (-not $hasTraverse) { $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop } }',
+        // A retry or migration must recognise the grant an earlier run wrote,
+        // or it rewrites every ancestor and fails where an ancestor still lets
+        // the VM through but no longer lets this user change its ACL. `.Access`
+        // names the group as an NTAccount, so rules are read back as SIDs, and
+        // the rule constructor adds Synchronize to every allow, so the rights
+        // are tested for the Traverse bit rather than for equality. A rule that
+        // is inherit-only does not apply to the directory itself.
+        '$grantsTraverse={ param($acl) foreach ($rule in $acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference -eq $identity -and $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and ([int]$rule.FileSystemRights -band [int]$traverseRight) -eq [int]$traverseRight -and ([int]$rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0) { return $true } }; return $false }',
+        'foreach ($dir in $traverse) { $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop; if (-not (& $grantsTraverse $acl)) { $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow)); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop } }',
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a
