@@ -30,10 +30,11 @@ table is a snapshot, not a substitute for the ledger.
 | Item | State on 2026-11-11 | What it means for December |
 |---|---|---|
 | #175 PLC record, PR #176 | #175 open, labelled `blocked`. PR #176 open and unmerged; its `build` check succeeded on head `e3427b5`. #175 has no review comments, and #177 records a `repair_exhausted` lesson for its review. `.loop/plc.md` is not on `main@2bca7bf`. | The November review has not finished, so milestone #3 stays open (see *November review*). |
-| PR #176 scope | The PR was cut from `2e88ef6`. Besides `.loop/plc.md`, it changes `managedHyperVRuntime.ts`, `managedRuntime.ts` and the runtime tests: its own temporary `-File` script runner, which writes the script without a BOM; a `Set-Acl` traversal grant in place of `icacls`; and a 600 s provisioning timeout. Since then `main` has landed a different `-File` runner, which writes a BOM-prefixed script and is covered by a non-ASCII profile-path test, plus #181's fix (PR #182) in the same file. #175's acceptance is the PLC record only. | The runtime changes are code changes and fall under row 3 of *Completion conditions*. They need their own issue, a rebase onto `main` that keeps the BOM-prefixed runner, and regression tests before they can merge. A PLC review does not cover them. |
+| PR #176 scope | The PR was cut from `2e88ef6`. Besides `.loop/plc.md`, it carries a `Set-Acl` traversal grant, a fixed 600 s provisioning timeout and a temporary `-File` runner without a BOM. The current base has a BOM-prefixed `-File` runner and #181's fix from PR #182. #175's acceptance is the PLC record only. | The runtime work was separated into #187 and delivered by PR #188 with regression tests, bounded timeout configuration and explicit traverse-only ACL rules; the current BOM-prefixed runner remains. A PLC review does not cover runtime code. |
+| #187, PR #188 | Closed; PR #188 merged as `6564329` on 2026-11-11. It separately delivered bounded VM-creation timeout and explicit traversal-only ACL handling while preserving the current BOM-prefixed script runner. | Complete. Its tests keep the 2-minute default, allow up to 10 minutes, reject a higher value, and verify the ACL script is explicit, non-inheriting and does not call `icacls`. The manager `/github` check reports `build: success`. |
 | #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@2bca7bf` contains. | Done. Its regression tests stay part of `pnpm test`. |
 | #183, PR #184 | Closed. PR #184 merged as `2bca7bf`. | Done. `2026-11-milestone-3-closeout.md` stays the November record. |
-| #185 (this plan) | Open, assigned to milestone #3. | Closes with this document. |
+| #185 (this plan) | Closed; this plan is present on the accepted base. | Complete. |
 
 ## Completion conditions
 
@@ -41,7 +42,7 @@ table is a snapshot, not a substitute for the ledger.
 |---|---|---|---|
 | 1 | Period and scope | Work lands between 2026-12-01 and 2026-12-31 and is stability or maintenance on the existing runtime. Unapproved features, direction changes and new costs are not in the milestone. | The milestone's issue list in the ledger; each issue's approval marker. |
 | 2 | November review | The #175 review has finished: PR #176 merged or closed, with the outcome recorded on #175, and `.loop/plc.md` present on the accepted base if it merged. | #175, PR #176 and the accepted commit's tree. |
-| 3 | Selected code changes | Every code change merged under this milestone adds or updates a regression test that fails without the change, and the pull request names it. The required checks pass on that pull request's head commit. | `pnpm lint`, `pnpm typecheck`, `pnpm test` and `pnpm --filter devhotel-mcp build` results, plus the CI `build` conclusion read for that exact head SHA. |
+| 3 | Selected code changes | Every code change merged under this milestone adds or updates a regression test that fails without the change, and the pull request names it. The required checks pass on that pull request's head commit. | `pnpm lint`, `pnpm typecheck`, `pnpm test` and `pnpm --filter devhotel-mcp build` results, plus the CI `build` conclusion read for that exact head SHA. #187/#188's merged hardening is evidence for the November work; it does not close #175. |
 | 4 | Clean-Windows gates (#106/#107/#111) | Kept separate and open until a real clean Windows 11 environment fills each required row. | The dated matrices required by `issue-106-clean-windows-acceptance.md`, `issue-107-managed-web-rooms.md` and `issue-111-release-gate-readiness.md`. |
 | 5 | Closeout record | A dated closeout document lists every remaining issue with its reason and every piece of evidence with its commit SHA. The version stays `0.5.4` and no deployment work is done. | The closeout document; `.loop/project.md` and the package manifests still at `0.5.4`. |
 
@@ -133,6 +134,7 @@ milestone is most often rounded up, and neither may be.
   opened.
 - GitHub #175, PR #176 and #177: PLC review state, scope and lesson record.
 - GitHub #181 and PR #182: the merged `preparing` observation fix and its tests.
+- GitHub #187 and PR #188: merged timeout and ACL hardening, its regression tests and CI check.
 - `docs/verification/2026-11-milestone-3-closeout.md`.
 - `docs/verification/issue-106-clean-windows-acceptance.md`.
 - `docs/verification/issue-107-managed-web-rooms.md`.
