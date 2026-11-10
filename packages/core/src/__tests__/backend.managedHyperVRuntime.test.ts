@@ -51,11 +51,6 @@ interface FakeVm {
   notes: string
 }
 
-function decodeScript(args: readonly string[]): string {
-  expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'])
-  return Buffer.from(args[5]!, 'base64').toString('utf16le')
-}
-
 function readPowerShellLiteral(script: string, variable: string): string {
   const match = script.match(new RegExp(`\\$${variable}='((?:''|[^'])*)'`))
   if (!match) throw new Error(`Missing ${variable}`)
@@ -65,13 +60,21 @@ function readPowerShellLiteral(script: string, variable: string): string {
 class FakeHyperV {
   vm: FakeVm | null = null
   readonly scripts: string[] = []
+  readonly scriptFiles: Array<{ file: string; bytes: Buffer }> = []
   readonly migrations: string[] = []
   /** What this Host pretends to answer to `-ExposeVirtualizationExtensions`. */
   grantsNested = true
 
   readonly runner: ManagedRuntimeCommandRunner = async (executable, args) => {
     expect(executable).toBe('powershell.exe')
-    const script = decodeScript(args)
+    expect(args.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'])
+    const scriptFile = args[5]!
+    expect(args.slice(6)).toEqual([])
+    const bytes = await readFile(scriptFile)
+    this.scriptFiles.push({ file: scriptFile, bytes })
+    expect(bytes.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf]))
+    const script = bytes.subarray(3).toString('utf8')
+    expect(path.extname(scriptFile)).toBe('.ps1')
     this.scripts.push(script)
     if (script.includes('Migrated=$true')) {
       if (this.vm) {
@@ -211,6 +214,24 @@ describe('ManagedHyperVRuntime', () => {
 
     expect(await readFile(path.join(path.dirname(marker.vmPath), 'images', `${imageDigest}.iso`))).toEqual(imageBytes)
     expect(marker.overlayDigest).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('executes a BOM-prefixed UTF-8 script from a non-ASCII user profile path', async () => {
+    const fake = new FakeHyperV()
+    const userData = path.join(await tempDir(), '사용자-Élodie')
+    const managed = runtimeAt(fake, userData, '0.1.0')
+
+    const marker = await managed.provision(await releaseImage())
+
+    expect(marker.vmPath).toContain('사용자-Élodie')
+    expect(fake.scriptFiles.length).toBeGreaterThan(0)
+    for (const { file, bytes } of fake.scriptFiles) {
+      expect(file).toContain('사용자-Élodie')
+      expect(bytes.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf]))
+      expect(bytes.subarray(3).toString('utf8')).not.toContain('\uFFFD')
+    }
+    const createScript = fake.scripts.find((script) => script.includes('New-VM -Name'))!
+    expect(createScript).toContain(marker.vmPath)
   })
 
   it('boots the Generation 2 VM from the pinned ISO on a SCSI DVD', async () => {

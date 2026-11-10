@@ -126,7 +126,7 @@ interface HyperVInspection {
 }
 
 const MARKER_FILE = 'provider.json'
-const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'] as const
+const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'] as const
 
 function isDigest(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value)
@@ -138,10 +138,6 @@ function isOpaqueId(value: string): boolean {
 
 function psLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
-}
-
-function encodedPowerShell(script: string): string[] {
-  return [...POWERSHELL_ARGS, Buffer.from(script, 'utf16le').toString('base64')]
 }
 
 /** `NT VIRTUAL MACHINE\Virtual Machines`, the group every VM worker account joins. */
@@ -933,11 +929,18 @@ export class ManagedHyperVRuntime {
   }
 
   private async runPowerShell(script: string): Promise<string> {
-    const result = await this.runner('powershell.exe', encodedPowerShell(script))
-    if (result.code !== 0) {
-      throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
+    const scriptFile = path.join(this.root, `.provider-${randomUUID()}.ps1`)
+    await this.ensureRoot()
+    try {
+      await writeFile(scriptFile, Buffer.concat([Buffer.from('\uFEFF', 'utf8'), Buffer.from(script, 'utf8')]), { flag: 'wx' })
+      const result = await this.runner('powershell.exe', [...POWERSHELL_ARGS, scriptFile])
+      if (result.code !== 0) {
+        throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
+      }
+      return result.stdout
+    } finally {
+      await rm(scriptFile, { force: true })
     }
-    return result.stdout
   }
 
   private async writeMarker(marker: ManagedHyperVRuntimeMarker): Promise<ManagedHyperVRuntimeMarker> {
