@@ -38,7 +38,8 @@ snapshot, not a substitute for the ledger.
 | #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@68a414d` contains. | Done. Its regression tests stay part of `pnpm test`. |
 | #183, PR #184 | Closed. PR #184 merged as `2bca7bf`. | Done. `2026-11-milestone-3-closeout.md` stays the November record. |
 | #185, PR #186 | Closed. PR #186 merged as `f3ed447` and put this plan on `main`. | Complete. |
-| #191 (this refresh) | Open, assigned to milestone #3. | Closes with this update. #175 is then the only open issue in milestone #3. |
+| #191 (this refresh) | Open, assigned to milestone #3. | Closes with this update. #175 and #193 then remain open in milestone #3. |
+| #193 traverse-deny handling | Open, assigned to milestone #3, planned on `main@68a414d`. On that base the provisioning script's `$grantsTraverse` check looks only for an allow rule, so an explicit deny on a required ancestor goes unnoticed: the script adds the traverse rule where no allow exists and continues, and because a deny outranks the allow, VM creation can fail later with access denied. Its acceptance asks provisioning to stop on a deny without changing it, to add the non-inheriting traverse rule only where it is missing, and to leave an existing grant alone. | Stability work on the runtime, not part of the PLC review. If it is still open on 2026-12-01, carry it into December under row 3: regression tests for the deny, missing and already-granted cases, and the four checks plus CI `build` on its head. Its merge changes the ACL step PR #188 hardened, so it must keep the four PR #188 cases listed under *November review* passing. |
 
 ## Completion conditions
 
@@ -154,6 +155,8 @@ milestone is most often rounded up, and neither may be.
 - GitHub #189 and PR #190: the #187 record in both milestone pages, merged as
   `68a414d`, and its CI check.
 - GitHub #191: this refresh of the plan against `main@68a414d`.
+- GitHub #193: planned handling of an explicit traverse deny during VM
+  provisioning, open in milestone #3.
 - `docs/verification/2026-11-milestone-3-closeout.md`.
 - `docs/verification/issue-106-clean-windows-acceptance.md`.
 - `docs/verification/issue-107-managed-web-rooms.md`.
