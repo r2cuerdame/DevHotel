@@ -33,11 +33,11 @@ snapshot, not a substitute for the ledger.
 
 | Item | State on 2026-11-11 | What it means for December |
 |---|---|---|
-| #175 PLC record, PR #176 | #175 open, labelled `blocked`, in milestone #3. PR #176 open and unmerged at head `e3427b5`; its `build` check succeeded on that head. #175 has no comments, and #177, the `repair_exhausted` lesson for its review, is still open. `.loop/plc.md` is not on `main@68a414d`. | The November review has not finished, so milestone #3 stays open (see *November review*). |
+| #175 PLC record, PR #176 | #175 open, labelled `blocked`, in milestone #3. PR #176 open and unmerged at head `e3427b5`; its `build` check succeeded on that head. #175 has no comments, and #177, the `repair_exhausted` lesson for its review, is still open. `.loop/plc.md` is not on `main@b96aab3`. | The November review has not finished, so milestone #3 stays open (see *November review*). |
 | PR #176 scope | The PR was cut from `2e88ef6`. Besides `.loop/plc.md`, it carries a `Set-Acl` traversal grant, a fixed 600 s provisioning timeout and a temporary `-File` runner without a BOM. Each of those hunks overlaps code PR #188 has since changed on `main`: the BOM-prefixed `-File` runner, the bounded `provisioningTimeoutMs` option, and the explicit traverse-only ACL rule. #175's acceptance is the PLC record only. | The runtime work was separated into #187 and delivered by PR #188. A PLC review does not cover runtime code, and a merge of PR #176 must not undo PR #188 (see *November review*). |
 | #187, PR #188 | Closed; PR #188 merged as `6564329` on 2026-11-11. It separately delivered bounded VM-creation timeout and explicit traversal-only ACL handling while preserving the current BOM-prefixed script runner. | Complete. Its tests keep the 2-minute default, allow up to 10 minutes, reject a higher value, and verify the ACL script is explicit, non-inheriting and does not call `icacls`. The manager `/github` check reports `build: success`. |
 | #189, PR #190 | Closed. PR #190 merged as `68a414d` on 2026-11-11; the manager `/github` check reports `build: success`. It recorded #187 and PR #188 in both milestone pages. | Done. |
-| #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@5239c0b` contains. | Done. Its regression tests stay part of `pnpm test`. |
+| #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@b96aab3` contains. | Done. Its regression tests stay part of `pnpm test`. |
 | #183, PR #184 | Closed. PR #184 merged as `2bca7bf`. | Done. `2026-11-milestone-3-closeout.md` stays the November record. |
 | #185, PR #186 | Closed. PR #186 merged as `f3ed447` and put this plan on `main`. | Complete. |
 | #191, PR #192 | Closed. PR #192 merged as `c7f2258` on 2026-11-11; the manager `/github` check reports `build: success`. It refreshed this plan against `main@68a414d` and recorded #193 as open. | Done. |
@@ -45,7 +45,7 @@ snapshot, not a substitute for the ledger.
 | #195, PR #196 | The supplied ledger marks #195 blocked at `ci:build`; its documentation changes are not accepted as complete until the required build result is resolved. | Keep the November milestone open while this issue or its required evidence remains open. Do not treat #197 as proof that PR #196 merged. |
 | #197, PR #198 | The first documentation refresh attempt; its required `build` check failed on the PR head, so it is not accepted as complete. | Keep milestone #3 open until the ledger shows a successful required check for the accepted head. Do not infer a merge from this follow-up. |
 | #199, PR #200 | Closed. PR #200 merged as `b96aab3`; its required `build` check succeeded. It recorded the PR #194 denial handling and regression protection in both milestone documents. | Complete. This refresh is the latest documentation base. |
-| #201 (this refresh) | Current documentation refresh, based on `main@b96aab3`. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
+| #201 (this refresh) | Current documentation refresh, based on `main@b96aab3`. `5239c0b..b96aab3` changes only the two milestone pages, so the runtime code is still PR #194's. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
 
 ## Completion conditions
 
