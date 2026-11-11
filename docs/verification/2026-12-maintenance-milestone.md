@@ -47,7 +47,7 @@ snapshot, not a substitute for the ledger.
 | #197, PR #198 | Open in milestone #3. PR #198 is open and unmerged, and its required `build` check failed on the PR head, so it is not accepted as complete. | Keep milestone #3 open until the ledger shows a successful required check for the accepted head. Do not infer a merge from a later refresh. |
 | #199, PR #200 | Closed. PR #200 merged as `b96aab3`; its required `build` check succeeded. It recorded PR #194's deny handling and the regression cases a PR #176 merge must keep, in both milestone pages. | Done. |
 | #201, PR #202 | Closed. PR #202 merged as `8ef148b` on 2026-11-11; its required `build` check succeeded on head `75d3fd1`. It refreshed both pages' history against `main@b96aab3`. | Done. `main@8ef148b` is the base of this refresh. |
-| #203 (this refresh) | Open in milestone #3. Current documentation refresh, based on `main@8ef148b`. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
+| #203, PR #204 (this refresh) | Open in milestone #3. PR #204 is the current documentation refresh, based on `main@8ef148b`. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
 
 ## Completion conditions
 
@@ -210,8 +210,8 @@ milestone is most often rounded up, and neither may be.
   and build states in the ledger.
 - GitHub #201 and PR #202: the page-history refresh against `main@b96aab3`,
   merged as `8ef148b` with `build: success`.
-- GitHub #203: this refresh against `main@8ef148b`; confirm its accepted head
-  and build state in the ledger.
+- GitHub #203 and PR #204: this refresh against `main@8ef148b`; confirm its
+  accepted head and build state in the ledger.
 - `docs/verification/2026-11-milestone-3-closeout.md`.
 - `docs/verification/issue-106-clean-windows-acceptance.md`.
 - `docs/verification/issue-107-managed-web-rooms.md`.
