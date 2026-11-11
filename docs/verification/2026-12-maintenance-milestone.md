@@ -2,11 +2,12 @@
 
 Status: **draft plan**, first written 2026-11-11 against `main@2bca7bf` and
 refreshed against `main@68a414d` (PR #190), `main@c7f2258` (PR #192),
-`main@5239c0b` (PR #194), and `main@b96aab3` (PR #200). This refresh records
-the merged runtime hardening and the regression cases a future review must
-preserve. It defines what has to be true, and what has to be recorded, before
-the December maintenance milestone can close. It claims no result: every row
-below starts unproven and is closed only by evidence on the accepted commit.
+`main@5239c0b` (PR #194), `main@b96aab3` (PR #200), and `main@8ef148b`
+(PR #202). This refresh records the merged runtime hardening and the regression
+cases a future review must preserve. It defines what has to be true, and what
+has to be recorded, before the December maintenance milestone can close. It
+claims no result: every row below starts unproven and is closed only by evidence
+on the accepted commit.
 
 ## Period and goal
 
@@ -28,31 +29,32 @@ issue is assigned to a December milestone.
 ## Carried over from milestone #3
 
 Read from the GitHub ledger through the manager `/github` gate on 2026-11-11,
-against `main@b96aab3`. Recheck before December starts; this table is a
+against `main@8ef148b`. Recheck before December starts; this table is a
 snapshot, not a substitute for the ledger.
 
 | Item | State on 2026-11-11 | What it means for December |
 |---|---|---|
-| #175 PLC record, PR #176 | #175 open, labelled `blocked`, in milestone #3. PR #176 open and unmerged at head `e3427b5`; its `build` check succeeded on that head. #175 has no comments, and #177, the `repair_exhausted` lesson for its review, is still open. `.loop/plc.md` is not on `main@b96aab3`. | The November review has not finished, so milestone #3 stays open (see *November review*). |
-| PR #176 scope | The PR was cut from `2e88ef6`. Besides `.loop/plc.md`, it carries a `Set-Acl` traversal grant, a fixed 600 s provisioning timeout and a temporary `-File` runner without a BOM. Each of those hunks overlaps code PR #188 has since changed on `main`: the BOM-prefixed `-File` runner, the bounded `provisioningTimeoutMs` option, and the explicit traverse-only ACL rule. #175's acceptance is the PLC record only. | The runtime work was separated into #187 and delivered by PR #188. A PLC review does not cover runtime code, and a merge of PR #176 must not undo PR #188 (see *November review*). |
+| #175 PLC record, PR #176 | #175 open, labelled `blocked`, in milestone #3. PR #176 open and unmerged at head `e3427b5`; its `build` check succeeded on that head. #175 has no comments, and #177, the `repair_exhausted` lesson for its review, is still open. `.loop/plc.md` is not on `main@8ef148b`. | The November review has not finished, so milestone #3 stays open (see *November review*). |
+| PR #176 scope | The PR was cut from `2e88ef6`. Besides `.loop/plc.md`, it carries a `Set-Acl` traversal grant, a fixed 600 s provisioning timeout and a temporary `-File` runner without a BOM. It also edits `managedRuntime.ts` and `backend.managedHyperVRuntime.test.ts`. Each runtime hunk overlaps code PR #188 or PR #194 has since changed on `main`: the BOM-prefixed `-File` runner, the bounded `provisioningTimeoutMs` option, the explicit traverse-only ACL rule, and the deny check before any ACL write. Its test hunks expect a 600 s timeout on the default VM-creation script, which contradicts PR #188's 2-minute default. #175's acceptance is the PLC record only. | The runtime work was separated into #187 and delivered by PR #188, then hardened by PR #194. A PLC review does not cover runtime code. A merge of PR #176 must not undo either PR, and must not resolve a test conflict by weakening their assertions (see *November review*). |
 | #187, PR #188 | Closed; PR #188 merged as `6564329` on 2026-11-11. It separately delivered bounded VM-creation timeout and explicit traversal-only ACL handling while preserving the current BOM-prefixed script runner. | Complete. Its tests keep the 2-minute default, allow up to 10 minutes, reject a higher value, and verify the ACL script is explicit, non-inheriting and does not call `icacls`. The manager `/github` check reports `build: success`. |
 | #189, PR #190 | Closed. PR #190 merged as `68a414d` on 2026-11-11; the manager `/github` check reports `build: success`. It recorded #187 and PR #188 in both milestone pages. | Done. |
-| #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@b96aab3` contains. | Done. Its regression tests stay part of `pnpm test`. |
+| #181, PR #182 | Closed. PR #182 merged as `5edfa56`, which `main@8ef148b` contains. | Done. Its regression tests stay part of `pnpm test`. |
 | #183, PR #184 | Closed. PR #184 merged as `2bca7bf`. | Done. `2026-11-milestone-3-closeout.md` stays the November record. |
 | #185, PR #186 | Closed. PR #186 merged as `f3ed447` and put this plan on `main`. | Complete. |
 | #191, PR #192 | Closed. PR #192 merged as `c7f2258` on 2026-11-11; the manager `/github` check reports `build: success`. It refreshed this plan against `main@68a414d` and recorded #193 as open. | Done. |
-| #193, PR #194 | Closed. PR #194 merged as `5239c0b` on 2026-11-11; the manager `/github` check reports `build: success`. Provisioning classifies every required ancestor as denied, missing or granted before writing any ACL. An explicit or inherited deny stops the operation before the first write and leaves the deny unchanged. It adds a non-inheriting traverse rule only where missing and leaves an existing grant alone. | Done. Runtime stability work; separate from the #175 PLC review. Its regression tests must remain intact through any later merge affecting the same runtime code. |
-| #195, PR #196 | The supplied ledger marks #195 blocked at `ci:build`; its documentation changes are not accepted as complete until the required build result is resolved. | Keep the November milestone open while this issue or its required evidence remains open. Do not treat #197 as proof that PR #196 merged. |
-| #197, PR #198 | The first documentation refresh attempt; its required `build` check failed on the PR head, so it is not accepted as complete. | Keep milestone #3 open until the ledger shows a successful required check for the accepted head. Do not infer a merge from this follow-up. |
-| #199, PR #200 | Closed. PR #200 merged as `b96aab3`; its required `build` check succeeded. It recorded the PR #194 denial handling and regression protection in both milestone documents. | Complete. This refresh is the latest documentation base. |
-| #201 (this refresh) | Current documentation refresh, based on `main@b96aab3`. `5239c0b..b96aab3` changes only the two milestone pages, so the runtime code is still PR #194's. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
+| #193, PR #194 | Closed. PR #194 merged as `5239c0b` on 2026-11-11; the manager `/github` check reports `build: success`. Provisioning classifies every required ancestor as denied, missing or granted before writing any ACL. An explicit or inherited deny stops the operation before the first write and leaves the deny unchanged. It adds a non-inheriting traverse rule only where missing and leaves an existing grant alone. | Done. Runtime stability work; separate from the #175 PLC review. Its regression tests must remain intact through any later merge affecting the same runtime code. `5239c0b..8ef148b` changes only the two milestone pages; a Windows per-test run of `backend.managedHyperVRuntime.test.ts` on that runtime code passed all 34 cases, both Windows-only PR #194 cases included. |
+| #195, PR #196 | Open, labelled `blocked`, in milestone #3. PR #196 is open and unmerged, and its required `build` check failed on the PR head. | Keep the November milestone open while this issue or its required evidence remains open. Do not treat a later refresh as proof that PR #196 merged. |
+| #197, PR #198 | Open in milestone #3. PR #198 is open and unmerged, and its required `build` check failed on the PR head, so it is not accepted as complete. | Keep milestone #3 open until the ledger shows a successful required check for the accepted head. Do not infer a merge from a later refresh. |
+| #199, PR #200 | Closed. PR #200 merged as `b96aab3`; its required `build` check succeeded. It recorded PR #194's deny handling and the regression cases a PR #176 merge must keep, in both milestone pages. | Done. |
+| #201, PR #202 | Closed. PR #202 merged as `8ef148b` on 2026-11-11; its required `build` check succeeded on head `75d3fd1`. It refreshed both pages' history against `main@b96aab3`. | Done. `main@8ef148b` is the base of this refresh. |
+| #203, PR #204 (this refresh) | Open in milestone #3. PR #204 is the current documentation refresh, based on `main@8ef148b`. | Closes only after its four local checks and required build evidence are recorded. #175 and any other ledger-open issue remain open. |
 
 ## Completion conditions
 
 | # | Area | Completion condition | Verification evidence |
 |---|---|---|---|
 | 1 | Period and scope | Work lands between 2026-12-01 and 2026-12-31 and is stability or maintenance on the existing runtime. Unapproved features, direction changes and new costs are not in the milestone. | The milestone's issue list in the ledger; each issue's approval marker. |
-| 2 | November review | The #175 review has finished: PR #176 merged or closed, with the outcome recorded on #175, and `.loop/plc.md` present on the accepted base if it merged. | #175, PR #176 and the accepted commit's tree. If PR #176 merged, PR #188's runtime tests pass on that merge commit. |
+| 2 | November review | The #175 review has finished: PR #176 merged or closed, with the outcome recorded on #175, and `.loop/plc.md` present on the accepted base if it merged. | #175, PR #176 and the accepted commit's tree. If PR #176 merged, the six PR #188 and PR #194 cases named under *November review* pass on that merge commit with their assertions unchanged, the two Windows-only cases included. |
 | 3 | Selected code changes | Every code change merged under this milestone adds or updates a regression test that fails without the change, and the pull request names it. The required checks pass on that pull request's head commit. | `pnpm lint`, `pnpm typecheck`, `pnpm test` and `pnpm --filter devhotel-mcp build` results, plus the CI `build` conclusion read for that exact head SHA. #187/#188's merged hardening is evidence for the November work; it does not close #175. |
 | 4 | Clean-Windows gates (#106/#107/#111) | Kept separate and open until a real clean Windows 11 environment fills each required row. | The dated matrices required by `issue-106-clean-windows-acceptance.md`, `issue-107-managed-web-rooms.md` and `issue-111-release-gate-readiness.md`. |
 | 5 | Closeout record | A dated closeout document lists every remaining issue with its reason and every piece of evidence with its commit SHA. The version stays `0.5.4` and no deployment work is done. | The closeout document; `.loop/project.md` and the package manifests still at `0.5.4`. |
@@ -92,7 +94,22 @@ At the start of December, read #175 and PR #176 in the ledger.
   skipped case is not a pass: verify them in a Windows run with a per-test
   reporter or the CI `build` job for that merge commit. The ACL probe uses
   in-memory security descriptors and shadows `Get-Acl`/`Set-Acl`, so it observes
-  the generated write decisions without changing host ACLs.
+  the generated write decisions without changing host ACLs. A per-test run from
+  the repository root:
+
+  ```
+  pnpm --filter @devhotel/core exec vitest run --reporter=verbose src/__tests__/backend.managedHyperVRuntime.test.ts
+  ```
+
+  On the runtime code of `main@8ef148b` this run passed all 34 cases, and both
+  PR #194 cases ran.
+- PR #176 also edits `backend.managedHyperVRuntime.test.ts`, so a passing run is
+  not enough on its own. The six cases must keep their names and assertions:
+  compare that file between the merge commit's first parent (on 2026-11-11,
+  `main@8ef148b`) and the merge commit, and reject a merge that deletes or
+  loosens an assertion in any of them. In particular, the
+  default VM-creation timeout stays 2 minutes; PR #176's expectation of a fixed
+  600 s timeout must not replace it.
 - If it has not finished, leave milestone #3 open. Record in the November
   closeout which item is still open and why (on 2026-11-11: review pending, and
   PR #176 carries runtime code outside #175's scope that overlaps the merged
@@ -186,12 +203,15 @@ milestone is most often rounded up, and neither may be.
   as `c7f2258`, and its CI check.
 - GitHub #193 and PR #194: traverse-deny handling during VM provisioning,
   merged as `5239c0b`, its regression tests and CI check.
-- GitHub #199 and PR #200: the latest record of PR #194's protection criteria,
-  merged as `b96aab3` with `build: success`.
+- GitHub #199 and PR #200: the record of PR #194's protection criteria in both
+  milestone pages, merged as `b96aab3` with `build: success`.
 - GitHub #195/PR #196 and #197/PR #198: outstanding milestone-document work;
-  confirm merge and build states in the ledger.
-- GitHub #201: this refresh against `main@b96aab3`; confirm its accepted head
-  and build state in the ledger.
+  both PR heads failed the required `build` check on 2026-11-11. Confirm merge
+  and build states in the ledger.
+- GitHub #201 and PR #202: the page-history refresh against `main@b96aab3`,
+  merged as `8ef148b` with `build: success`.
+- GitHub #203 and PR #204: this refresh against `main@8ef148b`; confirm its
+  accepted head and build state in the ledger.
 - `docs/verification/2026-11-milestone-3-closeout.md`.
 - `docs/verification/issue-106-clean-windows-acceptance.md`.
 - `docs/verification/issue-107-managed-web-rooms.md`.
