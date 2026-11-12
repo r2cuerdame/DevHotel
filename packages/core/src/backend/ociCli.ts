@@ -8175,7 +8175,7 @@ export class OciCliBackend implements IsolationBackend {
     const published = (anchor.NetworkSettings?.Ports?.[`${RELAY_PORT}/tcp`] ?? [])
       .map((binding) => `${binding?.HostIp ?? ''}:${binding?.HostPort ?? ''}`)
       .filter((line) => /:\d+$/.test(line))
-    if (published.length > 0) return parsePortOutput(published.join('\n'))
+    if (published.length > 0) return await this.reachHostPort(roomId, parsePortOutput(published.join('\n')))
     const result = must(
       await this.docker(['port', exactContainerId(anchor, roomId), `${RELAY_PORT}/tcp`]),
       'read anchor host port',
