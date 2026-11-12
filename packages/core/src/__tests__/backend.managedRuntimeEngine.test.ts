@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createWriteStream, mkdtempSync, readFileSync, rmSync, writeFileSync, type WriteStream } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { Writable } from 'node:stream'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   GuestFrameDecoder,
   GuestFrameType,
@@ -11,6 +12,27 @@ import {
 } from '../backend/managedRuntimeGuestProtocol'
 import { ManagedRuntimeEngine, type ManagedRuntimeChannel } from '../backend/managedRuntimeEngine'
 import { until } from './timing'
+
+// Keep real filesystem IO by default; inject disk failures without filling the
+// Host disk or changing its permissions. The Writable lifecycle stays real.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) }
+})
+
+async function within<T>(pending: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('file operation did not settle within 5 seconds')), 5_000)
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 /**
  * A guest agent that runs entirely in this process.
@@ -152,7 +174,10 @@ describe('ManagedRuntimeEngine', () => {
     dir = mkdtempSync(join(tmpdir(), 'dh-managed-engine-'))
   })
 
-  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+  afterEach(() => {
+    vi.mocked(createWriteStream).mockReset()
+    rmSync(dir, { recursive: true, force: true })
+  })
 
   it('delivers argv unchanged and returns the guest exit code and output', async () => {
     const guest = new FakeGuest()
@@ -251,6 +276,151 @@ describe('ManagedRuntimeEngine', () => {
 
     expect(result.stdout).toBe('')
     expect(readFileSync(target, 'utf8')).toBe('exported-bytes')
+  })
+
+  describe.each(['get', 'exec'] as const)('Host file output (%s)', (operation) => {
+    const save = (engine: ManagedRuntimeEngine, target: string, onAbort?: () => Promise<void>): Promise<unknown> =>
+      operation === 'get'
+        ? engine.getFile('staged-output', target)
+        : engine.run(['save', 'node:22'], { outputFile: target, timeoutMs: null, onAbort })
+
+    it('rejects a missing destination directory without waiting for the guest', async () => {
+      const guest = new FakeGuest()
+      guest.handler = () => {} // The guest reply must not be needed to report a local error.
+      const pending = save(engineFor(guest), join(dir, 'missing', 'output.tar'))
+      try {
+        await expect(within(pending)).rejects.toMatchObject({ code: 'ENOENT' })
+        const output = vi.mocked(createWriteStream).mock.results.at(-1)!.value as WriteStream
+        expect(output.closed).toBe(true)
+        expect(output.listenerCount('error')).toBe(0)
+        expect(guest.cancelled).toEqual([guest.requests[0]!.id])
+      } finally {
+        guest.drop()
+        await pending.catch(() => {})
+      }
+    })
+
+    it.each(['write', 'final', 'close'] as const)('rejects a %s failure while preserving other requests', async (stage) => {
+      const problem = new Error(`local ${stage} failed`)
+      let fail: () => void = () => { throw new Error('failure stage was not reached') }
+      let reached!: () => void
+      const ready = new Promise<void>((resolve) => { reached = resolve })
+      const output = new Writable({
+        write(_chunk, _encoding, callback) {
+          if (stage === 'write') {
+            fail = () => callback(problem)
+            reached()
+          } else callback()
+        },
+        final(callback) {
+          if (stage === 'final') {
+            fail = () => callback(problem)
+            reached()
+          } else callback()
+        },
+        destroy(error, callback) {
+          if (stage === 'close' && !error) {
+            fail = () => callback(problem)
+            reached()
+          } else callback(error)
+        }
+      })
+      vi.mocked(createWriteStream).mockReturnValueOnce(output as WriteStream)
+      const guest = new FakeGuest()
+      guest.handler = () => {}
+      const engine = engineFor(guest)
+      const cleanup = vi.fn(async () => {})
+      const pending = save(engine, join(dir, 'failed.tar'), cleanup)
+      // Observe rejection immediately, including when the disk fails before
+      // the test reaches the assertion. No process-level error handler masks it.
+      const outcome = pending.then(() => null, (error: unknown) => error)
+      const other = engine.run(['inspect', 'other-room'], { timeoutMs: null })
+      try {
+        await until(() => guest.requests.length === 2, { timeoutMs: 5_000, what: 'both guest requests' })
+        const fileId = guest.requests.find(({ request }) =>
+          request.op === 'get' || (request.argv as string[])[0] === 'save')!.id
+        const otherId = guest.requests.find(({ request }) => (request.argv as string[] | undefined)?.[0] === 'inspect')!.id
+        guest.stdout(fileId, 'partial output')
+        if (stage !== 'write') guest.result(fileId, 0)
+        await within(ready)
+        fail()
+        expect(await within(outcome)).toBe(problem)
+        expect(output.closed).toBe(true)
+        expect(output.destroyed).toBe(true)
+        expect(output.listenerCount('error')).toBe(0)
+        expect(output.listenerCount('close')).toBe(0)
+        expect(guest.cancelled).toEqual(stage === 'write' ? [fileId] : [])
+        expect(cleanup).toHaveBeenCalledTimes(operation === 'exec' && stage === 'write' ? 1 : 0)
+
+        // Late bytes/results from the failed request cannot pollute its peer.
+        guest.stdout(fileId, 'late bytes')
+        guest.result(fileId, 0)
+        guest.stdout(otherId, 'other room bytes')
+        guest.result(otherId, 0)
+        await expect(within(other)).resolves.toMatchObject({ code: 0, stdout: 'other room bytes' })
+
+        guest.handler = (self, id) => {
+          self.stdout(id, 'later file bytes')
+          self.result(id, 0)
+        }
+        const later = join(dir, 'later.tar')
+        await within(save(engine, later))
+        expect(readFileSync(later, 'utf8')).toBe('later file bytes')
+      } finally {
+        guest.drop()
+        output.destroy()
+        await Promise.allSettled([pending, other])
+      }
+    })
+
+    it('closes the destination before reporting a guest rejection', async () => {
+      const guest = new FakeGuest()
+      guest.handler = (self, id) => {
+        self.stdout(id, 'partial bytes')
+        self.reject(id, 'guest refused transfer')
+      }
+      await expect(within(save(engineFor(guest), join(dir, 'rejected.tar')))).rejects.toThrow('guest refused transfer')
+      const output = vi.mocked(createWriteStream).mock.results.at(-1)!.value as WriteStream
+      expect(output.closed).toBe(true)
+      expect(output.listenerCount('error')).toBe(0)
+      expect(output.listenerCount('close')).toBe(0)
+    })
+
+    it('preserves binary output delivered in multiple large frames', async () => {
+      const chunks = [Buffer.alloc(300_000, 0x00), Buffer.alloc(300_000, 0xff), Buffer.from([0x80, 0x00, 0x0a])]
+      const guest = new FakeGuest()
+      guest.handler = (self, id) => {
+        for (const chunk of chunks) self.stdout(id, chunk)
+        self.result(id, 0)
+      }
+      const target = join(dir, 'large.bin')
+      await within(save(engineFor(guest), target))
+      expect(readFileSync(target)).toEqual(Buffer.concat(chunks))
+    })
+  })
+
+  it('preserves caller cancellation and cleanup when writing output to a file', async () => {
+    const guest = new FakeGuest()
+    guest.handler = () => {}
+    const controller = new AbortController()
+    const cleanup = vi.fn(async () => {})
+    const pending = engineFor(guest).run(['save', 'node:22'], {
+      outputFile: join(dir, 'cancelled.tar'), signal: controller.signal, onAbort: cleanup
+    })
+    const outcome = pending.then(() => null, (error: unknown) => error)
+    try {
+      await until(() => guest.requests.length === 1, { timeoutMs: 5_000, what: 'the file-producing request' })
+      const reason = new Error('caller cancelled')
+      controller.abort(reason)
+      expect(await within(outcome)).toBe(reason)
+      const output = vi.mocked(createWriteStream).mock.results.at(-1)!.value as WriteStream
+      expect(output.closed).toBe(true)
+      expect(guest.cancelled).toEqual([guest.requests[0]!.id])
+      expect(cleanup).toHaveBeenCalledTimes(1)
+    } finally {
+      guest.drop()
+      await pending.catch(() => {})
+    }
   })
 
   it('cancels the guest request at its deadline and reports the timeout', async () => {
