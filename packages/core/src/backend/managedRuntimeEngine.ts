@@ -14,6 +14,7 @@ import {
 } from './managedRuntimeGuestProtocol'
 import { createWriteStream } from 'node:fs'
 import { open } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * A bidirectional byte channel to the guest agent.
@@ -442,6 +443,10 @@ function createOutputSinks(
   let stderrBytes = 0
   let outputLimitExceeded = false
   const output = opts.outputFile ? createWriteStream(opts.outputFile) : null
+  // Guest frames are byte chunks, so one character can straddle two of them.
+  // Each request and stream keeps its own decoder; raw sinks still get bytes.
+  const outDecoder = new StringDecoder('utf8')
+  const errDecoder = new StringDecoder('utf8')
 
   const feed = (rest: string, chunk: string): string => {
     const parts = (rest + chunk).split(/\r?\n/)
@@ -477,7 +482,7 @@ function createOutputSinks(
         opts.onStdout(kept)
         return
       }
-      const text = kept.toString('utf8')
+      const text = outDecoder.write(kept)
       stdout += text
       outRest = feed(outRest, text)
     },
@@ -488,11 +493,21 @@ function createOutputSinks(
         opts.onStderr(kept)
         return
       }
-      const text = kept.toString('utf8')
+      const text = errDecoder.write(kept)
       stderr += text
       errRest = feed(errRest, text)
     },
     finish: (result) => {
+      const outTail = outDecoder.end()
+      if (outTail.length > 0) {
+        stdout += outTail
+        outRest = feed(outRest, outTail)
+      }
+      const errTail = errDecoder.end()
+      if (errTail.length > 0) {
+        stderr += errTail
+        errRest = feed(errRest, errTail)
+      }
       if (opts.onLine) {
         if (outRest.length > 0) opts.onLine(outRest)
         if (errRest.length > 0) opts.onLine(errRest)
