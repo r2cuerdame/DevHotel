@@ -80,16 +80,24 @@ export class ManagedRuntimeIngress {
    */
   async publish(roomId: string, target: ManagedIngressTarget): Promise<number> {
     await this.revoke(roomId)
+    const connections = new Set<() => void>()
+    let closing = false
     const server = net.createServer({ allowHalfOpen: false }, (client) => {
+      if (closing) {
+        client.destroy()
+        return
+      }
       client.setNoDelay(true)
       const upstream = this.connect(target)
       upstream.setNoDelay(true)
       // A half-closed pair leaks a socket per request under keep-alive, so both
       // directions are torn down together rather than piped and forgotten.
       const destroy = (): void => {
+        connections.delete(destroy)
         client.destroy()
         upstream.destroy()
       }
+      connections.add(destroy)
       client.on('error', destroy)
       upstream.on('error', destroy)
       client.on('close', destroy)
@@ -118,7 +126,13 @@ export class ManagedRuntimeIngress {
     this.routes.set(roomId, {
       hostPort,
       close: async () => {
-        await new Promise<void>((resolve) => server.close(() => resolve()))
+        closing = true
+        await new Promise<void>((resolve) => {
+          // Stop accepting first, then close only this route's existing pairs.
+          // server.close alone waits indefinitely for persistent connections.
+          server.close(() => resolve())
+          for (const destroy of connections) destroy()
+        })
       }
     })
     // Written after the bind so the ledger never claims a port that was never
