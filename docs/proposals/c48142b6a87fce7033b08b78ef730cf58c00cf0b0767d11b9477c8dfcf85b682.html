@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>DevHotel PLC/KPI 제안</title>
+<style>
+body{margin:0;padding:16px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#f1f5f9}
+section{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:18px;margin-bottom:14px}
+h1,h2{color:#38bdf8;margin:0 0 8px;font-size:1.2rem}
+p,li{line-height:1.5;color:#cbd5e1;font-size:0.92rem}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th,td{border:1px solid #334155;padding:6px 8px;text-align:left;font-size:0.88rem}
+th{background:#0f172a;color:#38bdf8}
+.badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;background:#064e3b;color:#34d399;font-weight:bold;margin-bottom:6px}
+.svg-wrap{display:flex;justify-content:center;margin:10px 0}
+</style>
+</head>
+<body>
+<section id="s1">
+<span class="badge">PLC/KPI 의종 결정 제안</span>
+<h1>DevHotel 단기·분기·연간 목표 및 KPI 의종 결정 제안</h1>
+<p>DevHotel은 의종을 위한 Windows 11 격리 개발 런타임 및 내부 테스트 도구(Android·웹·Windows·Linux 방)입니다.</p>
+<div class="svg-wrap">
+<svg viewBox="0 0 480 60" width="480" height="60">
+<rect x="5" y="10" width="135" height="40" rx="4" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+<text x="72" y="35" fill="#f1f5f9" font-size="12" text-anchor="middle">Android/에뮬레이터</text>
+<polygon points="152,30 144,25 144,35" fill="#38bdf8"/>
+<rect x="156" y="10" width="145" height="40" rx="4" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+<text x="228" y="35" fill="#f1f5f9" font-size="12" text-anchor="middle">웹/Windows/Linux 방</text>
+<polygon points="313,30 305,25 305,35" fill="#38bdf8"/>
+<rect x="317" y="10" width="155" height="40" rx="4" fill="#064e3b" stroke="#34d399" stroke-width="1.5"/>
+<text x="394" y="35" fill="#34d399" font-size="12" text-anchor="middle">내부 DAU 1 (Pulse)</text>
+</svg>
+</div>
+</section>
+<section id="s2">
+<h2>1. 목표 및 KPI 제안 (의종 합의 구체화)</h2>
+<p>2026-11-12 의종 합의(내부 테스트 도구, 1주 배포 창, Pulse DAU) 기반 구체 목표입니다.</p>
+<table>
+<tr><th>구분</th><th>기간/시점</th><th>제안 내용</th><th>측정/기대값</th></tr>
+<tr><td>단기 목표</td><td>2026-11-12–11-18</td><td>Wave A3 Android 및 웹 방 격리 안정화</td><td>내부 테스트 1건 성공 / Pulse DAU 1</td></tr>
+<tr><td>분기 목표</td><td>2026 Q4</td><td>4종 런타임 룸 무결성 확보 및 상시 테스트 지원</td><td>주간 배포 창 지속 준수 / DAU 1 유지</td></tr>
+<tr><td>연간 목표</td><td>2027</td><td>DevHotel 무중단 자동화 격리 개발 허브 완성</td><td>내부 DAU 1~3 안정 유지</td></tr>
+<tr><td>기본 KPI</td><td>상시</td><td>내부 사용 DAU 1 (측정 소스: Pulse)</td><td>내부 도구 (수익 해당 없음)</td></tr>
+</table>
+</section>
+<section id="s3">
+<h2>2. 비용, 효과 및 위험 관리</h2>
+<ul>
+<li><strong>비용:</strong> 추가 비용 0원 (신규 유료 API/AWS 없음, 로컬 PC 및 할당 자원 전담)</li>
+<li><strong>효과:</strong> 4종 룸 격리 안정화로 의종의 앱/서버/OS 테스트 작업 즉시 수행</li>
+<li><strong>위험 & 대응:</strong> CI 지연 시 bounded wait 조정 및 headless 검증으로 안정화</li>
+<li><strong>배포 창:</strong> 7일 이하 단위(2026-11-12–2026-11-18) 배포 창 엄수</li>
+</ul>
+</section>
+<section id="s4">
+<h2>3. 추천 및 의종 선택지</h2>
+<p>PLC(단계·목표·기간·기대값·비용) 확정을 위해 아래 선택지 중 하나를 결정해 주십시오.</p>
+<table>
+<tr><th>선택지</th><th>내용</th><th>비고</th></tr>
+<tr><td><strong>선택 A (추천)</strong></td><td>제안된 단기·분기·연간 목표 및 내부 DAU 1 (Pulse) 일괄 확정</td><td>가장 빠른 안정화 경로</td></tr>
+<tr><td><strong>선택 B</strong></td><td>Android 기기/에뮬레이터 방 우선 집중 후 분기 목표 재조정</td><td>단계별 집중 진행</td></tr>
+<tr><td><strong>선택 C</strong></td><td>자유 입력: 의종의 구체적인 목표 수치 및 우선순위 직접 지시</td><td>의견에 따라 즉시 반영</td></tr>
+</table>
+</section>
+</body>
+</html>
