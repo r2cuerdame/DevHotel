@@ -303,6 +303,9 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
     const connection = await this.connected()
 
     const sinks = createOutputSinks(args, opts)
+  const signal = opts.signal && sinks.signal
+    ? AbortSignal.any([opts.signal, sinks.signal])
+    : (opts.signal ?? sinks.signal)
     try {
       const result = await connection.request(
         { op: 'exec', argv: args, ...(opts.input !== undefined || opts.inputFile ? { stdin: true } : {}) },
@@ -313,11 +316,11 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
             ? { stdin: () => inputStream(opts) }
             : {}),
           timeoutMs: opts.timeoutMs === null ? null : (opts.timeoutMs ?? this.defaultTimeoutMs),
-          ...(opts.signal ? { signal: opts.signal } : {}),
+        ...(signal ? { signal } : {}),
           ...(opts.onAbort ? { onAbort: opts.onAbort } : {})
         }
       )
-      return sinks.finish(result)
+    return await sinks.finish(result)
     } finally {
       await sinks.dispose()
     }
@@ -379,20 +382,16 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
   /** Copy a guest file out to the Host, the other half of Room file transfer. */
   async getFile(guestPath: string, hostPath: string): Promise<void> {
     const connection = await this.connected()
-    const output = createWriteStream(hostPath)
+  const output = createFileOutput(hostPath)
     try {
       const result = await connection.request(
         { op: 'get', path: guestPath },
-        { onStdout: (chunk) => output.write(chunk), timeoutMs: null }
+      { onStdout: output.write, signal: output.signal, timeoutMs: null }
       )
       if (result.code !== 0) throw new Error(`the managed runtime could not read ${guestPath}`)
-      await new Promise<void>((resolve, reject) => {
-        output.end(() => resolve())
-        output.once('error', reject)
-      })
-    } catch (error) {
-      output.destroy()
-      throw error
+    await output.finish()
+  } finally {
+    await output.dispose()
     }
   }
 }
