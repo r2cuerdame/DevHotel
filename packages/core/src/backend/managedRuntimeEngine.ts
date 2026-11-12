@@ -303,9 +303,9 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
     const connection = await this.connected()
 
     const sinks = createOutputSinks(args, opts)
-  const signal = opts.signal && sinks.signal
-    ? AbortSignal.any([opts.signal, sinks.signal])
-    : (opts.signal ?? sinks.signal)
+    const signal = opts.signal && sinks.signal
+      ? AbortSignal.any([opts.signal, sinks.signal])
+      : (opts.signal ?? sinks.signal)
     try {
       const result = await connection.request(
         { op: 'exec', argv: args, ...(opts.input !== undefined || opts.inputFile ? { stdin: true } : {}) },
@@ -316,11 +316,11 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
             ? { stdin: () => inputStream(opts) }
             : {}),
           timeoutMs: opts.timeoutMs === null ? null : (opts.timeoutMs ?? this.defaultTimeoutMs),
-        ...(signal ? { signal } : {}),
+          ...(signal ? { signal } : {}),
           ...(opts.onAbort ? { onAbort: opts.onAbort } : {})
         }
       )
-    return await sinks.finish(result)
+      return await sinks.finish(result)
     } finally {
       await sinks.dispose()
     }
@@ -382,16 +382,16 @@ export class ManagedRuntimeEngine implements OciEngineExecutor {
   /** Copy a guest file out to the Host, the other half of Room file transfer. */
   async getFile(guestPath: string, hostPath: string): Promise<void> {
     const connection = await this.connected()
-  const output = createFileOutput(hostPath)
+    const output = createFileOutput(hostPath)
     try {
       const result = await connection.request(
         { op: 'get', path: guestPath },
-      { onStdout: output.write, signal: output.signal, timeoutMs: null }
+        { onStdout: output.write, signal: output.signal, timeoutMs: null }
       )
       if (result.code !== 0) throw new Error(`the managed runtime could not read ${guestPath}`)
-    await output.finish()
-  } finally {
-    await output.dispose()
+      await output.finish()
+    } finally {
+      await output.dispose()
     }
   }
 }
@@ -424,13 +424,74 @@ function inputStream(opts: RunDockerOpts): AsyncIterable<Buffer> {
  * engine that honoured only the simple case would silently withdraw those
  * guarantees from every caller, so they are honoured here instead.
  */
+function createFileOutput(hostPath: string): {
+  signal: AbortSignal
+  write: (chunk: Buffer) => void
+  finish: () => Promise<void>
+  dispose: () => Promise<void>
+} {
+  const output = createWriteStream(hostPath)
+  const controller = new AbortController()
+  let failure: Error | undefined
+  let disposing = false
+  let closed = false
+  let resolveClosed!: () => void
+  const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve })
+  const fail = (error: Error): void => {
+    if (failure) return
+    failure = error
+    controller.abort(error)
+  }
+  const onClose = (): void => {
+    closed = true
+    if (!output.writableFinished && !disposing && !failure) {
+      fail(new Error('the managed runtime output file closed before all data was saved'))
+    }
+    resolveClosed()
+  }
+  output.on('error', fail)
+  output.on('close', onClose)
+
+  return {
+    signal: controller.signal,
+    write: (chunk) => {
+      if (failure || output.destroyed) return
+      try {
+        output.write(chunk)
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)))
+      }
+    },
+    finish: async () => {
+      if (!failure && !output.destroyed) {
+        try {
+          output.end()
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)))
+          output.destroy()
+        }
+      }
+      await closedPromise
+      if (failure) throw failure
+    },
+    dispose: async () => {
+      disposing = true
+      if (!closed) output.destroy()
+      await closedPromise
+      output.off('error', fail)
+      output.off('close', onClose)
+    }
+  }
+}
+
 function createOutputSinks(
   args: string[],
   opts: RunDockerOpts
 ): {
   onStdout: (chunk: Buffer) => void
   onStderr: (chunk: Buffer) => void
-  finish: (result: ExecResult) => ExecResult
+  signal?: AbortSignal
+  finish: (result: ExecResult) => Promise<ExecResult>
   dispose: () => Promise<void>
 } {
   let stdout = ''
@@ -440,7 +501,7 @@ function createOutputSinks(
   let stdoutBytes = 0
   let stderrBytes = 0
   let outputLimitExceeded = false
-  const output = opts.outputFile ? createWriteStream(opts.outputFile) : null
+  const output = opts.outputFile ? createFileOutput(opts.outputFile) : null
 
   const feed = (rest: string, chunk: string): string => {
     const parts = (rest + chunk).split(/\r?\n/)
@@ -465,6 +526,7 @@ function createOutputSinks(
   }
 
   return {
+    ...(output ? { signal: output.signal } : {}),
     onStdout: (chunk) => {
       const kept = bounded(chunk, 'stdout')
       if (!kept || kept.byteLength === 0) return
@@ -491,7 +553,8 @@ function createOutputSinks(
       stderr += text
       errRest = feed(errRest, text)
     },
-    finish: (result) => {
+    finish: async (result) => {
+      await output?.finish()
       if (opts.onLine) {
         if (outRest.length > 0) opts.onLine(outRest)
         if (errRest.length > 0) opts.onLine(errRest)
@@ -509,8 +572,7 @@ function createOutputSinks(
       return { code: result.code, stdout, stderr }
     },
     dispose: async () => {
-      if (!output) return
-      await new Promise<void>((resolve) => output.end(() => resolve()))
+      await output?.dispose()
     }
   }
 }
