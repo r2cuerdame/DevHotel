@@ -68,8 +68,8 @@ class FakeGuest {
     this.send(encodeGuestFrame(GuestFrameType.Stdout, id, Buffer.isBuffer(text) ? text : Buffer.from(text, 'utf8')))
   }
 
-  stderr(id: number, text: string): void {
-    this.send(encodeGuestFrame(GuestFrameType.Stderr, id, Buffer.from(text, 'utf8')))
+  stderr(id: number, text: string | Buffer): void {
+    this.send(encodeGuestFrame(GuestFrameType.Stderr, id, Buffer.isBuffer(text) ? text : Buffer.from(text, 'utf8')))
   }
 
   result(id: number, code: number, extra: Record<string, unknown> = {}): void {
@@ -237,6 +237,190 @@ describe('ManagedRuntimeEngine', () => {
     await engineFor(guest).run(['pull', 'node:22'], { onLine: (line) => lines.push(line) })
 
     expect(lines).toEqual(['pulling', 'extracting', 'no-newline'])
+  })
+
+  it.each([
+    ['é', 1],
+    ['한', 1],
+    ['한', 2],
+    ['🙂', 1],
+    ['🙂', 2],
+    ['🙂', 3],
+  ] as const)('preserves %s split at byte %i in independent output frames', async (character, split) => {
+    const guest = new FakeGuest()
+    const bytes = Buffer.from(character)
+    guest.handler = (self, id) => {
+      self.stdout(id, bytes.subarray(0, split))
+      self.stderr(id, bytes.subarray(0, split))
+      self.stdout(id, Buffer.concat([bytes.subarray(split), Buffer.from('\n')]))
+      self.stderr(id, bytes.subarray(split))
+      self.result(id, 0)
+    }
+    const lines: string[] = []
+
+    const result = await engineFor(guest).run(['logs'], { onLine: (line) => lines.push(line) })
+
+    expect(result).toEqual({ code: 0, stdout: `${character}\n`, stderr: character })
+    expect(lines).toEqual([character, character])
+  })
+
+  it('preserves bytewise interleaved output, CRLF and trailing partial lines', async () => {
+    const guest = new FakeGuest()
+    const stdout = '한🙂\r\n다음\n마지막🙂'
+    const stderr = '오류é\r\n끝한'
+    const outBytes = Buffer.from(stdout)
+    const errBytes = Buffer.from(stderr)
+    guest.handler = (self, id) => {
+      for (let index = 0; index < Math.max(outBytes.length, errBytes.length); index += 1) {
+        if (index < outBytes.length) self.stdout(id, outBytes.subarray(index, index + 1))
+        if (index < errBytes.length) self.stderr(id, errBytes.subarray(index, index + 1))
+      }
+      self.result(id, 0)
+    }
+    const lines: string[] = []
+
+    const result = await engineFor(guest).run(['logs'], { onLine: (line) => lines.push(line) })
+
+    expect(result).toEqual({ code: 0, stdout, stderr })
+    expect(lines).toEqual(['한🙂', '오류é', '다음', '마지막🙂', '끝한'])
+  })
+
+  it('keeps partial characters isolated between concurrent and subsequent requests', async () => {
+    const guest = new FakeGuest()
+    const engine = engineFor(guest)
+    const pending: number[] = []
+    const first = Buffer.from('한')
+    const second = Buffer.from('🙂')
+    guest.handler = (self, id) => {
+      pending.push(id)
+      if (pending.length === 1) {
+        self.stdout(id, first.subarray(0, 1))
+        self.stderr(id, second.subarray(0, 2))
+      } else if (pending.length === 2) {
+        self.stdout(id, second.subarray(0, 3))
+        self.stderr(id, first.subarray(0, 2))
+        self.stdout(id, second.subarray(3))
+        self.stderr(id, first.subarray(2))
+        self.result(id, 0)
+        self.stdout(pending[0]!, first.subarray(1))
+        self.stderr(pending[0]!, second.subarray(2))
+        self.result(pending[0]!, 0)
+      } else {
+        self.stdout(id, '후속🙂')
+        self.stderr(id, '정상한')
+        self.result(id, 0)
+      }
+    }
+    const firstLines: string[] = []
+    const secondLines: string[] = []
+
+    const [one, two] = await Promise.all([
+      engine.run(['first'], { onLine: (line) => firstLines.push(line) }),
+      engine.run(['second'], { onLine: (line) => secondLines.push(line) }),
+    ])
+    const next = await engine.run(['next'])
+
+    expect(one).toEqual({ code: 0, stdout: '한', stderr: '🙂' })
+    expect(two).toEqual({ code: 0, stdout: '🙂', stderr: '한' })
+    expect(firstLines).toEqual(['한', '🙂'])
+    expect(secondLines).toEqual(['🙂', '한'])
+    expect(next).toEqual({ code: 0, stdout: '후속🙂', stderr: '정상한' })
+  })
+
+  it('passes original split buffers to raw output callbacks', async () => {
+    const guest = new FakeGuest()
+    const bytes = Buffer.from('한🙂')
+    const chunks = [bytes.subarray(0, 1), bytes.subarray(1, 4), bytes.subarray(4)]
+    guest.handler = (self, id) => {
+      for (const chunk of chunks) {
+        self.stdout(id, chunk)
+        self.stderr(id, chunk)
+      }
+      self.result(id, 0)
+    }
+    const outChunks: Buffer[] = []
+    const errChunks: Buffer[] = []
+
+    const result = await engineFor(guest).run(['logs'], {
+      onStdout: (chunk) => outChunks.push(Buffer.from(chunk)),
+      onStderr: (chunk) => errChunks.push(Buffer.from(chunk)),
+    })
+
+    expect(outChunks).toEqual(chunks)
+    expect(errChunks).toEqual(chunks)
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' })
+  })
+
+  it('stores large split output as the original bytes without accumulating stdout', async () => {
+    const guest = new FakeGuest()
+    const bytes = Buffer.concat([Buffer.from('한🙂'.repeat(80_000)), Buffer.from([0, 255, 128])])
+    guest.handler = (self, id) => {
+      for (let offset = 0; offset < bytes.length; offset += 256 * 1024) {
+        self.stdout(id, bytes.subarray(offset, offset + 256 * 1024))
+      }
+      self.result(id, 0)
+    }
+    const outputFile = join(dir, 'large-output.bin')
+
+    const result = await engineFor(guest).run(['logs'], { outputFile })
+
+    expect(readFileSync(outputFile)).toEqual(bytes)
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' })
+  })
+
+  it('preserves exact byte limits while decoding split characters', async () => {
+    const guest = new FakeGuest()
+    const stdout = Buffer.from('한🙂')
+    const stderr = Buffer.from('é한')
+    guest.handler = (self, id) => {
+      for (const byte of stdout) self.stdout(id, Buffer.from([byte]))
+      for (const byte of stderr) self.stderr(id, Buffer.from([byte]))
+      self.result(id, 0)
+    }
+
+    const result = await engineFor(guest).run(['logs'], {
+      maxStdoutBytes: stdout.length,
+      maxStderrBytes: stderr.length,
+    })
+
+    expect(result).toEqual({ code: 0, stdout: '한🙂', stderr: 'é한' })
+  })
+
+  it.each(['stdout', 'stderr'] as const)('fails when the %s byte limit cuts a split character', async (stream) => {
+    const guest = new FakeGuest()
+    const bytes = Buffer.from('한🙂')
+    guest.handler = (self, id) => {
+      for (const byte of bytes) self[stream](id, Buffer.from([byte]))
+      self.result(id, 0)
+    }
+    const lines: string[] = []
+
+    const result = await engineFor(guest).run(['logs'], {
+      maxStdoutBytes: 5,
+      maxStderrBytes: 5,
+      onLine: (line) => lines.push(line),
+    })
+
+    expect(result.code).toBe(-1)
+    expect(result.outputLimitExceeded).toBe(true)
+    expect(result.stdout).toBe(stream === 'stdout' ? '한�' : '')
+    expect(result.stderr).toBe(`${stream === 'stderr' ? '한�' : ''}\nthe managed runtime command exceeded its configured safety limit`)
+    expect(lines).toEqual(['한�'])
+  })
+
+  it('flushes an incomplete final character once for each text stream', async () => {
+    const guest = new FakeGuest()
+    guest.handler = (self, id) => {
+      self.stdout(id, Buffer.from([0xed, 0x95]))
+      self.stderr(id, Buffer.from([0xf0, 0x9f, 0x99]))
+      self.result(id, 0)
+    }
+    const lines: string[] = []
+
+    const result = await engineFor(guest).run(['logs'], { onLine: (line) => lines.push(line) })
+
+    expect(result).toEqual({ code: 0, stdout: '�', stderr: '�' })
+    expect(lines).toEqual(['�', '�'])
   })
 
   it('streams to a Host file without accumulating it in memory', async () => {
