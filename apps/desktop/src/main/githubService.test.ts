@@ -6,6 +6,7 @@ import {
   GITHUB_SERVICE_DEFAULT_ENABLED,
   GitHubService,
   PINNED_GH,
+  runBounded,
   validateExpectedContentLength,
   type CredentialVault
 } from './githubService'
@@ -463,4 +464,19 @@ describe('GitHub Hotel Service', () => {
     },
     30_000
   )
+})
+
+describe('runBounded output decoding', () => {
+  it('decodes stdout and stderr whole so characters split across chunks stay intact', async () => {
+    // '한' is ED 95 9C and '글' is EA B8 80; each write pair splits one of them.
+    const script = [
+      'const w = (s, b) => new Promise((r) => s.write(Buffer.from(b), () => setTimeout(r, 80)));',
+      '(async () => {',
+      '  await w(process.stdout, [0xed]); await w(process.stdout, [0x95, 0x9c, 0x0a])',
+      '  await w(process.stderr, [0xea, 0xb8]); await w(process.stderr, [0x80])',
+      '})()'
+    ].join('\n')
+    const result = await runBounded(process.execPath, ['-e', script], { ...process.env, ELECTRON_RUN_AS_NODE: '1' })
+    expect(result).toEqual({ code: 0, stdout: '한\n', stderr: '글' })
+  }, 15_000)
 })

@@ -133,16 +133,23 @@ function currentVersionNeedsProvision(version: string | null): boolean {
 export async function runBounded(exe: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = COMMAND_TIMEOUT_MS): Promise<CommandResult> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(exe, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    let stdout = '', stderr = '', size = 0, settled = false
+    // Keep raw bytes until close: a multi-byte character can straddle two chunks.
+    const stdout: Buffer[] = [], stderr: Buffer[] = []
+    let size = 0, settled = false
     const timer = setTimeout(() => { if (!settled) { settled = true; child.kill(); reject(new Error('GitHub Service command timed out')) } }, timeoutMs)
     const collect = (chunk: Buffer, stderrStream: boolean): void => {
       size += chunk.length
       if (size > MAX_OUTPUT) { if (!settled) { settled = true; clearTimeout(timer); child.kill(); reject(new Error('GitHub Service command output exceeded its safety limit')) }; return }
-      if (stderrStream) stderr += chunk.toString('utf8'); else stdout += chunk.toString('utf8')
+      if (stderrStream) stderr.push(chunk); else stdout.push(chunk)
     }
     child.stdout.on('data', (c: Buffer) => collect(c, false)); child.stderr.on('data', (c: Buffer) => collect(c, true))
     child.once('error', (error) => { if (!settled) { settled = true; clearTimeout(timer); reject(error) } })
-    child.once('close', (code) => { if (!settled) { settled = true; clearTimeout(timer); resolvePromise({ code: code ?? -1, stdout, stderr }) } })
+    child.once('close', (code) => {
+      if (!settled) {
+        settled = true; clearTimeout(timer)
+        resolvePromise({ code: code ?? -1, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') })
+      }
+    })
   })
 }
 
