@@ -13,9 +13,14 @@ export function relayPreamble(token: string): string {
   return `${RELAY_PREAMBLE_PREFIX}${token}\n`
 }
 
+/** Opens the loopback TCP connection to a published relay; injectable for tests. */
+export type RelayDial = (port: number, host: string) => net.Socket
+
+const dialRelay: RelayDial = (port, host) => net.connect(port, host)
+
 /** Connect to a published relay and queue its authentication preamble first. */
-export function connectRelay(port: number, token?: string): net.Socket {
-  const socket = net.connect(port, '127.0.0.1')
+export function connectRelay(port: number, token?: string, dial: RelayDial = dialRelay): net.Socket {
+  const socket = dial(port, '127.0.0.1')
   socket.setNoDelay(true)
   // Queue before returning the socket. HTTP's ClientRequest may write as soon
   // as createConnection returns; a connect-event handler would otherwise race
@@ -28,24 +33,42 @@ export function connectRelay(port: number, token?: string): net.Socket {
  * Node's HTTP client needs the socket only after the gate preamble has been
  * flushed. Returning a socket immediately lets ClientRequest race its bytes
  * ahead of the preamble, so HTTP callers use the asynchronous callback form.
+ *
+ * Aborting `signal` before `oncreate` destroys the dialing socket: nothing is
+ * written after the abort and `oncreate` is never called, so the caller must
+ * destroy its own ClientRequest.
  */
 export function createHttpRelayConnection(
   port: number,
   token: string | undefined,
-  oncreate: (err: Error | null, socket: net.Socket) => void
+  oncreate: (err: Error | null, socket: net.Socket) => void,
+  opts: { signal?: AbortSignal; dial?: RelayDial } = {}
 ): undefined {
-  const socket = net.connect(port, '127.0.0.1')
+  const { signal } = opts
+  if (signal?.aborted) return undefined
+  const socket = (opts.dial ?? dialRelay)(port, '127.0.0.1')
   socket.setNoDelay(true)
   let settled = false
-  const finish = (err: Error | null): void => {
-    if (settled) return
+  const settle = (): boolean => {
+    if (settled) return false
     settled = true
     socket.removeListener('error', onError)
-    oncreate(err, socket)
+    signal?.removeEventListener('abort', onAbort)
+    return true
+  }
+  const finish = (err: Error | null): void => {
+    if (settle()) oncreate(err, socket)
   }
   const onError = (err: Error): void => finish(err)
+  const onAbort = (): void => {
+    if (!settle()) return
+    socket.on('error', () => {})
+    socket.destroy()
+  }
   socket.once('error', onError)
+  signal?.addEventListener('abort', onAbort, { once: true })
   socket.once('connect', () => {
+    if (settled) return
     if (!token) {
       finish(null)
       return

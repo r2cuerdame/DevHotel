@@ -16,6 +16,8 @@ export interface ManagedHyperVRuntimeOptions {
   installId: string
   runtimeId: string
   runtimeVersion: string
+  /** Upper bound for the one PowerShell command that creates the runtime VM. */
+  provisioningTimeoutMs?: number
   runner?: ManagedRuntimeCommandRunner
   guest?: ManagedHyperVGuestTransport
   now?: () => Date
@@ -140,15 +142,10 @@ function psLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-function powerShellFileArgs(file: string): string[] {
-  // PowerShell's encoded command duplicates the complete script in the
-  // CreateProcess command line. The provisioning script includes an apkovl
-  // payload, so pass it through an owner-only temporary file instead.
-  return [...POWERSHELL_ARGS, file]
-}
-
 /** `NT VIRTUAL MACHINE\Virtual Machines`, the group every VM worker account joins. */
 const HYPERV_VM_GROUP_SID = 'S-1-5-83-0'
+const DEFAULT_PROVISIONING_TIMEOUT_MS = 120_000
+const MAX_PROVISIONING_TIMEOUT_MS = 600_000
 
 /**
  * Every directory from the volume root down to `leaf`, outermost first.
@@ -172,7 +169,11 @@ function ancestorChain(leaf: string): string[] {
   return chain.reverse()
 }
 
-function defaultRunner(executable: string, args: readonly string[], opts?: { timeoutMs?: number }): Promise<ManagedRuntimeCommandResult> {
+function defaultRunner(
+  executable: string,
+  args: readonly string[],
+  options?: { timeoutMs?: number }
+): Promise<ManagedRuntimeCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, [...args], { windowsHide: true })
     let stdout = ''
@@ -187,7 +188,7 @@ function defaultRunner(executable: string, args: readonly string[], opts?: { tim
     const timer = setTimeout(() => {
       child.kill()
       finish({ code: -1, stdout, stderr: `${stderr}Managed Hyper-V command timed out.` })
-    }, opts?.timeoutMs ?? 120_000)
+    }, options?.timeoutMs ?? DEFAULT_PROVISIONING_TIMEOUT_MS)
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk) => (stdout += chunk))
@@ -316,6 +317,7 @@ export class ManagedHyperVRuntime {
   private readonly installId: string
   private readonly runtimeId: string
   private readonly runtimeVersion: string
+  private readonly provisioningTimeoutMs: number
   private readonly runner: ManagedRuntimeCommandRunner
   private readonly guest?: ManagedHyperVGuestTransport
   private readonly now: () => Date
@@ -330,11 +332,16 @@ export class ManagedHyperVRuntime {
     if (!isOpaqueId(opts.installId) || !isOpaqueId(opts.runtimeId) || !/^[0-9A-Za-z._-]{1,64}$/.test(opts.runtimeVersion)) {
       throw new Error('Managed Hyper-V identity is invalid')
     }
+    const provisioningTimeoutMs = opts.provisioningTimeoutMs ?? DEFAULT_PROVISIONING_TIMEOUT_MS
+    if (!Number.isInteger(provisioningTimeoutMs) || provisioningTimeoutMs < 1 || provisioningTimeoutMs > MAX_PROVISIONING_TIMEOUT_MS) {
+      throw new Error('Managed Hyper-V provisioning timeout must be between 1 and 600000 milliseconds')
+    }
     this.root = path.resolve(opts.userData, 'runtime', 'managed-linux', 'hyperv')
     this.markerPath = path.join(this.root, MARKER_FILE)
     this.installId = opts.installId
     this.runtimeId = opts.runtimeId
     this.runtimeVersion = opts.runtimeVersion
+    this.provisioningTimeoutMs = provisioningTimeoutMs
     this.runner = opts.runner ?? defaultRunner
     this.guest = opts.guest
     this.now = opts.now ?? (() => new Date())
@@ -463,23 +470,36 @@ export class ManagedHyperVRuntime {
         // Traverse only, and never inherited: this lets a VM worker account
         // resolve a path down to its own attachments without being able to
         // list these directories or read anything else inside them.
-        // Use the PowerShell process's ACL API rather than spawning icacls for
-        // each ancestor. A timed-out PowerShell command otherwise leaves an
-        // elevated icacls child running after its parent is killed.
-        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: grant traversal')`,
-        `$vmWorkerSid=[System.Security.Principal.SecurityIdentifier]::new(${psLiteral(HYPERV_VM_GROUP_SID)})`,
+        `$identity=[System.Security.Principal.SecurityIdentifier]::new(${psLiteral(HYPERV_VM_GROUP_SID)})`,
         '$traverseRight=[System.Security.AccessControl.FileSystemRights]::Traverse',
-        '$traverseRule=[System.Security.AccessControl.FileSystemAccessRule]::new($vmWorkerSid,$traverseRight,[System.Security.AccessControl.InheritanceFlags]::None,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow)',
-        'foreach ($dir in $traverse) {',
-        '  $acl=Get-Acl -LiteralPath $dir -ErrorAction Stop',
-        '  $granted=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $vmWorkerSid.Value -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and (($_.FileSystemRights -band $traverseRight) -eq $traverseRight) }).Count -gt 0',
-        '  if (-not $granted) { $acl.AddAccessRule($traverseRule); Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop }',
-        '}',
+        '$noInheritance=[System.Security.AccessControl.InheritanceFlags]::None',
+        '$noPropagation=[System.Security.AccessControl.PropagationFlags]::None',
+        // A retry or migration must recognise the grant an earlier run wrote,
+        // or it rewrites every ancestor and fails where an ancestor still lets
+        // the VM through but no longer lets this user change its ACL. `.Access`
+        // names the group as an NTAccount, so rules are read back as SIDs, and
+        // the rule constructor adds Synchronize to every allow, so the rights
+        // are tested for the Traverse bit rather than for equality. A rule that
+        // is inherit-only does not apply to the directory itself.
+        //
+        // Only an explicit allow counts as the grant, but every deny that
+        // applies counts as a refusal, inherited or not. An explicit deny
+        // outranks the allow this would add, so the VM would only fail later at
+        // start; an inherited one would be silently overridden by it, widening
+        // what someone deliberately closed. Either way the deny is left alone
+        // and provisioning stops here.
+        '$traverseStatus={ param($acl) $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference -eq $identity -and ([int]$_.FileSystemRights -band [int]$traverseRight) -eq [int]$traverseRight -and ([int]$_.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 }; if ($rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny }) { return \'denied\' }; if ($rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and -not $_.IsInherited }) { return \'granted\' }; return \'missing\' }',
+        '$ensureTraverse={ param($acl) $status=& $traverseStatus $acl; if ($status -eq \'denied\') { throw \'Managed runtime VM account is denied traversal\' }; if ($status -eq \'missing\') { $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity,$traverseRight,$noInheritance,$noPropagation,[System.Security.AccessControl.AccessControlType]::Allow)); return \'added\' }; return \'unchanged\' }',
+        // Every ancestor is judged before any is changed, so a deny anywhere on
+        // the path fails provisioning with no ACL written, and names where.
+        '$acls=@(foreach ($dir in $traverse) { Get-Acl -LiteralPath $dir -ErrorAction Stop })',
+        "$denied=@(for ($i=0; $i -lt $traverse.Count; $i++) { if ((& $traverseStatus $acls[$i]) -eq 'denied') { $traverse[$i] } })",
+        `if ($denied.Count -gt 0) { throw ('Managed runtime VM account (${HYPERV_VM_GROUP_SID}) is denied traversal of ' + ($denied -join ', ') + '; DevHotel does not override deny rules') }`,
+        "for ($i=0; $i -lt $traverse.Count; $i++) { if ((& $ensureTraverse $acls[$i]) -eq 'added') { Set-Acl -LiteralPath $traverse[$i] -AclObject $acls[$i] -ErrorAction Stop } }",
         // With no VM object, exact retained ownership authorizes rebuilding the
         // seed, which is disposable and regenerated from the marker identity.
         // The state disk is never destroyed here: it holds Room data, and a
         // power loss during first provision must not cost the user that.
-        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: create disks')`,
         'if (Test-Path -LiteralPath $seedPath) { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop }',
         'if (-not (Test-Path -LiteralPath $statePath)) { New-VHD -Path $statePath -Dynamic -SizeBytes 64GB | Out-Null }',
         'New-VHD -Path $seedPath -Dynamic -SizeBytes 64MB | Out-Null',
@@ -493,7 +513,6 @@ export class ManagedHyperVRuntime {
         '} finally { Dismount-VHD -Path $seedPath -ErrorAction SilentlyContinue }',
         // The guest runs from the pinned read-only ISO, so the boot media can
         // never drift from its verified digest.
-        `[Console]::Error.WriteLine('DevHotel Hyper-V provision: create VM')`,
         '$vm=New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 4GB -Path $vmPath -NoVHD',
         '$dvd=Add-VMDvdDrive -VM $vm -Path $isoPath -Passthru',
         'Add-VMHardDiskDrive -VM $vm -ControllerType SCSI -Path $statePath',
@@ -507,7 +526,8 @@ export class ManagedHyperVRuntime {
         // capability nobody recorded. Asking for it explicitly, and falling
         // back, makes both outcomes deliberate and observable.
         '$nested=$false',
-        'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true } catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }',
+        'try { Set-VMProcessor -VM $vm -Count 4 -ExposeVirtualizationExtensions $true -ErrorAction Stop; $nested=$true }',
+        'catch { Set-VMProcessor -VM $vm -Count 4 -ErrorAction Stop }',
         'Set-VMFirmware -VM $vm -EnableSecureBoot Off -FirstBootDevice $dvd',
         'Set-VMComPort -VM $vm -Number 2 -Path $pipePath',
         // The runtime needs one network path, for two things it cannot do
@@ -526,7 +546,7 @@ export class ManagedHyperVRuntime {
         'Set-VM -VM $vm -Notes $notes -AutomaticStartAction StartIfRunning -AutomaticStopAction Save',
         '[pscustomobject]@{Id=$vm.Id.Guid;State=[string]$vm.State;Nested=$nested}|ConvertTo-Json -Compress'
       ].join(';'),
-      600_000
+      this.provisioningTimeoutMs
     )
     const created = parseJsonRecord(create, 'Managed Hyper-V provider returned invalid creation evidence')
     if (typeof created['Id'] !== 'string') throw new Error('Managed Hyper-V provider did not return a VM identity')
@@ -796,6 +816,21 @@ export class ManagedHyperVRuntime {
         }
       }
       const inspection = await this.inspectVm()
+      // Before the first VM exists there is nothing for the Notes/ID proof to
+      // check, so an install still being provisioned is preparing, not broken.
+      // Only while the marker has never recorded a VM: once it has, a missing
+      // VM is a lost runtime, and any VM under the name must still prove itself.
+      if (!inspection.exists && marker.status === 'provisioning' && marker.vmId === null) {
+        return {
+          state: 'preparing',
+          runtimeId: marker.runtimeId,
+          runtimeVersion: marker.runtimeVersion,
+          daemonVersion: null,
+          baseImageDigest: marker.baseImageDigest,
+          nestedVirtualization: marker.nestedVirtualization ?? null,
+          detail: 'The DevHotel-managed Hyper-V runtime is being prepared.'
+        }
+      }
       this.assertOwnedVm(inspection, marker)
       if (inspection.state?.toLocaleLowerCase('en-US') !== 'running') {
         return {
@@ -949,11 +984,11 @@ export class ManagedHyperVRuntime {
   }
 
   private async runPowerShell(script: string, timeoutMs?: number): Promise<string> {
-    const scriptFile = path.join(this.root, `.command-${randomUUID()}.ps1`)
+    const scriptFile = path.join(this.root, `.provider-${randomUUID()}.ps1`)
     await this.ensureRoot()
     try {
-      await writeFile(scriptFile, script, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-      const result = await this.runner('powershell.exe', powerShellFileArgs(scriptFile), { timeoutMs })
+      await writeFile(scriptFile, Buffer.concat([Buffer.from('\uFEFF', 'utf8'), Buffer.from(script, 'utf8')]), { flag: 'wx' })
+      const result = await this.runner('powershell.exe', [...POWERSHELL_ARGS, scriptFile], timeoutMs ? { timeoutMs } : undefined)
       if (result.code !== 0) {
         throw new Error(result.stderr.trim() || 'Managed Hyper-V provider command failed')
       }

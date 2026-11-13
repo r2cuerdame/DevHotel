@@ -33,7 +33,7 @@ export interface ManagedRuntimeCommandResult {
 export type ManagedRuntimeCommandRunner = (
   executable: string,
   args: readonly string[],
-  opts?: { timeoutMs?: number }
+  options?: { timeoutMs?: number }
 ) => Promise<ManagedRuntimeCommandResult>
 
 export interface ManagedRuntimeBootstrapOptions {

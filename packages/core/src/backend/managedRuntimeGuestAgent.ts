@@ -93,14 +93,57 @@ def boot_token():
     return token
 
 
+def close_quietly(stream):
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+def terminate_process(process):
+    if process is None:
+        return
+    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        try:
+            # The whole group: an engine CLI can leave a child holding
+            # the Room's streams open after the parent is gone.
+            os.killpg(os.getpgid(process.pid), 9)
+        except Exception:
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
 class Connection:
     def __init__(self, sock, token):
         self.sock = sock
         self.token = token
         self.authorized = False
         self.lock = threading.Lock()
+        self.proc_lock = threading.Lock()
+        self.processes = {}
         self.stdin = {}
         self.cancelled = set()
+        self.closed = False
+
+    def close(self):
+        with self.proc_lock:
+            if self.closed:
+                return
+            self.closed = True
+            processes = list(self.processes.values())
+            sinks = list(self.stdin.values())
+            self.processes.clear()
+            self.stdin.clear()
+            self.cancelled.clear()
+        for sink in sinks:
+            close_quietly(sink)
+        for process in processes:
+            terminate_process(process)
 
     def send(self, kind, request_id, payload=b""):
         frame = HEADER.pack(len(payload) + 5, kind, request_id) + payload
@@ -113,27 +156,33 @@ class Connection:
     def read_exactly(self, count):
         buffer = b""
         while len(buffer) < count:
-            chunk = self.sock.recv(count - len(buffer))
+            try:
+                chunk = self.sock.recv(count - len(buffer))
+            except OSError:
+                return None
             if not chunk:
                 return None
             buffer += chunk
         return buffer
 
     def serve(self):
-        while True:
-            header = self.read_exactly(4)
-            if header is None:
-                return
-            declared = struct.unpack(">I", header)[0]
-            if declared < 5 or declared - 5 > MAX_PAYLOAD:
-                return
-            rest = self.read_exactly(declared)
-            if rest is None:
-                return
-            kind = rest[0]
-            request_id = struct.unpack(">I", rest[1:5])[0]
-            payload = rest[5:]
-            self.handle(kind, request_id, payload)
+        try:
+            while True:
+                header = self.read_exactly(4)
+                if header is None:
+                    return
+                declared = struct.unpack(">I", header)[0]
+                if declared < 5 or declared - 5 > MAX_PAYLOAD:
+                    return
+                rest = self.read_exactly(declared)
+                if rest is None:
+                    return
+                kind = rest[0]
+                request_id = struct.unpack(">I", rest[1:5])[0]
+                payload = rest[5:]
+                self.handle(kind, request_id, payload)
+        finally:
+            self.close()
 
     def handle(self, kind, request_id, payload):
         if kind == REQUEST:
@@ -166,38 +215,42 @@ class Connection:
             self.send_json(ERROR, request_id, {"message": "unsupported operation"})
             return
         if kind == STDIN:
-            sink = self.stdin.get(request_id)
+            with self.proc_lock:
+                sink = self.stdin.get(request_id)
             if sink is not None:
                 try:
                     sink.write(payload)
+                    sink.flush()
                 except Exception:
                     pass
             return
         if kind == STDIN_END:
-            sink = self.stdin.pop(request_id, None)
-            if sink is not None:
-                try:
-                    sink.close()
-                except Exception:
-                    pass
+            with self.proc_lock:
+                sink = self.stdin.pop(request_id, None)
+            close_quietly(sink)
             return
         if kind == CANCEL:
-            self.cancelled.add(request_id)
-            process = getattr(self, "processes", {}).get(request_id)
-            if process is not None:
-                try:
-                    # The whole group: an engine CLI can leave a child holding
-                    # the Room's streams open after the parent is gone.
-                    os.killpg(os.getpgid(process.pid), 9)
-                except Exception:
-                    pass
+            with self.proc_lock:
+                if not self.closed:
+                    self.cancelled.add(request_id)
+                process = self.processes.pop(request_id, None)
+                sink = self.stdin.pop(request_id, None)
+            close_quietly(sink)
+            terminate_process(process)
             return
 
     def exec_request(self, request_id, request):
         argv = request.get("argv")
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv) or not argv:
-            self.send_json(ERROR, request_id, {"message": "invalid argv"})
+            try:
+                self.send_json(ERROR, request_id, {"message": "invalid argv"})
+            except OSError:
+                pass
             return
+        with self.proc_lock:
+            if self.closed or request_id in self.cancelled:
+                self.cancelled.discard(request_id)
+                return
         wants_stdin = bool(request.get("stdin"))
         try:
             process = subprocess.Popen(
@@ -208,20 +261,48 @@ class Connection:
                 start_new_session=True,
             )
         except Exception as error:
-            self.send_json(ERROR, request_id, {"message": "engine could not start: %s" % error})
+            with self.proc_lock:
+                aborted = self.closed or (request_id in self.cancelled)
+                self.cancelled.discard(request_id)
+            if not aborted:
+                try:
+                    self.send_json(ERROR, request_id, {"message": "engine could not start: %s" % error})
+                except OSError:
+                    pass
             return
-        if not hasattr(self, "processes"):
-            self.processes = {}
-        self.processes[request_id] = process
-        if wants_stdin:
-            self.stdin[request_id] = process.stdin
+        abort_early = False
+        with self.proc_lock:
+            if self.closed or request_id in self.cancelled:
+                self.cancelled.discard(request_id)
+                abort_early = True
+            else:
+                self.processes[request_id] = process
+                if wants_stdin and process.stdin is not None:
+                    self.stdin[request_id] = process.stdin
+        if abort_early:
+            close_quietly(process.stdin)
+            terminate_process(process)
+            close_quietly(process.stdout)
+            close_quietly(process.stderr)
+            try:
+                process.wait()
+            except Exception:
+                pass
+            return
 
         def pump(stream, kind):
-            while True:
-                chunk = stream.read(CHUNK)
-                if not chunk:
-                    return
-                self.send(kind, request_id, chunk)
+            reader = stream.read1 if hasattr(stream, "read1") else stream.read
+            try:
+                while True:
+                    chunk = reader(CHUNK)
+                    if not chunk:
+                        return
+                    try:
+                        self.send(kind, request_id, chunk)
+                    except OSError:
+                        return
+            finally:
+                close_quietly(stream)
 
         pumps = [
             threading.Thread(target=pump, args=(process.stdout, STDOUT), daemon=True),
@@ -232,12 +313,18 @@ class Connection:
         code = process.wait()
         for thread in pumps:
             thread.join()
-        self.processes.pop(request_id, None)
-        self.stdin.pop(request_id, None)
-        if request_id in self.cancelled:
+        with self.proc_lock:
+            self.processes.pop(request_id, None)
+            sink = self.stdin.pop(request_id, None)
+            was_cancelled = self.closed or (request_id in self.cancelled)
             self.cancelled.discard(request_id)
+        close_quietly(sink)
+        if was_cancelled:
             return
-        self.send_json(RESULT, request_id, {"code": code})
+        try:
+            self.send_json(RESULT, request_id, {"code": code})
+        except OSError:
+            pass
 
     def staged_path(self, path):
         """Only beneath the staging root, and only after symlinks are resolved.
@@ -252,38 +339,82 @@ class Connection:
         return candidate
 
     def put_request(self, request_id, request):
+        temporary = None
         try:
             target = self.staged_path(str(request.get("path", "")))
             os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
             mode = request.get("mode")
             reader, writer = os.pipe()
-            self.stdin[request_id] = os.fdopen(writer, "wb")
+            sink = os.fdopen(writer, "wb")
+            source = os.fdopen(reader, "rb")
+            with self.proc_lock:
+                if self.closed or request_id in self.cancelled:
+                    self.cancelled.discard(request_id)
+                    close_quietly(sink)
+                    close_quietly(source)
+                    return
+                self.stdin[request_id] = sink
             handle, temporary = tempfile.mkstemp(dir=os.path.dirname(target))
-            with os.fdopen(handle, "wb") as out, os.fdopen(reader, "rb") as source:
+            with os.fdopen(handle, "wb") as out, source:
                 while True:
                     chunk = source.read(CHUNK)
                     if not chunk:
                         break
                     out.write(chunk)
+            with self.proc_lock:
+                self.stdin.pop(request_id, None)
+                aborted = self.closed or (request_id in self.cancelled)
+                self.cancelled.discard(request_id)
+            if aborted:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+                return
             os.chmod(temporary, int(mode) & 0o777 if isinstance(mode, int) else 0o600)
             os.replace(temporary, target)
+            temporary = None
             self.send_json(RESULT, request_id, {"code": 0})
         except Exception as error:
-            self.stdin.pop(request_id, None)
-            self.send_json(ERROR, request_id, {"message": "put failed: %s" % error})
+            with self.proc_lock:
+                leftover = self.stdin.pop(request_id, None)
+            close_quietly(leftover)
+            if temporary:
+                try:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                except OSError:
+                    pass
+            try:
+                self.send_json(ERROR, request_id, {"message": "put failed: %s" % error})
+            except OSError:
+                pass
 
     def get_request(self, request_id, request):
         try:
             source = self.staged_path(str(request.get("path", "")))
             with open(source, "rb") as handle:
                 while True:
+                    with self.proc_lock:
+                        if self.closed or request_id in self.cancelled:
+                            self.cancelled.discard(request_id)
+                            return
                     chunk = handle.read(CHUNK)
                     if not chunk:
                         break
                     self.send(STDOUT, request_id, chunk)
             self.send_json(RESULT, request_id, {"code": 0})
+        except OSError as error:
+            with self.proc_lock:
+                if self.closed:
+                    return
+            try:
+                self.send_json(ERROR, request_id, {"message": "get failed: %s" % error})
+            except OSError:
+                pass
         except Exception as error:
-            self.send_json(ERROR, request_id, {"message": "get failed: %s" % error})
+            try:
+                self.send_json(ERROR, request_id, {"message": "get failed: %s" % error})
+            except OSError:
+                pass
 
 
 def main():

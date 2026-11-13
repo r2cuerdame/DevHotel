@@ -1,8 +1,8 @@
 import http from 'node:http'
 import net from 'node:net'
 import type { Duplex } from 'node:stream'
-import type { RouteTable } from './routes'
-import { connectRelay, createHttpRelayConnection } from '../relayProtocol'
+import type { Route, RouteTable } from './routes'
+import { connectRelay, createHttpRelayConnection, type RelayDial } from '../relayProtocol'
 
 export interface ProxyRequestOpts {
   tls: boolean
@@ -13,6 +13,9 @@ export interface ProxyRequestOpts {
 export interface ProxyHandlers {
   request: (req: http.IncomingMessage, res: http.ServerResponse, opts: ProxyRequestOpts) => void
   upgrade: (req: http.IncomingMessage, socket: Duplex, head: Buffer) => void
+  /** Closes every tunnel and in-flight request opened under this domain. */
+  closeDomain: (domain: string) => void
+  closeAll: () => void
 }
 
 function isHopByHop(name: string): boolean {
@@ -43,8 +46,43 @@ const PAGE_502 = brandedPage(
   true
 )
 
-export function createProxyHandlers(table: RouteTable): ProxyHandlers {
+export interface ProxyHandlerOptions {
+  dial?: RelayDial
+}
+
+export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandlerOptions = {}): ProxyHandlers {
+  const { dial } = handlerOpts
+  // Every tunnel and in-flight request, by routed domain, so revoking or
+  // re-targeting a route can close what was opened under it.
+  const live = new Map<string, Set<() => void>>()
+  const track = (route: Route, close: () => void): (() => void) => {
+    const domain = route.domain.toLowerCase()
+    let closers = live.get(domain)
+    if (!closers) {
+      closers = new Set()
+      live.set(domain, closers)
+    }
+    const owned = closers
+    owned.add(close)
+    return () => {
+      owned.delete(close)
+      if (owned.size === 0 && live.get(domain) === owned) live.delete(domain)
+    }
+  }
+  const closeEach = (closers: Iterable<() => void>): void => {
+    for (const close of [...closers]) close()
+  }
+
   return {
+    closeDomain(domain) {
+      const closers = live.get(domain.toLowerCase())
+      if (closers) closeEach(closers)
+    },
+
+    closeAll() {
+      for (const closers of [...live.values()]) closeEach(closers)
+    },
+
     request(req, res, opts) {
       req.socket.setNoDelay(true)
       const route = table.byDomain(req.headers.host)
@@ -65,9 +103,31 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
       headers['x-forwarded-host'] = req.headers.host ?? route.domain
       headers['x-forwarded-for'] = req.socket.remoteAddress ?? '127.0.0.1'
 
+      // Aborted when the caller leaves early, the route is revoked or
+      // re-targeted, or the gateway stops: the dial, the upstream request and
+      // the caller response all close, and nothing is retried.
+      const cancelled = new AbortController()
+      let target: http.ClientRequest | null = null
+      const cancel = (): void => {
+        if (cancelled.signal.aborted) return
+        cancelled.abort()
+        untrack()
+        if (target) {
+          req.unpipe(target)
+          target.destroy()
+        }
+        if (!res.writableFinished) res.destroy()
+      }
+      const untrack = track(route, cancel)
+      res.once('close', () => {
+        if (res.writableFinished) untrack()
+        else cancel()
+      })
+
       const forward = (attempt: number): void => {
+        if (cancelled.signal.aborted) return
         let finished = false
-        const target = http.request(
+        const current = http.request(
           {
             host: '127.0.0.1',
             port: route.targetPort,
@@ -75,7 +135,10 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
             path: req.url,
             headers,
             createConnection: (_options, oncreate) =>
-              createHttpRelayConnection(route.targetPort, route.relayToken, oncreate)
+              createHttpRelayConnection(route.targetPort, route.relayToken, oncreate, {
+                signal: cancelled.signal,
+                dial
+              })
           },
           (targetRes) => {
             finished = true
@@ -83,27 +146,26 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
             targetRes.pipe(res)
           }
         )
-        target.on('error', (err: NodeJS.ErrnoException) => {
+        target = current
+        current.on('error', (err: NodeJS.ErrnoException) => {
+          if (cancelled.signal.aborted) return
           if (finished || res.headersSent) {
             res.destroy()
             return
           }
           // Transparently retry once if an idle keep-alive socket was closed by the upstream dev server
           const isIdempotent = !req.method || ['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
-          if (attempt === 0 && isIdempotent && (target.reusedSocket || err.code === 'ECONNRESET')) {
+          if (attempt === 0 && isIdempotent && (current.reusedSocket || err.code === 'ECONNRESET')) {
             forward(attempt + 1)
             return
           }
           res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' })
           res.end(PAGE_502)
         })
-        res.on('close', () => {
-          if (!res.writableFinished) target.destroy()
-        })
         if (attempt === 0) {
-          req.pipe(target)
+          req.pipe(current)
         } else {
-          target.end()
+          current.end()
         }
       }
       forward(0)
@@ -118,9 +180,32 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
         socket.destroy()
         return
       }
-      const target = connectRelay(route.targetPort, route.relayToken)
+      const target = connectRelay(route.targetPort, route.relayToken, dial)
       target.setNoDelay(true)
+      let closed = false
+      let connected = false
+      // Destroying both sides together keeps neither end of the tunnel open
+      // after the other goes; a destroyed dial never sends the upgrade.
+      const close = (): void => {
+        if (closed) return
+        closed = true
+        untrack()
+        socket.destroy()
+        target.destroy()
+      }
+      const untrack = track(route, close)
+      // Read the caller while the relay dials, so a caller that leaves early
+      // is noticed and its early bytes still reach the Room in order.
+      const early: Buffer[] = []
+      const keepEarly = (chunk: Buffer): void => {
+        early.push(chunk)
+      }
+      socket.on('data', keepEarly)
+      socket.resume()
       target.once('connect', () => {
+        if (closed) return
+        connected = true
+        socket.removeListener('data', keepEarly)
         const lines = [`${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/1.1`]
         for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
           const name = req.rawHeaders[i]
@@ -130,11 +215,21 @@ export function createProxyHandlers(table: RouteTable): ProxyHandlers {
         }
         target.write(lines.join('\r\n') + '\r\n\r\n')
         if (head.length > 0) target.write(head)
-        socket.pipe(target)
-        target.pipe(socket)
+        for (const chunk of early.splice(0)) target.write(chunk)
+        socket.pipe(target, { end: false })
+        target.pipe(socket, { end: false })
       })
-      target.on('error', () => socket.destroy())
-      socket.on('error', () => target.destroy())
+      // A normal end on either side flushes what is queued for the other
+      // side and then closes the whole tunnel.
+      socket.once('end', () => {
+        if (connected) target.end(close)
+        else close()
+      })
+      target.once('end', () => socket.end(close))
+      socket.once('close', close)
+      target.once('close', close)
+      socket.on('error', close)
+      target.on('error', close)
     }
   }
 }

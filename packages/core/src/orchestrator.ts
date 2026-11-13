@@ -1438,6 +1438,7 @@ export class RoomOrchestrator {
   private readonly componentObservations = new Map<string, { observedAt: string; components: ComponentInfo[] }>()
   private readonly activeMutations = new Set<Promise<unknown>>()
   private readonly deletingRooms = new Set<string>()
+  private readonly closingBrowserRooms = new Map<string, 'sleeping' | 'deleting'>()
   /** Room ID → the tracked delete operation that must survive its own cascade. */
   private readonly deletingRoomOperations = new Map<string, string>()
   private readonly materializingRooms = new Set<string>()
@@ -1567,7 +1568,11 @@ export class RoomOrchestrator {
       rooms: {
         get: (roomId) => {
           const room = this.rooms.get(roomId)
-          return room ? { id: room.id, project: room.project, nickname: room.nickname, status: room.status } : null
+          if (!room) return null
+          const status = this.deletingRooms.has(roomId)
+            ? 'deleting'
+            : (this.closingBrowserRooms.get(roomId) ?? room.status)
+          return { id: room.id, project: room.project, nickname: room.nickname, status }
         }
       },
       log: (line) => this.olog('system', line)
@@ -1647,15 +1652,6 @@ export class RoomOrchestrator {
       }
     }
     await this.gateway.start()
-    // Browsers from the previous process are unreachable through their
-    // endpoints; stop what is provably ours and forget the rest. Fail-soft:
-    // a stuck browser must not keep Rooms from reconciling.
-    try {
-      await this.clientBrowsers.reconcile()
-      await this.clientBrowsers.start()
-    } catch (error) {
-      this.olog('system', `client browser reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
-    }
     const health = await this.backend.health()
     let reconciled: ReconcileResult | null = null
     if (health.ok) {
@@ -1677,6 +1673,15 @@ export class RoomOrchestrator {
     }
     await this.reconcileWindowsRooms()
     await this.markInterruptedChanges(new Set(reconciled?.roomsSlept ?? []))
+    // Reconcile Client Browsers after Room reconciliation finishes any interrupted
+    // deletions, so persistent profiles of deleted Rooms go in the same pass.
+    // Fail-soft: a stuck browser must not fail startup.
+    try {
+      await this.clientBrowsers.reconcile()
+      await this.clientBrowsers.start()
+    } catch (error) {
+      this.olog('system', `client browser reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     return { backendOk: health.ok, reconciled }
   }
 
@@ -4916,11 +4921,27 @@ export class RoomOrchestrator {
     const room = this.mustGet(roomId)
     const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
-    this.gateway.removeRoute(room.domain)
-    await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
-    await this.releaseClientBrowsersLocked(roomId, 'Room went to sleep')
-    if (room.provider === 'windows') {
-      await this.mustWindowsVm().sleep(roomId)
+    this.closingBrowserRooms.set(roomId, 'sleeping')
+    try {
+      this.gateway.removeRoute(room.domain)
+      await this.releaseAndroidDeviceLocked(roomId, 'Room went to sleep')
+      await this.releaseClientBrowsersLocked(roomId, 'Room went to sleep')
+      if (room.provider === 'windows') {
+        await this.mustWindowsVm().sleep(roomId)
+        this.rooms.update(roomId, {
+          status: artifactRecoveryPending ? 'broken' : 'sleeping',
+          hostPort: null,
+          lastUsedAt: new Date().toISOString()
+        })
+        await writeManifest(this.userData, this.mustGet(roomId))
+        this.emit(roomId, 'status')
+        return
+      }
+      this.logs.detach(roomId)
+      // A running agent command must not outlive the runtime that hosts it, and
+      // sleep must not queue behind it either: cancel the workload slot, then stop.
+      await this.cancelRoomWorkloads(roomId, 'the Room went to sleep')
+      await this.backend.stopRoomPod(roomId)
       this.rooms.update(roomId, {
         status: artifactRecoveryPending ? 'broken' : 'sleeping',
         hostPort: null,
@@ -4928,20 +4949,9 @@ export class RoomOrchestrator {
       })
       await writeManifest(this.userData, this.mustGet(roomId))
       this.emit(roomId, 'status')
-      return
+    } finally {
+      this.closingBrowserRooms.delete(roomId)
     }
-    this.logs.detach(roomId)
-    // A running agent command must not outlive the runtime that hosts it, and
-    // sleep must not queue behind it either: cancel the workload slot, then stop.
-    await this.cancelRoomWorkloads(roomId, 'the Room went to sleep')
-    await this.backend.stopRoomPod(roomId)
-    this.rooms.update(roomId, {
-      status: artifactRecoveryPending ? 'broken' : 'sleeping',
-      hostPort: null,
-      lastUsedAt: new Date().toISOString()
-    })
-    await writeManifest(this.userData, this.mustGet(roomId))
-    this.emit(roomId, 'status')
   }
 
   /** Restart the Room's web process as a tracked operation. */
@@ -5297,13 +5307,27 @@ export class RoomOrchestrator {
     this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
     this.olog(roomId, 'delete room')
-    this.gateway.removeRoute(room.domain)
-    await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
-    await this.releaseClientBrowsersLocked(roomId, 'Room was deleted')
-    if (room.provider === 'windows') {
-      const windowsVm = this.mustWindowsVm()
+    this.closingBrowserRooms.set(roomId, 'deleting')
+    try {
+      this.gateway.removeRoute(room.domain)
+      await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
+      await this.purgeClientBrowsersLocked(roomId, 'Room was deleted')
+      if (room.provider === 'windows') {
+        const windowsVm = this.mustWindowsVm()
+        this.rooms.update(roomId, { status: 'deleting' })
+        const { reclaimedBytes } = await windowsVm.delete(roomId)
+        this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
+        this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
+        this.readinessMilestones.delete(roomId)
+        this.pendingHostResyncConfirmations.delete(roomId)
+        rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
+        this.emit(roomId, 'deleted')
+        return { reclaimedBytes }
+      }
       this.rooms.update(roomId, { status: 'deleting' })
-      const { reclaimedBytes } = await windowsVm.delete(roomId)
+      this.logs.detach(roomId)
+      await this.cancelRoomWorkloads(roomId, 'the Room was deleted')
+      const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
       this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
       this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
       this.readinessMilestones.delete(roomId)
@@ -5311,18 +5335,9 @@ export class RoomOrchestrator {
       rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
       this.emit(roomId, 'deleted')
       return { reclaimedBytes }
+    } finally {
+      this.closingBrowserRooms.delete(roomId)
     }
-    this.rooms.update(roomId, { status: 'deleting' })
-    this.logs.detach(roomId)
-    await this.cancelRoomWorkloads(roomId, 'the Room was deleted')
-    const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
-    this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
-    this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
-    this.readinessMilestones.delete(roomId)
-    this.pendingHostResyncConfirmations.delete(roomId)
-    rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
-    this.emit(roomId, 'deleted')
-    return { reclaimedBytes }
   }
 
   /**
@@ -8173,6 +8188,14 @@ export class RoomOrchestrator {
     }
   }
 
+  private async purgeClientBrowsersLocked(roomId: string, reason: string): Promise<void> {
+    try {
+      await this.clientBrowsers.purgeRoom(roomId, reason)
+    } catch (error) {
+      this.olog(roomId, `client browser purge failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   androidDeviceStatus(): DeviceBrokerStatus {
     return this.devices.status()
   }
@@ -10133,7 +10156,12 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room terminals require the forthcoming guest agent')
-      if (room.status === 'sleeping' || room.status === 'preparing') {
+      if (
+        room.status === 'sleeping' ||
+        room.status === 'preparing' ||
+        room.status === 'broken' ||
+        room.status === 'deleting'
+      ) {
         throw new Error('The room must be awake for a terminal session')
       }
       this.advanceStateRevision(roomId)
@@ -10318,7 +10346,10 @@ export class RoomOrchestrator {
         return s === 'running' || s === 'ready' || s === 'attention'
       },
       syncRoute: () => this.syncRouteFor(roomId),
-      clearBrowserData: this.clearBrowserData ? () => this.clearBrowserData!(roomId) : undefined,
+      clearBrowserData: async () => {
+        await this.clientBrowsers.purgeRoom(roomId, 'Room browser data reset')
+        if (this.clearBrowserData) await this.clearBrowserData(roomId)
+      },
       clearAndroidEmulatorInstalls: () => this.clearAndroidEmulatorInstalls(roomId),
       execFencedAndroidTarget: (args, opts) => {
         const expectedLeaseId = physicalDevice ? capturePhysicalLease() : null
