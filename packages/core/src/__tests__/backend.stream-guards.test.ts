@@ -1,10 +1,17 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDocker, spawnDockerProcess } from '../backend/cli'
-import { OciCliBackend } from '../backend/ociCli'
+import {
+  EXEC_OWNED_PROCESS_REAP_SCRIPT,
+  EXEC_OWNER_ENV,
+  OciCliBackend,
+  execOwnedProcessReapArgs
+} from '../backend/ociCli'
 
 vi.mock('../backend/cli', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backend/cli')>()
@@ -89,8 +96,107 @@ describe('streaming Room process guards', () => {
     await backend.spawnInteractiveExec('room1abc', ['sh', '-li'])
     await backend.followRoomLogs('room1abc', 25)
 
-    expect(mockedSpawnDocker).toHaveBeenNthCalledWith(1, ['exec', '-i', id, 'sh', '-li'])
+    expect(mockedSpawnDocker).toHaveBeenNthCalledWith(1, [
+      'exec',
+      '-i',
+      '-e',
+      expect.stringMatching(/^DEVHOTEL_EXEC_TOKEN=[0-9a-f-]{36}$/),
+      id,
+      'sh',
+      '-li'
+    ])
     expect(mockedSpawnDocker).toHaveBeenNthCalledWith(2, ['logs', '-f', '--tail', '25', id])
+  })
+
+  it('reaps only the closed console session tagged guest process group while keeping sibling consoles and Room services intact', async () => {
+    const id = 'd'.repeat(64)
+    const runCalls: string[][] = []
+    mockedRunDocker.mockImplementation(async (args) => {
+      runCalls.push(args)
+      if (args[0] === 'inspect') return { code: 0, stdout: inspectWeb({ id }), stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    const makeInteractiveChild = () => {
+      const rawKill = vi.fn(() => true)
+      return Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        exitCode: null,
+        signalCode: null,
+        rawKill,
+        kill: rawKill
+      }) as unknown as ChildProcessWithoutNullStreams & { rawKill: ReturnType<typeof vi.fn> }
+    }
+
+    const childA = makeInteractiveChild()
+    const childB = makeInteractiveChild()
+    mockedSpawnDocker.mockReturnValueOnce(childA).mockReturnValueOnce(childB)
+
+    const backend = new OciCliBackend()
+    const sessionA = await backend.spawnInteractiveExec('room1abc', ['sh', '-li'])
+    const sessionB = await backend.spawnInteractiveExec('room1abc', ['sh', '-li'])
+
+    const argsA = mockedSpawnDocker.mock.calls[0]?.[0] ?? []
+    const argsB = mockedSpawnDocker.mock.calls[1]?.[0] ?? []
+    const tagA = argsA[3] ?? ''
+    const tagB = argsB[3] ?? ''
+    expect(tagA).toMatch(new RegExp(`^${EXEC_OWNER_ENV}=[0-9a-f-]{36}$`))
+    expect(tagB).toMatch(new RegExp(`^${EXEC_OWNER_ENV}=[0-9a-f-]{36}$`))
+    const tokenA = tagA.slice(EXEC_OWNER_ENV.length + 1)
+    const tokenB = tagB.slice(EXEC_OWNER_ENV.length + 1)
+    expect(tokenA).not.toBe(tokenB)
+
+    sessionA.kill()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(childA.stdin.writableEnded).toBe(true)
+    expect(childA.rawKill).toHaveBeenCalledTimes(1)
+    expect(childB.rawKill).not.toHaveBeenCalled()
+
+    const reaps = runCalls.filter((args) => args[0] === 'exec' && args[4] === EXEC_OWNED_PROCESS_REAP_SCRIPT)
+    expect(reaps).toEqual([execOwnedProcessReapArgs(id, tokenA)])
+    expect(runCalls.some((args) => args[0] === 'stop' || args[0] === 'rm' || args[0] === 'kill')).toBe(false)
+
+    // Repeated kill on the closed session does not trigger a second reap.
+    sessionA.kill()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(runCalls.filter((args) => args[0] === 'exec' && args[4] === EXEC_OWNED_PROCESS_REAP_SCRIPT)).toHaveLength(1)
+
+    // Sibling console remains independent and reaps its own token only when closed.
+    sessionB.kill()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(runCalls.filter((args) => args[0] === 'exec' && args[4] === EXEC_OWNED_PROCESS_REAP_SCRIPT)).toEqual([
+      execOwnedProcessReapArgs(id, tokenA),
+      execOwnedProcessReapArgs(id, tokenB)
+    ])
+  })
+
+  it('swallows reap failures after container teardown without leaking an unhandled rejection', async () => {
+    const id = 'e'.repeat(64)
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: inspectWeb({ id }), stderr: '' }
+      if (args[0] === 'exec' && args[4] === EXEC_OWNED_PROCESS_REAP_SCRIPT) {
+        return { code: 1, stdout: '', stderr: 'container stopped during teardown' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn(() => true)
+    }) as unknown as ChildProcessWithoutNullStreams
+    mockedSpawnDocker.mockReturnValueOnce(child)
+
+    const backend = new OciCliBackend()
+    const session = await backend.spawnInteractiveExec('room1abc', ['sh', '-li'])
+    expect(() => session.kill()).not.toThrow()
+    await new Promise((resolve) => setTimeout(resolve, 25))
   })
 
   it('forwards hard output caps and cancellation to production Room exec', async () => {

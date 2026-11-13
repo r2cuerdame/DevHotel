@@ -94,6 +94,20 @@ async function compilePython(file: string): Promise<boolean> {
   return false
 }
 
+async function runPythonFile(file: string, args: string[] = []): Promise<boolean> {
+  for (const candidate of ['python3', 'python', 'py']) {
+    try {
+      await run(candidate, ['-I', '-B', file, ...args], { timeout: PYTHON_SPAWN_TIMEOUT_MS })
+      return true
+    } catch (error) {
+      const code = (error as { code?: unknown }).code
+      if (code === 'ENOENT' || code === 9009) continue
+      throw error
+    }
+  }
+  return false
+}
+
 async function posixShell(): Promise<string | null> {
   if (process.platform !== 'win32') return 'sh'
   for (const candidate of [
@@ -169,6 +183,179 @@ describe('managed runtime Room command agent', () => {
 
     if (!(await compilePython(file))) return ctx.skip()
   })
+
+  it(
+    'reaps spawned processes and stdin pipes on early CANCEL races and Host socket disconnects',
+    { timeout: PYTHON_SPAWN_TIMEOUT_MS + 10_000 },
+    async (ctx) => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'devhotel-room-agent-lifecycle-'))
+      temps.push(dir)
+      const agentFile = path.join(dir, 'agent.py')
+      const harnessFile = path.join(dir, 'harness.py')
+      await writeFile(
+        agentFile,
+        buildManagedRuntimeGuestAgent({ installId: identity.installId, runtimeId: identity.runtimeId })
+      )
+      await writeFile(
+        harnessFile,
+        `import importlib.util, json, os, socket, struct, subprocess, sys, threading, time
+
+spec = importlib.util.spec_from_file_location("agent", sys.argv[1])
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+
+agent.ENGINE = sys.executable
+agent.STAGE_ROOT = os.path.join(os.path.dirname(sys.argv[1]), "stage")
+os.makedirs(agent.STAGE_ROOT, exist_ok=True)
+real_popen = subprocess.Popen
+spawned = []
+
+def pack_frame(kind, req_id, payload=b""):
+    return agent.HEADER.pack(len(payload) + 5, kind, req_id) + payload
+
+def pack_json(kind, req_id, value):
+    return pack_frame(kind, req_id, json.dumps(value).encode("utf-8"))
+
+def read_frame(sock):
+    raw_len = b""
+    while len(raw_len) < 4:
+        chunk = sock.recv(4 - len(raw_len))
+        if not chunk:
+            raise RuntimeError("unexpected EOF reading frame length")
+        raw_len += chunk
+    declared = struct.unpack(">I", raw_len)[0]
+    rest = b""
+    while len(rest) < declared:
+        chunk = sock.recv(declared - len(rest))
+        if not chunk:
+            raise RuntimeError("unexpected EOF reading frame body")
+        rest += chunk
+    return rest[0], struct.unpack(">I", rest[1:5])[0], rest[5:]
+
+def wait_until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+try:
+    # 1. Early CANCEL arriving while exec_request is inside subprocess.Popen
+    popen_entered = threading.Event()
+    release_popen = threading.Event()
+
+    def gated_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        popen_entered.set()
+        release_popen.wait(timeout=3.0)
+        return proc
+
+    agent.subprocess.Popen = gated_popen
+    host_sock, guest_sock = socket.socketpair()
+    host_sock.settimeout(5.0)
+    conn = agent.Connection(guest_sock, "boot-token-1")
+    serve_thread = threading.Thread(target=conn.serve, daemon=True)
+    serve_thread.start()
+
+    host_sock.sendall(pack_json(agent.REQUEST, 1, {"op": "hello", "token": "boot-token-1"}))
+    kind, req_id, payload = read_frame(host_sock)
+    assert (kind, req_id, json.loads(payload.decode("utf-8"))) == (agent.RESULT, 1, {"code": 0})
+
+    host_sock.sendall(
+        pack_json(
+            agent.REQUEST,
+            2,
+            {"op": "exec", "argv": ["-I", "-B", "-c", "import time; time.sleep(60)"], "stdin": True},
+        )
+    )
+    assert popen_entered.wait(timeout=10.0), "exec_request never entered Popen"
+    host_sock.sendall(pack_frame(agent.CANCEL, 2))
+    assert wait_until(lambda: 2 in conn.cancelled, timeout=2.0), "CANCEL was not recorded before Popen returned"
+    release_popen.set()
+
+    assert wait_until(
+        lambda: spawned[0].poll() is not None
+        and len(getattr(conn, "processes", {})) == 0
+        and len(conn.stdin) == 0,
+        timeout=3.0,
+    ), "early CANCEL race leaked guest process or stdin pipe"
+    host_sock.close()
+    serve_thread.join(timeout=3.0)
+    guest_sock.close()
+
+    # 2. Abrupt Host socket disconnect while an interactive exec is running
+    spawned_disconnect = []
+
+    def tracked_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        spawned_disconnect.append(proc)
+        return proc
+
+    agent.subprocess.Popen = tracked_popen
+    host_sock2, guest_sock2 = socket.socketpair()
+    host_sock2.settimeout(10.0)
+    conn2 = agent.Connection(guest_sock2, "boot-token-2")
+    serve_thread2 = threading.Thread(target=conn2.serve, daemon=True)
+    serve_thread2.start()
+
+    host_sock2.sendall(pack_json(agent.REQUEST, 1, {"op": "hello", "token": "boot-token-2"}))
+    kind, req_id, _ = read_frame(host_sock2)
+    assert (kind, req_id) == (agent.RESULT, 1)
+
+    host_sock2.sendall(
+        pack_json(
+            agent.REQUEST,
+            3,
+            {
+                "op": "exec",
+                "argv": [
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import sys, time; sys.stdout.write('READY\\\\n'); sys.stdout.flush(); time.sleep(60)",
+                ],
+                "stdin": True,
+            },
+        )
+    )
+    seen = b""
+    while b"READY" not in seen:
+        kind, req_id, chunk = read_frame(host_sock2)
+        assert kind == agent.STDOUT and req_id == 3
+        seen += chunk
+
+    captured_stdin = conn2.stdin.get(3)
+    assert captured_stdin is not None and not captured_stdin.closed
+    assert len(spawned_disconnect) == 1 and spawned_disconnect[0].poll() is None
+
+    host_sock2.close()
+    serve_thread2.join(timeout=3.0)
+    assert not serve_thread2.is_alive(), "Connection.serve did not exit on Host disconnect"
+    assert wait_until(
+        lambda: spawned_disconnect[0].poll() is not None
+        and len(getattr(conn2, "processes", {})) == 0
+        and len(conn2.stdin) == 0
+        and captured_stdin.closed,
+        timeout=3.0,
+    ), "Host socket disconnect left guest process running or stdin pipe open"
+    guest_sock2.close()
+finally:
+    for proc in spawned:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2.0)
+        except Exception:
+            pass
+`
+      )
+
+      if (!(await runPythonFile(harnessFile, [agentFile]))) return ctx.skip()
+    }
+  )
 })
 
 describe('managed runtime guest overlay, Room-capable', () => {
