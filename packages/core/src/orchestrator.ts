@@ -10156,7 +10156,12 @@ export class RoomOrchestrator {
     return this.withRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room terminals require the forthcoming guest agent')
-      if (room.status === 'sleeping' || room.status === 'preparing') {
+      if (
+        room.status === 'sleeping' ||
+        room.status === 'preparing' ||
+        room.status === 'broken' ||
+        room.status === 'deleting'
+      ) {
         throw new Error('The room must be awake for a terminal session')
       }
       this.advanceStateRevision(roomId)
