@@ -1,5 +1,6 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { StringDecoder } from 'node:string_decoder'
 import type { WebContents } from 'electron'
 import { IPC, type RoomStatus } from '@devhotel/shared'
 import { type RoomOrchestrator } from '@devhotel/core'
@@ -225,14 +226,20 @@ export class TermManager {
       exitNotified: false
     }
     child.stdin?.on('error', () => {})
-    const forward = (chunk: Buffer): void => {
-      if (!session.closed && !this.disposed && !sender.isDestroyed()) {
-        sender.send(IPC.evTermData, id, chunk.toString('utf8').replaceAll('\n', '\r\n'))
+    const send = (text: string): void => {
+      if (text.length > 0 && !session.closed && !this.disposed && !sender.isDestroyed()) {
+        sender.send(IPC.evTermData, id, text.replaceAll('\n', '\r\n'))
       }
     }
-    child.stdout?.on('data', forward)
-    child.stderr?.on('data', forward)
+    // One decoder per stream: a multi-byte character can straddle two chunks,
+    // and stdout/stderr bytes must never be stitched into each other.
+    const outDecoder = new StringDecoder('utf8')
+    const errDecoder = new StringDecoder('utf8')
+    child.stdout?.on('data', (chunk: Buffer) => send(outDecoder.write(chunk)))
+    child.stderr?.on('data', (chunk: Buffer) => send(errDecoder.write(chunk)))
     child.on('close', () => {
+      send(outDecoder.end())
+      send(errDecoder.end())
       session.closed = true
       this.sessions.delete(id)
       this.releaseSenderIfIdle(sender)

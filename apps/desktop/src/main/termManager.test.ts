@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream'
 import type { WebContents } from 'electron'
 import { describe, expect, it, vi } from 'vitest'
 import type { OrchestratorEvent, RoomOrchestrator } from '@devhotel/core'
-import type { RoomStatus } from '@devhotel/shared'
+import { IPC, type RoomStatus } from '@devhotel/shared'
 import { TermManager } from './termManager'
 
 function childStub(): ChildProcessWithoutNullStreams & { rawKill: ReturnType<typeof vi.fn> } {
@@ -243,6 +243,35 @@ describe('TermManager Room boundary', () => {
     expect(childB.rawKill).toHaveBeenCalledTimes(1)
     expect(senderB.emitter.listenerCount('destroyed')).toBe(0)
     expect(senderB.emitter.listenerCount('render-process-gone')).toBe(0)
+    manager.dispose()
+  })
+
+  it('keeps multi-byte characters intact across chunk boundaries and flushes trailing bytes before exit', async () => {
+    const child = childStub()
+    const spawnInteractiveExec = vi.fn().mockResolvedValue(child)
+    const client = createSenderStub()
+    const manager = new TermManager({ spawnInteractiveExec } as unknown as RoomOrchestrator)
+    const { termId } = await manager.open('room1abc', client.sender)
+
+    const out = Buffer.from('콘솔 한글\n', 'utf8')
+    const at = Buffer.from('콘솔 ', 'utf8').length + 2
+    child.stdout.emit('data', out.subarray(0, at))
+    child.stderr.emit('data', Buffer.from([0xec, 0x98])) // '오' without its last byte
+    child.stdout.emit('data', out.subarray(at))
+    child.stderr.emit('data', Buffer.from([0xa4]))
+    const calls = client.send.mock.calls as [string, string, string?][]
+    const data = (): string[] =>
+      calls.filter(([channel]) => channel === IPC.evTermData).map(([, , text]) => text ?? '')
+    expect(data().join('')).toBe('콘솔 한글\r\n오')
+
+    child.stdout.emit('data', Buffer.from([0xeb, 0x81])) // '끝' cut off by exit
+    expect(data().join('')).toBe('콘솔 한글\r\n오')
+    child.emit('close', 0)
+
+    // The decoder's held bytes are surfaced once, before the exit notice, not dropped.
+    expect(data().join('')).toBe('콘솔 한글\r\n오�')
+    expect(calls.at(-1)).toEqual([IPC.evTermExit, termId])
+    expect(calls.at(-2)).toEqual([IPC.evTermData, termId, '�'])
     manager.dispose()
   })
 
