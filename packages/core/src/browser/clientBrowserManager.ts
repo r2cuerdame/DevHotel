@@ -36,6 +36,7 @@ export function hashClientBrowserToken(token: string): string {
 interface LiveSession {
   launched: LaunchedClientBrowser
   cdp: SimpleCdpClient | null
+  releasing: boolean
 }
 
 type PendingAbort =
@@ -74,6 +75,7 @@ export interface ClientBrowserManagerOptions {
   generation: string
   rooms: { get(roomId: string): ClientBrowserRoomView | null }
   log?: (message: string) => void
+  cdpCommandTimeoutMs?: number
 }
 
 /**
@@ -91,6 +93,7 @@ export class ClientBrowserManager {
   private readonly generation: string
   private readonly rooms: ClientBrowserManagerOptions['rooms']
   private readonly log: (message: string) => void
+  private readonly cdpCommandTimeoutMs?: number
   private readonly endpoint: ClientBrowserEndpointServer
   private readonly live = new Map<string, LiveSession>()
   private readonly pending = new Map<string, PendingAllocation>()
@@ -107,6 +110,7 @@ export class ClientBrowserManager {
     this.generation = options.generation
     this.rooms = options.rooms
     this.log = options.log ?? (() => {})
+    this.cdpCommandTimeoutMs = options.cdpCommandTimeoutMs
     this.endpoint = new ClientBrowserEndpointServer({
       resolve: (sessionId, token) => this.resolveUpstream(sessionId, token),
       preferredPort: Number.parseInt(this.settings.get(ENDPOINT_PORT_SETTING) ?? '', 10) || null
@@ -145,7 +149,7 @@ export class ClientBrowserManager {
     const record = this.repo.get(sessionId)
     if (!record || !tokenMatches(record, token)) return null
     const session = this.live.get(sessionId)
-    if (!session) return null
+    if (!session || session.releasing) return null
     const path = new URL(session.launched.cdpWsUrl).pathname
     return {
       sessionId,
@@ -438,7 +442,7 @@ export class ClientBrowserManager {
             })
           )
         }
-        this.live.set(id, { launched, cdp: null })
+        this.live.set(id, { launched, cdp: null, releasing: false })
         this.pending.delete(id)
         this.log(`client browser ${id}: ready (pid ${launched.pid ?? 'unknown'}, ${launched.browserKind})`)
         return { session: toInfo(session), token, endpoint }
@@ -450,13 +454,7 @@ export class ClientBrowserManager {
 
   attach(sessionId: string, token: string): ClientBrowserAllocation {
     const record = this.authorize(sessionId, token)
-    if (!this.live.has(sessionId)) {
-      throw new DevHotelError(
-        'CLIENT_BROWSER_NOT_LIVE',
-        `Client Browser session ${sessionId} has no running browser in this DevHotel process.`,
-        { recoveryHint: 'Release it and allocate a new session.' }
-      )
-    }
+    this.mustLive(sessionId)
     return { session: toInfo(record), token, endpoint: this.endpointFor(sessionId, token) }
   }
 
@@ -474,7 +472,7 @@ export class ClientBrowserManager {
       const live = this.live.get(sessionId) ?? null
       const probe = await this.runtime.probe({ pid: record.pid, devtoolsPort: record.devtoolsPort, profileDir: record.profilePath })
       let targets: ClientBrowserInspection['targets'] = []
-      if (live && probe.cdpReachable) {
+      if (live && !live.releasing && probe.cdpReachable) {
         try {
           const cdp = await this.cdpFor(sessionId, live)
           targets = (await cdp.getTargets())
@@ -485,12 +483,13 @@ export class ClientBrowserManager {
         }
       }
       const room = this.rooms.get(record.roomId)
+      const stillLive = live !== null && !live.releasing && this.live.get(sessionId) === live
       return {
         session: toInfo(record),
         owner: { roomId: record.roomId, project: room?.project ?? null, nickname: room?.nickname ?? null },
         liveness: { processAlive: probe.processAlive, cdpReachable: probe.cdpReachable, browserVersion: probe.browserVersion },
         connection: {
-          endpoint: live ? this.endpointFor(sessionId, token) : null,
+          endpoint: stillLive ? this.endpointFor(sessionId, token) : null,
           activeClients: this.endpoint.activeClients(sessionId)
         },
         targets
@@ -510,8 +509,7 @@ export class ClientBrowserManager {
     this.authorize(sessionId, token)
     assertNavigableUrl(url)
     return await this.withLock(sessionId, async () => {
-      const cdp = await this.cdpFor(sessionId, this.mustLive(sessionId))
-      const result = await cdp.navigate(url, timeoutMs)
+      const result = await this.withLiveCdp(sessionId, (cdp) => cdp.navigate(url, timeoutMs))
       this.repo.touch(sessionId, new Date().toISOString())
       return { sessionId, url, finalUrl: result.finalUrl, title: result.title, loaded: result.loaded }
     })
@@ -520,8 +518,9 @@ export class ClientBrowserManager {
   async screenshot(sessionId: string, token: string, options: { format?: 'png' | 'jpeg'; fullPage?: boolean } = {}): Promise<ClientBrowserScreenshotResult> {
     this.authorize(sessionId, token)
     return await this.withLock(sessionId, async () => {
-      const cdp = await this.cdpFor(sessionId, this.mustLive(sessionId))
-      const shot = await cdp.captureScreenshot(options.format ?? 'png', options.fullPage ?? false)
+      const shot = await this.withLiveCdp(sessionId, (cdp) =>
+        cdp.captureScreenshot(options.format ?? 'png', options.fullPage ?? false)
+      )
       this.repo.touch(sessionId, new Date().toISOString())
       return { sessionId, mimeType: shot.mimeType, contentBase64: shot.data, sizeBytes: Buffer.byteLength(shot.data, 'base64') }
     })
@@ -530,14 +529,14 @@ export class ClientBrowserManager {
   /** Runs a JavaScript expression in the session's page; used by tests to observe isolation from the outside. */
   async evaluate<T = unknown>(sessionId: string, token: string, expression: string): Promise<T> {
     this.authorize(sessionId, token)
-    return await this.withLock(sessionId, async () => {
-      const cdp = await this.cdpFor(sessionId, this.mustLive(sessionId))
-      return await cdp.evaluate<T>(expression)
-    })
+    return await this.withLock(sessionId, () =>
+      this.withLiveCdp(sessionId, (cdp) => cdp.evaluate<T>(expression))
+    )
   }
 
   async release(sessionId: string, token: string): Promise<ClientBrowserReleaseResult> {
     const record = this.authorize(sessionId, token)
+    this.interruptSession(sessionId)
     return await this.withLock(sessionId, () => this.releaseLocked(record, 'released by its owner', 'released'))
   }
 
@@ -548,9 +547,11 @@ export class ClientBrowserManager {
         this.abortPending(pending, { kind: 'released', reason })
       }
     }
+    this.interruptRoomSessions(roomId)
     return await this.withRoomCleanup(roomId, async () => {
       const results: ClientBrowserReleaseResult[] = []
       for (const record of this.repo.listByRoom(roomId)) {
+        this.interruptSession(record.id)
         results.push(await this.withLock(record.id, () => this.releaseLocked(record, reason, 'released')))
       }
       return results
@@ -564,6 +565,7 @@ export class ClientBrowserManager {
         this.abortPending(pending, { kind: 'purged', reason })
       }
     }
+    this.interruptRoomSessions(roomId)
     return await this.withRoomCleanup(roomId, async () => {
       const released: ClientBrowserReleaseResult[] = []
       const persistentDir = join(this.root, PERSISTENT_PROFILES_DIR, roomId)
@@ -572,6 +574,7 @@ export class ClientBrowserManager {
       let persistentSessionUnverified = false
 
       for (const record of this.repo.listByRoom(roomId)) {
+        this.interruptSession(record.id)
         const result = await this.withLock(record.id, () => this.releaseLocked(record, reason, 'purged'))
         released.push(result)
         if (resolve(record.profilePath) === resolvedPersistentDir) {
@@ -606,14 +609,13 @@ export class ClientBrowserManager {
   ): Promise<ClientBrowserReleaseResult> {
     const sessionId = record.id
     this.log(`client browser ${sessionId}: releasing (${reason})`)
-    this.endpoint.disconnect(sessionId)
+    this.interruptSession(sessionId)
     const pending = this.pending.get(sessionId)
     if (pending) {
       this.abortPending(pending, abortKind === 'shutdown' ? { kind: 'shutdown' } : { kind: abortKind, reason })
     }
     const live = this.live.get(sessionId)
     this.live.delete(sessionId)
-    live?.cdp?.close()
     if (!live && !pending && !this.repo.get(sessionId)) {
       return {
         sessionId,
@@ -726,8 +728,12 @@ export class ClientBrowserManager {
       for (const pending of this.pending.values()) {
         this.abortPending(pending, { kind: 'shutdown' })
       }
+      for (const sessionId of this.live.keys()) {
+        this.interruptSession(sessionId)
+      }
       for (const record of this.repo.listAll()) {
         if (!this.live.has(record.id) && !this.pending.has(record.id)) continue
+        this.interruptSession(record.id)
         try {
           await this.withLock(record.id, () => this.releaseLocked(record, 'DevHotel is shutting down', 'shutdown'))
         } catch (error) {
@@ -743,9 +749,33 @@ export class ClientBrowserManager {
 
   // ---------------------------------------------------------------- helpers
 
+  private interruptSession(sessionId: string): void {
+    this.endpoint.disconnect(sessionId)
+    const live = this.live.get(sessionId)
+    if (!live) return
+    live.releasing = true
+    const cdp = live.cdp
+    live.cdp = null
+    cdp?.close()
+  }
+
+  private interruptRoomSessions(roomId: string): void {
+    for (const record of this.repo.listByRoom(roomId)) {
+      this.interruptSession(record.id)
+    }
+  }
+
+  private assertStillLive(sessionId: string, live: LiveSession): void {
+    if (this.live.get(sessionId) !== live || live.releasing) {
+      throw new DevHotelError('CLIENT_BROWSER_NOT_LIVE', `Client Browser session ${sessionId} was released.`, {
+        recoveryHint: 'Release it and allocate a new session.'
+      })
+    }
+  }
+
   private mustLive(sessionId: string): LiveSession {
     const live = this.live.get(sessionId)
-    if (!live) {
+    if (!live || live.releasing) {
       throw new DevHotelError(
         'CLIENT_BROWSER_NOT_LIVE',
         `Client Browser session ${sessionId} has no running browser in this DevHotel process.`,
@@ -755,15 +785,48 @@ export class ClientBrowserManager {
     return live
   }
 
-  private async cdpFor(sessionId: string, live: LiveSession): Promise<SimpleCdpClient> {
-    if (live.cdp && live.cdp.isOpen) return live.cdp
-    live.cdp?.close()
-    live.cdp = await SimpleCdpClient.connect(live.launched.cdpWsUrl)
-    if (this.live.get(sessionId) !== live) {
-      live.cdp.close()
-      throw new DevHotelError('CLIENT_BROWSER_NOT_LIVE', `Client Browser session ${sessionId} was released.`)
+  private async withLiveCdp<T>(sessionId: string, work: (cdp: SimpleCdpClient, live: LiveSession) => Promise<T>): Promise<T> {
+    const live = this.mustLive(sessionId)
+    try {
+      const cdp = await this.cdpFor(sessionId, live)
+      const result = await work(cdp, live)
+      this.assertStillLive(sessionId, live)
+      return result
+    } catch (error) {
+      this.assertStillLive(sessionId, live)
+      throw error
     }
-    return live.cdp
+  }
+
+  private async cdpFor(sessionId: string, live: LiveSession): Promise<SimpleCdpClient> {
+    this.assertStillLive(sessionId, live)
+    if (live.cdp && live.cdp.isOpen) return live.cdp
+    const stale = live.cdp
+    live.cdp = null
+    stale?.close()
+    let connecting: SimpleCdpClient | null = null
+    try {
+      const client = await SimpleCdpClient.connect(live.launched.cdpWsUrl, {
+        ...(this.cdpCommandTimeoutMs !== undefined ? { commandTimeoutMs: this.cdpCommandTimeoutMs } : {}),
+        onCreate: (created) => {
+          connecting = created
+          if (this.live.get(sessionId) !== live || live.releasing) {
+            created.close()
+            return
+          }
+          live.cdp = created
+        }
+      })
+      this.assertStillLive(sessionId, live)
+      live.cdp = client
+      return client
+    } catch (error) {
+      if (connecting && live.cdp === connecting) {
+        live.cdp = null
+      }
+      this.assertStillLive(sessionId, live)
+      throw error
+    }
   }
 }
 
