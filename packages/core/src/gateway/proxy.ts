@@ -85,6 +85,12 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
 
     request(req, res, opts) {
       req.socket.setNoDelay(true)
+      let onCallerError = (): void => {
+        if (!res.writableFinished) res.destroy()
+      }
+      req.on('error', () => onCallerError())
+      res.on('error', () => onCallerError())
+
       const route = table.byDomain(req.headers.host)
       if (!route) {
         res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' })
@@ -108,16 +114,22 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
       // the caller response all close, and nothing is retried.
       const cancelled = new AbortController()
       let target: http.ClientRequest | null = null
+      let activeRes: http.IncomingMessage | null = null
       const cancel = (): void => {
         if (cancelled.signal.aborted) return
         cancelled.abort()
         untrack()
+        if (activeRes) {
+          activeRes.unpipe(res)
+          activeRes.destroy()
+        }
         if (target) {
           req.unpipe(target)
           target.destroy()
         }
         if (!res.writableFinished) res.destroy()
       }
+      onCallerError = cancel
       const untrack = track(route, cancel)
       res.once('close', () => {
         if (res.writableFinished) untrack()
@@ -127,6 +139,7 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
       const forward = (attempt: number): void => {
         if (cancelled.signal.aborted) return
         let finished = false
+        let settled = false
         const current = http.request(
           {
             host: '127.0.0.1',
@@ -141,6 +154,16 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
               })
           },
           (targetRes) => {
+            activeRes = targetRes
+            targetRes.on('error', cancel)
+            targetRes.on('close', () => {
+              if (!targetRes.complete) cancel()
+            })
+            if (cancelled.signal.aborted || res.destroyed) {
+              cancel()
+              targetRes.destroy()
+              return
+            }
             finished = true
             res.writeHead(targetRes.statusCode ?? 502, copyHeaders(targetRes.headers))
             targetRes.pipe(res)
@@ -148,9 +171,12 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
         )
         target = current
         current.on('error', (err: NodeJS.ErrnoException) => {
-          if (cancelled.signal.aborted) return
+          if (settled || target !== current || cancelled.signal.aborted) return
+          settled = true
+          req.unpipe(current)
+          current.destroy()
           if (finished || res.headersSent) {
-            res.destroy()
+            cancel()
             return
           }
           // Transparently retry once if an idle keep-alive socket was closed by the upstream dev server
@@ -159,8 +185,10 @@ export function createProxyHandlers(table: RouteTable, handlerOpts: ProxyHandler
             forward(attempt + 1)
             return
           }
-          res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' })
-          res.end(PAGE_502)
+          if (!res.destroyed && !res.writableEnded) {
+            res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' })
+            res.end(PAGE_502)
+          }
         })
         if (attempt === 0) {
           req.pipe(current)
