@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { ChildProcess } from 'node:child_process'
@@ -7,6 +7,7 @@ import type { IsolationBackend } from './backend/types'
 import { redactSecrets, secretSpans } from './diagnostics/redact'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
+const ROTATE_RETRY_MS = 1000
 /** Longest piece of a line emitted on its own when the line has no newline in sight. */
 export const MAX_LOG_LINE_CHARS = 64 * 1024
 /** How far back from the cap a forced split looks for whitespace. */
@@ -127,6 +128,27 @@ class LineAssembler {
   }
 }
 
+export interface LogHubOptions {
+  /** Size past which a log is moved to `<file>.1`. */
+  maxLogBytes?: number
+  /** Wait after a failed rotation before the next write tries again. */
+  rotateRetryMs?: number
+}
+
+/**
+ * Non-empty lines of a log file, or none when it is missing or cannot be read
+ * right now (moved by a rotation, briefly held by another process).
+ */
+function readLogLines(file: string): string[] {
+  try {
+    return readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => l.length > 0)
+  } catch {
+    return []
+  }
+}
+
 interface LogPump {
   child: ChildProcess
   /** Emits whatever partial output is still buffered. Idempotent. */
@@ -140,9 +162,19 @@ interface LogPump {
 export class LogHub extends EventEmitter {
   private pumps = new Map<string, LogPump>()
   private desired = new Set<string>()
+  /** Earliest time a log whose rotation failed is tried again, per file. */
+  private rotateRetryAt = new Map<string, number>()
+  private readonly maxLogBytes: number
+  private readonly rotateRetryMs: number
 
-  constructor(private readonly userData: string, private readonly backend: IsolationBackend) {
+  constructor(
+    private readonly userData: string,
+    private readonly backend: IsolationBackend,
+    opts: LogHubOptions = {}
+  ) {
     super()
+    this.maxLogBytes = opts.maxLogBytes ?? MAX_LOG_BYTES
+    this.rotateRetryMs = opts.rotateRetryMs ?? ROTATE_RETRY_MS
   }
 
   logDir(roomId: string): string {
@@ -219,9 +251,10 @@ export class LogHub extends EventEmitter {
 
   tail(roomId: string, kind: LogKind, maxLines = 300): string[] {
     const file = this.logFile(roomId, kind)
-    if (!existsSync(file)) return []
-    const content = readFileSync(file, 'utf8')
-    const lines = content.split(/\r?\n/).filter((l) => l.length > 0)
+    let lines = readLogLines(file)
+    // Right after a rotation the current file holds only a few lines; the
+    // rotated file still has the context leading up to them.
+    if (lines.length < maxLines) lines = [...readLogLines(`${file}.1`), ...lines]
     // Also protect logs written by an older build or another local producer.
     return lines.slice(-maxLines).map((line) => redactSecrets(line))
   }
@@ -231,14 +264,30 @@ export class LogHub extends EventEmitter {
     try {
       mkdirSync(this.logDir(roomId), { recursive: true })
       const file = this.logFile(roomId, kind)
-      if (existsSync(file) && statSync(file).size > MAX_LOG_BYTES) {
-        renameSync(file, `${file}.1`)
-      }
+      this.rotateIfFull(file)
       appendFileSync(file, safeLine + '\n', 'utf8')
     } catch {
       // logging must never take the orchestrator down
     }
     this.emit('line', { roomId, kind, line: safeLine } satisfies LogLineEvent)
+  }
+
+  /**
+   * Moves a full log aside. On Windows a viewer or scanner holding either
+   * file makes the rename fail; the line is then still appended to the
+   * current file, which runs over the cap until a later write rotates it.
+   */
+  private rotateIfFull(file: string): void {
+    const now = Date.now()
+    if ((this.rotateRetryAt.get(file) ?? 0) > now) return
+    try {
+      const size = statSync(file, { throwIfNoEntry: false })?.size ?? 0
+      if (size <= this.maxLogBytes) return
+      renameSync(file, `${file}.1`)
+      this.rotateRetryAt.delete(file)
+    } catch {
+      this.rotateRetryAt.set(file, now + this.rotateRetryMs)
+    }
   }
 
   dispose(): void {
