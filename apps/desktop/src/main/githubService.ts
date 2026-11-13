@@ -72,6 +72,7 @@ const MAX_OUTPUT = 256 * 1024
 const UUID_V4 = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 const CREDENTIAL_ARTIFACT = new RegExp(`^credential-${UUID_V4}\\.(tmp|previous)$`)
 const STAGE_ARTIFACT = new RegExp(`^stage-${UUID_V4}$`)
+const PREVIOUS_VERSION_ARTIFACT = new RegExp(`^\\.previous-\\d+\\.\\d+\\.\\d+-${UUID_V4}$`)
 const MAX_GC_ENTRIES = 128
 const MAX_GC_DEPTH = 8
 /**
@@ -81,6 +82,23 @@ const MAX_GC_DEPTH = 8
  */
 const STAGE_REMOVE_RETRIES = { maxRetries: 5, retryDelay: 100 } as const
 const TRANSIENT_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'])
+const RENAME_RETRY_DELAYS_MS = [50, 100, 150, 250, 450, 650] as const
+const RENAME_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES'])
+
+/** Retries directory swaps briefly when Windows holds a handle on a just-executed gh.exe. */
+async function renameTreeWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      const delayMs = RENAME_RETRY_DELAYS_MS[attempt]
+      if (delayMs === undefined || code === undefined || !RENAME_LOCK_CODES.has(code)) throw error
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs))
+    }
+  }
+}
 
 export function validateExpectedContentLength(value: string | null, expected: number): void {
   if (value === null) return
@@ -173,6 +191,7 @@ export class GitHubService {
   private readonly runtimeConfigDir: string
   private installing = false
   private activeStage: string | null = null
+  private activeQuarantine: string | null = null
   constructor(
     private readonly userData: string,
     private readonly bundledArchive: string | null = null,
@@ -287,21 +306,54 @@ export class GitHubService {
     }
   }
 
-  private cleanupStaleStages(): void {
-    const canonicalRoot = this.canonicalRoot()
-    for (const entry of readdirSync(this.root, { withFileTypes: true })) {
-      if (!STAGE_ARTIFACT.test(entry.name)) continue
-      const path = safeInside(this.root, join(this.root, entry.name))
-      if (this.activeStage !== null && resolve(path) === resolve(this.activeStage)) {
+  private sweepManagedTrees(
+    parentDir: string,
+    canonicalParent: string,
+    pattern: RegExp,
+    activePath: string | null,
+    label: 'stage' | 'backup'
+  ): void {
+    for (const entry of readdirSync(parentDir, { withFileTypes: true })) {
+      if (!pattern.test(entry.name)) continue
+      const path = safeInside(parentDir, join(parentDir, entry.name))
+      if (activePath !== null && resolve(path) === resolve(activePath)) {
         const activeStat = lstatSync(path)
-        if (!activeStat.isDirectory() || activeStat.isSymbolicLink()) throw new Error('GitHub Service active stage is not a regular directory')
-        this.assertCanonicalChild(path, canonicalRoot)
+        if (!activeStat.isDirectory() || activeStat.isSymbolicLink()) {
+          throw new Error(`GitHub Service active ${label} is not a regular directory`)
+        }
+        this.assertCanonicalChild(path, canonicalParent)
         continue
       }
-      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error('GitHub Service stale stage is not a regular directory')
-      this.assertRemovableTree(path, canonicalRoot, { entries: 0 })
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new Error(`GitHub Service stale ${label} is not a regular directory`)
+      }
+      this.assertRemovableTree(path, canonicalParent, { entries: 0 })
       this.removeStageTree(path)
     }
+  }
+
+  private cleanupStaleStages(): void {
+    const canonicalRoot = this.canonicalRoot()
+    this.sweepManagedTrees(this.root, canonicalRoot, STAGE_ARTIFACT, this.activeStage, 'stage')
+    const versionsStat = (() => {
+      try { return lstatSync(this.versionsDir) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+    })()
+    if (!versionsStat) return
+    if (!versionsStat.isDirectory() || versionsStat.isSymbolicLink()) {
+      throw new Error('GitHub Service versions storage is not a regular directory')
+    }
+    this.assertCanonicalChild(this.versionsDir, canonicalRoot)
+    this.sweepManagedTrees(
+      this.versionsDir,
+      realpathSync.native(this.versionsDir),
+      PREVIOUS_VERSION_ARTIFACT,
+      this.activeQuarantine,
+      'backup'
+    )
   }
 
   private prepareOwnedStorage(): boolean {
@@ -554,28 +606,42 @@ export class GitHubService {
       const target = safeInside(this.versionsDir, join(this.versionsDir, PINNED_GH.version))
       const quarantine = safeInside(this.versionsDir, join(this.versionsDir, `.previous-${PINNED_GH.version}-${randomUUID()}`))
       const hadTarget = existsSync(target)
-      if (hadTarget) renameSync(target, quarantine)
-      try { renameSync(unpack, target) }
-      catch (error) { if (hadTarget && existsSync(quarantine)) renameSync(quarantine, target); throw error }
-      const currentTmp = join(this.root, `current-${randomUUID()}.json`)
-      writeFileSync(currentTmp, JSON.stringify({
-        version: PINNED_GH.version,
-        archiveSha256: PINNED_GH.sha256,
-        executableSha256: PINNED_GH.executableSha256
-      }), { encoding: 'utf8', flag: 'wx' })
-      const current = join(this.root, 'current.json'), previous = join(this.root, `previous-${randomUUID()}.json`)
-      const hadCurrent = existsSync(current)
-      if (hadCurrent) renameSync(current, previous)
-      try {
-        renameSync(currentTmp, current)
-        if (hadCurrent) rmSync(previous, { force: true })
-        if (hadTarget) rmSync(quarantine, { recursive: true, force: true })
-      } catch (error) {
-        if (hadCurrent && existsSync(previous)) renameSync(previous, current)
-        rmSync(target, { recursive: true, force: true })
-        if (hadTarget && existsSync(quarantine)) renameSync(quarantine, target)
+      if (hadTarget) {
+        this.activeQuarantine = quarantine
+        await renameTreeWithRetry(target, quarantine)
+      }
+      try { await renameTreeWithRetry(unpack, target) }
+      catch (error) {
+        if (hadTarget && existsSync(quarantine)) await renameTreeWithRetry(quarantine, target)
         throw error
       }
+      const currentTmp = join(this.root, `current-${randomUUID()}.json`)
+      const current = join(this.root, 'current.json')
+      const previous = join(this.root, `previous-${randomUUID()}.json`)
+      const hadCurrent = existsSync(current)
+      let movedCurrent = false
+      try {
+        writeFileSync(currentTmp, JSON.stringify({
+          version: PINNED_GH.version,
+          archiveSha256: PINNED_GH.sha256,
+          executableSha256: PINNED_GH.executableSha256
+        }), { encoding: 'utf8', flag: 'wx' })
+        if (hadCurrent) {
+          renameSync(current, previous)
+          movedCurrent = true
+        }
+        renameSync(currentTmp, current)
+      } catch (error) {
+        try { rmSync(currentTmp, { force: true, ...STAGE_REMOVE_RETRIES }) } catch { /* Best-effort temp cleanup during rollback. */ }
+        if (movedCurrent && existsSync(previous)) renameSync(previous, current)
+        this.removeStageTree(target)
+        if (hadTarget && existsSync(quarantine) && !existsSync(target)) {
+          await renameTreeWithRetry(quarantine, target)
+        }
+        throw error
+      }
+      if (movedCurrent) rmSync(previous, { force: true })
+      if (hadTarget) this.removeStageTree(quarantine)
       this.installing = false
       return await this.status()
     } catch (error) {
@@ -598,6 +664,7 @@ export class GitHubService {
       this.installing = false
       this.removeStageTree(stage)
       this.activeStage = null
+      this.activeQuarantine = null
     }
   }
 

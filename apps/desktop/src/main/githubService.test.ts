@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -11,16 +11,18 @@ import {
   type CredentialVault
 } from './githubService'
 
-// rmSync is spied (call-through) so a test can inject the transient Windows
-// lock error that CI saw without depending on a real file lock.
+// rmSync and renameSync are spied (call-through) so tests can inject transient
+// Windows lock errors without depending on real file-handle races.
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
-  return { ...actual, rmSync: vi.fn(actual.rmSync) }
+  return { ...actual, rmSync: vi.fn(actual.rmSync), renameSync: vi.fn(actual.renameSync) }
 })
 const rmSyncSpy = vi.mocked(rmSync)
 const realRmSync = rmSyncSpy.getMockImplementation() as typeof rmSync
-const lockedError = (code: string, path: string): NodeJS.ErrnoException =>
-  Object.assign(new Error(`${code}: resource busy or locked, unlink '${path}'`), { code, syscall: 'unlink', path })
+const renameSyncSpy = vi.mocked(renameSync)
+const realRenameSync = renameSyncSpy.getMockImplementation() as typeof renameSync
+const lockedError = (code: string, path: string, syscall = 'unlink'): NodeJS.ErrnoException =>
+  Object.assign(new Error(`${code}: resource busy or locked, ${syscall} '${path}'`), { code, syscall, path })
 const failNextRemovalOf = (target: string, code: string): void => {
   rmSyncSpy.mockImplementationOnce((path, options) => {
     if (path === target) throw lockedError(code, join(target, 'unpacked', 'bin', 'gh.exe'))
@@ -30,6 +32,8 @@ const failNextRemovalOf = (target: string, code: string): void => {
 
 const dirs: string[] = []
 afterEach(() => {
+  rmSyncSpy.mockImplementation(realRmSync)
+  renameSyncSpy.mockImplementation(realRenameSync)
   // gh.exe was just executed; Windows may still hold its image briefly (see #82).
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_REPO', 'Gh_Pager', 'BROWSER']) delete process.env[key]
@@ -463,6 +467,273 @@ describe('GitHub Hotel Service', () => {
       expect(status).toMatchObject({ installed: true, version: PINNED_GH.version })
     },
     30_000
+  )
+
+  const bundledArchivePath = join(process.cwd(), 'resources', 'github', PINNED_GH.asset)
+  const hasBundledArchive = process.arch === 'x64' && existsSync(bundledArchivePath)
+  const stubVersionRunner = (): ReturnType<typeof vi.fn> =>
+    vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+
+  it.runIf(hasBundledArchive)(
+    'retries transient Windows rename locks when promoting unpack and quarantining an existing version',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-rename-retry-')
+      writeFileSync(exe, 'old-gh')
+      const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+      const targetDir = join(versionsDir, PINNED_GH.version)
+      let quarantineFailures = 1
+      let unpackFailures = 2
+      let quarantineAttempts = 0
+      let unpackAttempts = 0
+      renameSyncSpy.mockImplementation((from, to) => {
+        const fromPath = String(from), toPath = String(to)
+        if (fromPath === targetDir && /[/\\]\.previous-/.test(toPath)) {
+          quarantineAttempts++
+          if (quarantineFailures-- > 0) throw lockedError('EBUSY', fromPath, 'rename')
+        } else if (/[/\\]unpacked$/.test(fromPath) && toPath === targetDir) {
+          unpackAttempts++
+          if (unpackFailures-- > 0) throw lockedError(unpackFailures === 1 ? 'EPERM' : 'EACCES', fromPath, 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+
+      const status = await new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest).install()
+
+      expect(status).toMatchObject({ installed: true, installing: false, version: PINNED_GH.version, provisionState: 'provisioned' })
+      expect(quarantineAttempts).toBe(2)
+      expect(unpackAttempts).toBe(3)
+      expect(statSync(exe).size).toBe(PINNED_GH.executableSize)
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toEqual([])
+    },
+    15_000
+  )
+
+  it.runIf(hasBundledArchive)(
+    'retries a transient EPERM lock when promoting unpack on a fresh install',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'devhotel-gh-fresh-rename-retry-')); dirs.push(root)
+      const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+      const targetDir = join(versionsDir, PINNED_GH.version)
+      let unpackFailures = 1
+      renameSyncSpy.mockImplementation((from, to) => {
+        if (/[/\\]unpacked$/.test(String(from)) && String(to) === targetDir && unpackFailures-- > 0) {
+          throw lockedError('EPERM', String(from), 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+
+      const status = await new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest).install()
+
+      expect(status).toMatchObject({ installed: true, installing: false, version: PINNED_GH.version, provisionState: 'provisioned' })
+      expect(existsSync(join(targetDir, 'bin', 'gh.exe'))).toBe(true)
+    },
+    15_000
+  )
+
+  it.runIf(hasBundledArchive)(
+    'restores the previous version and surfaces a non-lock rename error immediately',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-rename-eio-')
+      writeFileSync(exe, 'previous-gh-binary')
+      const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+      const targetDir = join(versionsDir, PINNED_GH.version)
+      const sentinel = join(targetDir, 'sentinel.txt')
+      writeFileSync(sentinel, 'previous-tree')
+      let unpackAttempts = 0
+      renameSyncSpy.mockImplementation((from, to) => {
+        if (/[/\\]unpacked$/.test(String(from)) && String(to) === targetDir) {
+          unpackAttempts++
+          throw lockedError('EIO', String(from), 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+      const statusSink = vi.fn()
+      const service = new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest, statusSink)
+
+      await expect(service.install()).rejects.toThrow(/EIO/)
+      expect(unpackAttempts).toBe(1)
+      expect(readFileSync(exe, 'utf8')).toBe('previous-gh-binary')
+      expect(readFileSync(sentinel, 'utf8')).toBe('previous-tree')
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toEqual([])
+      expect(statusSink).toHaveBeenCalledWith(expect.objectContaining({ installed: false, installing: false, provisionState: 'failed' }))
+    },
+    15_000
+  )
+
+  it.runIf(hasBundledArchive)(
+    'restores the previous version and fails when transient rename locks exhaust retries',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-rename-exhausted-')
+      writeFileSync(exe, 'previous-gh-binary')
+      const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+      const targetDir = join(versionsDir, PINNED_GH.version)
+      let unpackAttempts = 0
+      renameSyncSpy.mockImplementation((from, to) => {
+        if (/[/\\]unpacked$/.test(String(from)) && String(to) === targetDir) {
+          unpackAttempts++
+          throw lockedError('EBUSY', String(from), 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+      const statusSink = vi.fn()
+      const service = new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest, statusSink)
+
+      await expect(service.install()).rejects.toThrow(/EBUSY/)
+      expect(unpackAttempts).toBeGreaterThanOrEqual(6)
+      expect(readFileSync(exe, 'utf8')).toBe('previous-gh-binary')
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toEqual([])
+      expect(statusSink).toHaveBeenCalledWith(expect.objectContaining({ installed: false, installing: false, provisionState: 'failed' }))
+    },
+    15_000
+  )
+
+  it.runIf(hasBundledArchive)(
+    'rolls back current.json and restores the previous version if committing current.json fails',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-commit-rollback-')
+      writeFileSync(exe, 'previous-gh-binary')
+      const serviceRoot = join(root, 'hotel-services', 'github')
+      const currentFile = join(serviceRoot, 'current.json')
+      writeFileSync(currentFile, JSON.stringify({ version: '2.96.0' }))
+      const versionsDir = join(serviceRoot, 'versions')
+      renameSyncSpy.mockImplementation((from, to) => {
+        if (/[/\\]current-[^/\\]+\.json$/.test(String(from)) && String(to) === currentFile) {
+          throw lockedError('EIO', String(to), 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+      const service = new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest)
+
+      await expect(service.install()).rejects.toThrow(/EIO/)
+      expect(JSON.parse(readFileSync(currentFile, 'utf8')).version).toBe('2.96.0')
+      expect(readFileSync(exe, 'utf8')).toBe('previous-gh-binary')
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toEqual([])
+      expect(readdirSync(serviceRoot).filter((name) => /^(current|previous)-.*\.json$/.test(name))).toEqual([])
+    },
+    15_000
+  )
+
+  it.runIf(hasBundledArchive)(
+    'keeps the new installation healthy when post-commit quarantine cleanup hits EBUSY, then sweeps it on next status',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-quarantine-locked-')
+      writeFileSync(exe, 'previous-gh-binary')
+      const serviceRoot = join(root, 'hotel-services', 'github')
+      const versionsDir = join(serviceRoot, 'versions')
+      rmSyncSpy.mockImplementation((path, options) => {
+        if (/[/\\]versions[/\\]\.previous-/.test(String(path))) {
+          throw lockedError('EBUSY', join(String(path), 'bin', 'gh.exe'))
+        }
+        return realRmSync(path, options)
+      })
+      const service = new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest)
+
+      const installStatus = await service.install()
+
+      expect(installStatus).toMatchObject({ installed: true, installing: false, version: PINNED_GH.version, provisionState: 'provisioned' })
+      expect(statSync(exe).size).toBe(PINNED_GH.executableSize)
+      expect(JSON.parse(readFileSync(join(serviceRoot, 'current.json'), 'utf8')).version).toBe(PINNED_GH.version)
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toHaveLength(1)
+
+      rmSyncSpy.mockImplementation(realRmSync)
+      const nextStatus = await service.status()
+
+      expect(nextStatus).toMatchObject({ installed: true, version: PINNED_GH.version, provisionState: 'provisioned' })
+      expect(readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))).toEqual([])
+    },
+    15_000
+  )
+
+  it('removes only exact bounded stale backup directories under versions while leaving unrelated folders intact', async () => {
+    const { root, exe } = installedServiceRoot('devhotel-gh-backup-sweep-')
+    const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+    const staleBackup = join(versionsDir, '.previous-2.97.0-11111111-1111-4111-8111-111111111111')
+    const lookalike = join(versionsDir, '.previous-manual-work')
+    const custom = join(versionsDir, 'custom-backup')
+    mkdirSync(join(staleBackup, 'bin'), { recursive: true }); writeFileSync(join(staleBackup, 'bin', 'gh.exe'), 'old')
+    mkdirSync(lookalike, { recursive: true }); writeFileSync(join(lookalike, 'keep.txt'), 'keep')
+    mkdirSync(custom, { recursive: true }); writeFileSync(join(custom, 'keep.txt'), 'keep')
+    const runner = vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+
+    await expect(new GitHubService(root, null, fetch, runner, new TestVault(), trustedDigest).status()).resolves.toMatchObject({
+      installed: true,
+      version: PINNED_GH.version
+    })
+
+    expect(existsSync(staleBackup)).toBe(false)
+    expect(existsSync(exe)).toBe(true)
+    expect(readFileSync(join(lookalike, 'keep.txt'), 'utf8')).toBe('keep')
+    expect(readFileSync(join(custom, 'keep.txt'), 'utf8')).toBe('keep')
+  })
+
+  it('rejects stale backup junctions and nested reparse points without touching outside targets', async () => {
+    const { root } = installedServiceRoot('devhotel-gh-backup-junction-')
+    const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+    const outside = mkdtempSync(join(tmpdir(), 'devhotel-gh-outside-backup-')); dirs.push(outside)
+    const sentinel = join(outside, 'sentinel.txt'); writeFileSync(sentinel, 'keep')
+    const junction = join(versionsDir, '.previous-2.97.0-11111111-1111-4111-8111-111111111111')
+    symlinkSync(outside, junction, process.platform === 'win32' ? 'junction' : 'dir')
+    const runner = vi.fn(async () => ({ code: 0, stdout: `gh version ${PINNED_GH.version}\n`, stderr: '' }))
+    const service = new GitHubService(root, null, fetch, runner, new TestVault(), trustedDigest)
+
+    await expect(service.status()).rejects.toThrow(/not a regular directory/)
+    expect(readFileSync(sentinel, 'utf8')).toBe('keep')
+    expect(existsSync(junction)).toBe(true)
+
+    rmSync(junction, { recursive: true, force: true })
+    const nestedBackup = join(versionsDir, '.previous-2.97.0-22222222-2222-4222-8222-222222222222')
+    mkdirSync(nestedBackup, { recursive: true })
+    symlinkSync(outside, join(nestedBackup, 'bin'), process.platform === 'win32' ? 'junction' : 'dir')
+
+    await expect(service.status()).rejects.toThrow(/reparse point/)
+    expect(readFileSync(sentinel, 'utf8')).toBe('keep')
+  })
+
+  it.runIf(hasBundledArchive)(
+    'preserves activeQuarantine during a concurrent status call while install is in progress',
+    async () => {
+      const { root, exe } = installedServiceRoot('devhotel-gh-active-quarantine-')
+      writeFileSync(exe, 'previous-gh-binary')
+      const versionsDir = join(root, 'hotel-services', 'github', 'versions')
+      const targetDir = join(versionsDir, PINNED_GH.version)
+      let releaseRename = false
+      let signalEnteredRename!: () => void
+      const enteredRename = new Promise<void>((resolve) => { signalEnteredRename = resolve })
+      renameSyncSpy.mockImplementation((from, to) => {
+        if (/[/\\]unpacked$/.test(String(from)) && String(to) === targetDir && !releaseRename) {
+          signalEnteredRename()
+          throw lockedError('EBUSY', String(from), 'rename')
+        }
+        return realRenameSync(from, to)
+      })
+      const service = new GitHubService(root, bundledArchivePath, fetch, stubVersionRunner(), new TestVault(), trustedDigest)
+
+      const installing = service.install()
+      try {
+        await enteredRename
+        const backups = readdirSync(versionsDir).filter((name) => name.startsWith('.previous-'))
+        expect(backups).toHaveLength(1)
+
+        await expect(service.status()).resolves.toMatchObject({
+          installed: false,
+          installing: true,
+          provisionState: 'provisioning'
+        })
+        expect(existsSync(join(versionsDir, backups[0]!))).toBe(true)
+
+        releaseRename = true
+        await expect(installing).resolves.toMatchObject({
+          installed: true,
+          installing: false,
+          version: PINNED_GH.version
+        })
+        expect(existsSync(join(versionsDir, backups[0]!))).toBe(false)
+      } finally {
+        releaseRename = true
+        await installing.catch(() => {})
+      }
+    },
+    15_000
   )
 })
 
