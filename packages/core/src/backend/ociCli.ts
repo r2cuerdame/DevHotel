@@ -2398,7 +2398,34 @@ export class OciCliBackend implements IsolationBackend {
   async spawnInteractiveExec(roomId: string, cmd: string[]) {
     await this.assertPinnedEngineIdentity()
     const container = await this.assertRoomContainer(roomId, webName(roomId), 'web')
-    return this.engine.spawn(['exec', '-i', exactContainerId(container, roomId), ...cmd])
+    const containerId = exactContainerId(container, roomId)
+    const token = randomUUID()
+    const child = this.engine.spawn(['exec', '-i', '-e', `${EXEC_OWNER_ENV}=${token}`, containerId, ...cmd])
+    let closed = typeof child.exitCode === 'number' || typeof child.signalCode === 'string'
+    let reaped = false
+    if (typeof child.on === 'function') {
+      child.on('close', () => {
+        closed = true
+      })
+    }
+    const rawKill = typeof child.kill === 'function' ? child.kill.bind(child) : null
+    child.kill = ((signal?: NodeJS.Signals | number): boolean => {
+      const shouldReap = !closed && !reaped
+      if (shouldReap) reaped = true
+      try {
+        if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
+          child.stdin.end()
+        }
+      } catch {
+        // Ignore stdin close errors when the stream already ended.
+      }
+      const killed = rawKill ? rawKill(signal) : false
+      if (shouldReap) {
+        void this.reapOwnedExecProcesses(roomId, containerId, token).catch(() => undefined)
+      }
+      return killed
+    }) as typeof child.kill
+    return child
   }
 
   async followRoomLogs(roomId: string, tail = 50) {
@@ -8175,7 +8202,7 @@ export class OciCliBackend implements IsolationBackend {
     const published = (anchor.NetworkSettings?.Ports?.[`${RELAY_PORT}/tcp`] ?? [])
       .map((binding) => `${binding?.HostIp ?? ''}:${binding?.HostPort ?? ''}`)
       .filter((line) => /:\d+$/.test(line))
-    if (published.length > 0) return parsePortOutput(published.join('\n'))
+    if (published.length > 0) return await this.reachHostPort(roomId, parsePortOutput(published.join('\n')))
     const result = must(
       await this.docker(['port', exactContainerId(anchor, roomId), `${RELAY_PORT}/tcp`]),
       'read anchor host port',

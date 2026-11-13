@@ -1,6 +1,9 @@
 import net from 'node:net'
+import { once } from 'node:events'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ManagedRuntimeIngress } from '../backend/managedRuntimeIngress'
+import { IngressLedger } from '../lifecycle/ingressLedger'
+import { tempDir } from './fakes'
 
 /** A stand-in for a Room's relay gate published inside the guest. */
 async function guestListener(onLine: (line: string, socket: net.Socket) => void): Promise<{
@@ -184,5 +187,179 @@ describe('ManagedRuntimeIngress', () => {
     const hostPort = await ingress.publish('r1', { host: '127.0.0.1', port: 1 })
 
     await expect(exchange(hostPort, 'x\n')).rejects.toThrow()
+  })
+})
+
+describe('persistent managed ingress connections', () => {
+  const cleanup: (() => Promise<void>)[] = []
+
+  afterEach(async () => {
+    for (const close of cleanup.splice(0).reverse()) await close()
+  })
+
+  async function withinDeadline<T>(operation: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('open connections prevented ingress cleanup')), 5_000)
+        })
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  function closed(socket: net.Socket): Promise<void> {
+    return new Promise((resolve) => socket.once('close', () => resolve()))
+  }
+
+  function request(socket: net.Socket, line: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      let reply = ''
+      const finish = (): void => {
+        socket.off('data', onData)
+        socket.off('error', onError)
+        socket.off('close', onClose)
+      }
+      const onData = (chunk: Buffer): void => {
+        reply += chunk.toString('utf8')
+        if (!reply.includes('\n')) return
+        finish()
+        resolve(reply)
+      }
+      const onError = (error: Error): void => {
+        finish()
+        reject(error)
+      }
+      const onClose = (): void => {
+        finish()
+        reject(new Error('the persistent connection closed before its reply'))
+      }
+      socket.on('data', onData)
+      socket.once('error', onError)
+      socket.once('close', onClose)
+      socket.write(`${line}\n`)
+    })
+  }
+
+  function fixture(): { ingress: ManagedRuntimeIngress; ledger: IngressLedger } {
+    const ledger = new IngressLedger({ userData: tempDir() })
+    const ingress = new ManagedRuntimeIngress({ ledger, runtimeId: 'runtime-owned' })
+    cleanup.push(() => ingress.revokeAll())
+    return { ingress, ledger }
+  }
+
+  async function heldRoute(ingress: ManagedRuntimeIngress, roomId: string): Promise<{
+    hostPort: number
+    client: net.Socket
+    guestSocket: net.Socket
+  }> {
+    let guestSocket: net.Socket | undefined
+    const guest = await guestListener((line, socket) => {
+      guestSocket = socket
+      socket.write(`echo:${line}\n`)
+    })
+    const client = new net.Socket()
+    cleanup.push(async () => {
+      // Also releases a deliberately held connection when the unfixed code
+      // times out, so the regression cannot strand its test process.
+      client.destroy()
+      guestSocket?.destroy()
+      await guest.close()
+    })
+    const hostPort = await ingress.publish(roomId, { host: '127.0.0.1', port: guest.port })
+    client.connect(hostPort, '127.0.0.1')
+    // Closing a live forwarding pair may reset its peer. The close event is
+    // the assertion; an expected peer reset must not be an unhandled error.
+    client.on('error', () => {})
+    await withinDeadline(once(client, 'connect'))
+    await expect(withinDeadline(request(client, 'held'))).resolves.toBe('echo:held\n')
+    expect(guestSocket).toBeDefined()
+    guestSocket!.on('error', () => {})
+    return { hostPort, client, guestSocket: guestSocket! }
+  }
+
+  it('revokes a Room without waiting for either peer to close its persistent connection', async () => {
+    const { ingress, ledger } = fixture()
+    const held = await heldRoute(ingress, 'room1abc')
+    const peersClosed = Promise.all([closed(held.client), closed(held.guestSocket)])
+
+    await withinDeadline(Promise.all([ingress.revoke('room1abc'), peersClosed]))
+
+    expect(ingress.portFor('room1abc')).toBeNull()
+    expect(ledger.list()).toEqual([])
+    await expect(exchange(held.hostPort, 'x\n')).rejects.toThrow()
+  })
+
+  it('keeps another Room connected while revoking one Room', async () => {
+    const { ingress, ledger } = fixture()
+    const first = await heldRoute(ingress, 'room1abc')
+    const second = await heldRoute(ingress, 'room2abc')
+    const peersClosed = Promise.all([closed(first.client), closed(first.guestSocket)])
+
+    await withinDeadline(Promise.all([ingress.revoke('room1abc'), peersClosed]))
+
+    expect(second.client.destroyed).toBe(false)
+    expect(second.guestSocket.destroyed).toBe(false)
+    await expect(withinDeadline(request(second.client, 'still-live'))).resolves.toBe('echo:still-live\n')
+    expect(ingress.portFor('room2abc')).toBe(second.hostPort)
+    expect(ledger.list().map((route) => route.roomId)).toEqual(['room2abc'])
+  })
+
+  it('replaces a forwarder while its old peers remain connected', async () => {
+    const { ingress, ledger } = fixture()
+    const before = await heldRoute(ingress, 'room1abc')
+    const after = await guestListener((_line, socket) => socket.write('after\n'))
+    cleanup.push(after.close)
+    const peersClosed = Promise.all([closed(before.client), closed(before.guestSocket)])
+
+    const hostPort = await withinDeadline(ingress.publish('room1abc', { host: '127.0.0.1', port: after.port }))
+    await withinDeadline(peersClosed)
+
+    await expect(exchange(hostPort, 'x\n')).resolves.toBe('after\n')
+    await expect(exchange(before.hostPort, 'x\n')).rejects.toThrow()
+    expect(ingress.portFor('room1abc')).toBe(hostPort)
+    expect(ledger.list().map((route) => route.hostPort)).toEqual([hostPort])
+  })
+
+  it('closes every persistent pair and clears the ledger on shutdown', async () => {
+    const { ingress, ledger } = fixture()
+    const first = await heldRoute(ingress, 'room1abc')
+    const second = await heldRoute(ingress, 'room2abc')
+    const peersClosed = Promise.all([
+      closed(first.client), closed(first.guestSocket), closed(second.client), closed(second.guestSocket)
+    ])
+
+    await withinDeadline(Promise.all([ingress.revokeAll(), peersClosed]))
+
+    expect(ingress.portFor('room1abc')).toBeNull()
+    expect(ingress.portFor('room2abc')).toBeNull()
+    expect(ledger.list()).toEqual([])
+    await expect(exchange(first.hostPort, 'x\n')).rejects.toThrow()
+    await expect(exchange(second.hostPort, 'x\n')).rejects.toThrow()
+  })
+
+  it('also destroys the upstream when a Room is revoked before it connects', async () => {
+    const upstream = new net.Socket()
+    let connectRequested!: () => void
+    const requested = new Promise<void>((resolve) => { connectRequested = resolve })
+    const ingress = new ManagedRuntimeIngress({ connect: () => {
+      connectRequested()
+      return upstream
+    } })
+    cleanup.push(() => ingress.revokeAll())
+    const hostPort = await ingress.publish('room1abc', { host: '127.0.0.1', port: 3999 })
+    const client = net.connect(hostPort, '127.0.0.1')
+    client.on('error', () => {})
+    cleanup.push(async () => { client.destroy(); upstream.destroy() })
+    await withinDeadline(requested)
+    const peersClosed = Promise.all([closed(client), closed(upstream)])
+
+    await withinDeadline(Promise.all([ingress.revoke('room1abc'), peersClosed]))
+
+    expect(upstream.destroyed).toBe(true)
+    expect(ingress.portFor('room1abc')).toBeNull()
   })
 })

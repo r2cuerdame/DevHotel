@@ -60,12 +60,24 @@ export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
     const ro = new ResizeObserver(() => fit.fit())
     ro.observe(host)
 
+    const closeActiveSession = (): void => {
+      const activeId = termId
+      termId = null
+      if (activeId) api.term.close(activeId)
+    }
+    const onPageHide = (): void => {
+      disposed = true
+      closeActiveSession()
+    }
+    window.addEventListener('pagehide', onPageHide)
+
     return () => {
       disposed = true
+      window.removeEventListener('pagehide', onPageHide)
       ro.disconnect()
       offData()
       offExit()
-      if (termId) api.term.close(termId)
+      closeActiveSession()
       term.dispose()
     }
   }, [room.id])

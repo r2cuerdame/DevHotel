@@ -20,6 +20,8 @@ export interface EndpointServerOptions {
   resolve: (sessionId: string, token: string) => EndpointUpstream | null
   /** Port to try first, so endpoints stay put across restarts when the OS allows it. */
   preferredPort?: number | null
+  /** Dials a session's DevTools listener; defaults to `net.connect`. Tests hold a dial open with it. */
+  connect?: (port: number, host: string) => Socket
 }
 
 const SESSION_ID = /^cbr_[a-z0-9]{16}$/
@@ -41,6 +43,12 @@ export class ClientBrowserEndpointServer {
   private server: Server | null = null
   private port: number | null = null
   private readonly clients = new Map<string, Set<Duplex>>()
+  /**
+   * Tunnels still dialling and discovery requests still waiting on the
+   * browser, as abort callbacks. Neither is a tunnelled client yet, but a
+   * released session or a stopping server must not leave them behind.
+   */
+  private readonly inFlight = new Map<string, Set<() => void>>()
 
   constructor(private readonly options: EndpointServerOptions) {}
 
@@ -92,10 +100,17 @@ export class ClientBrowserEndpointServer {
     const server = this.server
     this.server = null
     this.port = null
-    for (const sockets of this.clients.values()) for (const socket of sockets) socket.destroy()
+    const sockets = [...this.clients.values()].flatMap((set) => [...set])
+    const aborts = [...this.inFlight.values()].flatMap((set) => [...set])
     this.clients.clear()
+    this.inFlight.clear()
+    for (const socket of sockets) socket.destroy()
+    for (const abort of aborts) abort()
     if (!server) return
-    await new Promise<void>((resolve) => server.close(() => resolve()))
+    const closed = new Promise<void>((resolve) => server.close(() => resolve()))
+    // Keep-alive and half-answered discovery sockets would otherwise hold close() open.
+    server.closeAllConnections()
+    await closed
   }
 
   /** Automation clients currently tunnelled for a session. */
@@ -103,12 +118,18 @@ export class ClientBrowserEndpointServer {
     return this.clients.get(sessionId)?.size ?? 0
   }
 
-  /** Drop every tunnelled client of a session; used when the session is released. */
+  /**
+   * Drop every tunnelled client of a session, along with tunnels still
+   * dialling and discovery requests still waiting; used when the session is
+   * released.
+   */
   disconnect(sessionId: string): void {
     const sockets = this.clients.get(sessionId)
-    if (!sockets) return
-    for (const socket of sockets) socket.destroy()
+    const aborts = this.inFlight.get(sessionId)
     this.clients.delete(sessionId)
+    this.inFlight.delete(sessionId)
+    for (const socket of sockets ?? []) socket.destroy()
+    for (const abort of aborts ?? []) abort()
   }
 
   endpointFor(sessionId: string, token: string): { http: string; ws: string } | null {
@@ -151,6 +172,8 @@ export class ClientBrowserEndpointServer {
       return
     }
     const { upstream, rest, base } = routed
+    // stop() clears this.port while an answer may still be on its way.
+    const port = this.port
     // Playwright appends `/json/version/`; chrome-remote-interface asks `/json/list`.
     // Only discovery is proxied over HTTP; everything else is the WebSocket.
     if (!rest.startsWith('/json')) {
@@ -171,7 +194,7 @@ export class ClientBrowserEndpointServer {
         upstreamRes.on('data', (chunk: Buffer) => chunks.push(chunk))
         upstreamRes.on('end', () => {
           const body = Buffer.concat(chunks).toString('utf8')
-          const publicOrigin = `127.0.0.1:${this.port}${base}`
+          const publicOrigin = `127.0.0.1:${port}${base}`
           const rewritten = body
             .split(`${upstream.devtoolsHost}:${upstream.devtoolsPort}`)
             .join(publicOrigin)
@@ -192,6 +215,15 @@ export class ClientBrowserEndpointServer {
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'the browser behind this session is not answering' }))
     })
+    const release = this.add(this.inFlight, upstream.sessionId, () => {
+      upstreamReq.destroy()
+      res.destroy()
+    })
+    // Fires once the answer is out or the caller hung up first; only the latter leaves the upstream open.
+    res.on('close', () => {
+      release()
+      if (!res.writableFinished) upstreamReq.destroy()
+    })
     req.pipe(upstreamReq)
   }
 
@@ -204,9 +236,45 @@ export class ClientBrowserEndpointServer {
     const { upstream, rest } = routed
     // The base path is the browser endpoint; anything deeper (/devtools/page/<id>) is forwarded as-is.
     const upstreamPath = rest === '/' ? null : rest
-    const upstreamSocket: Socket = connect(upstream.devtoolsPort, upstream.devtoolsHost)
+    const upstreamSocket: Socket = (this.options.connect ?? connect)(upstream.devtoolsPort, upstream.devtoolsHost)
+    const { sessionId } = upstream
+    // Until the dial lands the pair is in flight: the caller, a release or
+    // stop() may each end it, and whichever does takes the dial down too.
+    const release = this.add(this.inFlight, sessionId, () => {
+      socket.destroy()
+      upstreamSocket.destroy()
+    })
+    const untrack = (): void => {
+      release()
+      this.remove(this.clients, sessionId, socket)
+    }
+    // Nothing reads an upgraded socket on its own, so a caller hanging up
+    // mid-dial would go unnoticed; read it now and hold what arrives early.
+    let dialling = true
+    const early: Buffer[] = []
+    const hold = (chunk: Buffer): void => {
+      early.push(chunk)
+    }
+    socket.on('data', hold)
+    socket.on('end', () => {
+      if (dialling) socket.destroy()
+    })
     upstreamSocket.on('error', () => socket.destroy())
+    socket.on('close', () => {
+      untrack()
+      upstreamSocket.destroy()
+    })
+    upstreamSocket.on('close', () => {
+      untrack()
+      socket.destroy()
+    })
     upstreamSocket.once('connect', () => {
+      // A dial that lands after its caller, session or server is gone must not be forwarded.
+      if (socket.destroyed || upstreamSocket.destroyed) return
+      release()
+      dialling = false
+      socket.removeListener('data', hold)
+      socket.pause()
       const path = upstreamPath ?? upstream.browserPath
       const headers = this.upstreamHeaders(req, upstream)
       const lines = [`GET ${path} HTTP/1.1`]
@@ -215,36 +283,30 @@ export class ClientBrowserEndpointServer {
       }
       upstreamSocket.write(lines.join('\r\n') + '\r\n\r\n')
       if (head.length > 0) upstreamSocket.write(head)
+      for (const chunk of early) upstreamSocket.write(chunk)
       // From here on the two sockets are one wire: Chromium's 101 answer and
       // every frame after it pass through untouched.
       socket.pipe(upstreamSocket)
       upstreamSocket.pipe(socket)
-      this.track(upstream.sessionId, socket)
-      const untrack = (): void => this.untrack(upstream.sessionId, socket)
-      socket.on('close', () => {
-        untrack()
-        upstreamSocket.destroy()
-      })
-      upstreamSocket.on('close', () => {
-        untrack()
-        socket.destroy()
-      })
+      this.add(this.clients, sessionId, socket)
     })
   }
 
-  private track(sessionId: string, socket: Duplex): void {
-    let sockets = this.clients.get(sessionId)
-    if (!sockets) {
-      sockets = new Set()
-      this.clients.set(sessionId, sockets)
+  /** Files `item` under its session; the returned callback takes it back out. */
+  private add<T>(map: Map<string, Set<T>>, sessionId: string, item: T): () => void {
+    let items = map.get(sessionId)
+    if (!items) {
+      items = new Set()
+      map.set(sessionId, items)
     }
-    sockets.add(socket)
+    items.add(item)
+    return () => this.remove(map, sessionId, item)
   }
 
-  private untrack(sessionId: string, socket: Duplex): void {
-    const sockets = this.clients.get(sessionId)
-    if (!sockets) return
-    sockets.delete(socket)
-    if (sockets.size === 0) this.clients.delete(sessionId)
+  private remove<T>(map: Map<string, Set<T>>, sessionId: string, item: T): void {
+    const items = map.get(sessionId)
+    if (!items) return
+    items.delete(item)
+    if (items.size === 0) map.delete(sessionId)
   }
 }
