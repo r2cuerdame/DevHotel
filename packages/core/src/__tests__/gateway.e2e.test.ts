@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
@@ -46,6 +46,23 @@ function request(
   })
 }
 
+/** An https request that only succeeds when the served chain verifies against `ca` for `host`. */
+function verifiedRequest(port: number, host: string, ca: string): Promise<SimpleResponse> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      { host: '127.0.0.1', port, path: '/', headers: { host }, servername: host, ca, agent: false },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c: string) => (body += c))
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }))
+      }
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
 function listen(server: net.Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject)
@@ -63,6 +80,7 @@ let httpPort: number
 let httpsPort: number
 let targetA: http.Server
 let targetB: http.Server
+let portB: number
 let gatedTarget: net.Server
 const GATED_TOKEN = 'd'.repeat(64)
 const upgradeSockets = new Set<Duplex>()
@@ -85,7 +103,7 @@ beforeAll(async () => {
     res.setHeader('content-type', 'text/plain')
     res.end('room-b')
   })
-  const portB = await listen(targetB)
+  portB = await listen(targetB)
 
   gatedTarget = net.createServer((socket) => {
     let buffer = ''
@@ -314,4 +332,56 @@ describe('gateway e2e', () => {
       throw error
     }
   })
+
+  it('answers parallel first handshakes for an https domain that is not cached yet', async () => {
+    await gateway.setRoute({ domain: 'c.localhost', roomId: 'room-c', targetPort: portB, https: true })
+    // a restart drops every cached context, so all of these handshakes miss at once
+    await gateway.stop()
+    const restarted = await gateway.start()
+    httpPort = restarted.httpPort!
+    httpsPort = restarted.httpsPort!
+    const ca = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+
+    const responses = await Promise.all(
+      Array.from({ length: 6 }, () => verifiedRequest(httpsPort, 'c.localhost', ca))
+    )
+    expect(responses.map((res) => res.status)).toEqual([200, 200, 200, 200, 200, 200])
+    expect(responses.every((res) => res.body === 'room-b')).toBe(true)
+    gateway.removeRoute('c.localhost')
+  }, 60000)
+
+  it('serves a domain it already handshook from memory, without reading the certificate files again', async () => {
+    const ca = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    expect((await verifiedRequest(httpsPort, 'b.localhost', ca)).status).toBe(200)
+
+    // with certs/ turned into a plain file any disk lookup for a leaf fails
+    const certsDir = path.join(caDir, 'certs')
+    const saved = path.join(caDir, 'certs.saved')
+    await rename(certsDir, saved)
+    await writeFile(certsDir, 'not a directory')
+    try {
+      const res = await verifiedRequest(httpsPort, 'b.localhost', ca)
+      expect(res).toMatchObject({ status: 200, body: 'room-b' })
+    } finally {
+      await rm(certsDir, { force: true })
+      await rename(saved, certsDir)
+    }
+  }, 60000)
+
+  it('reissues room certificates under a regenerated CA after a restart', async () => {
+    const oldCa = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    await gateway.stop()
+    await rm(path.join(caDir, 'rootCA.pem'))
+    await rm(path.join(caDir, 'rootCA.key'))
+    const restarted = await gateway.start()
+    httpPort = restarted.httpPort!
+    httpsPort = restarted.httpsPort!
+    const newCa = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    expect(newCa).not.toBe(oldCa)
+
+    // the leaf left on disk was signed by the old CA; strict verification proves it was replaced
+    const res = await verifiedRequest(httpsPort, 'b.localhost', newCa)
+    expect(res).toMatchObject({ status: 200, body: 'room-b' })
+    await expect(verifiedRequest(httpsPort, 'b.localhost', oldCa)).rejects.toThrow()
+  }, 60000)
 })

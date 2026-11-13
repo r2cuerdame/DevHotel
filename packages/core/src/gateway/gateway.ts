@@ -34,12 +34,22 @@ function sameTarget(a: Route, b: Route): boolean {
   )
 }
 
+interface LeafContext {
+  context: tls.SecureContext
+  keyPem: string
+  certPem: string
+  /** The CA chained into `context`; a different current CA invalidates the entry. */
+  caCertPem: string
+}
+
 export class Gateway {
   private readonly caDir: string
   private readonly httpCandidates: number[]
   private readonly httpsCandidates: number[]
   private readonly table = new RouteTable()
-  private readonly contexts = new Map<string, tls.SecureContext>()
+  private readonly contexts = new Map<string, LeafContext>()
+  private readonly pendingContexts = new Map<string, Promise<LeafContext>>()
+  private contextEpoch = 0
   private httpServer: http.Server | null = null
   private httpsServer: https.Server | null = null
   private httpIpv6Server: http.Server | null = null
@@ -118,19 +128,38 @@ export class Gateway {
     return this.status()
   }
 
-  private async secureContextFor(
-    domain: string
-  ): Promise<{ context: tls.SecureContext; keyPem: string; certPem: string }> {
-    const leaf = await issueLeafCert(this.caDir, domain)
-    let context = this.contexts.get(domain)
-    if (!context) {
-      context = tls.createSecureContext({
-        key: leaf.keyPem,
-        cert: leaf.certPem + this.caCertPem
+  /**
+   * A served domain's TLS context, from memory when one was already built
+   * against the current CA. Handshakes for a known domain therefore never touch
+   * the disk, and concurrent first handshakes for the same domain share one
+   * issue-and-build instead of racing each other.
+   */
+  private secureContextFor(domain: string): Promise<LeafContext> {
+    const name = domain.toLowerCase()
+    const cached = this.contexts.get(name)
+    if (cached && cached.caCertPem === this.caCertPem) return Promise.resolve(cached)
+    const pending = this.pendingContexts.get(name)
+    if (pending) return pending
+
+    const epoch = this.contextEpoch
+    const caCertPem = this.caCertPem
+    const build = issueLeafCert(this.caDir, name)
+      .then((leaf) => {
+        const entry: LeafContext = {
+          context: tls.createSecureContext({ key: leaf.keyPem, cert: leaf.certPem + caCertPem }),
+          keyPem: leaf.keyPem,
+          certPem: leaf.certPem,
+          caCertPem
+        }
+        // a stop() or removeRoute() while this was in flight must not resurrect a stale context
+        if (epoch === this.contextEpoch) this.contexts.set(name, entry)
+        return entry
       })
-      this.contexts.set(domain, context)
-    }
-    return { context, keyPem: leaf.keyPem, certPem: leaf.certPem }
+      .finally(() => {
+        if (this.pendingContexts.get(name) === build) this.pendingContexts.delete(name)
+      })
+    this.pendingContexts.set(name, build)
+    return build
   }
 
   private async listenOnFirstFree(
@@ -215,6 +244,10 @@ export class Gateway {
     this.httpPort = null
     this.httpsPort = null
     this.running = false
+    // the next start() re-reads the CA and leaves from disk, so replaced files take effect
+    this.contextEpoch += 1
+    this.contexts.clear()
+    this.pendingContexts.clear()
   }
 
   async setRoute(route: Route): Promise<void> {
@@ -226,7 +259,9 @@ export class Gateway {
 
   removeRoute(domain: string): void {
     this.table.remove(domain)
+    this.contextEpoch += 1
     this.contexts.delete(domain.toLowerCase())
+    this.pendingContexts.delete(domain.toLowerCase())
     this.handlers.closeDomain(domain)
   }
 
