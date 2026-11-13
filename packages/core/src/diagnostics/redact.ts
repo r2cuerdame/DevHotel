@@ -128,6 +128,36 @@ export class SecretRedactor {
     return out
   }
 
+  /**
+   * Whole-match spans of `text` that `redactText` would rewrite (custom
+   * patterns aside). Code that has to cut text must not cut inside one:
+   * neither fragment would be recognised on its own.
+   */
+  secretSpans(text: string): Array<[number, number]> {
+    const patterns = [
+      PAIRING_MDNS_LINE,
+      ADB_PAIR_COMMAND,
+      PAIRING_PROMPT,
+      PAIRING_KEYED_VALUE,
+      PEM_BLOCK,
+      KEYED_VALUE,
+      BEARER,
+      CONNECTION_STRING,
+      URL_USERINFO,
+      ...WELL_KNOWN_TOKENS,
+      ENV_LINE,
+      ...[...this.sensitiveValues.keys()].map((value) => new RegExp(escapeRegExp(value), 'gi'))
+    ]
+    const spans: Array<[number, number]> = []
+    for (const re of patterns) {
+      for (const match of text.matchAll(re)) {
+        const start = match.index ?? 0
+        if (match[0].length > 0) spans.push([start, start + match[0].length])
+      }
+    }
+    return spans
+  }
+
   redactStructured<T>(value: T, customPatterns: string[] = []): T {
     const seenPlain = new WeakMap<object, unknown>()
     const seenPairing = new WeakMap<object, unknown>()
@@ -176,6 +206,11 @@ export function registerSensitiveSecrets(values: Iterable<string>): () => void {
 
 export function redactSecrets(text: string, customPatterns: string[] = []): string {
   return secretRedactor.redactText(text, customPatterns)
+}
+
+/** Spans `redactSecrets` would rewrite; see `SecretRedactor.secretSpans`. */
+export function secretSpans(text: string): Array<[number, number]> {
+  return secretRedactor.secretSpans(text)
 }
 
 /** Recursively redact strings and pairing-specific fields before serialization. */

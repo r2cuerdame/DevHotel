@@ -176,4 +176,50 @@ describe('LogHub chunked Room output', () => {
     expect(sinks).not.toContain(token.slice(-20))
     expect(emitted.some((line) => line.includes(REDACTED_SECRET))).toBe(true)
   })
+
+  function fill(child: FakeLogChild, char: string, length: number): void {
+    for (let sent = 0; sent < length; sent += 4096) child.out(char.repeat(Math.min(4096, length - sent)))
+  }
+
+  for (const ending of ['newline', 'more output', 'stream end'] as const) {
+    it(`redacts a compact token straddling the line cap with no whitespace nearby (${ending})`, async () => {
+      const { logs, child, emitted, file } = await attached()
+      const token = `ghp_${'Q1w2E3r4T5'.repeat(4)}`
+      fill(child, 'x', MAX_LOG_LINE_CHARS - 10)
+      child.out(`:${token}`)
+      if (ending === 'newline') child.out('\n')
+      if (ending === 'more output') fill(child, 'y', MAX_LOG_LINE_CHARS)
+      logs.dispose()
+
+      for (const sink of [emitted.join('\n'), file().join('\n')]) {
+        expect(sink).not.toContain(token.slice(4, 14))
+        expect(sink).not.toContain(token.slice(-20))
+      }
+      expect(emitted.some((line) => line.startsWith(REDACTED_SECRET))).toBe(true)
+      expect(emitted.every((line) => line.length <= MAX_LOG_LINE_CHARS)).toBe(true)
+    })
+  }
+
+  it('cuts compact key=value output before a keyed secret that straddles the line cap', async () => {
+    const { logs, child, emitted } = await attached()
+    const secret = 'hunter2-Sup3rS3cretValue-0123456789'
+    fill(child, 'q', MAX_LOG_LINE_CHARS - 30)
+    child.out(`&user=dev&password=${secret}&next=1\n`)
+    logs.dispose()
+
+    expect(emitted.join('\n')).not.toContain(secret.slice(0, 12))
+    expect(emitted.join('\n')).not.toContain(secret.slice(-12))
+    expect(emitted.some((line) => line.includes(`password=${REDACTED_SECRET}`))).toBe(true)
+  })
+
+  it('masks the rest of a line whose secret-shaped value is longer than the cap', async () => {
+    const { logs, child, emitted, file } = await attached()
+    child.out('token=')
+    fill(child, 'v', MAX_LOG_LINE_CHARS * 2)
+    child.out(' trailing\nnext line\n')
+    logs.dispose()
+
+    expect(emitted).toEqual([`token=${REDACTED_SECRET}`, 'next line'])
+    expect(file()).toEqual(emitted)
+  })
 })

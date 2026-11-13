@@ -4,17 +4,20 @@ import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { ChildProcess } from 'node:child_process'
 import type { IsolationBackend } from './backend/types'
-import { redactSecrets } from './diagnostics/redact'
+import { redactSecrets, secretSpans } from './diagnostics/redact'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
-/**
- * Longest line kept in memory while waiting for its newline. Far above any
- * secret shape `redactSecrets` recognises, so a forced split only happens on
- * output that is not a credential line anyway.
- */
+/** Longest piece of a line emitted on its own when the line has no newline in sight. */
 export const MAX_LOG_LINE_CHARS = 64 * 1024
 /** How far back from the cap a forced split looks for whitespace. */
 const SPLIT_LOOKBACK_CHARS = 1024
+/**
+ * Output kept past the cap before a forced split, so a credential that is
+ * still arriving at the end of the buffer has already taken a recognisable
+ * shape when the cut point is chosen.
+ */
+const SPLIT_LOOKAHEAD_CHARS = 1024
+const SPLIT_WINDOW_CHARS = MAX_LOG_LINE_CHARS + SPLIT_LOOKAHEAD_CHARS
 
 export type LogKind = 'web' | 'orchestrator'
 
@@ -24,13 +27,32 @@ export interface LogLineEvent {
   line: string
 }
 
-/** Cut point for an over-long line: prefer whitespace, never split a surrogate pair. */
-function forcedCut(text: string): number {
+/**
+ * Cut point for an over-long line. Each piece is redacted on its own, so a
+ * cut must never fall inside a value `redactSecrets` recognises: prefer
+ * whitespace outside every secret, else cut just before the secret that
+ * straddles the cap. When one secret-shaped value runs from the start past
+ * the cap, cut right after it; if that value may still be growing (`open`),
+ * return -1 so the caller masks the rest of the line instead.
+ */
+function forcedCut(text: string, open: boolean): number {
+  const spans = secretSpans(text)
+  const inside = (i: number): [number, number] | undefined => spans.find(([start, end]) => start < i && i < end)
   for (let i = MAX_LOG_LINE_CHARS; i > MAX_LOG_LINE_CHARS - SPLIT_LOOKBACK_CHARS; i--) {
-    if (/\s/.test(text[i - 1] ?? '')) return i
+    if (/\s/.test(text[i - 1] ?? '') && !inside(i)) return i
   }
-  const code = text.charCodeAt(MAX_LOG_LINE_CHARS - 1)
-  return code >= 0xd800 && code <= 0xdbff ? MAX_LOG_LINE_CHARS - 1 : MAX_LOG_LINE_CHARS
+  let cut = MAX_LOG_LINE_CHARS
+  for (;;) {
+    const span = inside(cut)
+    const code = text.charCodeAt(cut - 1)
+    if (span) cut = span[0]
+    else if (code >= 0xd800 && code <= 0xdbff) cut--
+    else break
+  }
+  if (cut > 0) return cut
+  cut = MAX_LOG_LINE_CHARS
+  for (let span = inside(cut); span; span = inside(cut)) cut = span[1]
+  return open && cut > text.length - SPLIT_LOOKAHEAD_CHARS ? -1 : cut
 }
 
 /**
@@ -42,6 +64,8 @@ function forcedCut(text: string): number {
 class LineAssembler {
   private readonly decoder = new StringDecoder('utf8')
   private rest = ''
+  /** The current line's remainder belongs to a masked value and is dropped. */
+  private masking = false
 
   constructor(private readonly onLine: (line: string) => void) {}
 
@@ -53,26 +77,53 @@ class LineAssembler {
     this.feed(this.decoder.end())
     const rest = this.rest
     this.rest = ''
-    if (rest) this.onLine(rest)
+    this.masking = false
+    if (rest) this.emit(rest)
   }
 
   private feed(text: string): void {
     if (!text) return
     const parts = (this.rest + text).split(/\r?\n/)
     this.rest = parts.pop() ?? ''
-    for (let part of parts) {
-      while (part.length > MAX_LOG_LINE_CHARS) {
-        const cut = forcedCut(part)
-        this.onLine(part.slice(0, cut))
-        part = part.slice(cut)
+    for (const part of parts) {
+      if (this.masking) {
+        this.masking = false
+        continue
       }
-      this.onLine(part)
+      this.emit(part)
     }
-    while (this.rest.length > MAX_LOG_LINE_CHARS) {
-      const cut = forcedCut(this.rest)
-      this.onLine(this.rest.slice(0, cut))
-      this.rest = this.rest.slice(cut)
+    if (this.masking) {
+      this.rest = ''
+      return
     }
+    const left = this.split(this.rest, false)
+    this.masking = left === null
+    this.rest = left ?? ''
+  }
+
+  private emit(line: string): void {
+    const left = this.split(line, true)
+    if (left !== null) this.onLine(left)
+  }
+
+  /**
+   * Emits forced pieces of an over-long line and returns what is left, or
+   * null once a secret-shaped value too long to cut around masked the rest.
+   * An incomplete line keeps a lookahead past the cap before it is cut.
+   */
+  private split(text: string, complete: boolean): string | null {
+    const limit = complete ? MAX_LOG_LINE_CHARS : SPLIT_WINDOW_CHARS
+    while (text.length > limit) {
+      const window = text.slice(0, SPLIT_WINDOW_CHARS)
+      const cut = forcedCut(window, !complete || window.length < text.length)
+      if (cut < 0) {
+        this.onLine(window)
+        return null
+      }
+      this.onLine(text.slice(0, cut))
+      text = text.slice(cut)
+    }
+    return text
   }
 }
 
