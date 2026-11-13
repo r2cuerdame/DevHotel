@@ -522,4 +522,21 @@ describe('RoomOrchestrator shutdown gate', () => {
     })
     expect(orch.rooms.get(room.id)?.status).toBe('attention')
   })
+
+  it('keeps deleting status and stops pods/leases during shutdown of a deleting Android Room without sleeping it', async () => {
+    const room = makeRoom({
+      id: 'anddel1',
+      provider: 'android',
+      workspaceMode: 'hotel',
+      status: 'deleting',
+      hostPort: 42345
+    })
+    orch.rooms.create(room)
+
+    await orch.shutdown()
+
+    expect(backend.calls).toContain(`stopRoomPod:${room.id}`)
+    expect(orch.rooms.get(room.id)?.status).toBe('deleting')
+    expect(orch.rooms.get(room.id)?.hostPort).toBeNull()
+  })
 })

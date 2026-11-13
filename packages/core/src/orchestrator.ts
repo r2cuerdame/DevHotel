@@ -2520,7 +2520,7 @@ export class RoomOrchestrator {
         this.olog(room.id, detail)
       }
       const current = this.rooms.get(room.id)
-      if (current && current.status !== 'broken') {
+      if (current && current.status !== 'broken' && current.status !== 'deleting') {
         const wasAwake = roomsSlept.has(room.id) || current.status !== 'sleeping'
         if (wasAwake || hasUncleanRetry) {
           this.rooms.update(room.id, { status: 'attention' })
@@ -2628,11 +2628,23 @@ export class RoomOrchestrator {
           // lifecycle implementation fail-closed if its caller changes later.
           this.assertNoPendingAndroidLocaleRestoration(room.id)
           this.assertNoPendingAndroidAcceptanceRestore(room.id)
-          if (room.status === 'broken') {
-            // broken rooms may still own running containers — stop them but keep the status visible
-            if (room.provider === 'android') await this.releaseAndroidDeviceLocked(room.id, 'Broken Room shut down')
-            if (room.provider === 'windows') await this.mustWindowsVm().sleep(room.id)
-            else await this.backend.stopRoomPod(room.id)
+          if (room.status === 'broken' || room.status === 'deleting') {
+            // Broken or deleting Rooms may still own running resources — stop them
+            // while keeping status visible and without rewriting manifest.yaml.
+            if (room.status === 'deleting') this.gateway.removeRoute(room.domain)
+            if (room.provider === 'android') {
+              await this.releaseAndroidDeviceLocked(
+                room.id,
+                room.status === 'deleting' ? 'Deleting Room shut down' : 'Broken Room shut down'
+              )
+            }
+            if (room.provider === 'windows') {
+              if (room.status === 'broken') await this.mustWindowsVm().sleep(room.id)
+              else if (this.windowsVm && (await this.windowsVm.state(room.id)) !== 'missing') await this.windowsVm.sleep(room.id)
+            } else {
+              if (room.status === 'deleting') await this.cancelRoomWorkloads(room.id, 'DevHotel is shutting down')
+              await this.backend.stopRoomPod(room.id)
+            }
             this.rooms.update(room.id, { hostPort: null })
           } else {
             // The shutdown gate rejects public lifecycle calls. All admitted work
@@ -4238,11 +4250,12 @@ export class RoomOrchestrator {
   }
 
   cloneRoom(input: CloneRoomInput): Promise<RoomRecord> {
-    return this.withRoomLock(input.sourceRoomId, () => this.cloneRoomLocked(input))
+    return this.withNonDeletingRoomLock(input.sourceRoomId, () => this.cloneRoomLocked(input))
   }
 
   private async cloneRoomLocked(input: CloneRoomInput): Promise<RoomRecord> {
     const source = this.mustGet(input.sourceRoomId)
+    this.assertNotDeleting(input.sourceRoomId, source)
     if (source.provider !== 'web') throw new Error('Clone Room currently supports Web rooms only')
     if (source.status === 'preparing') throw new Error('Wait for the source room to finish preparing before cloning it')
     if (source.workspaceMode === 'legacy-host-bind') {
@@ -4615,7 +4628,19 @@ export class RoomOrchestrator {
           // Every accepted request keeps its own durable ID. The Room lock, not
           // the operation key, is what stops two mutations from interleaving;
           // joining by kind here would alias two different requested changes.
-          joinRunningByRoom: false
+          joinRunningByRoom: false,
+          beforeStart: () => {
+            if (this.mutationGate !== 'open') throw this.mutationGateError()
+            if (opts.deleteOwnRoom) {
+              if (this.deletingRooms.has(roomId)) {
+                throw new Error(`Room ${roomId} is already being deleted`)
+              }
+              return
+            }
+            if (kind !== 'room-create') {
+              this.assertNotDeleting(roomId, this.rooms.get(roomId))
+            }
+          }
         }
       )
     } catch (error) {
@@ -4906,7 +4931,7 @@ export class RoomOrchestrator {
   }
 
   sleepRoom(roomId: string, actor: Actor): Promise<void> {
-    return this.withRoomLock(
+    return this.withNonDeletingRoomLock(
       roomId,
       () => {
         this.recordRoomActivity(roomId)
@@ -4919,6 +4944,7 @@ export class RoomOrchestrator {
   private async sleepRoomLocked(roomId: string, _actor: Actor): Promise<void> {
     this.assertNoPendingAndroidAcceptanceRestore(roomId)
     const room = this.mustGet(roomId)
+    this.assertNotDeleting(roomId, room)
     const artifactRecoveryPending = this.settings.get(pendingArtifactExportKey(roomId)) !== null
     this.olog(roomId, 'sleep room')
     this.closingBrowserRooms.set(roomId, 'sleeping')
@@ -4972,7 +4998,7 @@ export class RoomOrchestrator {
 
   /** Pinning is durable and immediately cancels an outstanding expiry grace period. */
   setRoomPinned(roomId: string, pinned: boolean, actor: Actor): Promise<RoomRecord> {
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       const before = this.mustGet(roomId)
       const now = new Date().toISOString()
       this.rooms.update(roomId, {
@@ -5005,6 +5031,7 @@ export class RoomOrchestrator {
       try {
         await this.withRoomLock(snapshot.id, async () => {
           let room = this.mustGet(snapshot.id)
+          if (this.deletingRooms.has(room.id) || room.status === 'preparing' || room.status === 'deleting') return
           const activityMs = Date.parse(room.lastActivityAt ?? room.lastUsedAt)
           if (!Number.isFinite(activityMs)) {
             result.retained.push({ roomId: room.id, reason: 'invalid activity timestamp' })
@@ -5133,8 +5160,10 @@ export class RoomOrchestrator {
   }
 
   restartWeb(roomId: string, actor: Actor): Promise<ChangeEntry> {
+    const denied = this.rejectingIfDeleting<ChangeEntry>(roomId)
+    if (denied) return denied
     if (this.mustGet(roomId).provider === 'windows') throw new Error('Windows Rooms do not have a Web process to restart')
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       const entry = await this.engine.execute(this.ctxFor(roomId), 'restart-web', {}, actor)
       this.reattachLogs(roomId)
       this.emit(roomId, 'change')
@@ -5150,7 +5179,9 @@ export class RoomOrchestrator {
    * so the takeover is observable afterwards.
    */
   async openWindows(roomId: string, actor: Actor): Promise<void> {
-    const room = this.mustGet(roomId)
+    const current = this.rooms.get(roomId)
+    this.assertNotDeleting(roomId, current)
+    const room = current ?? this.mustGet(roomId)
     if (room.provider !== 'windows') throw new Error('Only Windows Rooms open in VMware Workstation')
     const capability = hostInputCapability(VMWARE_CONSOLE_CAPABILITY)!
     if (actor !== capability.requiresActor) {
@@ -5163,7 +5194,7 @@ export class RoomOrchestrator {
   }
 
   resetWindows(roomId: string, actor: Actor): Promise<void> {
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider !== 'windows') throw new Error('Clean VM reset is available only for Windows Rooms')
       if (actor !== 'user') throw new Error('Clean VM reset requires an explicit user action')
@@ -5312,28 +5343,19 @@ export class RoomOrchestrator {
       this.gateway.removeRoute(room.domain)
       await this.releaseAndroidDeviceLocked(roomId, 'Room was deleted')
       await this.purgeClientBrowsersLocked(roomId, 'Room was deleted')
+      const keepOperationId = this.deletingRoomOperations.get(roomId)
       if (room.provider === 'windows') {
         const windowsVm = this.mustWindowsVm()
         this.rooms.update(roomId, { status: 'deleting' })
         const { reclaimedBytes } = await windowsVm.delete(roomId)
-        this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
-        this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
-        this.readinessMilestones.delete(roomId)
-        this.pendingHostResyncConfirmations.delete(roomId)
-        rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
-        this.emit(roomId, 'deleted')
+        this.finalizeDeletedRoom(roomId, keepOperationId)
         return { reclaimedBytes }
       }
       this.rooms.update(roomId, { status: 'deleting' })
       this.logs.detach(roomId)
       await this.cancelRoomWorkloads(roomId, 'the Room was deleted')
       const { reclaimedBytes } = await this.backend.deleteRoomPod(roomId, { volumes: true })
-      this.rooms.delete(roomId, this.deletingRoomOperations.get(roomId))
-      this.operations.forgetRoom(roomId, this.deletingRoomOperations.get(roomId))
-      this.readinessMilestones.delete(roomId)
-      this.pendingHostResyncConfirmations.delete(roomId)
-      rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
-      this.emit(roomId, 'deleted')
+      this.finalizeDeletedRoom(roomId, keepOperationId)
       return { reclaimedBytes }
     } finally {
       this.closingBrowserRooms.delete(roomId)
@@ -5547,7 +5569,7 @@ export class RoomOrchestrator {
 
   /** Official file ingress: write one workspace file from base64, capped at 16MB. */
   async pushRoomFile(roomId: string, path: string, contentBase64: string): Promise<{ path: string; size: number }> {
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       if (this.mustGet(roomId).provider === 'windows') {
         throw new Error('Windows Room file transfer requires the forthcoming guest agent')
       }
@@ -9029,7 +9051,7 @@ export class RoomOrchestrator {
   }
 
   syncFromHost(roomId: string, actor: Actor): Promise<RoomRecord> {
-    return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
+    return this.withNonDeletingRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, false))
   }
 
   /**
@@ -9063,7 +9085,7 @@ export class RoomOrchestrator {
     actor: Actor,
     confirmationToken?: string
   ): Promise<SafeHostResyncOutcome> {
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (actor !== 'user' && !this.agentHostSyncAllowed(roomId)) {
         throw new Error('Agent Host sync is revoked for this Room. Re-enable it in the Room, or run the sync yourself.')
@@ -9182,7 +9204,7 @@ export class RoomOrchestrator {
   }
 
   moveIntoHotel(roomId: string, actor: Actor): Promise<RoomRecord> {
-    return this.withRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, true))
+    return this.withNonDeletingRoomLock(roomId, () => this.replaceWorkspaceFromHostLocked(roomId, actor, true))
   }
 
   /**
@@ -9194,7 +9216,7 @@ export class RoomOrchestrator {
    * sync itself, still needs its own explicit user action.
    */
   resetSyncBaseline(roomId: string, actor: Actor): Promise<RoomRecord> {
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.workspaceMode !== 'hotel') {
         throw new Error('Only Hotel-owned workspaces have a Host sync baseline')
@@ -9860,11 +9882,12 @@ export class RoomOrchestrator {
   }
 
   runChecks(roomId: string): Promise<CheckReport> {
-    return this.withRoomLock(roomId, () => this.runChecksLocked(roomId))
+    return this.withNonDeletingRoomLock(roomId, () => this.runChecksLocked(roomId))
   }
 
   private async runChecksLocked(roomId: string): Promise<CheckReport> {
     const room = this.mustGet(roomId)
+    this.assertNotDeleting(roomId, room)
     const report =
       room.provider === 'windows'
         ? await this.runWindowsChecks(room)
@@ -9877,7 +9900,7 @@ export class RoomOrchestrator {
             syncRoute: () => this.syncRouteFor(roomId)
           })
     this.checks.saveReport(report)
-    if (room.status !== 'sleeping' && room.status !== 'preparing') {
+    if (room.status !== 'sleeping' && room.status !== 'preparing' && room.status !== 'deleting') {
       const coreBroken = report.results.some(
         (r) => (r.step === 'process' || r.step === 'port' || r.step === 'http') && r.status === 'broken'
       )
@@ -10019,11 +10042,13 @@ export class RoomOrchestrator {
     opts?: { timeoutMs?: number; output?: OutputSelection; signal?: AbortSignal; responseLost?: () => boolean },
     actor: Actor = 'agent'
   ): Promise<RoomExecResult> {
-    const beforeUse = this.mustGet(roomId)
+    const current = this.rooms.get(roomId)
+    this.assertNotDeleting(roomId, current)
+    const beforeUse = current ?? this.mustGet(roomId)
     if (beforeUse.status === 'sleeping' && beforeUse.lifecycle?.autoSleptAt) {
       await this.startRoom(roomId, actor)
     }
-    await this.withRoomLock(roomId, async () => {
+    await this.withNonDeletingRoomLock(roomId, async () => {
       const room = this.mustGet(roomId)
       if (room.provider === 'windows') throw new Error('Windows Room commands require the forthcoming guest agent')
       if (actor === 'agent' && room.workspaceMode === 'legacy-host-bind') {
@@ -10309,8 +10334,9 @@ export class RoomOrchestrator {
   }
 
   setThumbnail(roomId: string, thumbPath: string): void {
-    if (this.mutationGate !== 'open') return
-    if (this.rooms.get(roomId)) this.rooms.update(roomId, { thumbPath })
+    if (this.mutationGate !== 'open' || this.deletingRooms.has(roomId)) return
+    const room = this.rooms.get(roomId)
+    if (room && room.status !== 'deleting') this.rooms.update(roomId, { thumbPath })
   }
 
   /* ------------------------------------------------------------------ */
@@ -10900,26 +10926,26 @@ export class RoomOrchestrator {
     return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20)
   }
 
+  private markUnavailableWindowsRooms(windowsRooms: RoomRecord[]): void {
+    for (const room of windowsRooms) {
+      if (room.status === 'deleting') continue
+      if (room.status === 'preparing') this.rooms.update(room.id, { status: 'broken', hostPort: null })
+      else if (room.status !== 'sleeping' && room.status !== 'broken') {
+        this.rooms.update(room.id, { status: 'attention', hostPort: null })
+      }
+    }
+  }
+
   private async reconcileWindowsRooms(): Promise<void> {
     const windowsRooms = this.rooms.list().filter((room) => room.provider === 'windows')
     if (windowsRooms.length === 0) return
     if (!this.windowsVm) {
-      for (const room of windowsRooms) {
-        if (room.status === 'preparing') this.rooms.update(room.id, { status: 'broken', hostPort: null })
-        else if (room.status !== 'sleeping' && room.status !== 'broken') {
-          this.rooms.update(room.id, { status: 'attention', hostPort: null })
-        }
-      }
+      this.markUnavailableWindowsRooms(windowsRooms)
       return
     }
     const health = await this.windowsVm.health()
     if (!health.ok) {
-      for (const room of windowsRooms) {
-        if (room.status === 'preparing') this.rooms.update(room.id, { status: 'broken', hostPort: null })
-        else if (room.status !== 'sleeping' && room.status !== 'broken') {
-          this.rooms.update(room.id, { status: 'attention', hostPort: null })
-        }
-      }
+      this.markUnavailableWindowsRooms(windowsRooms)
       return
     }
 
@@ -10927,6 +10953,18 @@ export class RoomOrchestrator {
     // cost one slow guest, not the sum of them.
     await Promise.all(
       windowsRooms.map(async (room) => {
+        if (room.status === 'deleting') {
+          try {
+            await this.windowsVm!.delete(room.id)
+            this.finalizeDeletedRoom(room.id)
+          } catch (error) {
+            this.olog(
+              room.id,
+              `VMware delete reconciliation failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+          }
+          return
+        }
         try {
           const state = await this.windowsVm!.state(room.id)
           if (state === 'running') await this.windowsVm!.sleep(room.id)
@@ -10976,6 +11014,50 @@ export class RoomOrchestrator {
     if (this.deletingRooms.has(roomId) || room?.status === 'deleting') {
       throw new Error(`Room ${roomId} is being deleted and cannot be modified`)
     }
+  }
+
+  /** Reject immediately without queueing behind an in-flight delete lock when a Room is deleting. */
+  private rejectingIfDeleting<T>(roomId: string): Promise<T> | null {
+    try {
+      this.assertNotDeleting(roomId, this.rooms.get(roomId))
+      return null
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
+
+  /** Run a per-Room task under the Room lock, refusing entry both before queueing and once locked if deleting. */
+  private withNonDeletingRoomLock<T>(
+    roomId: string,
+    fn: () => Promise<T>,
+    opts: {
+      admittedBeforeGate?: boolean
+      allowPendingArtifactExport?: boolean
+      allowPendingAndroidLocaleRestoration?: boolean
+      allowPendingAndroidAcceptanceRestore?: boolean
+    } = {}
+  ): Promise<T> {
+    const denied = this.rejectingIfDeleting<T>(roomId)
+    if (denied) return denied
+    return this.withRoomLock(
+      roomId,
+      async () => {
+        this.assertNotDeleting(roomId, this.rooms.get(roomId))
+        return fn()
+      },
+      opts
+    )
+  }
+
+  /** Purge a deleted Room's host folder, SQLite row, operations, and in-memory state in safe order. */
+  private finalizeDeletedRoom(roomId: string, keepOperationId?: string): void {
+    this.logs.detach(roomId)
+    rmSync(join(this.userData, 'rooms', roomId), { recursive: true, force: true })
+    this.rooms.delete(roomId, keepOperationId)
+    this.operations.forgetRoom(roomId, keepOperationId)
+    this.readinessMilestones.delete(roomId)
+    this.pendingHostResyncConfirmations.delete(roomId)
+    this.emit(roomId, 'deleted')
   }
 
   private olog(roomId: string, line: string): void {

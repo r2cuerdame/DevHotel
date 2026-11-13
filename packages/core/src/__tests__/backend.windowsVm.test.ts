@@ -342,6 +342,48 @@ describe('WindowsVmBackend owned lifecycle', () => {
     expect(existsSync(roomDir)).toBe(false)
   })
 
+  it('falls back to a hard stop during delete when a running guest ignores soft stop', async () => {
+    const { backend, calls, templateVmxPath, roomDir, roomVmxPath } = createHarness({ guestIgnoresSoftStop: true })
+    await backend.create({ roomId: 'room1abc', templateVmxPath, snapshot: 'Clean Base' })
+    await backend.start('room1abc')
+    const canonicalRoomVmx = canonical(roomVmxPath)
+
+    await expect(backend.delete('room1abc')).resolves.toMatchObject({ reclaimedBytes: expect.any(Number) })
+
+    expect(calls.map((call) => call.args)).toContainEqual(['stop', canonicalRoomVmx, 'soft'])
+    expect(calls.map((call) => call.args)).toContainEqual(['stop', canonicalRoomVmx, 'hard'])
+    expect(calls.map((call) => call.args)).toContainEqual(['deleteVM', canonicalRoomVmx])
+    await expect(readFile(templateVmxPath, 'utf8')).resolves.toContain('Base Windows')
+    expect(existsSync(roomDir)).toBe(false)
+  })
+
+  it('falls back to a hard stop during delete when soft stop fails or times out', async () => {
+    const { backend, templateVmxPath, roomDir, roomVmxPath, userData } = createHarness()
+    await backend.create({ roomId: 'room1abc', templateVmxPath, snapshot: 'Clean Base' })
+    const canonicalRoomVmx = canonical(roomVmxPath)
+    const softFailCalls: (readonly string[])[] = []
+    let stopped = false
+    const flaky = new WindowsVmBackend({
+      userData,
+      vmrunExecutable: 'vmrun.exe',
+      runner: async (_executable, args) => {
+        softFailCalls.push(args)
+        if (args[0] === 'list') return ok(stopped ? 'Total running VMs: 0\n' : `Total running VMs: 1\n${canonicalRoomVmx}\n`)
+        if (args[0] === 'stop' && args[2] === 'soft') return { code: 1, stdout: '', stderr: 'VMware Tools timed out' }
+        if (args[0] === 'stop' && args[2] === 'hard') stopped = true
+        return ok()
+      }
+    })
+
+    await expect(flaky.delete('room1abc')).resolves.toMatchObject({ reclaimedBytes: expect.any(Number) })
+
+    expect(softFailCalls).toContainEqual(['stop', canonicalRoomVmx, 'soft'])
+    expect(softFailCalls).toContainEqual(['stop', canonicalRoomVmx, 'hard'])
+    expect(softFailCalls).toContainEqual(['deleteVM', canonicalRoomVmx])
+    await expect(readFile(templateVmxPath, 'utf8')).resolves.toContain('Base Windows')
+    expect(existsSync(roomDir)).toBe(false)
+  })
+
   it('cleans an exact empty pre-marker directory and treats an absent clone as already deleted', async () => {
     const { backend, roomDir } = createHarness()
     await mkdir(roomDir, { recursive: true })

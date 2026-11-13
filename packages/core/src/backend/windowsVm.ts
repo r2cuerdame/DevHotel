@@ -298,6 +298,11 @@ export class WindowsVmBackend {
 
   async sleep(roomId: string): Promise<void> {
     const owned = await this.requireOwnedRoom(roomId)
+    await this.stopRunningClone(roomId, owned)
+  }
+
+  /** Stop a running clone softly, falling back to hard power-off when soft stop fails or stalls. */
+  private async stopRunningClone(roomId: string, owned: OwnedRoom): Promise<void> {
     if (!(await isRegularFile(owned.vmxPath))) return
     await assertDistinctClone(owned.vmxPath, owned.marker.templateVmxPath)
     if ((await this.state(roomId)) !== 'running') return
@@ -328,9 +333,7 @@ export class WindowsVmBackend {
       await rmdir(canonicalRoomDir)
       return { reclaimedBytes: 0 }
     }
-    if ((await isRegularFile(owned.vmxPath)) && (await this.state(roomId)) === 'running') {
-      await this.mustRun(['stop', owned.vmxPath, 'soft'], 'sleep Windows Room before deletion')
-    }
+    await this.stopRunningClone(roomId, owned)
     const reclaimedBytes = await directorySizeWithoutFollowingLinks(owned.roomDir)
     await this.disposeOwnedClone(owned)
     return { reclaimedBytes }
