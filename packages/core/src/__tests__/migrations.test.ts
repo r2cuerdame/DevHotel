@@ -35,7 +35,7 @@ describe('database migrations', () => {
       expect(
         (sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[])
           .map(({ version }) => version)
-      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+      ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
       expect(sqlite.prepare('SELECT id, status FROM operations').get()).toEqual({
         id: 'operation-before-device-broker',
         status: 'succeeded'
@@ -219,7 +219,39 @@ describe('database migrations', () => {
       expect(sqlite.prepare(
         "SELECT length(value) AS bytes FROM android_acceptance_secrets WHERE name = 'acceptance-hmac-v1'"
       ).get()).toEqual({ bytes: 32 })
-      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 14 })
+      expect(sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 15 })
+    } finally {
+      sqlite.close()
+    }
+  })
+
+  it('counts every device lease that predates the use flag as used', () => {
+    const sqlite = new DatabaseSync(':memory:')
+    try {
+      for (const migration of migrations.filter(({ version }) => version <= 14)) {
+        sqlite.exec(migration.sql)
+        sqlite.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(migration.version)
+      }
+      const at = '2026-11-14T00:00:00.000Z'
+      sqlite.prepare(
+        `INSERT INTO android_devices (id, serial, physical_identity, nickname, connection, health, first_seen_at, last_seen_at)
+         VALUES ('device-1', 'R5CT30ABCDE', ?, 'Phone', 'usb', 'ready', ?, ?)`
+      ).run('a'.repeat(64), at, at)
+      const insertLease = sqlite.prepare(
+        `INSERT INTO android_device_leases (
+           id, device_id, room_id, project, issue_ref, run_id, worker_id, purpose, state,
+           acquired_at, heartbeat_at, activity_at, ttl_ms, max_duration_ms, released_at, release_reason
+         ) VALUES (?, 'device-1', ?, 'AppDied', NULL, NULL, 'worker', 'acceptance', ?, ?, ?, ?, 60000, 1800000, NULL, NULL)`
+      )
+      insertLease.run('lease-before', 'aaaa1111', 'active', at, at, at)
+
+      applyMigrations(sqlite)
+
+      // An upgrade cannot know whether the holder already used the phone, so a
+      // late queue cancel must never be allowed to take a pre-upgrade lease back.
+      expect(sqlite.prepare("SELECT touched FROM android_device_leases WHERE id = 'lease-before'").get()).toEqual({ touched: 1 })
+      insertLease.run('lease-after', 'bbbb2222', 'released', at, at, at)
+      expect(sqlite.prepare("SELECT touched FROM android_device_leases WHERE id = 'lease-after'").get()).toEqual({ touched: 0 })
     } finally {
       sqlite.close()
     }

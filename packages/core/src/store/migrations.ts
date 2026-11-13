@@ -477,6 +477,18 @@ export const migrations: Migration[] = [
     sql: `
       ALTER TABLE operations ADD COLUMN result_json TEXT;
     `
+  },
+  {
+    // A late queue cancel may hand back a promoted phone only while the Room
+    // has never touched it. Timestamps cannot prove that — a heartbeat in the
+    // grant's own millisecond leaves them equal — so the first heartbeat or
+    // device operation sets a durable flag. Leases that predate this column
+    // count as used, so an upgrade never releases a phone someone may hold.
+    version: 15,
+    sql: `
+      ALTER TABLE android_device_leases ADD COLUMN touched INTEGER NOT NULL DEFAULT 0;
+      UPDATE android_device_leases SET touched = 1;
+    `
   }
 ]
 

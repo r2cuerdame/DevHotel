@@ -827,7 +827,7 @@ export class AndroidDeviceBroker {
     const reason = 'queued request cancelled after promotion'
     const result = lease
       ? this.repo.cancelPromotedRequest(granted.id, lease.id, at, reason, (current, row) =>
-          this.unusedPromotion(current, row) && !this.recoveryProtected(current)
+          this.leaseFromPromotion(current, row) && !this.recoveryProtected(current)
         )
       : null
     if (!result) {
@@ -844,15 +844,16 @@ export class AndroidDeviceBroker {
     return result.entry
   }
 
-  /** The lease this queue row produced, still exactly as the promotion left it. */
-  private unusedPromotion(lease: DeviceLease, entry: DeviceQueueEntry): boolean {
+  /**
+   * The lease this queue row produced. Whether the Room has used it since is
+   * the repository's durable flag, set by any heartbeat or device operation.
+   */
+  private leaseFromPromotion(lease: DeviceLease, entry: DeviceQueueEntry): boolean {
     return (
       lease.roomId === entry.roomId &&
       (entry.deviceId === null || lease.deviceId === entry.deviceId) &&
       entry.resolvedAt !== null &&
-      lease.acquiredAt === entry.resolvedAt &&
-      lease.heartbeatAt === lease.acquiredAt &&
-      lease.activityAt === lease.acquiredAt
+      lease.acquiredAt === entry.resolvedAt
     )
   }
 
@@ -1061,6 +1062,8 @@ export class AndroidDeviceBroker {
     if (this.now() - Date.parse(lease.heartbeatAt) > lease.ttlMs) {
       throw new DeviceLeaseError('lease-expired', `The lease on ${device.nickname} went stale — heartbeat it or take it again before ${reason}.`)
     }
+    // From here the Room is using the phone; a late queue cancel must not take it back.
+    this.repo.markLeaseUsed(lease.id)
     return { serial: device.serial, device, leaseId: lease.id }
   }
 

@@ -52,6 +52,7 @@ interface LeaseRow {
   max_duration_ms: number
   released_at: string | null
   release_reason: string | null
+  touched: number
 }
 
 interface QueueRow {
@@ -206,7 +207,10 @@ export interface AndroidDevicesRepo {
   getLease(id: string): DeviceLease | null
   /** Atomically creates the lease and consumes this Room's durable queue rows. */
   grantLease(input: LeaseInsert, queuedRequestId: string | null): LeaseGrant
+  /** Heartbeat an active lease; also marks it as used by its Room. */
   touchLease(id: string, heartbeatAt: string, activityAt: string | null): DeviceLease
+  /** Record that the Room ran a device operation under this active lease. */
+  markLeaseUsed(id: string): void
   closeLease(id: string, state: 'released' | 'expired' | 'revoked', at: string, reason: string): DeviceLease
   closeLeaseIf(
     id: string,
@@ -223,8 +227,8 @@ export interface AndroidDevicesRepo {
   resolveQueueEntry(id: string, state: 'granted' | 'cancelled', at: string): DeviceQueueEntry
   /**
    * Atomically cancel a granted queue row and release the lease it produced,
-   * only while `shouldRelease` still accepts that active lease. Returns null and
-   * changes nothing otherwise.
+   * only while that active lease was never heartbeated or used and
+   * `shouldRelease` still accepts it. Returns null and changes nothing otherwise.
    */
   cancelPromotedRequest(
     id: string,
@@ -496,12 +500,15 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
       const changed = sqlite
         .prepare(
           `UPDATE android_device_leases
-             SET heartbeat_at = ?, activity_at = COALESCE(?, activity_at)
+             SET heartbeat_at = ?, activity_at = COALESCE(?, activity_at), touched = 1
            WHERE id = ? AND state = 'active'`
         )
         .run(heartbeatAt, activityAt, id)
       if (changed.changes === 0) throw new Error(`no active lease to heartbeat: ${id}`)
       return repo.getLease(id)!
+    },
+    markLeaseUsed(id) {
+      sqlite.prepare("UPDATE android_device_leases SET touched = 1 WHERE id = ? AND state = 'active' AND touched = 0").run(id)
     },
     closeLease(id, state, at, reason) {
       const changed = sqlite
@@ -614,13 +621,18 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
           sqlite.exec('COMMIT')
           return null
         }
+        // The durable use flag, not timestamp equality, decides: a heartbeat in
+        // the grant's own millisecond still leaves heartbeat_at = acquired_at.
         const closed = sqlite
           .prepare(
             `UPDATE android_device_leases SET state = 'released', released_at = ?, release_reason = ?
-             WHERE id = ? AND state = 'active'`
+             WHERE id = ? AND state = 'active' AND touched = 0`
           )
           .run(at, reason, leaseId)
-        if (closed.changes !== 1) throw new Error(`no active lease to close: ${leaseId}`)
+        if (closed.changes !== 1) {
+          sqlite.exec('COMMIT')
+          return null
+        }
         // Keep resolved_at: it still records when the request left the line.
         const cancelled = sqlite
           .prepare("UPDATE android_device_queue SET state = 'cancelled' WHERE id = ? AND state = 'granted'")

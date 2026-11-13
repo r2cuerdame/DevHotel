@@ -93,7 +93,8 @@ apart from "broken".
 - A waiting request can be cancelled. Cancelling it again answers the same
   cancelled request; an unknown request ID is refused with `device-unknown`.
   If the request was promoted just before the cancel and the Room has not
-  heartbeated or touched the phone since, the cancel releases that lease
+  heartbeated or run a device operation since (a durable per-lease use flag,
+  not a timestamp comparison), the cancel releases that lease
   ("queued request cancelled after promotion") and the phone goes to the next
   waiter. A promoted lease already in use is kept and the cancel is refused
   with `request-already-granted`; release the device instead.

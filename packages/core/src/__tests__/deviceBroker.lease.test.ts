@@ -783,6 +783,50 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     expect(androidDevicesRepo(db).getQueueEntry(waiting.requestId)).toMatchObject({ state: 'granted' })
   })
 
+  it('keeps a promoted lease heartbeated busy in the grant millisecond and refuses the late cancel', async () => {
+    const { broker, db, now } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    const waiting = await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    await broker.requestDevice({ roomId: 'cccc3333', project: 'Movit', purpose: 'smoke', workerId: 'worker-c' })
+    if (owner.state !== 'granted' || waiting.state !== 'queued') throw new Error('unreachable')
+
+    now.value += 1000
+    const released = await broker.release(owner.lease.id, 'owner finished')
+    // No clock advance: every timestamp the heartbeat writes equals acquiredAt.
+    const touched = broker.heartbeat(released.promoted!.id, { busy: true })
+    expect(touched.heartbeatAt).toBe(touched.acquiredAt)
+    expect(touched.activityAt).toBe(touched.acquiredAt)
+
+    expect(() => broker.cancelRequest(waiting.requestId)).toThrow(
+      expect.objectContaining({ code: 'request-already-granted' })
+    )
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ id: released.promoted!.id, state: 'active' })
+    expect(broker.leaseForRoom('cccc3333')).toBeNull()
+    expect(androidDevicesRepo(db).getQueueEntry(waiting.requestId)).toMatchObject({ state: 'granted' })
+  })
+
+  it('keeps a promoted lease that already ran a device operation in the grant millisecond', async () => {
+    const { broker, db, now } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    const waiting = await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    await broker.requestDevice({ roomId: 'cccc3333', project: 'Movit', purpose: 'smoke', workerId: 'worker-c' })
+    if (owner.state !== 'granted' || waiting.state !== 'queued') throw new Error('unreachable')
+
+    now.value += 1000
+    const released = await broker.release(owner.lease.id, 'owner finished')
+    const promoted = released.promoted!
+    broker.authorizeInternalOperation('bbbb2222', promoted.deviceId, 'test', promoted.id)
+
+    expect(() => broker.cancelRequest(waiting.requestId)).toThrow(
+      expect.objectContaining({ code: 'request-already-granted' })
+    )
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ id: promoted.id, state: 'active' })
+    expect(broker.leaseForRoom('cccc3333')).toBeNull()
+    expect(androidDevicesRepo(db).getQueueEntry(waiting.requestId)).toMatchObject({ state: 'granted' })
+  })
+
   it('serves an urgent acceptance gate before older routine requests', async () => {
     const { broker, db, now } = makeBroker()
     await broker.refreshInventory()
