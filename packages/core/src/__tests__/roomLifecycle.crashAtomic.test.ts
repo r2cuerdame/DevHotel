@@ -256,5 +256,64 @@ describe('Crash-atomic Room lifecycle and rollback', () => {
       expect(result.straysRemoved).toContain('dh-crashprep1-web')
       expect(result.networksRemoved).toContain('dh-crashprep1-net')
     })
+
+    it('preserves deleting status during shutdown without calling sleepRoomLocked or writing manifest.yaml', async () => {
+      const { backend, orch, userData } = await setup()
+      const room = makeRoom({
+        id: 'shutdel1',
+        domain: 'shutdel1.localhost',
+        status: 'deleting',
+        hostPort: 41234
+      })
+      orch.rooms.create(room)
+
+      await orch.shutdown()
+
+      expect(backend.calls).toContain(`stopRoomPod:${room.id}`)
+      expect(orch.rooms.get(room.id)?.status).toBe('deleting')
+      expect(orch.rooms.get(room.id)?.hostPort).toBeNull()
+      expect(existsSync(join(userData, 'rooms', room.id, 'manifest.yaml'))).toBe(false)
+    })
+
+    it('preserves deleting status across startup markInterruptedChanges when a pending change exists', async () => {
+      const { backend, orch } = await setup()
+      const room = makeRoom({
+        id: 'penddel1',
+        domain: 'penddel1.localhost',
+        sourceType: 'managed-git',
+        sourceRef: 'https://example.test/demo.git',
+        workspaceMode: 'hotel',
+        syncStatus: 'synced',
+        status: 'deleting'
+      })
+      orch.rooms.create(room)
+      orch.changes.append({
+        id: 'chg-penddel-1',
+        roomId: room.id,
+        kind: 'restart-web',
+        title: 'Restart web',
+        actor: 'agent',
+        component: 'web',
+        before: null,
+        after: null,
+        captured: null,
+        steps: [],
+        verify: null,
+        undoable: false,
+        undoStrategy: 'none',
+        status: 'pending',
+        rawLogPath: null,
+        createdAt: new Date().toISOString(),
+        undoneAt: null
+      })
+
+      backend.deleteRoomPod = async () => {
+        throw new Error('temporary pod removal outage')
+      }
+
+      await orch.init()
+
+      expect(orch.rooms.get(room.id)?.status).toBe('deleting')
+    })
   })
 })

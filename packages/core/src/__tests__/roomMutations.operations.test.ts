@@ -291,4 +291,110 @@ describe('long Room mutations as pollable operations', () => {
     slow.open()
     await orch.waitForOperation(CALLER_ID, 10_000)
   })
+
+  it('blocks new mutations while deleting or failed-deleting without persisting orphan operations, while keeping delete retry and polling intact', async () => {
+    const { backend, orch, room } = await setup()
+    const delGate = gate()
+    const originalDelete = backend.deleteRoomPod.bind(backend)
+    let attempts = 0
+    backend.deleteRoomPod = async (roomId: string) => {
+      attempts++
+      if (attempts === 1) {
+        await delGate.promise
+        throw new Error('temporary volume busy')
+      }
+      return originalDelete(roomId)
+    }
+
+    const accepted = await orch.deleteRoomOperation(room.id, 'agent', { operationId: CALLER_ID, waitMs: 0 })
+    expect(accepted.operation.status).toBe('running')
+    expect(orch.getOperation(CALLER_ID)?.status).toBe('running')
+
+    // Replaying the active delete operation ID returns the in-flight operation rather than rejecting
+    const sameDeleteReplay = await orch.deleteRoomOperation(room.id, 'agent', { operationId: CALLER_ID, waitMs: 0 })
+    expect(sameDeleteReplay.operation.id).toBe(CALLER_ID)
+    expect(sameDeleteReplay.operation.status).toBe('running')
+
+    // New mutations and duplicate delete requests must reject before persisting operation rows
+    await expect(orch.sleepRoom(room.id, 'agent')).rejects.toThrow(/being deleted/)
+    await expect(orch.sleepRoomOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(
+      orch.cloneRoom({
+        sourceRoomId: room.id,
+        nickname: 'fork',
+        copyDependencies: false,
+        services: 'exclude',
+        actor: 'user'
+      })
+    ).rejects.toThrow(/being deleted/)
+    await expect(
+      orch.cloneRoomOperation(
+        {
+          sourceRoomId: room.id,
+          nickname: 'fork2',
+          copyDependencies: false,
+          services: 'exclude',
+          actor: 'user'
+        },
+        { operationId: OTHER_ID }
+      )
+    ).rejects.toThrow(/being deleted/)
+    await expect(orch.restartWeb(room.id, 'agent')).rejects.toThrow(/being deleted/)
+    await expect(orch.restartWebOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(orch.runChecks(room.id)).rejects.toThrow(/being deleted/)
+    await expect(orch.runChecksOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(orch.setRoomPinned(room.id, true, 'user')).rejects.toThrow(/being deleted/)
+    await expect(orch.deleteRoomOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(
+      /already being deleted/
+    )
+
+    expect(orch.listOperations(room.id).map((op) => op.id)).toEqual([CALLER_ID])
+    expect(orch.getOperation(OTHER_ID)).toBeNull()
+
+    // Let first deletion fail -> Room stays persisted as 'deleting'
+    delGate.open()
+    const failed = await orch.waitForOperation(CALLER_ID, 10_000)
+    expect(failed?.status).toBe('failed')
+    expect(orch.rooms.get(room.id)?.status).toBe('deleting')
+
+    // Mutations must remain blocked with no orphan operations persisted
+    await expect(orch.sleepRoom(room.id, 'agent')).rejects.toThrow(/being deleted/)
+    await expect(orch.sleepRoomOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(
+      orch.cloneRoom({
+        sourceRoomId: room.id,
+        nickname: 'fork3',
+        copyDependencies: false,
+        services: 'exclude',
+        actor: 'user'
+      })
+    ).rejects.toThrow(/being deleted/)
+    await expect(
+      orch.cloneRoomOperation(
+        {
+          sourceRoomId: room.id,
+          nickname: 'fork4',
+          copyDependencies: false,
+          services: 'exclude',
+          actor: 'user'
+        },
+        { operationId: OTHER_ID }
+      )
+    ).rejects.toThrow(/being deleted/)
+    await expect(orch.restartWeb(room.id, 'agent')).rejects.toThrow(/being deleted/)
+    await expect(orch.restartWebOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(orch.runChecks(room.id)).rejects.toThrow(/being deleted/)
+    await expect(orch.runChecksOperation(room.id, 'agent', { operationId: OTHER_ID })).rejects.toThrow(/being deleted/)
+    await expect(orch.setRoomPinned(room.id, true, 'user')).rejects.toThrow(/being deleted/)
+
+    expect(orch.listOperations(room.id).map((op) => op.id)).toEqual([CALLER_ID])
+    expect(orch.getOperation(OTHER_ID)).toBeNull()
+
+    // Retrying deletion with a new operationId must succeed and retain the retry receipt
+    const retry = await orch.deleteRoomOperation(room.id, 'agent', { operationId: OTHER_ID })
+    expect(retry.operation.status).toBe('succeeded')
+    expect(orch.rooms.get(room.id)).toBeNull()
+    expect(orch.getOperation(CALLER_ID)).toBeNull()
+    expect(orch.getOperation(OTHER_ID)?.status).toBe('succeeded')
+  })
 })
