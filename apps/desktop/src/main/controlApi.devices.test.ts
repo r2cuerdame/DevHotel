@@ -161,6 +161,30 @@ describe('agents reach the shared phone only through the broker', () => {
     })
   })
 
+  it('answers an ended lease heartbeat and a late cancel with structured conflicts', async () => {
+    const heartbeatAndroidDevice = vi.fn(() => {
+      throw new DeviceLeaseError('lease-expired', 'The lease on this device is released: owner finished. Request the device again to continue.')
+    })
+    const cancelAndroidDeviceRequest = vi.fn(() => {
+      throw new DeviceLeaseError('request-already-granted', 'This request was already granted. Release the device instead of cancelling.')
+    })
+
+    await withApi({ heartbeatAndroidDevice, cancelAndroidDeviceRequest } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const beat = await call('/v1/devices/heartbeat', {
+        method: 'POST',
+        body: JSON.stringify({ leaseId: '2f1b0f9c-1111-4222-8333-444455556666' })
+      })
+      const cancel = await call('/v1/devices/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ requestId: '2f1b0f9c-1111-4222-8333-444455556667' })
+      })
+
+      expect(beat).toMatchObject({ status: 409, body: { code: 'lease-expired' } })
+      expect(beat.body.error).toMatch(/released: owner finished/)
+      expect(cancel).toMatchObject({ status: 409, body: { code: 'request-already-granted' } })
+    })
+  })
+
   it('still refuses every device route without the bearer token', async () => {
     const androidDeviceStatus = vi.fn()
     const userData = mkdtempSync(join(tmpdir(), 'devhotel-control-devices-auth-'))

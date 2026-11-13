@@ -637,10 +637,29 @@ export class AndroidDeviceBroker {
   }
 
   heartbeat(leaseId: string, opts: { busy?: boolean } = {}): DeviceLease {
+    const current = this.repo.getLease(leaseId)
+    if (!current) throw new DeviceLeaseError('device-unknown', `unknown lease: ${leaseId}`)
+    if (current.state !== 'active') throw this.endedLeaseError(current)
     const at = this.at()
-    const lease = this.repo.touchLease(leaseId, at, opts.busy ? at : null)
+    let lease: DeviceLease
+    try {
+      lease = this.repo.touchLease(leaseId, at, opts.busy ? at : null)
+    } catch (error) {
+      // The lease closed between the read and the conditional UPDATE.
+      const closed = this.repo.getLease(leaseId)
+      if (closed && closed.state !== 'active') throw this.endedLeaseError(closed)
+      throw error
+    }
     this.deathObservedAt.delete(leaseId)
     return lease
+  }
+
+  private endedLeaseError(lease: DeviceLease): DeviceLeaseError {
+    const reason = lease.releaseReason ? `: ${lease.releaseReason}` : ''
+    return new DeviceLeaseError(
+      'lease-expired',
+      `The lease on this device is ${lease.state}${reason}. Request the device again to continue.`
+    )
   }
 
   /** Renew only the exact lease retained by a durable recovery fence. */
@@ -780,8 +799,61 @@ export class AndroidDeviceBroker {
     return null
   }
 
+  /**
+   * Leave the queue. Repeating a cancel answers the same cancelled row. A
+   * request promoted just before the cancel landed gives its phone back to the
+   * line when the Room never touched it; a lease already in use stays put.
+   */
   cancelRequest(requestId: string): DeviceQueueEntry {
-    return this.repo.resolveQueueEntry(requestId, 'cancelled', this.at())
+    let entry = this.repo.getQueueEntry(requestId)
+    if (!entry) throw new DeviceLeaseError('device-unknown', `unknown queued request: ${requestId}`)
+    if (entry.state === 'cancelled') return entry
+    const at = this.at()
+    if (entry.state === 'waiting') {
+      try {
+        const cancelled = this.repo.resolveQueueEntry(requestId, 'cancelled', at)
+        this.recordCancelledWaiters([cancelled], at, 'queued request cancelled by the Room')
+        return cancelled
+      } catch (error) {
+        // Promotion or another cancel resolved the row first; answer what it became.
+        entry = this.repo.getQueueEntry(requestId)
+        if (!entry || entry.state === 'waiting') throw error
+        if (entry.state === 'cancelled') return entry
+      }
+    }
+
+    const granted = entry
+    const lease = this.repo.activeLeaseForRoom(granted.roomId)
+    const reason = 'queued request cancelled after promotion'
+    const result = lease
+      ? this.repo.cancelPromotedRequest(granted.id, lease.id, at, reason, (current, row) =>
+          this.unusedPromotion(current, row) && !this.recoveryProtected(current)
+        )
+      : null
+    if (!result) {
+      throw new DeviceLeaseError(
+        'request-already-granted',
+        lease
+          ? `This request was already granted and the lease on device ${lease.deviceId} is in use. Release the device instead of cancelling.`
+          : 'This request was already granted and its lease has ended. Request the device again if it is still needed.'
+      )
+    }
+    this.deathObservedAt.delete(result.lease.id)
+    this.repo.recordEvent({ deviceId: result.lease.deviceId, roomId: result.lease.roomId, kind: 'released', detail: reason, at })
+    this.promote(result.lease.deviceId)
+    return result.entry
+  }
+
+  /** The lease this queue row produced, still exactly as the promotion left it. */
+  private unusedPromotion(lease: DeviceLease, entry: DeviceQueueEntry): boolean {
+    return (
+      lease.roomId === entry.roomId &&
+      (entry.deviceId === null || lease.deviceId === entry.deviceId) &&
+      entry.resolvedAt !== null &&
+      lease.acquiredAt === entry.resolvedAt &&
+      lease.heartbeatAt === lease.acquiredAt &&
+      lease.activityAt === lease.acquiredAt
+    )
   }
 
   /**

@@ -90,7 +90,13 @@ apart from "broken".
 - One waiting entry per Room — an identical retry rejoins its own place, while
   a changed request explicitly replaces the previous durable row instead of
   leaving a stale request that can acquire another phone later.
-- A waiting request can be cancelled.
+- A waiting request can be cancelled. Cancelling it again answers the same
+  cancelled request; an unknown request ID is refused with `device-unknown`.
+  If the request was promoted just before the cancel and the Room has not
+  heartbeated or touched the phone since, the cancel releases that lease
+  ("queued request cancelled after promotion") and the phone goes to the next
+  waiter. A promoted lease already in use is kept and the cancel is refused
+  with `request-already-granted`; release the device instead.
 - Waiters see the current owner, their position, and the reason.
 - With several phones connected, a request that names no specific device takes
   whichever matching one frees up first.
@@ -111,6 +117,9 @@ A worker that is killed must not park the phone forever — and a worker that is
 merely busy must not lose it.
 
 - The owner heartbeats; `busy: true` marks real device activity.
+- A heartbeat on a released, expired or revoked lease is refused with
+  `lease-expired` and names how the lease ended; an unknown lease ID is refused
+  with `device-unknown`. Request the device again to continue.
 - **A missed heartbeat alone is not an immediate reclaim.** After the TTL, a
   known-live `pid:<process id>` worker keeps its lease. A deleted, sleeping or
   broken Room, a dead PID, or an opaque worker that remains silent through the
@@ -158,7 +167,7 @@ whether they write files.
 
 A refusal is structured, not a generic error — `no-lease`,
 `lease-held-by-another-room`, `lease-expired`, `device-unhealthy`,
-`device-unknown`, `adb-command-forbidden` — and it names the current owner so the caller can explain
+`device-unknown`, `adb-command-forbidden`, `request-already-granted` — and it names the current owner so the caller can explain
 itself.
 
 ## No hand-written serials

@@ -694,6 +694,95 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     db.close()
   })
 
+  it('refuses a heartbeat on an ended or unknown lease with a structured code', async () => {
+    const { broker, now } = makeBroker()
+    await broker.refreshInventory()
+    const granted = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    if (granted.state !== 'granted') throw new Error('unreachable')
+    now.value += 1000
+    await broker.release(granted.lease.id, 'owner finished')
+
+    let ended: unknown
+    try {
+      broker.heartbeat(granted.lease.id, { busy: true })
+    } catch (error) {
+      ended = error
+    }
+    expect(ended).toBeInstanceOf(DeviceLeaseError)
+    expect(ended).toMatchObject({ code: 'lease-expired' })
+    expect((ended as Error).message).toMatch(/released: owner finished/)
+    expect(() => broker.heartbeat('2f1b0f9c-1111-4222-8333-444455556666')).toThrow(
+      expect.objectContaining({ code: 'device-unknown' })
+    )
+  })
+
+  it('answers a repeated cancel with the same cancelled request and refuses an unknown one', async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    const waiting = await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    if (waiting.state !== 'queued') throw new Error('unreachable')
+
+    const first = broker.cancelRequest(waiting.requestId)
+    const again = broker.cancelRequest(waiting.requestId)
+
+    expect(first).toMatchObject({ id: waiting.requestId, state: 'cancelled' })
+    expect(again).toEqual(first)
+    expect(() => broker.cancelRequest('2f1b0f9c-1111-4222-8333-444455556667')).toThrow(
+      expect.objectContaining({ code: 'device-unknown' })
+    )
+  })
+
+  it('returns an untouched promoted phone to the line when the cancel lands after promotion', async () => {
+    const { broker, db, now } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    const waiting = await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    await broker.requestDevice({ roomId: 'cccc3333', project: 'Movit', purpose: 'smoke', workerId: 'worker-c' })
+    if (owner.state !== 'granted' || waiting.state !== 'queued') throw new Error('unreachable')
+
+    now.value += 1000
+    const released = await broker.release(owner.lease.id, 'owner finished')
+    expect(released.promoted?.roomId).toBe('bbbb2222')
+
+    now.value += 500
+    const cancelled = broker.cancelRequest(waiting.requestId)
+
+    expect(cancelled).toMatchObject({ id: waiting.requestId, state: 'cancelled' })
+    expect(androidDevicesRepo(db).getLease(released.promoted!.id)).toMatchObject({
+      state: 'released',
+      releaseReason: 'queued request cancelled after promotion'
+    })
+    expect(broker.leaseForRoom('bbbb2222')).toBeNull()
+    expect(broker.leaseForRoom('cccc3333')).toMatchObject({ roomId: 'cccc3333' })
+    expect(androidDevicesRepo(db).recentEvents(10)).toContainEqual(
+      expect.objectContaining({ kind: 'released', roomId: 'bbbb2222', detail: 'queued request cancelled after promotion' })
+    )
+    expect(broker.cancelRequest(waiting.requestId)).toEqual(cancelled)
+  })
+
+  it('keeps a promoted lease already in use and refuses the late cancel', async () => {
+    const { broker, db, now } = makeBroker()
+    await broker.refreshInventory()
+    const owner = await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+    const waiting = await broker.requestDevice({ roomId: 'bbbb2222', project: 'MiracleKeyboard', purpose: 'keyboard', workerId: 'worker-b' })
+    await broker.requestDevice({ roomId: 'cccc3333', project: 'Movit', purpose: 'smoke', workerId: 'worker-c' })
+    if (owner.state !== 'granted' || waiting.state !== 'queued') throw new Error('unreachable')
+
+    now.value += 1000
+    const released = await broker.release(owner.lease.id, 'owner finished')
+    now.value += 500
+    broker.heartbeat(released.promoted!.id, { busy: true })
+    now.value += 500
+
+    expect(() => broker.cancelRequest(waiting.requestId)).toThrow(
+      expect.objectContaining({ code: 'request-already-granted' })
+    )
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ id: released.promoted!.id, state: 'active' })
+    expect(broker.leaseForRoom('cccc3333')).toBeNull()
+    expect(androidDevicesRepo(db).getQueueEntry(waiting.requestId)).toMatchObject({ state: 'granted' })
+  })
+
   it('serves an urgent acceptance gate before older routine requests', async () => {
     const { broker, db, now } = makeBroker()
     await broker.refreshInventory()

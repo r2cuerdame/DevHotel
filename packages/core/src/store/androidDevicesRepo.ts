@@ -221,6 +221,18 @@ export interface AndroidDevicesRepo {
   getQueueEntry(id: string): DeviceQueueEntry | null
   enqueue(input: QueueInsert): DeviceQueueEntry
   resolveQueueEntry(id: string, state: 'granted' | 'cancelled', at: string): DeviceQueueEntry
+  /**
+   * Atomically cancel a granted queue row and release the lease it produced,
+   * only while `shouldRelease` still accepts that active lease. Returns null and
+   * changes nothing otherwise.
+   */
+  cancelPromotedRequest(
+    id: string,
+    leaseId: string,
+    at: string,
+    reason: string,
+    shouldRelease: (lease: DeviceLease, entry: DeviceQueueEntry) => boolean
+  ): { entry: DeviceQueueEntry; lease: DeviceLease } | null
   recordEvent(input: { deviceId: string | null; roomId: string | null; kind: DeviceEventKind; detail: string; at: string }): DeviceEvent
   recentEvents(limit?: number): DeviceEvent[]
 }
@@ -592,6 +604,35 @@ export function androidDevicesRepo(db: Db): AndroidDevicesRepo {
         .run(state, at, id)
       if (changed.changes === 0) throw new Error(`no waiting queue entry: ${id}`)
       return repo.getQueueEntry(id)!
+    },
+    cancelPromotedRequest(id, leaseId, at, reason, shouldRelease) {
+      sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        const entry = repo.getQueueEntry(id)
+        const lease = repo.getLease(leaseId)
+        if (!entry || entry.state !== 'granted' || !lease || lease.state !== 'active' || !shouldRelease(lease, entry)) {
+          sqlite.exec('COMMIT')
+          return null
+        }
+        const closed = sqlite
+          .prepare(
+            `UPDATE android_device_leases SET state = 'released', released_at = ?, release_reason = ?
+             WHERE id = ? AND state = 'active'`
+          )
+          .run(at, reason, leaseId)
+        if (closed.changes !== 1) throw new Error(`no active lease to close: ${leaseId}`)
+        // Keep resolved_at: it still records when the request left the line.
+        const cancelled = sqlite
+          .prepare("UPDATE android_device_queue SET state = 'cancelled' WHERE id = ? AND state = 'granted'")
+          .run(id)
+        if (cancelled.changes !== 1) throw new Error(`no granted queue entry: ${id}`)
+        const result = { entry: repo.getQueueEntry(id)!, lease: repo.getLease(leaseId)! }
+        sqlite.exec('COMMIT')
+        return result
+      } catch (error) {
+        if (sqlite.isTransaction) sqlite.exec('ROLLBACK')
+        throw error
+      }
     },
     recordEvent(input) {
       const id = randomUUID()

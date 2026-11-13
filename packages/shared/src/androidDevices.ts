@@ -324,6 +324,7 @@ export type DeviceDenialCode =
   | 'device-unknown'
   | 'device-unhealthy'
   | 'adb-command-forbidden'
+  | 'request-already-granted'
 
 export class DeviceLeaseError extends Error {
   constructor(
