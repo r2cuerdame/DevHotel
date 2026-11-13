@@ -80,9 +80,13 @@ function processAlive(pid: number | null): boolean {
 
 async function fetchVersion(
   host: string,
-  port: number
+  port: number,
+  signal?: AbortSignal
 ): Promise<{ browser: string; webSocketDebuggerUrl: string } | null> {
+  if (signal?.aborted) return null
   const controller = new AbortController()
+  const onAbort = (): void => controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
   try {
     const response = await fetch(`http://${host}:${port}/json/version`, { signal: controller.signal })
@@ -94,7 +98,24 @@ async function fetchVersion(
     return null
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
   }
+}
+
+function waitTick(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 async function waitForExit(pid: number | null, timeoutMs: number): Promise<boolean> {
@@ -235,6 +256,9 @@ export class HostChromiumRuntime implements ClientBrowserRuntime {
   }
 
   async launch(request: ClientBrowserLaunchRequest): Promise<LaunchedClientBrowser> {
+    if (request.signal?.aborted) {
+      throw new DevHotelError('CLIENT_BROWSER_LAUNCH_FAILED', 'The browser launch was cancelled before startup.')
+    }
     const candidate = this.resolveExecutable()
     mkdirSync(request.profileDir, { recursive: true })
 
@@ -267,24 +291,27 @@ export class HostChromiumRuntime implements ClientBrowserRuntime {
 
     const deadline = Date.now() + this.launchTimeoutMs
     let active: DevToolsActivePort | null = null
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !request.signal?.aborted) {
       active = readDevToolsActivePort(request.profileDir)
       if (active) {
         // The file can be observed before the listener accepts; confirm it answers.
-        const version = await fetchVersion('127.0.0.1', active.port)
-        if (version) break
+        const version = await fetchVersion('127.0.0.1', active.port, request.signal)
+        if (version && !request.signal?.aborted) break
         active = null
       }
-      if (exited) break
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      if (exited || request.signal?.aborted) break
+      await waitTick(100, request.signal)
     }
-    if (!active) {
+    if (!active || request.signal?.aborted) {
       if (!exited) await forceKill(child.pid ?? -1)
+      await reapProfileProcesses(request.profileDir, 2_000)
       throw new DevHotelError(
         'CLIENT_BROWSER_LAUNCH_FAILED',
-        exited
-          ? `The browser exited (code ${exitCode ?? 'unknown'}) before its DevTools listener came up.`
-          : 'The browser did not expose its DevTools listener in time.',
+        request.signal?.aborted
+          ? 'The browser launch was cancelled.'
+          : exited
+            ? `The browser exited (code ${exitCode ?? 'unknown'}) before its DevTools listener came up.`
+            : 'The browser did not expose its DevTools listener in time.',
         {
           recoveryHint: 'Check that the browser binary runs on this host; set DEVHOTEL_BROWSER_PATH to choose another Chromium.',
           evidence: { browser: candidate.path, stderr: stderrTail.join('').slice(-2_000) }
