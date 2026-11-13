@@ -4,7 +4,8 @@ import type net from 'node:net'
 import tls from 'node:tls'
 import type { GatewayStatusInfo } from '@devhotel/shared'
 import { ensureCa, issueLeafCert } from './ca'
-import { createProxyHandlers } from './proxy'
+import type { RelayDial } from '../relayProtocol'
+import { createProxyHandlers, type ProxyHandlers } from './proxy'
 import { RouteTable, type Route } from './routes'
 
 const DEFAULT_DOMAIN = 'devhotel.localhost'
@@ -19,6 +20,18 @@ export interface GatewayOptions {
   caDir: string
   httpPorts?: number[]
   httpsPorts?: number[]
+  /** Test seam for the relay TCP dial; defaults to a loopback net.connect. */
+  relayDial?: RelayDial
+}
+
+/** A route keeps its open connections only while everything they were opened against is unchanged. */
+function sameTarget(a: Route, b: Route): boolean {
+  return (
+    a.roomId === b.roomId &&
+    a.targetPort === b.targetPort &&
+    a.https === b.https &&
+    a.relayToken === b.relayToken
+  )
 }
 
 export class Gateway {
@@ -36,17 +49,19 @@ export class Gateway {
   private running = false
   private caCertPem = ''
   private readonly openSockets = new Set<net.Socket>()
+  private readonly handlers: ProxyHandlers
 
   constructor(opts: GatewayOptions) {
     this.caDir = opts.caDir
     this.httpCandidates = opts.httpPorts ?? [80, 8080]
     this.httpsCandidates = opts.httpsPorts ?? [443, 8443]
+    this.handlers = createProxyHandlers(this.table, { dial: opts.relayDial })
   }
 
   async start(): Promise<GatewayStatusInfo> {
     const ca = await ensureCa(this.caDir)
     this.caCertPem = ca.certPem
-    const handlers = createProxyHandlers(this.table)
+    const handlers = this.handlers
     const requestOpts = () => ({ httpPort: this.httpPort, httpsPort: this.httpsPort })
 
     this.httpServer = http.createServer((req, res) =>
@@ -189,6 +204,7 @@ export class Gateway {
       close(this.httpIpv6Server),
       close(this.httpsIpv6Server)
     ]
+    this.handlers.closeAll()
     for (const socket of this.openSockets) socket.destroy()
     this.openSockets.clear()
     await Promise.all(closing)
@@ -203,12 +219,15 @@ export class Gateway {
 
   async setRoute(route: Route): Promise<void> {
     if (route.https) await this.secureContextFor(route.domain.toLowerCase())
+    const previous = this.table.byDomain(route.domain)
     this.table.set(route)
+    if (previous && !sameTarget(previous, route)) this.handlers.closeDomain(route.domain)
   }
 
   removeRoute(domain: string): void {
     this.table.remove(domain)
     this.contexts.delete(domain.toLowerCase())
+    this.handlers.closeDomain(domain)
   }
 
   status(): GatewayStatusInfo {

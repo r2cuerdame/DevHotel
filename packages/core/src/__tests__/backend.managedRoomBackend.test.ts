@@ -133,8 +133,15 @@ describe('ManagedRoomBackend', () => {
     )
   })
 
-  it('hands the Gateway a Host loopback port that forwards to the guest published port', async () => {
-    const guest = net.createServer((socket) => socket.end('guest\n'))
+  it.each(['inspect', 'port'] as const)('forwards the guest published port from %s through Host loopback', async (lookup) => {
+    const guest = net.createServer((socket) => {
+      let request = ''
+      socket.setEncoding('utf8')
+      socket.on('data', (chunk: string) => {
+        request += chunk
+        if (request.endsWith('\n')) socket.end(`guest:${request}`)
+      })
+    })
     await new Promise<void>((resolve) => guest.listen(0, '127.0.0.1', () => resolve()))
     const guestPort = (guest.address() as net.AddressInfo).port
 
@@ -145,7 +152,10 @@ describe('ManagedRoomBackend', () => {
           return {
             code: 0,
             stdout: inspectJson(anchorId, anchorName(roomId), 'anchor', {
-              HostConfig: { NetworkMode: roomNetworkName(roomId) }
+              HostConfig: { NetworkMode: roomNetworkName(roomId) },
+              ...(lookup === 'inspect' ? {
+                NetworkSettings: { Ports: { [`${RELAY_PORT}/tcp`]: [{ HostIp: '0.0.0.0', HostPort: String(guestPort) }] } }
+              } : {})
             }),
             stderr: ''
           }
@@ -186,25 +196,30 @@ describe('ManagedRoomBackend', () => {
     })
     const backend = backendWith(engine, ingress)
 
-    const { hostPort } = await backend.startRoomPod(roomId)
+    try {
+      const { hostPort } = await backend.startRoomPod(roomId)
 
-    expect(hostPort).not.toBe(guestPort)
-    expect(ingress.portFor(roomId)).toBe(hostPort)
+      expect(hostPort).not.toBe(guestPort)
+      expect(ingress.portFor(roomId)).toBe(hostPort)
+      expect(engine.runs.filter(({ args }) => args[0] === 'port')).toHaveLength(lookup === 'port' ? 1 : 0)
 
-    // And it really carries bytes to the guest side.
-    const reply = await new Promise<string>((resolve, reject) => {
-      const socket = net.connect(hostPort!, '127.0.0.1')
-      let text = ''
-      socket.setEncoding('utf8')
-      socket.on('data', (chunk: string) => (text += chunk))
-      socket.on('end', () => resolve(text))
-      socket.on('error', reject)
-    })
-    expect(reply).toBe('guest\n')
-    expect(connections).toEqual([{ host: '172.30.1.5', port: guestPort }])
-
-    await ingress.revokeAll()
-    await new Promise<void>((resolve) => guest.close(() => resolve()))
+      // Both the request and response cross the Host forwarder.
+      const reply = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(hostPort!, '127.0.0.1')
+        let text = ''
+        socket.setEncoding('utf8')
+        socket.on('data', (chunk: string) => (text += chunk))
+        socket.on('end', () => resolve(text))
+        socket.on('error', reject)
+        socket.write('request\n')
+      })
+      expect(reply).toBe('guest:request\n')
+      expect(connections).toEqual([{ host: '172.30.1.5', port: guestPort }])
+      expect(mockedRunDocker).not.toHaveBeenCalled()
+    } finally {
+      await ingress.revokeAll()
+      await new Promise<void>((resolve) => guest.close(() => resolve()))
+    }
   })
 
   it('revokes the Host port when a Room sleeps, so an asleep Room does not look up', async () => {
