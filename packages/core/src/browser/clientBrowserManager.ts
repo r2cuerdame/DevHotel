@@ -38,6 +38,26 @@ interface LiveSession {
   cdp: SimpleCdpClient | null
 }
 
+type PendingAbort =
+  | { kind: 'shutdown' }
+  | { kind: 'purged'; reason: string }
+  | { kind: 'released'; reason: string }
+
+interface PendingAllocation {
+  id: string
+  roomId: string
+  profileMode: ClientBrowserProfileMode
+  profilePath: string
+  createdProfileDir: boolean
+  controller: AbortController
+  abort: PendingAbort | null
+}
+
+export interface ClientBrowserPurgeResult {
+  released: ClientBrowserReleaseResult[]
+  persistentProfileRemoved: boolean
+}
+
 export interface ClientBrowserRoomView {
   id: string
   project: string
@@ -73,8 +93,11 @@ export class ClientBrowserManager {
   private readonly log: (message: string) => void
   private readonly endpoint: ClientBrowserEndpointServer
   private readonly live = new Map<string, LiveSession>()
+  private readonly pending = new Map<string, PendingAllocation>()
   private readonly locks = new Map<string, Promise<unknown>>()
+  private readonly roomCleanups = new Map<string, Promise<unknown>>()
   private started = false
+  private shuttingDown = false
 
   constructor(options: ClientBrowserManagerOptions) {
     this.userData = options.userData
@@ -100,6 +123,12 @@ export class ClientBrowserManager {
 
   /** Binds the endpoint. Idempotent; allocation before this refuses rather than guessing a port. */
   async start(): Promise<void> {
+    if (this.shuttingDown) {
+      throw new DevHotelError('CLIENT_BROWSER_UNAVAILABLE', 'The Client Browser endpoint is shutting down.', {
+        httpStatus: 503,
+        recoveryHint: 'Retry once DevHotel restarts.'
+      })
+    }
     if (this.started) return
     const port = await this.endpoint.start()
     this.settings.set(ENDPOINT_PORT_SETTING, String(port))
@@ -156,18 +185,28 @@ export class ClientBrowserManager {
     return next
   }
 
-  // ---------------------------------------------------------------- lifecycle
+  /** Serializes Room-wide release/purge passes so profile removal never races another Room cleanup. */
+  private withRoomCleanup<T>(roomId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.roomCleanups.get(roomId) ?? Promise.resolve()
+    const next = previous.then(work, work)
+    const settled = next.then(() => undefined, () => undefined)
+    this.roomCleanups.set(roomId, settled)
+    void settled.then(() => {
+      if (this.roomCleanups.get(roomId) === settled) this.roomCleanups.delete(roomId)
+    })
+    return next
+  }
 
-  async allocate(
-    roomId: string,
-    options: { profileMode?: ClientBrowserProfileMode; headless?: boolean } = {}
-  ): Promise<ClientBrowserAllocation> {
-    if (!this.started) {
+  private assertManagerRunning(): void {
+    if (!this.started || this.shuttingDown) {
       throw new DevHotelError('CLIENT_BROWSER_UNAVAILABLE', 'The Client Browser endpoint is not running.', {
         httpStatus: 503,
         recoveryHint: 'DevHotel is still starting; retry shortly.'
       })
     }
+  }
+
+  private assertAwakeRoom(roomId: string): ClientBrowserRoomView {
     const room = this.rooms.get(roomId)
     if (!room) {
       throw new DevHotelError('ROOM_NOT_FOUND', `Room ${roomId} does not exist.`, { httpStatus: 404 })
@@ -179,13 +218,94 @@ export class ClientBrowserManager {
         { recoveryHint: 'Start the Room first (start_room or acquire_room), then allocate the browser.' }
       )
     }
-    const availability = await this.runtime.availability()
-    if (!availability.available) {
-      throw new DevHotelError('CLIENT_BROWSER_NOT_FOUND', availability.detail, {
+    return room
+  }
+
+  private abortPending(pending: PendingAllocation, next: PendingAbort): void {
+    if (
+      pending.abort === null ||
+      next.kind === 'shutdown' ||
+      (next.kind === 'purged' && pending.abort.kind === 'released')
+    ) {
+      pending.abort = next
+    }
+    pending.controller.abort()
+  }
+
+  private abortErrorFor(pending: PendingAllocation, requireStartingRow: boolean): DevHotelError | null {
+    if (!this.started || this.shuttingDown || pending.abort?.kind === 'shutdown') {
+      return new DevHotelError('CLIENT_BROWSER_UNAVAILABLE', 'The Client Browser endpoint is not running.', {
         httpStatus: 503,
-        recoveryHint: 'Install Google Chrome, Chromium or Microsoft Edge on the Host, or set DEVHOTEL_BROWSER_PATH.'
+        recoveryHint: 'DevHotel is still starting; retry shortly.'
       })
     }
+    const room = this.rooms.get(pending.roomId)
+    if (!room) {
+      return new DevHotelError('ROOM_NOT_FOUND', `Room ${pending.roomId} does not exist.`, { httpStatus: 404 })
+    }
+    if (room.status === 'sleeping' || room.status === 'broken' || room.status === 'deleting') {
+      return new DevHotelError(
+        'CLIENT_BROWSER_ROOM_NOT_AWAKE',
+        `Room ${pending.roomId} is ${room.status}; a Client Browser belongs to an awake Room.`,
+        { recoveryHint: 'Start the Room first (start_room or acquire_room), then allocate the browser.' }
+      )
+    }
+    if (pending.abort?.kind === 'released') {
+      return new DevHotelError(
+        'CLIENT_BROWSER_ROOM_NOT_AWAKE',
+        `Room ${pending.roomId} closed its Client Browsers while launching (${pending.abort.reason}).`,
+        { recoveryHint: 'Start the Room first (start_room or acquire_room), then allocate the browser.' }
+      )
+    }
+    if (pending.abort?.kind === 'purged') {
+      return new DevHotelError(
+        'CLIENT_BROWSER_UNAVAILABLE',
+        `Client Browser allocation for Room ${pending.roomId} was cancelled (${pending.abort.reason}).`,
+        { httpStatus: 503, recoveryHint: 'Retry browser allocation once the Room action finishes.' }
+      )
+    }
+    if (requireStartingRow) {
+      const current = this.repo.get(pending.id)
+      if (!current || current.status !== 'starting') {
+        return new DevHotelError(
+          'CLIENT_BROWSER_UNAVAILABLE',
+          `Client Browser session ${pending.id} was released while starting.`,
+          { httpStatus: 503, recoveryHint: 'Allocate a new Client Browser session.' }
+        )
+      }
+    }
+    return null
+  }
+
+  private cleanupAbortedProfile(pending: PendingAllocation): void {
+    if (pending.profileMode === 'ephemeral') {
+      removeProfile(pending.profilePath)
+      return
+    }
+    const roomDeleted = this.rooms.get(pending.roomId) === null
+    if (!pending.createdProfileDir && pending.abort?.kind !== 'purged' && !roomDeleted) {
+      return
+    }
+    const resolved = resolve(pending.profilePath)
+    const heldByOther = this.repo
+      .listByRoom(pending.roomId)
+      .some((other) => other.id !== pending.id && resolve(other.profilePath) === resolved && other.status !== 'stopped')
+    if (!heldByOther) {
+      removeProfile(pending.profilePath)
+    }
+  }
+
+  // ---------------------------------------------------------------- lifecycle
+
+  async allocate(
+    roomId: string,
+    options: { profileMode?: ClientBrowserProfileMode; headless?: boolean } = {}
+  ): Promise<ClientBrowserAllocation> {
+    this.assertManagerRunning()
+    const activeCleanup = this.roomCleanups.get(roomId)
+    if (activeCleanup) await activeCleanup
+    this.assertManagerRunning()
+    this.assertAwakeRoom(roomId)
 
     const profileMode = options.profileMode ?? 'ephemeral'
     const headless = options.headless ?? true
@@ -195,50 +315,137 @@ export class ClientBrowserManager {
       profileMode === 'persistent'
         ? join(this.root, PERSISTENT_PROFILES_DIR, roomId)
         : join(this.root, id)
-    if (profileMode === 'persistent') {
-      const holder = this.repo.listByRoom(roomId).find((other) => other.profilePath === profilePath && other.status !== 'stopped')
-      if (holder) {
-        throw new DevHotelError(
-          'CLIENT_BROWSER_PROFILE_BUSY',
-          `Room ${roomId} already has a persistent-profile browser (${holder.id}) open.`,
-          { recoveryHint: 'Release that session first, or allocate an ephemeral one.' }
-        )
-      }
-    }
-    const now = new Date().toISOString()
-    const record: ClientBrowserSessionRecord = {
+
+    const pending: PendingAllocation = {
       id,
       roomId,
-      tokenHash: hashClientBrowserToken(token),
-      status: 'starting',
-      pid: null,
-      devtoolsPort: null,
-      browserKind: null,
-      headless,
       profileMode,
       profilePath,
-      runtimeGeneration: this.generation,
-      createdAt: now,
-      lastActiveAt: now
+      createdProfileDir: false,
+      controller: new AbortController(),
+      abort: null
     }
-    mkdirSync(profilePath, { recursive: true })
-    this.repo.create(record)
-    this.log(`client browser ${id}: launching for Room ${roomId} (${profileMode}, ${headless ? 'headless' : 'headed'})`)
-
-    let launched: LaunchedClientBrowser
+    this.pending.set(id, pending)
     try {
-      launched = await this.runtime.launch({ sessionId: id, profileDir: profilePath, headless })
-    } catch (error) {
-      this.repo.delete(id)
-      if (profileMode === 'ephemeral') rmSync(profilePath, { recursive: true, force: true })
-      throw error
+      const availability = await this.runtime.availability()
+      const afterAvailabilityAbort = this.abortErrorFor(pending, false)
+      if (afterAvailabilityAbort) throw afterAvailabilityAbort
+      if (!availability.available) {
+        throw new DevHotelError('CLIENT_BROWSER_NOT_FOUND', availability.detail, {
+          httpStatus: 503,
+          recoveryHint: 'Install Google Chrome, Chromium or Microsoft Edge on the Host, or set DEVHOTEL_BROWSER_PATH.'
+        })
+      }
+
+      if (profileMode === 'persistent') {
+        const resolved = resolve(profilePath)
+        const holder = this.repo
+          .listByRoom(roomId)
+          .find((other) => resolve(other.profilePath) === resolved && other.status !== 'stopped')
+        if (holder) {
+          throw new DevHotelError(
+            'CLIENT_BROWSER_PROFILE_BUSY',
+            `Room ${roomId} already has a persistent-profile browser (${holder.id}) open.`,
+            { recoveryHint: 'Release that session first, or allocate an ephemeral one.' }
+          )
+        }
+      }
+
+      const now = new Date().toISOString()
+      const record: ClientBrowserSessionRecord = {
+        id,
+        roomId,
+        tokenHash: hashClientBrowserToken(token),
+        status: 'starting',
+        pid: null,
+        devtoolsPort: null,
+        browserKind: null,
+        headless,
+        profileMode,
+        profilePath,
+        runtimeGeneration: this.generation,
+        createdAt: now,
+        lastActiveAt: now
+      }
+      pending.createdProfileDir = !existsSync(profilePath)
+      mkdirSync(profilePath, { recursive: true })
+      try {
+        this.repo.create(record)
+      } catch (error) {
+        this.cleanupAbortedProfile(pending)
+        const createAbort = this.abortErrorFor(pending, false)
+        if (createAbort) throw createAbort
+        throw error
+      }
+      this.log(`client browser ${id}: launching for Room ${roomId} (${profileMode}, ${headless ? 'headless' : 'headed'})`)
+
+      let launched: LaunchedClientBrowser
+      try {
+        launched = await this.runtime.launch({
+          sessionId: id,
+          profileDir: profilePath,
+          headless,
+          signal: pending.controller.signal
+        })
+      } catch (error) {
+        this.repo.delete(id)
+        this.cleanupAbortedProfile(pending)
+        const launchAbort = this.abortErrorFor(pending, false)
+        if (launchAbort) throw launchAbort
+        throw error
+      }
+
+      return await this.withLock(id, async () => {
+        const postLaunchAbort = this.abortErrorFor(pending, true)
+        if (postLaunchAbort) {
+          try {
+            await launched.stop()
+          } finally {
+            this.repo.delete(id)
+            this.cleanupAbortedProfile(pending)
+          }
+          throw postLaunchAbort
+        }
+        let endpoint: ClientBrowserEndpoint
+        try {
+          endpoint = this.endpointFor(id, token)
+        } catch (error) {
+          try {
+            await launched.stop()
+          } finally {
+            this.repo.delete(id)
+            this.cleanupAbortedProfile(pending)
+          }
+          throw error
+        }
+        const readyAt = new Date().toISOString()
+        this.repo.markLaunched(
+          id,
+          { pid: launched.pid, devtoolsPort: launched.devtoolsPort, browserKind: launched.browserKind },
+          readyAt
+        )
+        const session = this.repo.get(id)
+        if (!session) {
+          try {
+            await launched.stop()
+          } finally {
+            this.cleanupAbortedProfile(pending)
+          }
+          throw (
+            this.abortErrorFor(pending, false) ??
+            new DevHotelError('CLIENT_BROWSER_UNAVAILABLE', `Client Browser session ${id} was removed before becoming ready.`, {
+              httpStatus: 503
+            })
+          )
+        }
+        this.live.set(id, { launched, cdp: null })
+        this.pending.delete(id)
+        this.log(`client browser ${id}: ready (pid ${launched.pid ?? 'unknown'}, ${launched.browserKind})`)
+        return { session: toInfo(session), token, endpoint }
+      })
+    } finally {
+      this.pending.delete(id)
     }
-    const readyAt = new Date().toISOString()
-    this.repo.markLaunched(id, { pid: launched.pid, devtoolsPort: launched.devtoolsPort, browserKind: launched.browserKind }, readyAt)
-    this.live.set(id, { launched, cdp: null })
-    const session = this.repo.get(id)!
-    this.log(`client browser ${id}: ready (pid ${launched.pid ?? 'unknown'}, ${launched.browserKind})`)
-    return { session: toInfo(session), token, endpoint: this.endpointFor(id, token) }
   }
 
   attach(sessionId: string, token: string): ClientBrowserAllocation {
@@ -331,28 +538,96 @@ export class ClientBrowserManager {
 
   async release(sessionId: string, token: string): Promise<ClientBrowserReleaseResult> {
     const record = this.authorize(sessionId, token)
-    return await this.withLock(sessionId, () => this.releaseLocked(record, 'released by its owner'))
+    return await this.withLock(sessionId, () => this.releaseLocked(record, 'released by its owner', 'released'))
   }
 
-  /** Every session of a Room, whoever holds the tokens. Room delete and sleep call this. */
+  /** Every session of a Room, whoever holds the tokens. Room sleep calls this. */
   async releaseRoom(roomId: string, reason: string): Promise<ClientBrowserReleaseResult[]> {
-    const results: ClientBrowserReleaseResult[] = []
-    for (const record of this.repo.listByRoom(roomId)) {
-      results.push(await this.withLock(record.id, () => this.releaseLocked(record, reason)))
+    for (const pending of this.pending.values()) {
+      if (pending.roomId === roomId) {
+        this.abortPending(pending, { kind: 'released', reason })
+      }
     }
-    return results
+    return await this.withRoomCleanup(roomId, async () => {
+      const results: ClientBrowserReleaseResult[] = []
+      for (const record of this.repo.listByRoom(roomId)) {
+        results.push(await this.withLock(record.id, () => this.releaseLocked(record, reason, 'released')))
+      }
+      return results
+    })
   }
 
-  private async releaseLocked(record: ClientBrowserSessionRecord, reason: string): Promise<ClientBrowserReleaseResult> {
+  /** Stops every active or starting browser for a Room and deletes its persistent profile when safe. */
+  async purgeRoom(roomId: string, reason: string): Promise<ClientBrowserPurgeResult> {
+    for (const pending of this.pending.values()) {
+      if (pending.roomId === roomId) {
+        this.abortPending(pending, { kind: 'purged', reason })
+      }
+    }
+    return await this.withRoomCleanup(roomId, async () => {
+      const released: ClientBrowserReleaseResult[] = []
+      const persistentDir = join(this.root, PERSISTENT_PROFILES_DIR, roomId)
+      const resolvedPersistentDir = resolve(persistentDir)
+      let persistentSessionStopped = false
+      let persistentSessionUnverified = false
+
+      for (const record of this.repo.listByRoom(roomId)) {
+        const result = await this.withLock(record.id, () => this.releaseLocked(record, reason, 'purged'))
+        released.push(result)
+        if (resolve(record.profilePath) === resolvedPersistentDir) {
+          if (result.processStopped) persistentSessionStopped = true
+          else persistentSessionUnverified = true
+        }
+      }
+
+      let persistentProfileRemoved = false
+      if (existsSync(persistentDir)) {
+        if (persistentSessionUnverified) {
+          this.log(`client browser persistent profile for Room ${roomId}: process could not be proven stopped; profile left in place`)
+        } else {
+          const safeToRemove =
+            persistentSessionStopped ||
+            (await this.runtime.stopOrphan({ pid: null, devtoolsPort: null, profileDir: persistentDir }))
+          if (safeToRemove) {
+            persistentProfileRemoved = removeProfile(persistentDir)
+          } else {
+            this.log(`client browser persistent profile for Room ${roomId}: orphan process could not be proven ours; profile left in place`)
+          }
+        }
+      }
+      return { released, persistentProfileRemoved }
+    })
+  }
+
+  private async releaseLocked(
+    record: ClientBrowserSessionRecord,
+    reason: string,
+    abortKind: 'released' | 'purged' | 'shutdown' = 'released'
+  ): Promise<ClientBrowserReleaseResult> {
     const sessionId = record.id
     this.log(`client browser ${sessionId}: releasing (${reason})`)
     this.endpoint.disconnect(sessionId)
+    const pending = this.pending.get(sessionId)
+    if (pending) {
+      this.abortPending(pending, abortKind === 'shutdown' ? { kind: 'shutdown' } : { kind: abortKind, reason })
+    }
     const live = this.live.get(sessionId)
     this.live.delete(sessionId)
     live?.cdp?.close()
+    if (!live && !pending && !this.repo.get(sessionId)) {
+      return {
+        sessionId,
+        roomId: record.roomId,
+        released: true,
+        processStopped: true,
+        profileRemoved: record.profileMode === 'ephemeral' && !existsSync(record.profilePath)
+      }
+    }
     let processStopped = false
     if (live) {
       await live.launched.stop()
+      processStopped = true
+    } else if (pending) {
       processStopped = true
     } else {
       processStopped = await this.runtime.stopOrphan({ pid: record.pid, devtoolsPort: record.devtoolsPort, profileDir: record.profilePath })
@@ -394,12 +669,16 @@ export class ClientBrowserManager {
         continue
       }
       report.stoppedProcesses += 1
-      if (record.profileMode === 'ephemeral' && removeProfile(record.profilePath)) report.removedProfiles += 1
+      const roomDeleted = this.rooms.get(record.roomId) === null
+      if ((record.profileMode === 'ephemeral' || roomDeleted) && removeProfile(record.profilePath)) {
+        report.removedProfiles += 1
+      }
       this.repo.delete(record.id)
     }
     // Directories with no row: an allocation that crashed between mkdir and
-    // insert, or a row lost with its database. Only session-shaped names are
-    // ours to remove; the persistent folder holds Room-owned profiles.
+    // insert, or a row lost with its database. Session-shaped names are
+    // ephemeral leftovers; persistent/<roomId> profiles belong to Rooms and are
+    // removed only when the owning Room no longer exists.
     const root = this.root
     if (existsSync(root)) {
       const known = new Set(this.repo.listAll().map((record) => resolve(record.profilePath)))
@@ -414,6 +693,22 @@ export class ClientBrowserManager {
         }
         if (removeProfile(dir)) report.removedProfiles += 1
       }
+      const persistentRoot = join(root, PERSISTENT_PROFILES_DIR)
+      if (existsSync(persistentRoot)) {
+        for (const entry of readdirSync(persistentRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue
+          const roomId = entry.name
+          if (this.rooms.get(roomId) !== null) continue
+          const dir = join(persistentRoot, roomId)
+          if (known.has(resolve(dir))) continue
+          const stopped = await this.runtime.stopOrphan({ pid: null, devtoolsPort: null, profileDir: dir })
+          if (!stopped) {
+            report.unverified.push(`${PERSISTENT_PROFILES_DIR}/${roomId}`)
+            continue
+          }
+          if (removeProfile(dir)) report.removedProfiles += 1
+        }
+      }
     }
     if (report.orphanedSessions > 0 || report.removedProfiles > 0 || report.unverified.length > 0) {
       this.log(
@@ -424,18 +719,26 @@ export class ClientBrowserManager {
     return report
   }
 
-  /** Stops every live browser and the endpoint. Rows that could not be cleaned are left for the next reconcile. */
+  /** Stops every live or starting browser and the endpoint. Rows that could not be cleaned are left for the next reconcile. */
   async shutdown(): Promise<void> {
-    for (const record of this.repo.listAll()) {
-      if (!this.live.has(record.id)) continue
-      try {
-        await this.withLock(record.id, () => this.releaseLocked(record, 'DevHotel is shutting down'))
-      } catch (error) {
-        this.log(`client browser ${record.id}: shutdown release failed: ${error instanceof Error ? error.message : String(error)}`)
+    this.shuttingDown = true
+    try {
+      for (const pending of this.pending.values()) {
+        this.abortPending(pending, { kind: 'shutdown' })
       }
+      for (const record of this.repo.listAll()) {
+        if (!this.live.has(record.id) && !this.pending.has(record.id)) continue
+        try {
+          await this.withLock(record.id, () => this.releaseLocked(record, 'DevHotel is shutting down', 'shutdown'))
+        } catch (error) {
+          this.log(`client browser ${record.id}: shutdown release failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      await this.endpoint.stop()
+      this.started = false
+    } finally {
+      this.shuttingDown = false
     }
-    await this.endpoint.stop()
-    this.started = false
   }
 
   // ---------------------------------------------------------------- helpers

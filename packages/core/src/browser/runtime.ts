@@ -12,6 +12,8 @@ export interface ClientBrowserLaunchRequest {
   /** Directory that must hold this session's entire profile: cookies, storage, cache, tabs. */
   profileDir: string
   headless: boolean
+  /** Optional cancellation signal when the owning Room or DevHotel stops mid-launch. */
+  signal?: AbortSignal
 }
 
 export interface LaunchedClientBrowser {
