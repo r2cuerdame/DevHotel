@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { zBackupId, type ServiceKind } from '@devhotel/shared'
+import { zBackupId, type ChangeEntry, type ServiceKind } from '@devhotel/shared'
 import { SERVICE_DB_NAME, SERVICE_DB_USER, SERVICE_DEFAULT_VERSIONS } from '../../backend/naming'
 import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
@@ -261,12 +261,25 @@ export const serviceAddChange: ChangeDefinition<{ service: ServiceKind; version?
     return pingService(ctx, p.service)
   },
   async undo(ctx, entry) {
-    const service = (entry.captured as { service: ServiceKind } | null)?.service ?? inferService(entry.title)
+    const service = addedService(entry)
     const services = { ...ctx.room().services }
     delete services[service]
     ctx.rooms.update(ctx.roomId, { services })
     await ctx.backend.removeService(ctx.roomId, service, { volume: true })
+  },
+  async verifyUndo(ctx, entry) {
+    const service = addedService(entry)
+    const label = SERVICE_LABEL[service]
+    if (ctx.room().services[service]) return { ok: false, detail: `${label} is still recorded in this room` }
+    const state = await ctx.backend.serviceState(ctx.roomId, service)
+    return state === 'missing'
+      ? { ok: true, detail: `${label} removed with its data volume` }
+      : { ok: false, detail: `${label} container still exists` }
   }
+}
+
+function addedService(entry: ChangeEntry): ServiceKind {
+  return (entry.captured as { service: ServiceKind } | null)?.service ?? inferService(entry.title)
 }
 
 function inferService(title: string): ServiceKind {
@@ -360,6 +373,9 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
     const ping = await pingService(ctx, service)
     if (!ping.ok) throw new Error(ping.detail)
     await restoreServiceFromFile(ctx, service, backupFile)
+  },
+  verifyUndo(ctx, entry) {
+    return pingService(ctx, inferService(entry.title))
   }
 }
 
@@ -406,17 +422,26 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
     return pingService(ctx, p.service)
   },
   async undo(ctx, entry) {
-    const captured = entry.captured as { prevVersion: string; backupFile: string } | null
+    const captured = entry.captured as { prevVersion?: string; backupFile?: unknown } | null
     const service = inferService(entry.title)
-    const prevVersion = captured?.prevVersion ?? SERVICE_DEFAULT_VERSIONS[service]
-    ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version: prevVersion } } })
-    if (ctx.isAwake()) {
-      await ctx.backend.removeService(ctx.roomId, service, { volume: true })
-      await ctx.backend.createService(ctx.roomId, service, prevVersion)
-      const ping = await pingService(ctx, service)
-      if (!ping.ok) throw new Error(ping.detail)
-      if (captured?.backupFile) await restoreServiceFromFile(ctx, service, captured.backupFile)
+    const label = SERVICE_LABEL[service]
+    const backupFile = removeCapturedBackup(captured)
+    if (!backupFile || !existsSync(backupFile)) {
+      throw new Error(
+        `${label} safety backup is missing — undo would leave an empty older ${label}; restore a backup you still have instead`
+      )
     }
+    if (!ctx.isAwake()) throw new Error(`Wake the room first — switching ${label} back restores its data from the safety backup`)
+    const prevVersion = captured?.prevVersion ?? (entry.before as { version?: string } | null)?.version ?? SERVICE_DEFAULT_VERSIONS[service]
+    ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version: prevVersion } } })
+    await ctx.backend.removeService(ctx.roomId, service, { volume: true })
+    await ctx.backend.createService(ctx.roomId, service, prevVersion)
+    const ping = await pingService(ctx, service)
+    if (!ping.ok) throw new Error(ping.detail)
+    await restoreServiceFromFile(ctx, service, backupFile)
+  },
+  verifyUndo(ctx, entry) {
+    return pingService(ctx, inferService(entry.title))
   }
 }
 
@@ -516,9 +541,16 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; backupId:
     return pingService(ctx, p.service)
   },
   async undo(ctx, entry) {
-    const captured = entry.captured as { backupFile: string } | null
-    if (!captured?.backupFile) throw new Error('No safety backup was captured')
     const service = inferService(entry.title)
-    await restoreServiceFromFile(ctx, service, captured.backupFile)
+    const label = SERVICE_LABEL[service]
+    const backupFile = removeCapturedBackup(entry.captured)
+    if (!backupFile || !existsSync(backupFile)) {
+      throw new Error(`${label} safety backup is missing — undo cannot bring back the data from before the restore`)
+    }
+    if (!ctx.isAwake()) throw new Error(`Wake the room first — restoring ${label} from its safety backup needs it running`)
+    await restoreServiceFromFile(ctx, service, backupFile)
+  },
+  verifyUndo(ctx, entry) {
+    return pingService(ctx, inferService(entry.title))
   }
 }

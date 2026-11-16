@@ -45,6 +45,18 @@ export const domainChange: ChangeDefinition<{ domain: string }> = {
       ? { ok: true, detail: `${domain} routed by the local gateway` }
       : { ok: false, detail: `${domain} missing from the gateway routing table` }
   },
+  async verifyUndo(ctx, entry) {
+    if (!ctx.isAwake()) return { ok: true, detail: 'applies on next wake (room is asleep)' }
+    const domain = ctx.room().domain
+    const routes = ctx.gateway.status().routes
+    const reverted = (entry.after as { domain?: string } | null)?.domain
+    if (reverted && reverted !== domain && routes.some((r) => r.domain === reverted && r.roomId === ctx.roomId)) {
+      return { ok: false, detail: `${reverted} is still routed by the local gateway` }
+    }
+    return routes.some((r) => r.domain === domain && r.roomId === ctx.roomId)
+      ? { ok: true, detail: `${domain} routed by the local gateway` }
+      : { ok: false, detail: `${domain} missing from the gateway routing table` }
+  },
   async undo(ctx, entry) {
     const prev =
       (entry.captured as { prevDomain?: string } | null)?.prevDomain ?? (entry.before as { domain: string }).domain

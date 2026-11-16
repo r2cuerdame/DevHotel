@@ -292,6 +292,8 @@ const ANDROID_CHANGE_KINDS = new Set([
 
 const WORKSPACE_MUTATION_KINDS = new Set(['package-install', 'deps-install'])
 
+const WORKSPACE_REPUBLISHING_KINDS = new Set(['package-install', 'normalize-line-endings'])
+
 /**
  * The adb readiness probe is deliberately a single bounded question, not a
  * wait. A wake recreates the emulator, and a cold Android image needs minutes
@@ -9820,7 +9822,7 @@ export class RoomOrchestrator {
     const room = this.mustGet(roomId)
     this.assertNotDeleting(roomId, room)
     if (room.provider === 'windows') throw new Error('Windows VM lifecycle actions are not undoable')
-    return this.withRoomLock(roomId, async () => {
+    return this.withNonDeletingRoomLock(roomId, async () => {
       if (actor === 'agent' && this.mustGet(roomId).workspaceMode === 'legacy-host-bind') {
         throw new Error('Agent mutations are blocked for legacy Host-bound Rooms. Move the Room into the Hotel first.')
       }
@@ -9828,6 +9830,8 @@ export class RoomOrchestrator {
       const entry = await this.engine.undo(this.ctxFor(roomId), changeId, actor)
       if (original && original.kind !== 'package-install' && WORKSPACE_MUTATION_KINDS.has(original.kind)) {
         this.advanceStateRevision(roomId)
+        await this.refreshSyncStatus(roomId)
+      } else if (original && WORKSPACE_REPUBLISHING_KINDS.has(original.kind)) {
         await this.refreshSyncStatus(roomId)
       }
       this.syncStatusFromVerify(roomId, entry)

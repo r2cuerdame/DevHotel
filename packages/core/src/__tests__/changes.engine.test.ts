@@ -576,6 +576,275 @@ describe('services', () => {
   })
 })
 
+describe('undo verification follows the reverted target', () => {
+  function androidEmulatorRoom(): void {
+    rooms.update('room1abc', {
+      provider: 'android',
+      runtime: { kind: 'jdk', version: '17' },
+      packageManager: { kind: 'gradle' },
+      hostPort: 45000,
+      android: { device: 'Samsung Galaxy S10', version: '14.0' }
+    })
+  }
+
+  it('records an emulator-config undo as failed when the restored emulator is unhealthy', async () => {
+    androidEmulatorRoom()
+    const entry = await engine.execute(ctx(), 'emulator-config', { device: 'Pixel 6', version: '15.0' }, 'user')
+    expect(entry.status).toBe('verified')
+    backend.createEmulator = async () => {
+      backend.emulatorStateValue = 'degraded'
+    }
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toMatchObject({ kind: 'undo', status: 'applied', verify: { ok: false, detail: 'emulator container degraded' } })
+    expect(changes.get(entry.id)!.status).toBe('undone')
+  })
+
+  it('verifies an emulator-config undo by the emulator rather than the build container', async () => {
+    androidEmulatorRoom()
+    const entry = await engine.execute(ctx(), 'emulator-config', { device: 'Pixel 6', version: '15.0' }, 'user')
+    backend.webStateValue = 'exited'
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true, detail: expect.stringContaining('emulator container running') } })
+  })
+
+  it('fails a domain undo whose restored route is missing from the gateway', async () => {
+    const entry = await engine.execute(ctx(), 'domain', { domain: 'renamed.localhost' }, 'user')
+    const undoCtx = ctx()
+    undoCtx.syncRoute = async () => undefined
+
+    const undone = await engine.undo(undoCtx, entry.id, 'user')
+
+    expect(rooms.get('room1abc')!.domain).toBe('demo-dev.localhost')
+    expect(undone).toMatchObject({
+      status: 'applied',
+      verify: { ok: false, detail: 'demo-dev.localhost missing from the gateway routing table' }
+    })
+  })
+
+  it('verifies a domain undo from the gateway without waiting on a stopped web process', async () => {
+    const entry = await engine.execute(ctx(), 'domain', { domain: 'renamed.localhost' }, 'user')
+    backend.webStateValue = 'exited'
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true, detail: 'demo-dev.localhost routed by the local gateway' } })
+    expect(gateway.routes.has('renamed.localhost')).toBe(false)
+  })
+
+  it('fails an https undo while the gateway still routes the room via TLS', async () => {
+    const entry = await engine.execute(ctx(), 'https', { enabled: true }, 'user')
+    expect(gateway.routes.get('demo-dev.localhost')?.https).toBe(true)
+    const undoCtx = ctx()
+    undoCtx.syncRoute = async () => undefined
+
+    const undone = await engine.undo(undoCtx, entry.id, 'user')
+
+    expect(rooms.get('room1abc')!.https).toBe(false)
+    expect(undone).toMatchObject({ status: 'applied', verify: { ok: false, detail: 'gateway still routes the room via TLS' } })
+  })
+
+  it('verifies an https undo against the plain route it restored', async () => {
+    const entry = await engine.execute(ctx(), 'https', { enabled: true }, 'user')
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(gateway.routes.get('demo-dev.localhost')?.https).toBe(false)
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true, detail: 'http://demo-dev.localhost routed without TLS' } })
+  })
+
+  it('fails a service-add undo whose container survived removal', async () => {
+    const entry = await engine.execute(ctx(), 'service-add', { service: 'postgres' }, 'user')
+    backend.removeService = async (_roomId, svc, opts) => {
+      backend.calls.push(`removeService:${svc}:${opts.volume ? 'with-volume' : 'keep-volume'}`)
+    }
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(rooms.get('room1abc')!.services.postgres).toBeUndefined()
+    expect(undone).toMatchObject({ status: 'applied', verify: { ok: false, detail: 'PostgreSQL container still exists' } })
+  })
+
+  it('verifies a service-add undo by the removed service, not the web process', async () => {
+    const entry = await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    backend.webStateValue = 'exited'
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true, detail: 'Redis removed with its data volume' } })
+  })
+
+  it('fails a service-remove undo whose restored service does not come back', async () => {
+    await engine.execute(ctx(), 'service-add', { service: 'redis' }, 'user')
+    const entry = await engine.execute(ctx(), 'service-remove', { service: 'redis' }, 'user')
+    backend.startService = async (_roomId, svc) => {
+      backend.calls.push(`startService:${svc}`)
+      backend.serviceStates.set(svc, 'missing')
+    }
+
+    const undone = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'applied', verify: { ok: false, detail: 'Redis container missing' } })
+  })
+
+  it('verifies service-version and db-restore undos with the service probe', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+    const changeCtx = ctx()
+    const version = await engine.execute(changeCtx, 'service-version', { service: 'postgres', version: '17' }, 'user')
+    backend.webStateValue = 'exited'
+
+    const versionUndo = await engine.undo(changeCtx, version.id, 'user')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(versionUndo).toMatchObject({ status: 'verified', verify: { ok: true, detail: expect.stringContaining('PostgreSQL answering') } })
+
+    const restore = await restorePostgresFromBackup(changeCtx)
+    const restoreUndo = await engine.undo(changeCtx, restore.id, 'user')
+    expect(restoreUndo).toMatchObject({ status: 'verified', verify: { ok: true, detail: expect.stringContaining('PostgreSQL answering') } })
+  })
+
+  it('completes the undo record without leaking a rejected verifier error', async () => {
+    let undone = false
+    engine.register({
+      kind: 'verify-undo-throws-test',
+      plan: () => ({
+        title: 'Throwing undo verifier',
+        component: 'Test',
+        before: { value: 1 },
+        after: { value: 2 },
+        undoable: true,
+        undoStrategy: 'restore-test-state',
+        autoRollback: false
+      }),
+      async apply() {},
+      async verify() {
+        return { ok: true, detail: 'applied' }
+      },
+      async undo() {
+        undone = true
+      },
+      async verifyUndo() {
+        throw new Error('token=super-secret C:\\Users\\private\\backend.exe --raw-argument')
+      }
+    } satisfies ChangeDefinition<Record<string, never>>)
+    const entry = await engine.execute(ctx(), 'verify-undo-throws-test', {}, 'user')
+
+    const undoEntry = await engine.undo(ctx(), entry.id, 'user')
+
+    expect(undone).toBe(true)
+    expect(undoEntry).toMatchObject({
+      kind: 'undo',
+      title: 'Undo: Throwing undo verifier',
+      status: 'applied',
+      verify: { ok: false, detail: 'Verification could not complete because its probe failed unexpectedly.' }
+    })
+    expect(JSON.stringify(changes.list('room1abc'))).not.toMatch(/super-secret|Users|backend\.exe|raw-argument/i)
+    expect(changes.get(entry.id)).toMatchObject({ status: 'undone', undoneAt: expect.any(String) })
+    expect(changes.list('room1abc').filter((c) => c.kind === 'undo')).toHaveLength(1)
+  })
+})
+
+async function restorePostgresFromBackup(changeCtx: ChangeCtx) {
+  await engine.execute(changeCtx, 'db-backup', { service: 'postgres' }, 'user')
+  const { readdirSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const backupId = readdirSync(join(changeCtx.userData, 'rooms', 'room1abc', 'backups'))
+    .filter((name) => name.startsWith('postgres-') && name.endsWith('.sql'))
+    .sort()
+    .at(-1)!
+  const entry = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId }, 'user')
+  expect(entry.status).toBe('verified')
+  return entry
+}
+
+describe('service data undo refuses before touching data', () => {
+  async function upgradedPostgres() {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+    expect(entry.status).toBe('verified')
+    backend.calls.length = 0
+    return entry
+  }
+
+  function touchedServiceData(): boolean {
+    return backend.calls.some((call) =>
+      call.startsWith('removeService:') ||
+      call.startsWith('createService:') ||
+      call.startsWith('execInServiceFromFile:') ||
+      call === 'execInService:postgres:psql'
+    )
+  }
+
+  it('refuses a service-version undo in a sleeping room without lowering the recorded version', async () => {
+    const entry = await upgradedPostgres()
+    rooms.update('room1abc', { status: 'sleeping', hostPort: null })
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/Wake the room first/)
+
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(touchedServiceData()).toBe(false)
+    expect(changes.get(entry.id)!.status).toBe('verified')
+    expect(changes.list('room1abc').filter((c) => c.kind === 'undo')).toHaveLength(0)
+  })
+
+  it('refuses a service-version undo whose safety backup is gone instead of emptying the volume', async () => {
+    const entry = await upgradedPostgres()
+    const { rmSync } = await import('node:fs')
+    rmSync((entry.captured as { backupFile: string }).backupFile)
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/safety backup is missing/)
+
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(touchedServiceData()).toBe(false)
+    expect(changes.get(entry.id)!.status).toBe('verified')
+  })
+
+  it('refuses a service-version undo whose record lost its safety backup', async () => {
+    const entry = await upgradedPostgres()
+    changes.setStatus(entry.id, 'verified', { captured: { prevVersion: '16' } })
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/safety backup is missing/)
+
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(touchedServiceData()).toBe(false)
+  })
+
+  it('refuses a db-restore undo in a sleeping room before restoring anything', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '17' } } })
+    backend.serviceStates.set('postgres', 'running')
+    const entry = await restorePostgresFromBackup(ctx())
+    backend.calls.length = 0
+    rooms.update('room1abc', { status: 'sleeping', hostPort: null })
+
+    await expect(engine.undo(ctx(), entry.id, 'user')).rejects.toThrow(/Wake the room first/)
+
+    expect(touchedServiceData()).toBe(false)
+    expect(changes.get(entry.id)!.status).toBe('verified')
+  })
+
+  it('refuses a db-restore undo whose safety backup is gone without exposing its path', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '17' } } })
+    backend.serviceStates.set('postgres', 'running')
+    const entry = await restorePostgresFromBackup(ctx())
+    const backupFile = (entry.captured as { backupFile: string }).backupFile
+    const { rmSync } = await import('node:fs')
+    rmSync(backupFile)
+    backend.calls.length = 0
+
+    const refused = await engine.undo(ctx(), entry.id, 'user').catch((error: unknown) => error as Error)
+
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/safety backup is missing/)
+    expect((refused as Error).message).not.toContain(backupFile)
+    expect(touchedServiceData()).toBe(false)
+    expect(changes.get(entry.id)!.status).toBe('verified')
+  })
+})
+
 describe('engine safety', () => {
   it('rejects unknown change kinds', async () => {
     await expect(engine.execute(ctx(), 'format-host-disk', {}, 'agent')).rejects.toThrow(/Unknown change kind/)

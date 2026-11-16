@@ -53,6 +53,22 @@ export const httpsChange: ChangeDefinition<{ enabled: boolean }> = {
       ? { ok: true, detail: `https://${room.domain} routed with a local certificate` }
       : { ok: false, detail: 'HTTPS route missing from the gateway' }
   },
+  async verifyUndo(ctx) {
+    const room = ctx.room()
+    const status = ctx.gateway.status()
+    if (room.https && status.httpsPort == null) {
+      return { ok: false, detail: 'gateway could not bind an HTTPS port (443/8443 both busy)' }
+    }
+    if (!ctx.isAwake()) return { ok: true, detail: room.https ? 'certificate ready; routes on next wake' : 'HTTPS off; routes on next wake' }
+    const route = status.routes.find((r) => r.domain === room.domain && r.roomId === ctx.roomId)
+    if (!route) return { ok: false, detail: `${room.domain} missing from the gateway routing table` }
+    if (route.https !== room.https) {
+      return { ok: false, detail: room.https ? 'HTTPS route missing from the gateway' : 'gateway still routes the room via TLS' }
+    }
+    return room.https
+      ? { ok: true, detail: `https://${room.domain} routed with a local certificate` }
+      : { ok: true, detail: `http://${room.domain} routed without TLS` }
+  },
   async undo(ctx, entry) {
     const prev =
       (entry.captured as { prevHttps?: boolean } | null)?.prevHttps ?? (entry.before as { https: boolean }).https

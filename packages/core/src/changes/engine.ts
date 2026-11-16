@@ -163,7 +163,12 @@ export class ChangeEngine {
     await def.undo(ctx, entry)
     ctx.changes.setStatus(entry.id, 'undone', { undoneAt: new Date().toISOString() })
 
-    const verify = await verifyWebUp(ctx)
+    let verify: { ok: boolean; detail: string }
+    try {
+      verify = def.verifyUndo ? await def.verifyUndo(ctx, entry) : await verifyWebUp(ctx)
+    } catch {
+      verify = { ok: false, detail: VERIFY_EXCEPTION_DETAIL }
+    }
     if (!verify.ok) ctx.log(`undo verify failed: ${verify.detail}`)
     return ctx.changes.append({
       id: randomUUID(),
