@@ -25,6 +25,7 @@ import { ensureDataOwnership } from './cleanRemoval'
 import { managedRuntimeStatusInfo } from './managedRuntimeStatus'
 import { CleanRemovalGate, deferShutdownForCleanRemoval } from './cleanRemovalGate'
 import { executeShutdownPolicy, type ShutdownAction } from './shutdownPolicy'
+import { canFocusMainWindow, createStartupFailureReporter, executeStartupPolicy } from './startupPolicy'
 import { GITHUB_SERVICE_DEFAULT_ENABLED, GITHUB_SERVICE_MANIFEST, GitHubService, PINNED_GH } from './githubService'
 import { roomPreviewPartition } from './previewSecurity'
 import { assertPackagedVersion, BUILD_IDENTITY } from './buildIdentity'
@@ -105,283 +106,339 @@ function createWindow(): BrowserWindow {
   return win
 }
 
+function ignoreCleanupError(cleanup: () => void): void {
+  try {
+    cleanup()
+  } catch {
+    // Preserve the primary startup error.
+  }
+}
+
 async function bootstrap(): Promise<void> {
   const userData = app.getPath('userData')
   if (app.isPackaged) {
     void sendStartupTelemetry({ userData, version: app.getVersion(), os: process.platform })
   }
   const dataOwnershipId = ensureDataOwnership(userData)
-  const managedRuntime = new ManagedRuntimeManager({
-    userData,
-    installId: dataOwnershipId,
-    fetch: (url, init) => net.fetch(url, init)
-  })
-  // Preparation is resumable and intentionally does not block the Lobby. It is
-  // awaited only far enough to answer one question — is there a usable runtime
-  // to run Rooms on — because a Room's volumes live in exactly one engine and
-  // that choice cannot be revised after the first Room operation.
-  void managedRuntime.prepare().catch((error) => console.error('managed runtime preparation failed:', error))
   const db = openDb(userData)
-  const hotelServices = hotelServicesRepo(db)
-  hotelServices.register({
-    manifest: GITHUB_SERVICE_MANIFEST,
-    availability: process.arch === 'x64' ? 'available' : 'unavailable',
-    enabled: GITHUB_SERVICE_DEFAULT_ENABLED,
-    initialConnectionState: 'disconnected'
-  })
-  const gateway = new Gateway({ caDir: join(userData, 'ca') })
-  // Host ingress ports are the one owned artifact no engine can enumerate, so
-  // DevHotel writes them down itself. The ledger outlives the process, which is
-  // the whole point: a crash must not be able to leave a port listening for a
-  // container that no longer exists.
-  const ingressLedger = new IngressLedger({ userData })
-  const ownershipRooms = roomsRepo(db)
-  // The managed runtime is preferred; a Host whose Hyper-V gate has not been
-  // passed, or whose runtime is still preparing, keeps working on the external
-  // compatibility engine and is told which one it got.
-  const managedRuntimeReady = await managedRuntime.roomChannel().catch(() => null)
-  const managedRuntimeId = managedRuntimeReady?.runtimeId ?? null
-  const runtime = await selectRoomRuntime({
-    channel: managedRuntimeReady?.channel ?? null,
-    runtimeId: managedRuntimeId,
-    compatibility: {
-      identityFile: join(userData, 'runtime', 'docker-engine.json'),
-      legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
-      networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
-      canAdoptLegacyVolume: (roomId) =>
-        ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
-      isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
-    },
-    onIngressError: (error) => console.error('managed runtime ingress failed:', error),
-    ingressLedger
-  })
-  console.log(`DevHotel Room runtime: ${runtime.mode} — ${runtime.detail}`)
-  const backend = runtime.backend
-  const windowsVm = new WindowsVmBackend({
-    userData,
-    consoleLauncher: async (vmxPath) => {
-      const error = await shell.openPath(vmxPath)
-      if (error) throw new Error(`VMware Workstation could not open the Room: ${error}`)
-    }
-  })
-  // The GitHub Service is built after the orchestrator, so clone-time credential
-  // lookups go through this holder instead of a construction-order dependency.
-  const githubRef: { current: GitHubService | null } = { current: null }
-  const orch = new RoomOrchestrator({
-    userData,
-    backend,
-    windowsVm,
-    gateway,
-    db,
-    appVersion: app.getVersion(),
-    appBuild: BUILD_IDENTITY,
-    managedRuntimeStatus: () => managedRuntime.observe(),
-    // Reported, never assumed: this is the executor Rooms actually got, which is
-    // the only thing that explains why a Room behaves the way it does.
-    runtimeMode: runtime.mode,
-    ingressLedger,
-    revokeIngress: runtime.revokeIngress,
-    runtimeId: managedRuntimeId,
-    // The Room's browser profile is an Electron session partition, so only the
-    // desktop app can clear it; core asks through this hook.
-    clearBrowserData: async (roomId) => {
-      await session.fromPartition(roomPreviewPartition(roomId)).clearStorageData()
-    },
-    // Private repositories clone with the credential the human connected to the
-    // GitHub Service; the token stays in the encrypted vault and never reaches
-    // the Room record, the URL, or the logs.
-    gitCredential: async (gitUrl) => githubRef.current?.gitCredentialFor(gitUrl) ?? null
-  })
-
-  protocol.handle('devhotel-thumb', (request) => {
-    const url = new URL(request.url)
-    const roomId = url.hostname
-    if (!/^[a-z0-9]+$/.test(roomId)) return new Response('bad room id', { status: 400 })
-    const file = join(userData, 'rooms', roomId, 'thumb.png')
-    if (!existsSync(file)) return new Response('no thumbnail', { status: 404 })
-    return net.fetch(pathToFileURL(file).toString())
-  })
+  let previews: PreviewManager | null = null
+  let terms: TermManager | null = null
+  let deviceSweeper: ReturnType<typeof startDeviceSweeper> | null = null
+  let roomLifecycleSweeper: ReturnType<typeof startRoomLifecycleSweeper> | null = null
+  let control: Awaited<ReturnType<typeof startControlApi>> | null = null
+  let win: BrowserWindow | null = null
 
   try {
-    await orch.init()
-  } catch (err) {
-    // The orchestrator already recorded this durably: the tray and /v1/status
-    // report startup.code = STARTUP_INIT_FAILED until the next successful init.
-    console.error('orchestrator init failed:', err)
-  }
-
-  const hotelForAgents: import('./controlApi').HotelServicesRef = { github: null }
-  const control = await startControlApi(orch, userData, BUILD_IDENTITY, hotelForAgents).catch((err) => {
-    console.error('control api failed to start:', err)
-    return null
-  })
-
-  // Shared phones are discovered, and dead owners are reclaimed, on the Hotel's
-  // own clock: an owner that died will never call anything again.
-  const deviceSweeper = startDeviceSweeper(orch, {
-    onError: (error) => console.error('Android device sweep failed:', error)
-  })
-  const roomLifecycleSweeper = startRoomLifecycleSweeper(orch, {
-    onError: (error) => console.error('Room lifecycle sweep failed:', error)
-  })
-
-  mainWindow = createWindow()
-  const previews = new PreviewManager(mainWindow, orch, userData)
-  const terms = new TermManager(orch)
-  const cleanRemoval = new CleanRemovalGate()
-  const updater = setupUpdater(mainWindow)
-  hotelForAgents.updateStatus = updater.status
-  const github = new GitHubService(
-    userData,
-    app.isPackaged ? join(process.resourcesPath, 'github', PINNED_GH.asset) : null,
-    fetch,
-    undefined,
-    {
-      isAvailable: () => safeStorage.isEncryptionAvailable(),
-      encryptString: (value) => safeStorage.encryptString(value),
-      decryptString: (value) => safeStorage.decryptString(value)
-    },
-    undefined,
-    (status) => hotelServices.updateState(GITHUB_SERVICE_MANIFEST.id, {
-      provisionState: status.provisionState,
-      connectionState: status.credentialState,
-      statusDetail: status.detail
+    const hotelServices = hotelServicesRepo(db)
+    hotelServices.register({
+      manifest: GITHUB_SERVICE_MANIFEST,
+      availability: process.arch === 'x64' ? 'available' : 'unavailable',
+      enabled: GITHUB_SERVICE_DEFAULT_ENABLED,
+      initialConnectionState: 'disconnected'
     })
-  )
-  hotelForAgents.github = github
-  githubRef.current = github
-  // A packaged Hotel provisions its built-in GitHub infrastructure without
-  // waiting for the Store UI to be opened. Failure is retryable from there.
-  void github.status().catch((error) => console.error('GitHub Service provisioning failed:', error))
-
-  let shutdownAction: ShutdownAction | null = null
-
-  const shutdown = (action: ShutdownAction): void => {
-    // First request wins. In particular, quitAndInstall's before-quit event
-    // must not start a second orchestrator shutdown or race app.exit().
-    if (shutdownAction) return
-    shutdownAction = action
-    quitting = true
-    previews.dispose()
-    terms.dispose()
-    deviceSweeper.stop()
-    roomLifecycleSweeper.stop()
-    control?.stop()
-    void executeShutdownPolicy(action, {
-      shutdown: async () => {
-        await orch.shutdown()
-        // Host ports the managed backend opened for Room ingress must not
-        // outlive the app that opened them.
-        await runtime.dispose()
-        await managedRuntime.stop()
+    const managedRuntime = new ManagedRuntimeManager({
+      userData,
+      installId: dataOwnershipId,
+      fetch: (url, init) => net.fetch(url, init)
+    })
+    // Preparation is resumable and intentionally does not block the Lobby. It is
+    // awaited only far enough to answer one question — is there a usable runtime
+    // to run Rooms on — because a Room's volumes live in exactly one engine and
+    // that choice cannot be revised after the first Room operation.
+    void managedRuntime.prepare().catch((error) => console.error('managed runtime preparation failed:', error))
+    const gateway = new Gateway({ caDir: join(userData, 'ca') })
+    // Host ingress ports are the one owned artifact no engine can enumerate, so
+    // DevHotel writes them down itself. The ledger outlives the process, which is
+    // the whole point: a crash must not be able to leave a port listening for a
+    // container that no longer exists.
+    const ingressLedger = new IngressLedger({ userData })
+    const ownershipRooms = roomsRepo(db)
+    // The managed runtime is preferred; a Host whose Hyper-V gate has not been
+    // passed, or whose runtime is still preparing, keeps working on the external
+    // compatibility engine and is told which one it got.
+    const managedRuntimeReady = await managedRuntime.roomChannel().catch(() => null)
+    const managedRuntimeId = managedRuntimeReady?.runtimeId ?? null
+    const runtime = await selectRoomRuntime({
+      channel: managedRuntimeReady?.channel ?? null,
+      runtimeId: managedRuntimeId,
+      compatibility: {
+        identityFile: join(userData, 'runtime', 'docker-engine.json'),
+        legacyVolumeAdoptionFile: join(userData, 'runtime', 'legacy-volume-adoptions.json'),
+        networkRecoveryAttestationDir: join(userData, 'runtime', 'network-recovery-attestations'),
+        canAdoptLegacyVolume: (roomId) =>
+          ownershipRooms.get(roomId) !== null && existsSync(join(userData, 'rooms', roomId, 'manifest.yaml')),
+        isRoomActive: (roomId) => ownershipRooms.get(roomId) !== null
       },
-      installUpdate: updater.install,
-      relaunch: () => app.relaunch(),
-      exit: (code) => app.exit(code),
-      reportFailure: async (failedAction, error) => {
-        const detail = error instanceof Error ? error.message : String(error)
-        console.error(`DevHotel ${failedAction} shutdown failed:`, error)
-        // Each Room outcome is its own line with its stable code, so a fenced
-        // Android Room is named explicitly rather than folded into one message.
-        if (error instanceof AggregateError) {
-          for (const entry of error.errors) {
-            const code = entry instanceof Error && 'code' in entry ? String(entry.code) : 'SHUTDOWN_FAILURE'
-            console.error(`  [${code}] ${entry instanceof Error ? entry.message : String(entry)}`)
+      onIngressError: (error) => console.error('managed runtime ingress failed:', error),
+      ingressLedger
+    })
+    console.log(`DevHotel Room runtime: ${runtime.mode} — ${runtime.detail}`)
+    const backend = runtime.backend
+    const windowsVm = new WindowsVmBackend({
+      userData,
+      consoleLauncher: async (vmxPath) => {
+        const error = await shell.openPath(vmxPath)
+        if (error) throw new Error(`VMware Workstation could not open the Room: ${error}`)
+      }
+    })
+    // The GitHub Service is built after the orchestrator, so clone-time credential
+    // lookups go through this holder instead of a construction-order dependency.
+    const githubRef: { current: GitHubService | null } = { current: null }
+    const orch = new RoomOrchestrator({
+      userData,
+      backend,
+      windowsVm,
+      gateway,
+      db,
+      appVersion: app.getVersion(),
+      appBuild: BUILD_IDENTITY,
+      managedRuntimeStatus: () => managedRuntime.observe(),
+      // Reported, never assumed: this is the executor Rooms actually got, which is
+      // the only thing that explains why a Room behaves the way it does.
+      runtimeMode: runtime.mode,
+      ingressLedger,
+      revokeIngress: runtime.revokeIngress,
+      runtimeId: managedRuntimeId,
+      // The Room's browser profile is an Electron session partition, so only the
+      // desktop app can clear it; core asks through this hook.
+      clearBrowserData: async (roomId) => {
+        await session.fromPartition(roomPreviewPartition(roomId)).clearStorageData()
+      },
+      // Private repositories clone with the credential the human connected to the
+      // GitHub Service; the token stays in the encrypted vault and never reaches
+      // the Room record, the URL, or the logs.
+      gitCredential: async (gitUrl) => githubRef.current?.gitCredentialFor(gitUrl) ?? null
+    })
+
+    protocol.handle('devhotel-thumb', (request) => {
+      const url = new URL(request.url)
+      const roomId = url.hostname
+      if (!/^[a-z0-9]+$/.test(roomId)) return new Response('bad room id', { status: 400 })
+      const file = join(userData, 'rooms', roomId, 'thumb.png')
+      if (!existsSync(file)) return new Response('no thumbnail', { status: 404 })
+      return net.fetch(pathToFileURL(file).toString())
+    })
+
+    try {
+      await orch.init()
+    } catch (err) {
+      // The orchestrator already recorded this durably: the tray and /v1/status
+      // report startup.code = STARTUP_INIT_FAILED until the next successful init.
+      console.error('orchestrator init failed:', err)
+    }
+
+    const hotelForAgents: import('./controlApi').HotelServicesRef = { github: null }
+    const activeControl = (control = await startControlApi(orch, userData, BUILD_IDENTITY, hotelForAgents).catch((err) => {
+      console.error('control api failed to start:', err)
+      return null
+    }))
+
+    // Shared phones are discovered, and dead owners are reclaimed, on the Hotel's
+    // own clock: an owner that died will never call anything again.
+    const activeDeviceSweeper = (deviceSweeper = startDeviceSweeper(orch, {
+      onError: (error) => console.error('Android device sweep failed:', error)
+    }))
+    const activeRoomLifecycleSweeper = (roomLifecycleSweeper = startRoomLifecycleSweeper(orch, {
+      onError: (error) => console.error('Room lifecycle sweep failed:', error)
+    }))
+
+    const activeWin = (win = createWindow())
+    const activePreviews = (previews = new PreviewManager(activeWin, orch, userData))
+    const activeTerms = (terms = new TermManager(orch))
+    const cleanRemoval = new CleanRemovalGate()
+    const updater = setupUpdater(activeWin)
+    hotelForAgents.updateStatus = updater.status
+    const github = new GitHubService(
+      userData,
+      app.isPackaged ? join(process.resourcesPath, 'github', PINNED_GH.asset) : null,
+      fetch,
+      undefined,
+      {
+        isAvailable: () => safeStorage.isEncryptionAvailable(),
+        encryptString: (value) => safeStorage.encryptString(value),
+        decryptString: (value) => safeStorage.decryptString(value)
+      },
+      undefined,
+      (status) => hotelServices.updateState(GITHUB_SERVICE_MANIFEST.id, {
+        provisionState: status.provisionState,
+        connectionState: status.credentialState,
+        statusDetail: status.detail
+      })
+    )
+    hotelForAgents.github = github
+    githubRef.current = github
+
+    let shutdownAction: ShutdownAction | null = null
+
+    const shutdown = (action: ShutdownAction): void => {
+      // First request wins. In particular, quitAndInstall's before-quit event
+      // must not start a second orchestrator shutdown or race app.exit().
+      if (shutdownAction) return
+      shutdownAction = action
+      quitting = true
+      activePreviews.dispose()
+      activeTerms.dispose()
+      activeDeviceSweeper.stop()
+      activeRoomLifecycleSweeper.stop()
+      activeControl?.stop()
+      void executeShutdownPolicy(action, {
+        shutdown: async () => {
+          await orch.shutdown()
+          // Host ports the managed backend opened for Room ingress must not
+          // outlive the app that opened them.
+          await runtime.dispose()
+          await managedRuntime.stop()
+        },
+        installUpdate: updater.install,
+        relaunch: () => app.relaunch(),
+        exit: (code) => app.exit(code),
+        reportFailure: async (failedAction, error) => {
+          const detail = error instanceof Error ? error.message : String(error)
+          console.error(`DevHotel ${failedAction} shutdown failed:`, error)
+          // Each Room outcome is its own line with its stable code, so a fenced
+          // Android Room is named explicitly rather than folded into one message.
+          if (error instanceof AggregateError) {
+            for (const entry of error.errors) {
+              const code = entry instanceof Error && 'code' in entry ? String(entry.code) : 'SHUTDOWN_FAILURE'
+              console.error(`  [${code}] ${entry instanceof Error ? entry.message : String(entry)}`)
+            }
+          }
+          if (failedAction === 'install-update') {
+            await dialog.showMessageBox(activeWin, {
+              type: 'error',
+              title: 'Update not installed',
+              message: 'DevHotel could not safely stop every Room.',
+              detail: `The update was not installed. DevHotel will exit with the Room data preserved.\n\n${detail}`,
+              buttons: ['Exit DevHotel'],
+              defaultId: 0,
+              noLink: true
+            })
+          } else if (failedAction === 'relaunch') {
+            await dialog.showMessageBox(activeWin, {
+              type: 'error',
+              title: 'DevHotel could not relaunch',
+              message: 'DevHotel could not safely stop every Room.',
+              detail: `DevHotel will exit without scheduling a relaunch. Open it again manually after checking the Rooms.\n\n${detail}`,
+              buttons: ['Exit DevHotel'],
+              defaultId: 0,
+              noLink: true
+            })
           }
         }
-        if (failedAction === 'install-update') {
-          await dialog.showMessageBox(mainWindow!, {
-            type: 'error',
-            title: 'Update not installed',
-            message: 'DevHotel could not safely stop every Room.',
-            detail: `The update was not installed. DevHotel will exit with the Room data preserved.\n\n${detail}`,
-            buttons: ['Exit DevHotel'],
-            defaultId: 0,
-            noLink: true
-          })
-        } else if (failedAction === 'relaunch') {
-          await dialog.showMessageBox(mainWindow!, {
-            type: 'error',
-            title: 'DevHotel could not relaunch',
-            message: 'DevHotel could not safely stop every Room.',
-            detail: `DevHotel will exit without scheduling a relaunch. Open it again manually after checking the Rooms.\n\n${detail}`,
-            buttons: ['Exit DevHotel'],
-            defaultId: 0,
-            noLink: true
-          })
+      })
+    }
+
+    const requestShutdown = (action: ShutdownAction): void => {
+      if (deferShutdownForCleanRemoval(cleanRemoval, () => shutdown(action))) return
+      shutdown(action)
+    }
+
+    const quit = (): void => requestShutdown('quit')
+
+    registerIpc({
+      win: activeWin,
+      orch,
+      windowsVm,
+      gateway,
+      previews: activePreviews,
+      terms: activeTerms,
+      userData,
+      dataOwnershipId,
+      github,
+      requestRelaunch: () => requestShutdown('relaunch'),
+      runCleanRemoval: (operation) => cleanRemoval.run(operation),
+      removeManagedRuntime: (scope) => managedRuntime.remove(scope),
+      // Read-only: reports what the runtime is, and never provisions or elevates.
+      managedRuntimeStatus: async () => managedRuntimeStatusInfo(await managedRuntime.observe()),
+      enableManagedRuntimeFeatures: async () => {
+        const observation = await managedRuntime.enableWindowsFeatures()
+        const gate = observation.windowsFeature
+        return {
+          stage: gate?.stage ?? 'completed',
+          restartRequired: gate?.restartRequired ?? false,
+          edition: gate?.edition ?? null,
+          detail: gate?.detail ?? observation.detail
         }
+      },
+      // Bypass the removal gate only after the detached coordinator exists. The
+      // normal shutdown path still disposes streams/gateway before app.exit.
+      finishCleanRemoval: () => setTimeout(() => shutdown('quit'), 500)
+    })
+
+    createTray({
+      win: activeWin,
+      orch,
+      onQuit: quit,
+      updateStatus: updater.status,
+      onUpdateStatusChange: updater.onStatusChange,
+      checkForUpdates: updater.check,
+      installUpdate: () => requestShutdown('install-update')
+    })
+
+    app.on('before-quit', (e) => {
+      if (!quitting) {
+        e.preventDefault()
+        quit()
       }
     })
+
+    // Expose the window to second-instance launches only after IPC, tray, and quit
+    // hooks are wired so a mid-startup failure can never surface a broken shell.
+    mainWindow = activeWin
+    // A packaged Hotel provisions its built-in GitHub infrastructure without
+    // waiting for the Store UI to be opened. Failure is retryable from there.
+    void github.status().catch((error) => console.error('GitHub Service provisioning failed:', error))
+  } catch (error) {
+    mainWindow = null
+    ignoreCleanupError(() => previews?.dispose())
+    ignoreCleanupError(() => terms?.dispose())
+    ignoreCleanupError(() => deviceSweeper?.stop())
+    ignoreCleanupError(() => roomLifecycleSweeper?.stop())
+    ignoreCleanupError(() => control?.stop())
+    ignoreCleanupError(() => {
+      if (win && !win.isDestroyed()) win.destroy()
+    })
+    ignoreCleanupError(() => db.close())
+    throw error
   }
-
-  const requestShutdown = (action: ShutdownAction): void => {
-    if (deferShutdownForCleanRemoval(cleanRemoval, () => shutdown(action))) return
-    shutdown(action)
-  }
-
-  const quit = (): void => requestShutdown('quit')
-
-  registerIpc({
-    win: mainWindow,
-    orch,
-    windowsVm,
-    gateway,
-    previews,
-    terms,
-    userData,
-    dataOwnershipId,
-    github,
-    requestRelaunch: () => requestShutdown('relaunch'),
-    runCleanRemoval: (operation) => cleanRemoval.run(operation),
-    removeManagedRuntime: (scope) => managedRuntime.remove(scope),
-    // Read-only: reports what the runtime is, and never provisions or elevates.
-    managedRuntimeStatus: async () => managedRuntimeStatusInfo(await managedRuntime.observe()),
-    enableManagedRuntimeFeatures: async () => {
-      const observation = await managedRuntime.enableWindowsFeatures()
-      const gate = observation.windowsFeature
-      return {
-        stage: gate?.stage ?? 'completed',
-        restartRequired: gate?.restartRequired ?? false,
-        edition: gate?.edition ?? null,
-        detail: gate?.detail ?? observation.detail
-      }
-    },
-    // Bypass the removal gate only after the detached coordinator exists. The
-    // normal shutdown path still disposes streams/gateway before app.exit.
-    finishCleanRemoval: () => setTimeout(() => shutdown('quit'), 500)
-  })
-
-  createTray({
-    win: mainWindow,
-    orch,
-    onQuit: quit,
-    updateStatus: updater.status,
-    onUpdateStatusChange: updater.onStatusChange,
-    checkForUpdates: updater.check,
-    installUpdate: () => requestShutdown('install-update')
-  })
-
-  app.on('before-quit', (e) => {
-    if (!quitting) {
-      e.preventDefault()
-      quit()
-    }
-  })
 }
+
+const reportStartupFailure = createStartupFailureReporter({
+  argv: process.argv,
+  logError: (message) => console.error(message),
+  showDialog: async ({ title, message, detail }) => {
+    if (!app.isReady()) {
+      dialog.showErrorBox(title, `${message}\n\n${detail}`)
+      return
+    }
+    await dialog.showMessageBox({
+      type: 'error',
+      title,
+      message,
+      detail,
+      buttons: ['Exit DevHotel'],
+      defaultId: 0,
+      noLink: true
+    })
+  }
+})
 
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
-    }
+    if (!canFocusMainWindow(mainWindow)) return
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
   })
 
-  void app.whenReady().then(() => bootstrap())
+  void executeStartupPolicy({
+    bootstrap: () => app.whenReady().then(() => bootstrap()),
+    reportFailure: reportStartupFailure,
+    exit: (code) => app.exit(code)
+  })
 
   app.on('window-all-closed', () => {
     // tray app — stay alive until Quit
