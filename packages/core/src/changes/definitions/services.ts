@@ -36,7 +36,6 @@ export function serviceForBackupId(id: string): ServiceKind | null {
   return null
 }
 
-/** Resolve a public opaque backup ID only inside its owning Room's plain backups directory. */
 export function resolveRoomBackupFile(
   userData: string,
   roomId: string,
@@ -97,11 +96,6 @@ export async function pingService(
   return { ok: false, detail: `${SERVICE_LABEL[svc]} not answering${last ? `: ${last}` : ''}` }
 }
 
-/**
- * Awake clones use a portable logical dump of DevHotel's managed database.
- * Reject whole-instance state which that format cannot faithfully represent;
- * sleeping clones use a stopped full-volume copy and therefore need no check.
- */
 export async function validatePostgresLogicalClone(ctx: ChangeCtx): Promise<void> {
   const databases = await ctx.backend.execInService(
     ctx.roomId,
@@ -162,8 +156,6 @@ export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Pro
       )
       if (res.code !== 0) throw new Error(`pg_dump failed: ${res.stderr.slice(-300)}`)
       if (statSync(partial).size === 0) throw new Error('pg_dump produced an empty backup')
-      // A completed dump becomes visible atomically; crashes and disk errors
-      // leave at most a uniquely named .partial file which finally removes.
       renameSync(partial, file)
       return file
     } finally {
@@ -187,12 +179,11 @@ export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Pro
 export async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: string): Promise<void> {
   if (!existsSync(file)) throw new Error(`Backup file not found: ${file}`)
   if (svc === 'postgres') {
-    // separate -c invocations: DROP DATABASE refuses to run inside the implicit
-    // transaction psql wraps around a single multi-statement -c
+    // separate -c calls: psql runs a multi-statement -c in one transaction, which DROP DATABASE refuses
     const drop = await ctx.backend.execInService(
       ctx.roomId,
       'postgres',
-      ['psql', '-U', SERVICE_DB_USER, '-d', 'postgres', '-c', `DROP DATABASE IF EXISTS ${SERVICE_DB_NAME};`],
+      ['psql', '-U', SERVICE_DB_USER, '-d', 'postgres', '-c', `DROP DATABASE IF EXISTS ${SERVICE_DB_NAME} WITH (FORCE);`],
       { timeoutMs: 120_000 }
     )
     if (drop.code !== 0) throw new Error(`database reset failed: ${drop.stderr.slice(-300)}`)
@@ -214,7 +205,14 @@ export async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, f
     return
   }
   await ctx.backend.stopService(ctx.roomId, 'redis')
-  await ctx.backend.copyToService(ctx.roomId, 'redis', file, '/data/dump.rdb')
+  try {
+    await ctx.backend.copyToService(ctx.roomId, 'redis', file, '/data/dump.rdb')
+  } catch (copyError) {
+    await ctx.backend.startService(ctx.roomId, 'redis').catch((startError: unknown) => {
+      ctx.log(`Redis restart after a failed restore copy failed: ${startError instanceof Error ? startError.message : String(startError)}`)
+    })
+    throw copyError
+  }
   await ctx.backend.startService(ctx.roomId, 'redis')
 }
 
@@ -312,19 +310,12 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
   },
   async preflight(ctx, p) {
     if (!ctx.room().services[p.service]) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
-    // the safety dump is taken by talking to the running service, so refuse
-    // early and say why rather than deleting the volume with nothing saved
     if (!ctx.isAwake() || (await ctx.backend.serviceState(ctx.roomId, p.service)) !== 'running') {
       throw new Error(
         `Start the room and its ${SERVICE_LABEL[p.service]} app before removing it — the safety backup needs it running`
       )
     }
   },
-  /**
-   * The interlock: capture runs before the change is admitted, so a failed
-   * dump aborts the removal with the container and volume still intact.
-   * Nothing below this point may delete data this dump does not cover.
-   */
   async capture(ctx, p): Promise<RemoveCaptured> {
     const version = ctx.room().services[p.service]!.version
     const backupFile = await backupServiceToFile(ctx, p.service)
@@ -359,8 +350,6 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
     const label = SERVICE_LABEL[service]
     const captured = entry.captured as Partial<RemoveCaptured> | null
     const backupFile = removeCapturedBackup(captured)
-    // an undo that only recreates an empty database is not a restore — refuse
-    // before touching the record so the operator can find the dump instead
     if (!backupFile || !existsSync(backupFile)) {
       throw new Error(
         `${label} safety backup is missing — undo cannot restore its data; add ${label} again and restore a backup you still have`
@@ -494,7 +483,6 @@ export const dbBackupChange: ChangeDefinition<{ service: ServiceKind }> = {
     steps.push(`Backup written: ${file}`)
   },
   async verify(ctx, p) {
-    // newest backup for this service must exist and be non-empty
     const { readdirSync } = await import('node:fs')
     const dir = backupsDir(ctx)
     const files = readdirSync(dir)

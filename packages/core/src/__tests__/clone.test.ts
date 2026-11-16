@@ -331,6 +331,41 @@ describe('RoomOrchestrator.cloneRoom', () => {
     expect(backend.calls.some((call) => call.startsWith('copyVolume:'))).toBe(false)
   })
 
+  it('restores copied Postgres data even when an app session holds the clone database open', async () => {
+    const source = makeRoom({
+      id: 'source12',
+      project: 'api',
+      nickname: 'dev',
+      domain: 'api-connected.localhost',
+      services: { postgres: { version: '17' } },
+      hostPort: backend.hostPort
+    })
+    orch.rooms.create(source)
+    backend.serviceStates.set('postgres', 'running')
+    const sql: string[] = []
+    const exec = backend.execInService.bind(backend)
+    backend.execInService = async (roomId, svc, cmd) => {
+      const statement = cmd[cmd.length - 2] === '-c' ? cmd[cmd.length - 1]! : ''
+      if (statement.startsWith('DROP DATABASE') || statement.startsWith('CREATE DATABASE')) sql.push(statement)
+      if (statement.startsWith('DROP DATABASE') && !statement.includes('WITH (FORCE)')) {
+        return { code: 1, stdout: '', stderr: 'ERROR:  database "devhotel" is being accessed by other users' }
+      }
+      return exec(roomId, svc, cmd)
+    }
+
+    const cloned = await orch.cloneRoom({
+      sourceRoomId: source.id,
+      nickname: 'connected',
+      copyDependencies: false,
+      services: 'copy',
+      actor: 'user'
+    })
+
+    expect(cloned.status).toBe('ready')
+    expect(sql).toEqual(['DROP DATABASE IF EXISTS devhotel WITH (FORCE);', 'CREATE DATABASE devhotel;'])
+    expect(backend.calls).toContain('execInServiceFromFile:postgres:psql')
+  })
+
   it('removes a partial streamed Postgres dump and resumes the source when disk output fails', async () => {
     const source = makeRoom({
       id: 'source09',
