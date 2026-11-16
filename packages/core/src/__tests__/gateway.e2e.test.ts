@@ -1,11 +1,14 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import crypto from 'node:crypto'
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
+import tls from 'node:tls'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { ensureCa } from '../gateway/ca'
 import { Gateway } from '../gateway/gateway'
 import { relayPreamble } from '../relayProtocol'
 
@@ -63,6 +66,7 @@ let httpPort: number
 let httpsPort: number
 let targetA: http.Server
 let targetB: http.Server
+let portB: number
 let gatedTarget: net.Server
 const GATED_TOKEN = 'd'.repeat(64)
 const upgradeSockets = new Set<Duplex>()
@@ -85,7 +89,7 @@ beforeAll(async () => {
     res.setHeader('content-type', 'text/plain')
     res.end('room-b')
   })
-  const portB = await listen(targetB)
+  portB = await listen(targetB)
 
   gatedTarget = net.createServer((socket) => {
     let buffer = ''
@@ -314,4 +318,174 @@ describe('gateway e2e', () => {
       throw error
     }
   })
+
+  it('serves a handshaken domain from memory without reading the certificate files again', async () => {
+    const ca = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    expect(await strictRequest(httpsPort, 'b.localhost', ca)).toMatchObject({ status: 200, body: 'room-b' })
+
+    const certsDir = path.join(caDir, 'certs')
+    const saved = path.join(caDir, 'certs.saved')
+    await rename(certsDir, saved)
+    await writeFile(certsDir, 'not a directory')
+    try {
+      expect(await strictRequest(httpsPort, 'b.localhost', ca)).toMatchObject({ status: 200, body: 'room-b' })
+    } finally {
+      await rm(certsDir, { force: true })
+      await rename(saved, certsDir)
+    }
+  }, 60000)
+
+  it('serves a replaced leaf certificate once the https route is set again', async () => {
+    const ca = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    const before = await leafSerial(httpsPort, 'b.localhost', ca)
+    await rm(path.join(caDir, 'certs', 'b.localhost.pem'))
+    await rm(path.join(caDir, 'certs', 'b.localhost.key'))
+    expect(await leafSerial(httpsPort, 'b.localhost', ca)).toBe(before)
+
+    await gateway.setRoute({ domain: 'b.localhost', roomId: 'room-b', targetPort: portB, https: true })
+    const after = await leafSerial(httpsPort, 'b.localhost', ca)
+    expect(after).not.toBe(before)
+    expect(await strictRequest(httpsPort, 'b.localhost', ca)).toMatchObject({ status: 200, body: 'room-b' })
+  }, 60000)
+
+  it('reissues room certificates under a regenerated root CA after a restart', async () => {
+    const oldCa = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    await gateway.stop()
+    await rm(path.join(caDir, 'rootCA.pem'))
+    await rm(path.join(caDir, 'rootCA.key'))
+    const restarted = await gateway.start()
+    httpPort = restarted.httpPort!
+    httpsPort = restarted.httpsPort!
+    const newCa = await readFile(path.join(caDir, 'rootCA.pem'), 'utf8')
+    expect(newCa).not.toBe(oldCa)
+
+    expect(await strictRequest(httpsPort, 'b.localhost', newCa)).toMatchObject({ status: 200, body: 'room-b' })
+    await expect(strictRequest(httpsPort, 'b.localhost', oldCa)).rejects.toThrow()
+  }, 60000)
+})
+
+function fingerprintOfPem(pem: string): string {
+  return new crypto.X509Certificate(pem).fingerprint256
+}
+
+function strictHandshake(
+  port: number,
+  servername: string | undefined,
+  ca: string
+): Promise<{ authorized: boolean; error: string | null; serial: string; issuerFingerprint: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host: '127.0.0.1', port, servername, ca, rejectUnauthorized: false, checkServerIdentity: () => undefined },
+      () => {
+        const peer = socket.getPeerCertificate(true)
+        const result = {
+          authorized: socket.authorized,
+          error: socket.authorizationError ? String(socket.authorizationError) : null,
+          serial: peer.serialNumber,
+          issuerFingerprint: peer.issuerCertificate?.fingerprint256 ?? ''
+        }
+        socket.end()
+        resolve(result)
+      }
+    )
+    socket.on('error', reject)
+  })
+}
+
+async function leafSerial(port: number, servername: string, ca: string): Promise<string> {
+  const handshake = await strictHandshake(port, servername, ca)
+  expect(handshake.authorized).toBe(true)
+  return handshake.serial
+}
+
+function strictRequest(port: number, host: string, ca: string): Promise<SimpleResponse> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      { host: '127.0.0.1', port, path: '/', headers: { host }, servername: host, ca, agent: false },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c: string) => (body += c))
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }))
+      }
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+describe('root CA regenerated while the gateway is running', () => {
+  let liveDir: string
+  let liveGateway: Gateway
+  let liveHttpsPort: number
+  let liveTarget: http.Server
+  let liveTargetPort: number
+
+  beforeAll(async () => {
+    liveDir = await mkdtemp(path.join(os.tmpdir(), 'devhotel-gw-rotate-'))
+    liveTarget = http.createServer((_req, res) => {
+      res.setHeader('content-type', 'text/plain')
+      res.end('live-room')
+    })
+    liveTargetPort = await listen(liveTarget)
+    liveGateway = new Gateway({ caDir: liveDir, httpPorts: [0], httpsPorts: [0] })
+    liveHttpsPort = (await liveGateway.start()).httpsPort!
+  }, 60000)
+
+  afterAll(async () => {
+    await liveGateway.stop()
+    liveTarget.closeAllConnections()
+    await new Promise((r) => liveTarget.close(r))
+    await rm(liveDir, { recursive: true, force: true })
+  }, 30000)
+
+  it('serves cached and first-time domains under the new root without a restart', async () => {
+    await liveGateway.setRoute({
+      domain: 'cached.localhost',
+      roomId: 'room-cached',
+      targetPort: liveTargetPort,
+      https: true
+    })
+    await liveGateway.setRoute({
+      domain: 'first.localhost',
+      roomId: 'room-first',
+      targetPort: liveTargetPort,
+      https: false
+    })
+    const oldCa = await readFile(path.join(liveDir, 'rootCA.pem'), 'utf8')
+    expect(await strictRequest(liveHttpsPort, 'cached.localhost', oldCa)).toMatchObject({
+      status: 200,
+      body: 'live-room'
+    })
+
+    await writeFile(path.join(liveDir, 'rootCA.key'), 'damaged')
+    const regenerated = await ensureCa(liveDir)
+    const newCa = await readFile(path.join(liveDir, 'rootCA.pem'), 'utf8')
+    expect(regenerated.certPem).toBe(newCa)
+    expect(newCa).not.toBe(oldCa)
+
+    for (const domain of ['cached.localhost', 'first.localhost', undefined]) {
+      expect(await strictHandshake(liveHttpsPort, domain, newCa)).toMatchObject({
+        authorized: true,
+        error: null,
+        issuerFingerprint: fingerprintOfPem(newCa)
+      })
+    }
+    expect(await strictRequest(liveHttpsPort, 'cached.localhost', newCa)).toMatchObject({
+      status: 200,
+      body: 'live-room'
+    })
+
+    await liveGateway.setRoute({
+      domain: 'added.localhost',
+      roomId: 'room-added',
+      targetPort: liveTargetPort,
+      https: true
+    })
+    expect(await strictRequest(liveHttpsPort, 'added.localhost', newCa)).toMatchObject({
+      status: 200,
+      body: 'live-room'
+    })
+    await expect(strictRequest(liveHttpsPort, 'cached.localhost', oldCa)).rejects.toThrow()
+  }, 90000)
 })
