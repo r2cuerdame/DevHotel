@@ -1,5 +1,16 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync
+} from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { zBackupId, type ChangeEntry, type ServiceKind } from '@devhotel/shared'
 import { SERVICE_DB_NAME, SERVICE_DB_USER, SERVICE_DEFAULT_VERSIONS } from '../../backend/naming'
@@ -16,6 +27,40 @@ function assertAllowedServiceVersion(service: ServiceKind, version: string): voi
   if (!SERVICE_ALLOWED_VERSIONS[service].includes(version)) {
     throw new Error(`Unsupported ${SERVICE_LABEL[service]} version: ${version}`)
   }
+}
+
+function assertNotPostgresDowngrade(service: ServiceKind, from: string, to: string): void {
+  if (service !== 'postgres' || Number(to) >= Number(from)) return
+  throw new Error(
+    `PostgreSQL ${from} cannot be switched down to ${to} — a ${from} backup does not load into an older PostgreSQL. Keep ${from}, or restore a backup made on ${to} or earlier into a fresh ${to}.`
+  )
+}
+
+const POSTGRES_DUMP_HEADER_BYTES = 8192
+
+export function postgresDumpMajorVersion(file: string): number | null {
+  let header: string
+  try {
+    const fd = openSync(file, 'r')
+    try {
+      const buffer = Buffer.alloc(POSTGRES_DUMP_HEADER_BYTES)
+      header = buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString('utf8')
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+  const majors = [...header.matchAll(/^-- Dumped (?:from database|by pg_dump) version (\d+)/gm)].map((m) => Number(m[1]))
+  return majors.length ? Math.max(...majors) : null
+}
+
+function assertPostgresBackupFits(file: string, backupId: string, current: string): void {
+  const dumped = postgresDumpMajorVersion(file)
+  if (dumped === null || dumped <= Number(current)) return
+  throw new Error(
+    `Backup ${backupId} was made on PostgreSQL ${dumped} and cannot be restored into PostgreSQL ${current}. Switch this Room to PostgreSQL ${dumped} first, then restore it.`
+  )
 }
 
 function backupsDir(ctx: ChangeCtx): string {
@@ -387,6 +432,7 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
     assertAllowedServiceVersion(p.service, p.version)
     if (!current) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
     if (current.version === p.version) throw new Error(`${SERVICE_LABEL[p.service]} is already on ${p.version}`)
+    assertNotPostgresDowngrade(p.service, current.version, p.version)
     if (!ctx.isAwake()) throw new Error('Wake the room first — the data is backed up before switching')
   },
   async apply(ctx, p, steps) {
@@ -511,9 +557,11 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; backupId:
     }
   },
   async preflight(ctx, p) {
-    if (!ctx.room().services[p.service]) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
+    const current = ctx.room().services[p.service]
+    if (!current) throw new Error(`${SERVICE_LABEL[p.service]} is not in this room`)
     if (!ctx.isAwake()) throw new Error('Wake the room first')
-    resolveRoomBackupFile(ctx.userData, ctx.roomId, p.service, p.backupId)
+    const file = resolveRoomBackupFile(ctx.userData, ctx.roomId, p.service, p.backupId)
+    if (p.service === 'postgres') assertPostgresBackupFits(file, p.backupId, current.version)
   },
   async capture(ctx, p) {
     const backupFile = await backupServiceToFile(ctx, p.service)

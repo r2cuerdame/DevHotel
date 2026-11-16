@@ -576,6 +576,108 @@ describe('services', () => {
   })
 })
 
+describe('PostgreSQL version direction', () => {
+  function touchedPostgres(): boolean {
+    return backend.calls.some((call) =>
+      call.startsWith('removeService:postgres') ||
+      call.startsWith('createService:postgres') ||
+      call.startsWith('execInServiceToFile:postgres') ||
+      call.startsWith('execInServiceFromFile:postgres') ||
+      call === 'execInService:postgres:psql'
+    )
+  }
+
+  async function roomBackup(changeCtx: ChangeCtx, header: string): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const dir = join(changeCtx.userData, 'rooms', 'room1abc', 'backups')
+    mkdirSync(dir, { recursive: true })
+    const backupId = 'postgres-2026-11-01T10-00-00-0a1b2c3d.sql'
+    writeFileSync(join(dir, backupId), `${header}SET statement_timeout = 0;\nCREATE TABLE t();\n`)
+    return backupId
+  }
+
+  function dumpHeader(major: string): string {
+    return [
+      '--',
+      '-- PostgreSQL database dump',
+      '--',
+      '',
+      `-- Dumped from database version ${major} (Debian ${major}-1.pgdg120+1)`,
+      `-- Dumped by pg_dump version ${major} (Debian ${major}-1.pgdg120+1)`,
+      '',
+      ''
+    ].join('\n')
+  }
+
+  beforeEach(() => {
+    backend.serviceStates.set('postgres', 'running')
+  })
+
+  it('refuses switching PostgreSQL to an older major before backing up or deleting its data', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '17' } } })
+
+    await expect(
+      engine.execute(ctx(), 'service-version', { service: 'postgres', version: '16' }, 'user')
+    ).rejects.toThrow(/PostgreSQL 17 cannot be switched down to 16/)
+
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(backend.serviceStates.get('postgres')).toBe('running')
+    expect(touchedPostgres()).toBe(false)
+    expect(changes.list('room1abc').filter((c) => c.kind === 'service-version')).toHaveLength(0)
+  })
+
+  it('still upgrades PostgreSQL 16 to 17', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(backend.calls).toContain('createService:postgres:17')
+    expect(backend.calls).toContain('execInServiceFromFile:postgres:psql')
+  })
+
+  it('keeps Redis version switches in both directions', async () => {
+    rooms.update('room1abc', { services: { redis: { version: '8' } } })
+    backend.serviceStates.set('redis', 'running')
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'redis', version: '7' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '7' })
+  })
+
+  it('refuses restoring a backup dumped by a newer PostgreSQL before the safety backup or drop', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    const changeCtx = ctx()
+    const backupId = await roomBackup(changeCtx, dumpHeader('17.2'))
+
+    await expect(
+      engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId }, 'user')
+    ).rejects.toThrow(/made on PostgreSQL 17 and cannot be restored into PostgreSQL 16/)
+
+    expect(touchedPostgres()).toBe(false)
+    expect(changes.list('room1abc').filter((c) => c.kind === 'db-restore')).toHaveLength(0)
+  })
+
+  it.each([
+    ['the same major', dumpHeader('16.4')],
+    ['an older major', dumpHeader('15.8')],
+    ['no version header', '-- hand written dump\n']
+  ])('restores a backup with %s', async (_label, header) => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    const changeCtx = ctx()
+    const backupId = await roomBackup(changeCtx, header)
+
+    const entry = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(backend.calls).toContain('execInServiceToFile:postgres:pg_dump')
+    expect(backend.calls).toContain('execInServiceFromFile:postgres:psql')
+  })
+})
+
 describe('undo verification follows the reverted target', () => {
   function androidEmulatorRoom(): void {
     rooms.update('room1abc', {
