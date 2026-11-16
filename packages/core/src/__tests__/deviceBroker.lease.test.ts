@@ -711,3 +711,99 @@ describe('Android device broker — exclusive lease over a shared USB phone', ()
     db.close()
   })
 })
+
+describe('Android device broker — conditional release by expected lease ID', () => {
+  async function granted(broker: AndroidDeviceBroker, roomId = 'aaaa1111') {
+    const result = await broker.requestDevice({ roomId, project: 'AppDied', purpose: 'acceptance', workerId: `worker-${roomId}` })
+    if (result.state !== 'granted') throw new Error('unreachable')
+    return result.lease
+  }
+
+  it('releases when the Room still holds exactly the expected lease', async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const lease = await granted(broker)
+
+    const released = await broker.releaseRoom('aaaa1111', 'qa finished', { expectedLeaseId: lease.id })
+
+    expect(released?.lease).toMatchObject({ id: lease.id, state: 'released' })
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+  })
+
+  it('refuses a stale or unknown lease ID while the Room holds a newer lease, and keeps the newer one', async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const old = await granted(broker)
+    await broker.releaseRoom('aaaa1111', 'reclaimed')
+    const current = await granted(broker)
+
+    await expect(broker.releaseRoom('aaaa1111', 'stale caller', { expectedLeaseId: old.id }))
+      .rejects.toMatchObject({ code: 'lease-ended' })
+    await expect(broker.releaseRoom('aaaa1111', 'stale caller', { expectedLeaseId: '00000000-0000-4000-8000-000000000000' }))
+      .rejects.toMatchObject({ code: 'lease-mismatch' })
+    expect(broker.leaseForRoom('aaaa1111')).toMatchObject({ id: current.id, state: 'active' })
+  })
+
+  it("never releases another Room's phone through an ID it does not hold", async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const theirs = await granted(broker, 'bbbb2222')
+    // aaaa1111 waits in line; a refused conditional release must not cancel that either.
+    await broker.requestDevice({ roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a' })
+
+    const refusal = await broker.releaseRoom('aaaa1111', 'wrong lease', { expectedLeaseId: theirs.id }).catch((error) => error)
+
+    expect(refusal).toBeInstanceOf(DeviceLeaseError)
+    expect(refusal).toMatchObject({ code: 'lease-mismatch' })
+    expect(String(refusal.message)).not.toContain('bbbb2222')
+    expect(broker.leaseForRoom('bbbb2222')).toMatchObject({ id: theirs.id, state: 'active' })
+    expect(broker.listDevices()[0]!.queueDepth).toBe(1)
+  })
+
+  it('refuses with lease-ended once the expected lease was released or reclaimed', async () => {
+    const { broker, now } = makeBroker()
+    await broker.refreshInventory()
+    const lease = await granted(broker)
+    await broker.releaseRoom('aaaa1111', 'first release', { expectedLeaseId: lease.id })
+
+    await expect(broker.releaseRoom('aaaa1111', 'again', { expectedLeaseId: lease.id }))
+      .rejects.toMatchObject({ code: 'lease-ended' })
+
+    const stale = await broker.requestDevice({
+      roomId: 'aaaa1111', project: 'AppDied', purpose: 'acceptance', workerId: 'worker-a', ttlMs: 30_000
+    })
+    if (stale.state !== 'granted') throw new Error('unreachable')
+    // A silent opaque worker is reclaimed after it stays unobserved through grace.
+    now.value += 10 * 60 * 60 * 1000
+    await broker.reap()
+    now.value += 10 * 60 * 60 * 1000
+    await broker.reap()
+    expect(broker.leaseForRoom('aaaa1111')).toBeNull()
+    await expect(broker.releaseRoom('aaaa1111', 'after reclaim', { expectedLeaseId: stale.lease.id }))
+      .rejects.toMatchObject({ code: 'lease-ended' })
+  })
+
+  it('still lets the holder acknowledge exactly its own disconnect-revoked lease', async () => {
+    const { broker, adb } = makeBroker()
+    await broker.refreshInventory()
+    const lease = await granted(broker)
+    adb.phones = []
+    await broker.refreshInventory()
+
+    const acknowledged = await broker.releaseRoom('aaaa1111', 'qa finished', { expectedLeaseId: lease.id })
+
+    expect(acknowledged?.lease.id).toBe(lease.id)
+    await expect(broker.releaseRoom('aaaa1111', 'again', { expectedLeaseId: lease.id }))
+      .rejects.toMatchObject({ code: 'lease-ended' })
+  })
+
+  it('keeps the unconditional release by Room for callers that send no lease ID', async () => {
+    const { broker } = makeBroker()
+    await broker.refreshInventory()
+    const lease = await granted(broker)
+
+    const released = await broker.releaseRoom('aaaa1111', 'legacy caller')
+
+    expect(released?.lease).toMatchObject({ id: lease.id, state: 'released' })
+  })
+})

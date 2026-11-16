@@ -557,7 +557,9 @@ export async function startControlApi(
         }
         if (action === 'release') {
           const body = zReleaseDeviceBody.parse(await readBody(req))
-          sendJson(res, 200, await orch.releaseAndroidDevice(safeRoomId, body.reason))
+          // expectedLeaseId turns this into a conditional release; a lease that
+          // is no longer the named one answers 409 lease-mismatch/lease-ended.
+          sendJson(res, 200, await orch.releaseAndroidDevice(safeRoomId, body.reason, { expectedLeaseId: body.expectedLeaseId }))
           return
         }
         if (action === 'adb') {

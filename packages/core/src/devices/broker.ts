@@ -15,7 +15,8 @@ import {
   type DeviceQueueEntry,
   type DeviceRequest,
   type DeviceRequestResult,
-  type DeviceWaiter
+  type DeviceWaiter,
+  type ReleaseDeviceOptions
 } from '@devhotel/shared'
 import type { AndroidDevicesRepo } from '../store/androidDevicesRepo'
 import { classifyAdbCommand } from './adbOperations'
@@ -662,9 +663,18 @@ export class AndroidDeviceBroker {
     return this.close(lease, 'released', reason)
   }
 
-  /** Releasing by Room is what Room stop/delete needs — it has no lease ID. */
-  async releaseRoom(roomId: string, reason = 'room released the device'): Promise<{ lease: DeviceLease; promoted: DeviceLease | null } | null> {
+  /**
+   * Releasing by Room is what Room stop/delete needs — it has no lease ID. A
+   * caller that does hold one passes expectedLeaseId, so a lease that was
+   * reclaimed and re-granted in the meantime is never handed back by mistake.
+   */
+  async releaseRoom(
+    roomId: string,
+    reason = 'room released the device',
+    opts: ReleaseDeviceOptions = {}
+  ): Promise<{ lease: DeviceLease; promoted: DeviceLease | null } | null> {
     const lease = this.repo.activeLeaseForRoom(roomId)
+    if (opts.expectedLeaseId !== undefined) this.assertExpectedLease(roomId, lease, opts.expectedLeaseId)
     // A Room that goes away should not keep its place in line either.
     for (const entry of this.repo.waiting(null)) {
       if (entry.roomId === roomId) this.repo.resolveQueueEntry(entry.id, 'cancelled', this.at())
@@ -683,6 +693,33 @@ export class AndroidDeviceBroker {
       return null
     }
     return this.close(lease, 'released', reason)
+  }
+
+  /** Refuse, before any side effect, a conditional release of a lease the Room no longer holds. */
+  private assertExpectedLease(roomId: string, active: DeviceLease | null, expectedLeaseId: string): void {
+    if (active?.id === expectedLeaseId) return
+    const expected = this.repo.getLease(expectedLeaseId)
+    if (expected && expected.roomId === roomId && expected.state !== 'active') {
+      // A disconnect revokes the lease but leaves the Room sticky on the failed
+      // phone until it releases; acknowledging that exact lease is still its own.
+      const unacknowledgedDisconnect = !active &&
+        expected.state === 'revoked' &&
+        expected.releaseReason === 'device disconnected' &&
+        this.repo.latestLeaseForRoom(roomId)?.id === expectedLeaseId
+      if (unacknowledgedDisconnect) return
+      throw new DeviceLeaseError(
+        'lease-ended',
+        `Device lease ${expectedLeaseId} already ended (${expected.state}); nothing was released.`
+      )
+    }
+    // Another Room's lease or an unknown ID is answered the same way, so the
+    // refusal never tells a caller who holds the phone now.
+    throw new DeviceLeaseError(
+      'lease-mismatch',
+      active
+        ? `Room ${roomId} now holds a different device lease than ${expectedLeaseId}; nothing was released.`
+        : `Room ${roomId} holds no device lease ${expectedLeaseId}; nothing was released.`
+    )
   }
 
   private async close(

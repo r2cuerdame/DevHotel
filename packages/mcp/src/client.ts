@@ -568,8 +568,11 @@ export class ControlClient {
   attachAndroidDevice(roomId: string, body: Record<string, unknown>) {
     return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/device/attach`, body)
   }
-  releaseAndroidDevice(roomId: string, reason?: string) {
-    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/device/release`, reason ? { reason } : {})
+  releaseAndroidDevice(roomId: string, reason?: string, expectedLeaseId?: string) {
+    return this.req<unknown>('POST', `/v1/rooms/${encodeURIComponent(roomId)}/device/release`, {
+      ...(reason ? { reason } : {}),
+      ...(expectedLeaseId ? { expectedLeaseId } : {})
+    })
   }
   adbOnDevice(roomId: string, args: string[], timeoutMs?: number) {
     return this.req<{ code: number; stdout: string; stderr: string }>(
