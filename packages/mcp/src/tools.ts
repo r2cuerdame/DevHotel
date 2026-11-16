@@ -971,8 +971,15 @@ export function makeTools(getClient: () => Promise<ControlClient>): ToolDef[] {
       name: 'release_android_device',
       description:
         'Give the phone back and let the next queued Room have it. The phone is handed on exactly as it was left: DevHotel runs no uninstall, no pm clear and no data wipe, so the build you just verified stays installed for a human to open. Always release as soon as your device work is done.',
-      schema: { roomId: zRoomId, reason: z.string().optional().describe('what finished, shown in the device history') },
-      handler: wrap(async (a) => (await getClient()).releaseAndroidDevice(a.roomId, a.reason))
+      schema: {
+        roomId: zRoomId,
+        reason: z.string().optional().describe('what finished, shown in the device history'),
+        expectedLeaseId: z
+          .string()
+          .optional()
+          .describe('lease ID from attach_android_device; release only if the Room still holds exactly this lease, otherwise refuse with lease-mismatch or lease-ended')
+      },
+      handler: wrap(async (a) => (await getClient()).releaseAndroidDevice(a.roomId, a.reason, a.expectedLeaseId))
     },
     {
       name: 'heartbeat_android_device',

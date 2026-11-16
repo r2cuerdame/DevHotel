@@ -248,6 +248,24 @@ terminated with an explicit error rather than buffered into the desktop process.
 | MCP | `android_devices`, `attach_android_device`, `release_android_device`, `heartbeat_android_device`, `cancel_android_device_request`, `android_device_adb` |
 | Core | `RoomOrchestrator.attachAndroidDevice / releaseAndroidDevice / adbOnDevice / resolveAdbTarget / androidDeviceStatus / reapAndroidDevices` |
 
+### Conditional release
+
+`POST /v1/rooms/:id/device/release` (MCP `release_android_device`) accepts an
+optional `expectedLeaseId` — the lease ID returned by attach. With it the
+broker releases only when the Room still holds exactly that lease; otherwise it
+changes nothing (no release, no queue cancellation) and answers `409` with
+`{ error, code }`:
+
+| `code` | Meaning |
+|---|---|
+| `lease-mismatch` | The Room holds no lease with that ID — a different lease, no lease, an unknown ID or another Room's lease. The refusal never names the current holder. |
+| `lease-ended` | That lease belonged to this Room but has already been released, expired or revoked. |
+
+The one ended lease that still releases is the Room's own most recent lease
+revoked by a device disconnect, so its holder can clear the sticky
+failed-physical target. A body without `expectedLeaseId` keeps the
+unconditional release by Room.
+
 A Room releases its phone automatically when it sleeps or is deleted, and the
 desktop app sweeps discovery plus stale recovery on its own timer — an owner
 that died will never call anything again.

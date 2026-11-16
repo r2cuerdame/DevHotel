@@ -131,6 +131,18 @@ describe('Android device broker MCP tools', () => {
     expect(result.isError).toBeFalsy()
     expect(release.description).toMatch(/install/i)
     expect(seen.at(-1)).toMatchObject({ url: '/v1/rooms/abc12345/device/release', body: { reason: 'acceptance finished' } })
+    expect(seen.at(-1)!.body).not.toHaveProperty('expectedLeaseId')
+  })
+
+  it('sends the expected lease ID so the broker releases only that lease', async () => {
+    const leaseId = '3f2b8c1e-7d4a-4e5b-9c6d-0a1b2c3d4e5f'
+    const result = await tool('release_android_device').handler({ roomId: 'abc12345', reason: 'qa done', expectedLeaseId: leaseId })
+
+    expect(result.isError).toBeFalsy()
+    expect(seen.at(-1)).toMatchObject({
+      url: '/v1/rooms/abc12345/device/release',
+      body: { reason: 'qa done', expectedLeaseId: leaseId }
+    })
   })
 
   it('tells agents to use the emulator for ordinary development', () => {

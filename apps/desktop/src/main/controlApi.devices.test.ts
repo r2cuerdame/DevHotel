@@ -104,7 +104,52 @@ describe('agents reach the shared phone only through the broker', () => {
       const result = await call('/v1/rooms/room1abc/device/release', { method: 'POST', body: JSON.stringify({ reason: 'done' }) })
 
       expect(result.status).toBe(200)
-      expect(releaseAndroidDevice).toHaveBeenCalledWith('room1abc', 'done')
+      expect(releaseAndroidDevice).toHaveBeenCalledWith('room1abc', 'done', { expectedLeaseId: undefined })
+    })
+  })
+
+  it('passes an expected lease ID through as a conditional release', async () => {
+    const leaseId = '3f2b8c1e-7d4a-4e5b-9c6d-0a1b2c3d4e5f'
+    const releaseAndroidDevice = vi.fn(async () => ({ id: leaseId }))
+
+    await withApi({ releaseAndroidDevice } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/device/release', {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'qa done', expectedLeaseId: leaseId })
+      })
+
+      expect(result.status).toBe(200)
+      expect(releaseAndroidDevice).toHaveBeenCalledWith('room1abc', 'qa done', { expectedLeaseId: leaseId })
+    })
+  })
+
+  it.each(['lease-mismatch', 'lease-ended'] as const)('answers a refused conditional release with 409 %s', async (code) => {
+    const releaseAndroidDevice = vi.fn(async () => {
+      throw new DeviceLeaseError(code, 'nothing was released')
+    })
+
+    await withApi({ releaseAndroidDevice } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/device/release', {
+        method: 'POST',
+        body: JSON.stringify({ expectedLeaseId: '3f2b8c1e-7d4a-4e5b-9c6d-0a1b2c3d4e5f' })
+      })
+
+      expect(result.status).toBe(409)
+      expect(result.body.code).toBe(code)
+    })
+  })
+
+  it('rejects an expected lease ID that is not a lease ID before releasing anything', async () => {
+    const releaseAndroidDevice = vi.fn()
+
+    await withApi({ releaseAndroidDevice } as unknown as Partial<RoomOrchestrator>, async (call) => {
+      const result = await call('/v1/rooms/room1abc/device/release', {
+        method: 'POST',
+        body: JSON.stringify({ expectedLeaseId: 'lease-1' })
+      })
+
+      expect(result.status).not.toBe(200)
+      expect(releaseAndroidDevice).not.toHaveBeenCalled()
     })
   })
 

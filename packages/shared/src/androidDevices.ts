@@ -321,6 +321,10 @@ export type DeviceDenialCode =
   | 'lease-held-by-another-room'
   | 'lease-expired'
   | 'lease-recovery-protected'
+  /** A conditional release named a lease the Room does not hold right now. */
+  | 'lease-mismatch'
+  /** A conditional release named a lease of this Room that already ended. */
+  | 'lease-ended'
   | 'device-unknown'
   | 'device-unhealthy'
   | 'adb-command-forbidden'
@@ -342,7 +346,19 @@ oomId comes from the route
  * phone under someone else's project name.
  */
 export const zAttachDeviceBody = zDeviceRequest.omit({ roomId: true, project: true }).strict()
-export const zReleaseDeviceBody = z.object({ reason: z.string().trim().min(1).max(200).optional() }).strict()
+/**
+ * expectedLeaseId makes the release conditional: the broker closes the Room's
+ * lease only when it is exactly that lease, and otherwise refuses with 409
+ * `lease-mismatch` or `lease-ended` without touching the phone or the queue.
+ * Omitting it keeps the unconditional release by Room.
+ */
+export const zReleaseDeviceBody = z
+  .object({
+    reason: z.string().trim().min(1).max(200).optional(),
+    expectedLeaseId: z.string().uuid().optional()
+  })
+  .strict()
+export type ReleaseDeviceOptions = { expectedLeaseId?: string }
 export const zHeartbeatBody = z
   .object({ leaseId: z.string().uuid(), busy: z.boolean().optional() })
   .strict()

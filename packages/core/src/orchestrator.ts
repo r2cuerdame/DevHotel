@@ -104,7 +104,14 @@ import {
   zCreateAndroidAcceptanceReportBody,
   zCaptureScreenshotArtifactBody
 } from '@devhotel/shared'
-import type { DeviceBrokerStatus, DeviceLease, DeviceRequest, DeviceRequestResult, DeviceQueueEntry } from '@devhotel/shared'
+import type {
+  DeviceBrokerStatus,
+  DeviceLease,
+  DeviceRequest,
+  DeviceRequestResult,
+  DeviceQueueEntry,
+  ReleaseDeviceOptions
+} from '@devhotel/shared'
 import type { HostFootprint, HostGcResult, LifecycleQuotas, QuotaVerdict } from '@devhotel/shared'
 import { AndroidDeviceBroker } from './devices/broker'
 import { ClientBrowserManager } from './browser/clientBrowserManager'
@@ -8250,16 +8257,24 @@ export class RoomOrchestrator {
     return result
   }
 
-  releaseAndroidDevice(roomId: string, reason = 'released by the Room'): Promise<DeviceLease | null> {
+  releaseAndroidDevice(
+    roomId: string,
+    reason = 'released by the Room',
+    opts: ReleaseDeviceOptions = {}
+  ): Promise<DeviceLease | null> {
     return this.withRoomLock(
       roomId,
-      () => this.releaseAndroidDeviceLocked(roomId, reason),
+      () => this.releaseAndroidDeviceLocked(roomId, reason, opts),
       { allowPendingArtifactExport: true }
     )
   }
 
-  private async releaseAndroidDeviceLocked(roomId: string, reason: string): Promise<DeviceLease | null> {
-    const released = await this.devices.releaseRoom(roomId, reason)
+  private async releaseAndroidDeviceLocked(
+    roomId: string,
+    reason: string,
+    opts: ReleaseDeviceOptions = {}
+  ): Promise<DeviceLease | null> {
+    const released = await this.devices.releaseRoom(roomId, reason, opts)
     if (released) {
       this.olog(roomId, `released the attached device: ${reason}`)
       this.emit(roomId, 'status')
