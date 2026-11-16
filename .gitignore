@@ -12,3 +12,5 @@ Thumbs.db
 .env.local
 .serena/
 apps/desktop/resources/github/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

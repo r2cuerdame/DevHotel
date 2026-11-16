@@ -12,6 +12,16 @@ Use GitHub issues, PRs and milestones as the ledger and execute only latest plan
 
 Free isolated validation: `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm --filter devhotel-mcp build`; Windows CI job `build` additionally packages with `--publish never`. Run builds/tests through CSX observation. Respect host input isolation and Room boundaries; do not change host sessions, VM/Docker setup or infrastructure to bypass unavailable environments. Record those limitations. Never print secrets.
 
+## 로컬 웹 QA 도구 (Playwright CLI, #235 · LoopOffice #397)
+
+- DevHotel과 로컬 웹 QA의 기본 도구는 **Playwright CLI**(`@playwright/cli@latest`, 로컬 스킬 `.claude/skills/playwright-cli`)다.
+  - 설치·확인: `npm install -g @playwright/cli@latest` 후 `playwright-cli --help`, 스킬 등록: `playwright-cli install --skills`
+  - **기본은 헤드리스**다. 집 PC에서 의종이 보는 창을 띄우거나(`--headed` 금지) 의종의 마우스·키보드·창을 조작하지 않는다.
+  - 대안: Playwright MCP(`https://github.com/microsoft/playwright-mcp`).
+  - 보조 유지: `agent-browser` / `agent-desktop`(LoopOffice #383)은 도우미로 유지하며 제거하거나 대체하지 않는다.
+- 금지: Browserbase, Steel, Hyperbrowser, browser-use cloud, Lightpanda 등 유료·클라우드 브라우저 및 새 유료 플랜.
+- 되돌리기: 창 침범·불안정·작업 방해가 발생하면 `npm uninstall -g @playwright/cli` 및 `.claude/skills/playwright-cli` 제거로 즉시 원복한다.
+
 ## 문서·주석 원칙 (nocomment-rule-1116, 의종 2026-11-16 20:14 결정, 춈스케 전달)
 
 코드를 설명하는 문서와 주석은 쓰지 않는다.
