@@ -1,18 +1,37 @@
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { generateKeyPair } from 'node:crypto'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import forge from 'node-forge'
 
 const execFileAsync = promisify(execFile)
+const generateKeyPairAsync = promisify(generateKeyPair)
 
 const CA_NAME = 'DevHotel Local CA'
 const DAY_MS = 24 * 60 * 60 * 1000
+const LEAF_RENEW_MARGIN_MS = 30 * DAY_MS
+const RETRYABLE_RENAME = new Set(['EPERM', 'EACCES', 'EBUSY'])
 
 export interface CaMaterial {
   certPem: string
   keyPem: string
   fingerprint256: string
+}
+
+export interface LeafCertMaterial {
+  certPem: string
+  keyPem: string
+  caCertPem: string
+}
+
+export type CaListener = (ca: CaMaterial) => void | Promise<void>
+
+interface LoadedCa {
+  certPem: string
+  keyPem: string
+  cert: forge.pki.Certificate
+  key: forge.pki.rsa.PrivateKey
 }
 
 function rootCertPath(caDir: string): string {
@@ -24,18 +43,10 @@ function rootKeyPath(caDir: string): string {
 }
 
 /**
- * A certificate serial, as a DER INTEGER that OpenSSL will accept.
- *
- * Two rules apply at once, and satisfying only the first is the trap: the
- * integer must be positive, so the leading byte cannot be `>= 0x80`, and it
- * must be minimally encoded, so a leading `0x00` is legal only when the byte
- * after it has its high bit set. Forcing just the top *nibble* to zero leaves
- * a one-in-sixteen chance of a `0x00` leading byte, and half of those are
- * followed by a byte below `0x80` — about 3% of serials, which OpenSSL rejects
- * with `ERR_OSSL_ASN1_ILLEGAL_PADDING` only once the certificate is loaded.
- *
- * Constraining the whole leading byte to `0x01..0x7f` satisfies both rules by
- * construction and still leaves 127 * 2^120 serials.
+ * A DER INTEGER serial must be positive (leading byte < 0x80) and minimally
+ * encoded (no leading 0x00 before a byte < 0x80); OpenSSL rejects violations
+ * only when the finished certificate is loaded (ERR_OSSL_ASN1_ILLEGAL_PADDING).
+ * A leading byte in 0x01..0x7f satisfies both.
  */
 export function randomSerial(): string {
   const lead = (forge.random.getBytesSync(1).charCodeAt(0) % 0x7f) + 1
@@ -60,19 +71,113 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-export async function ensureCa(caDir: string): Promise<CaMaterial> {
-  await mkdir(caDir, { recursive: true })
-  const certFile = rootCertPath(caDir)
-  const keyFile = rootKeyPath(caDir)
-
-  if ((await exists(certFile)) && (await exists(keyFile))) {
-    const certPem = await readFile(certFile, 'utf8')
-    const keyPem = await readFile(keyFile, 'utf8')
-    const cert = forge.pki.certificateFromPem(certPem)
-    return { certPem, keyPem, fingerprint256: fingerprintOf(cert) }
+async function readOptional(file: string): Promise<string | null> {
+  try {
+    return await readFile(file, 'utf8')
+  } catch {
+    return null
   }
+}
 
-  const keys = forge.pki.rsa.generateKeyPair({ bits: 2048 })
+function dirKey(caDir: string): string {
+  const resolved = path.resolve(caDir)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+const inFlight = new Map<string, Promise<unknown>>()
+
+function singleFlight<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const pending = inFlight.get(key) as Promise<T> | undefined
+  if (pending) return pending
+  const run = work().finally(() => inFlight.delete(key))
+  inFlight.set(key, run)
+  return run
+}
+
+const caListeners = new Map<string, Set<CaListener>>()
+
+export function subscribeCa(caDir: string, listener: CaListener): () => void {
+  const key = dirKey(caDir)
+  let listeners = caListeners.get(key)
+  if (!listeners) {
+    listeners = new Set()
+    caListeners.set(key, listeners)
+  }
+  listeners.add(listener)
+  return () => {
+    const current = caListeners.get(key)
+    if (!current) return
+    current.delete(listener)
+    if (current.size === 0) caListeners.delete(key)
+  }
+}
+
+async function writeAtomic(file: string, content: string): Promise<void> {
+  const tmp = `${file}.${process.pid}.${forge.util.bytesToHex(forge.random.getBytesSync(6))}.tmp`
+  try {
+    await writeFile(tmp, content, 'utf8')
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(tmp, file)
+        return
+      } catch (err) {
+        // Windows: a reader or antivirus scan briefly holding the target fails the rename
+        const code = (err as NodeJS.ErrnoException).code
+        if (attempt >= 5 || !code || !RETRYABLE_RENAME.has(code)) throw err
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)))
+      }
+    }
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
+async function generateRsaKeyPair(): Promise<forge.pki.rsa.KeyPair> {
+  const { privateKey } = await generateKeyPairAsync('rsa', {
+    modulusLength: 2048,
+    publicExponent: 0x10001,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
+  })
+  const priv = forge.pki.privateKeyFromPem(privateKey)
+  return { privateKey: priv, publicKey: forge.pki.setRsaPublicKey(priv.n, priv.e) }
+}
+
+function keyMatchesCert(key: forge.pki.rsa.PrivateKey, cert: forge.pki.Certificate): boolean {
+  const pub = cert.publicKey as forge.pki.rsa.PublicKey
+  return Boolean(pub?.n && pub?.e && pub.n.equals(key.n) && pub.e.equals(key.e))
+}
+
+function validAt(cert: forge.pki.Certificate, now: number, marginMs: number): boolean {
+  return cert.validity.notBefore.getTime() <= now && cert.validity.notAfter.getTime() - marginMs > now
+}
+
+async function loadCa(caDir: string): Promise<LoadedCa | null> {
+  const [certPem, keyPem] = await Promise.all([
+    readOptional(rootCertPath(caDir)),
+    readOptional(rootKeyPath(caDir))
+  ])
+  if (!certPem || !keyPem) return null
+  try {
+    const cert = forge.pki.certificateFromPem(certPem)
+    const key = forge.pki.privateKeyFromPem(keyPem)
+    const bc = cert.getExtension('basicConstraints') as { cA?: boolean } | undefined
+    if (!bc?.cA || !keyMatchesCert(key, cert) || !validAt(cert, Date.now(), 0) || !cert.verify(cert)) {
+      return null
+    }
+    return { certPem, keyPem, cert, key }
+  } catch {
+    return null
+  }
+}
+
+async function loadOrCreateCa(caDir: string): Promise<LoadedCa> {
+  await mkdir(caDir, { recursive: true })
+  const existing = await loadCa(caDir)
+  if (existing) return existing
+
+  const keys = await generateRsaKeyPair()
   const cert = forge.pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
@@ -90,32 +195,52 @@ export async function ensureCa(caDir: string): Promise<CaMaterial> {
 
   const certPem = forge.pki.certificateToPem(cert)
   const keyPem = forge.pki.privateKeyToPem(keys.privateKey)
-  await writeFile(certFile, certPem, 'utf8')
-  await writeFile(keyFile, keyPem, 'utf8')
-  return { certPem, keyPem, fingerprint256: fingerprintOf(cert) }
+  await writeAtomic(rootKeyPath(caDir), keyPem)
+  await writeAtomic(rootCertPath(caDir), certPem)
+  return { certPem, keyPem, cert, key: keys.privateKey }
 }
 
-export async function issueLeafCert(
-  caDir: string,
-  domain: string
-): Promise<{ keyPem: string; certPem: string }> {
-  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(domain) || domain.includes('..')) {
-    throw new Error(`refusing to issue a certificate for suspicious domain: ${JSON.stringify(domain)}`)
+export async function ensureCa(caDir: string): Promise<CaMaterial> {
+  const material = await singleFlight(`${dirKey(caDir)}\0ca`, async () => {
+    const ca = await loadOrCreateCa(caDir)
+    return { certPem: ca.certPem, keyPem: ca.keyPem, fingerprint256: fingerprintOf(ca.cert) }
+  })
+  const listeners = caListeners.get(dirKey(caDir))
+  if (listeners) {
+    for (const listener of [...listeners]) await listener(material)
   }
+  return material
+}
+
+function leafUsable(certPem: string, keyPem: string, domain: string, caCert: forge.pki.Certificate): boolean {
+  try {
+    const cert = forge.pki.certificateFromPem(certPem)
+    const key = forge.pki.privateKeyFromPem(keyPem)
+    if (!keyMatchesCert(key, cert) || !validAt(cert, Date.now(), LEAF_RENEW_MARGIN_MS)) return false
+    const san = cert.getExtension('subjectAltName') as
+      | { altNames?: { type: number; value: string }[] }
+      | undefined
+    if (!san?.altNames?.some((n) => n.type === 2 && n.value === domain)) return false
+    return caCert.verify(cert)
+  } catch {
+    return false
+  }
+}
+
+async function loadOrIssueLeaf(caDir: string, domain: string, ca: CaMaterial): Promise<LeafCertMaterial> {
+  const caCert = forge.pki.certificateFromPem(ca.certPem)
   const certsDir = path.join(caDir, 'certs')
   await mkdir(certsDir, { recursive: true })
   const certFile = path.join(certsDir, `${domain}.pem`)
   const keyFile = path.join(certsDir, `${domain}.key`)
 
-  if ((await exists(certFile)) && (await exists(keyFile))) {
-    return { certPem: await readFile(certFile, 'utf8'), keyPem: await readFile(keyFile, 'utf8') }
+  const [storedCert, storedKey] = await Promise.all([readOptional(certFile), readOptional(keyFile)])
+  if (storedCert && storedKey && leafUsable(storedCert, storedKey, domain, caCert)) {
+    return { certPem: storedCert, keyPem: storedKey, caCertPem: ca.certPem }
   }
 
-  const ca = await ensureCa(caDir)
-  const caCert = forge.pki.certificateFromPem(ca.certPem)
   const caKey = forge.pki.privateKeyFromPem(ca.keyPem)
-
-  const keys = forge.pki.rsa.generateKeyPair({ bits: 2048 })
+  const keys = await generateRsaKeyPair()
   const cert = forge.pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
@@ -133,9 +258,19 @@ export async function issueLeafCert(
 
   const certPem = forge.pki.certificateToPem(cert)
   const keyPem = forge.pki.privateKeyToPem(keys.privateKey)
-  await writeFile(certFile, certPem, 'utf8')
-  await writeFile(keyFile, keyPem, 'utf8')
-  return { certPem, keyPem }
+  await writeAtomic(keyFile, keyPem)
+  await writeAtomic(certFile, certPem)
+  return { certPem, keyPem, caCertPem: ca.certPem }
+}
+
+export async function issueLeafCert(caDir: string, domain: string, ca?: CaMaterial): Promise<LeafCertMaterial> {
+  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(domain) || domain.includes('..')) {
+    throw new Error(`refusing to issue a certificate for suspicious domain: ${JSON.stringify(domain)}`)
+  }
+  const signer = ca ?? (await ensureCa(caDir))
+  return singleFlight(`${dirKey(caDir)}\0leaf\0${domain}\0${signer.fingerprint256}`, () =>
+    loadOrIssueLeaf(caDir, domain, signer)
+  )
 }
 
 async function caSerialHex(caDir: string): Promise<string> {

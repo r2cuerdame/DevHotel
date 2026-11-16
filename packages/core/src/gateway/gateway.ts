@@ -3,7 +3,7 @@ import https from 'node:https'
 import type net from 'node:net'
 import tls from 'node:tls'
 import type { GatewayStatusInfo } from '@devhotel/shared'
-import { ensureCa, issueLeafCert } from './ca'
+import { ensureCa, issueLeafCert, subscribeCa, type CaMaterial } from './ca'
 import type { RelayDial } from '../relayProtocol'
 import { createProxyHandlers, type ProxyHandlers } from './proxy'
 import { RouteTable, type Route } from './routes'
@@ -20,11 +20,16 @@ export interface GatewayOptions {
   caDir: string
   httpPorts?: number[]
   httpsPorts?: number[]
-  /** Test seam for the relay TCP dial; defaults to a loopback net.connect. */
   relayDial?: RelayDial
 }
 
-/** A route keeps its open connections only while everything they were opened against is unchanged. */
+interface LeafContext {
+  context: tls.SecureContext
+  keyPem: string
+  certPem: string
+  caCertPem: string
+}
+
 function sameTarget(a: Route, b: Route): boolean {
   return (
     a.roomId === b.roomId &&
@@ -39,7 +44,7 @@ export class Gateway {
   private readonly httpCandidates: number[]
   private readonly httpsCandidates: number[]
   private readonly table = new RouteTable()
-  private readonly contexts = new Map<string, tls.SecureContext>()
+  private readonly contexts = new Map<string, LeafContext>()
   private httpServer: http.Server | null = null
   private httpsServer: https.Server | null = null
   private httpIpv6Server: http.Server | null = null
@@ -47,7 +52,9 @@ export class Gateway {
   private httpPort: number | null = null
   private httpsPort: number | null = null
   private running = false
-  private caCertPem = ''
+  private ca: CaMaterial | null = null
+  private unsubscribeCa: (() => void) | null = null
+  private defaultRefresh: Promise<void> | null = null
   private readonly openSockets = new Set<net.Socket>()
   private readonly handlers: ProxyHandlers
 
@@ -59,8 +66,9 @@ export class Gateway {
   }
 
   async start(): Promise<GatewayStatusInfo> {
-    const ca = await ensureCa(this.caDir)
-    this.caCertPem = ca.certPem
+    this.unsubscribeCa?.()
+    this.unsubscribeCa = subscribeCa(this.caDir, (ca) => this.adoptCa(ca))
+    this.adoptCa(await ensureCa(this.caDir))
     const handlers = this.handlers
     const requestOpts = () => ({ httpPort: this.httpPort, httpsPort: this.httpsPort })
 
@@ -82,7 +90,7 @@ export class Gateway {
     const defaultLeaf = await this.secureContextFor(DEFAULT_DOMAIN)
     const httpsServerOptions = {
       key: defaultLeaf.keyPem,
-      cert: defaultLeaf.certPem + this.caCertPem,
+      cert: defaultLeaf.certPem + defaultLeaf.caCertPem,
       SNICallback: (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => {
         const name = servername.toLowerCase()
         // only mint/serve certificates for routed rooms — an arbitrary
@@ -115,22 +123,56 @@ export class Gateway {
     }
 
     this.running = true
+    if (defaultLeaf.caCertPem !== this.ca?.certPem) await this.refreshDefaultContext()
     return this.status()
   }
 
-  private async secureContextFor(
-    domain: string
-  ): Promise<{ context: tls.SecureContext; keyPem: string; certPem: string }> {
-    const leaf = await issueLeafCert(this.caDir, domain)
-    let context = this.contexts.get(domain)
-    if (!context) {
-      context = tls.createSecureContext({
-        key: leaf.keyPem,
-        cert: leaf.certPem + this.caCertPem
-      })
-      this.contexts.set(domain, context)
+  private adoptCa(ca: CaMaterial): Promise<void> | undefined {
+    if (this.ca?.certPem === ca.certPem) return this.defaultRefresh ?? undefined
+    this.ca = ca
+    this.contexts.clear()
+    if (!this.httpsServer && !this.httpsIpv6Server) return undefined
+    const refresh = this.refreshDefaultContext().finally(() => {
+      if (this.defaultRefresh === refresh) this.defaultRefresh = null
+    })
+    this.defaultRefresh = refresh
+    return refresh
+  }
+
+  private async refreshDefaultContext(): Promise<void> {
+    const ca = this.ca
+    if (!ca) return
+    try {
+      const leaf = await this.secureContextFor(DEFAULT_DOMAIN, ca)
+      if (leaf.caCertPem !== this.ca?.certPem) return
+      const options = { key: leaf.keyPem, cert: leaf.certPem + leaf.caCertPem }
+      this.httpsServer?.setSecureContext(options)
+      this.httpsIpv6Server?.setSecureContext(options)
+    } catch (err) {
+      console.warn('[devhotel] gateway: could not refresh the default certificate after a CA change', err)
     }
-    return { context, keyPem: leaf.keyPem, certPem: leaf.certPem }
+  }
+
+  private async secureContextFor(domain: string, ca?: CaMaterial): Promise<LeafContext> {
+    const name = domain.toLowerCase()
+    let signer = ca
+    for (;;) {
+      const cached = this.contexts.get(name)
+      if (cached && cached.caCertPem === this.ca?.certPem) return cached
+      const leaf = await issueLeafCert(this.caDir, name, signer)
+      const entry: LeafContext = {
+        context: tls.createSecureContext({ key: leaf.keyPem, cert: leaf.certPem + leaf.caCertPem }),
+        keyPem: leaf.keyPem,
+        certPem: leaf.certPem,
+        caCertPem: leaf.caCertPem
+      }
+      if (!this.ca) return entry
+      if (leaf.caCertPem === this.ca.certPem) {
+        this.contexts.set(name, entry)
+        return entry
+      }
+      signer = this.ca
+    }
   }
 
   private async listenOnFirstFree(
@@ -189,6 +231,11 @@ export class Gateway {
   }
 
   async stop(): Promise<void> {
+    this.unsubscribeCa?.()
+    this.unsubscribeCa = null
+    this.ca = null
+    this.contexts.clear()
+    this.defaultRefresh = null
     const close = (server: http.Server | https.Server | null) =>
       new Promise<void>((resolve) => {
         if (!server || !server.listening) {
@@ -218,7 +265,10 @@ export class Gateway {
   }
 
   async setRoute(route: Route): Promise<void> {
-    if (route.https) await this.secureContextFor(route.domain.toLowerCase())
+    if (route.https) {
+      this.contexts.delete(route.domain.toLowerCase())
+      await this.secureContextFor(route.domain)
+    }
     const previous = this.table.byDomain(route.domain)
     this.table.set(route)
     if (previous && !sameTarget(previous, route)) this.handlers.closeDomain(route.domain)
