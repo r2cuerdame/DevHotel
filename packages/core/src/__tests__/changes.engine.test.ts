@@ -4,7 +4,7 @@ import { registerQuickChanges } from '../changes/definitions/index'
 import { androidRunChange } from '../changes/definitions/androidRun'
 import { ANDROID_SNAPSHOT_CLEAN_SCRIPT, cleanupAndroidBuildArtifacts } from '../changes/definitions/androidBuild'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
-import { serviceRemoveChange } from '../changes/definitions/services'
+import { restoreServiceFromFile, serviceRemoveChange } from '../changes/definitions/services'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
   LINE_ENDING_NORMALIZE_SCRIPT,
@@ -759,6 +759,176 @@ async function restorePostgresFromBackup(changeCtx: ChangeCtx) {
   expect(entry.status).toBe('verified')
   return entry
 }
+
+const DROP_DEVHOTEL = 'DROP DATABASE IF EXISTS devhotel WITH (FORCE);'
+const CREATE_DEVHOTEL = 'CREATE DATABASE devhotel;'
+const RESTORE_FROM_FILE = 'restore-from-file'
+
+function appConnectedToPostgres(): string[] {
+  const trace: string[] = []
+  const exec = backend.execInService.bind(backend)
+  backend.execInService = async (roomId, svc, cmd) => {
+    const sql = cmd[cmd.length - 2] === '-c' ? cmd[cmd.length - 1]! : ''
+    if (svc === 'postgres' && sql) trace.push(sql)
+    if (svc === 'postgres' && sql.startsWith('DROP DATABASE') && !sql.includes('WITH (FORCE)')) {
+      backend.calls.push(`execInService:${svc}:${cmd[0]}`)
+      return {
+        code: 1,
+        stdout: '',
+        stderr: 'ERROR:  database "devhotel" is being accessed by other users\nDETAIL:  There is 1 other session using the database.'
+      }
+    }
+    return exec(roomId, svc, cmd)
+  }
+  const restore = backend.execInServiceFromFile.bind(backend)
+  backend.execInServiceFromFile = async (roomId, svc, cmd) => {
+    if (svc === 'postgres') trace.push(RESTORE_FROM_FILE)
+    return restore(roomId, svc, cmd)
+  }
+  return trace
+}
+
+function resetSequences(trace: string[]): string[][] {
+  const sequences: string[][] = []
+  for (const [index, step] of trace.entries()) {
+    if (step.startsWith('DROP DATABASE')) sequences.push(trace.slice(index, index + 3))
+  }
+  return sequences
+}
+
+describe('service data restore while the room app holds a database connection', () => {
+  beforeEach(() => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+  })
+
+  it('restores a backup and undoes that restore by force-dropping the connected database', async () => {
+    const trace = appConnectedToPostgres()
+    const changeCtx = ctx()
+
+    const restore = await restorePostgresFromBackup(changeCtx)
+    const undone = await engine.undo(changeCtx, restore.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true } })
+    expect(changes.get(restore.id)!.status).toBe('undone')
+    expect(resetSequences(trace)).toEqual([
+      [DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE],
+      [DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE]
+    ])
+  })
+
+  it('switches the PostgreSQL version and back while the app stays connected', async () => {
+    const trace = appConnectedToPostgres()
+    const changeCtx = ctx()
+
+    const version = await engine.execute(changeCtx, 'service-version', { service: 'postgres', version: '17' }, 'user')
+    expect(version.status).toBe('verified')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+
+    const undone = await engine.undo(changeCtx, version.id, 'user')
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true } })
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(resetSequences(trace)).toHaveLength(2)
+  })
+
+  it('rolls a failed version switch back to the previous version and its data while the app is connected', async () => {
+    const trace = appConnectedToPostgres()
+    const restore = backend.execInServiceFromFile.bind(backend)
+    let restores = 0
+    backend.execInServiceFromFile = async (roomId, svc, cmd) => {
+      restores += 1
+      if (restores === 1) {
+        backend.calls.push(`execInServiceFromFile:${svc}:${cmd[0]}`)
+        trace.push(RESTORE_FROM_FILE)
+        return { code: 3, stdout: '', stderr: 'ERROR:  type "legacy_money" does not exist' }
+      }
+      return restore(roomId, svc, cmd)
+    }
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('rolled-back')
+    expect(entry.verify?.detail).toMatch(/psql restore failed.*legacy_money/)
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(backend.calls.indexOf('createService:postgres:17')).toBeLessThan(backend.calls.indexOf('createService:postgres:16'))
+    expect(restores).toBe(2)
+    expect(resetSequences(trace)).toEqual([
+      [DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE],
+      [DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE]
+    ])
+  })
+
+  it('brings a removed PostgreSQL back from its safety backup while the app is connected', async () => {
+    const trace = appConnectedToPostgres()
+    const changeCtx = ctx()
+    const removed = await engine.execute(changeCtx, 'service-remove', { service: 'postgres' }, 'user')
+    expect(removed.status).toBe('verified')
+
+    const undone = await engine.undo(changeCtx, removed.id, 'user')
+
+    expect(undone).toMatchObject({ status: 'verified', verify: { ok: true } })
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+    expect(resetSequences(trace)).toEqual([[DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE]])
+  })
+
+  it('stops before recreating or loading data when the database still cannot be dropped', async () => {
+    const trace: string[] = []
+    backend.execInService = async (_roomId, svc, cmd) => {
+      backend.calls.push(`execInService:${svc}:${cmd[0]}`)
+      trace.push(cmd[cmd.length - 1]!)
+      return { code: 1, stdout: '', stderr: 'ERROR:  must be owner of database devhotel' }
+    }
+    const { writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const file = join(tempDir(), 'postgres-dump.sql')
+    writeFileSync(file, 'CREATE TABLE t();')
+
+    await expect(restoreServiceFromFile(ctx(), 'postgres', file)).rejects.toThrow(/database reset failed: .*must be owner/)
+    expect(trace).toEqual([DROP_DEVHOTEL])
+    expect(backend.calls.some((call) => call.startsWith('execInServiceFromFile:'))).toBe(false)
+  })
+})
+
+describe('Redis restore keeps the service running when the copy fails', () => {
+  async function rdbFile(): Promise<string> {
+    const { writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const file = join(tempDir(), 'redis-dump.rdb')
+    writeFileSync(file, 'fake-rdb')
+    return file
+  }
+
+  beforeEach(() => {
+    rooms.update('room1abc', { services: { redis: { version: '8' } } })
+    backend.serviceStates.set('redis', 'running')
+    backend.copyToService = async (_roomId, svc, _hostPath, containerPath) => {
+      backend.calls.push(`copyToService:${svc}:${containerPath}`)
+      throw new Error('no space left on device')
+    }
+  })
+
+  it('starts Redis again and reports the copy error', async () => {
+    await expect(restoreServiceFromFile(ctx(), 'redis', await rdbFile())).rejects.toThrow('no space left on device')
+
+    expect(backend.calls).toEqual(['stopService:redis', 'copyToService:redis:/data/dump.rdb', 'startService:redis'])
+    expect(backend.serviceStates.get('redis')).toBe('running')
+  })
+
+  it('keeps the copy error when Redis also fails to start again', async () => {
+    const logged: string[] = []
+    backend.startService = async (_roomId, svc) => {
+      backend.calls.push(`startService:${svc}`)
+      throw new Error('container exited immediately')
+    }
+
+    await expect(
+      restoreServiceFromFile({ ...ctx(), log: (line) => logged.push(line) }, 'redis', await rdbFile())
+    ).rejects.toThrow('no space left on device')
+
+    expect(backend.calls).toContain('startService:redis')
+    expect(logged.join('\n')).toMatch(/container exited immediately/)
+  })
+})
 
 describe('service data undo refuses before touching data', () => {
   async function upgradedPostgres() {
