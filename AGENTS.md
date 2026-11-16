@@ -11,3 +11,11 @@ Use GitHub issues, PRs and milestones as the ledger and execute only latest plan
 ## Validation
 
 Free isolated validation: `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm --filter devhotel-mcp build`; Windows CI job `build` additionally packages with `--publish never`. Run builds/tests through CSX observation. Respect host input isolation and Room boundaries; do not change host sessions, VM/Docker setup or infrastructure to bypass unavailable environments. Record those limitations. Never print secrets.
+
+## 문서·주석 원칙 (nocomment-rule-1116, 의종 2026-11-16 20:14 결정, 춈스케 전달)
+
+코드를 설명하는 문서와 주석은 쓰지 않는다.
+- 이유: 문서·주석도 관리 대상이 되어 코드·문서·주석이 따로 놀고, 코딩마다 셋을 다 갱신해야 해서 문제가 생긴다.
+- 문서: 사용법, 가이드, 방향성 같은 기획 문서만 둔다. 코드 구조나 동작을 따라 적는 문서는 만들지 않는다.
+- 주석: 기본 금지. 코드만 봐서는 알 수 없는 예외(외부 버그 우회, 의도적인 특이 동작 등)만 짧게 쓴다.
+- 리뷰(체크 항목): 새 PR에 이 원칙을 어긴 문서·주석이 있으면 지적한다. 기존 코드는 그 파일을 고칠 때 같이 정리한다. 대청소 PR은 만들지 않는다.
