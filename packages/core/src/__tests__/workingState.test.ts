@@ -7,6 +7,7 @@ import { RoomOrchestrator } from '../orchestrator'
 import { retainedWorkspaceGenKey, workspaceSyncBaseKey } from '../workingState'
 import { serializeWorkspaceSnapshot, WorkspaceDriftError } from '../workspaceDrift'
 import { buildDiagnostic } from '../diagnostics/bundle'
+import { LINE_ENDING_NORMALIZE_SCRIPT, SCAN_SENTINEL } from '../checks/lineEndings'
 import type { Db } from '../store/db'
 import { FakeBackend, FakeGateway, listeningPort, makeRoom, tempDir, testDb } from './fakes'
 import { workspaceGenMaxKey } from '../workingState'
@@ -1062,6 +1063,59 @@ describe('Room-owned working state', () => {
     expect(orch.settings.get(depsGenKey(room.id, '22'))).toBe('0')
     expect(backend.calls).toContain('removeWorkspaceVolume:r2')
     expect(backend.calls).toContain('removeDependencyVolume:node22:g1')
+  })
+
+  it('shows a Room synced again once package Undo restores its original files', async () => {
+    const room = packageRoom()
+    backend.fingerprintWorkspace = async (_roomId?: string, revision?: number) =>
+      revision === 1 ? 'synced-baseline' : 'package-generation'
+    const installed = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('modified')
+
+    await orch.undoChange(room.id, installed.id, 'user')
+
+    expect(orch.rooms.get(room.id)).toMatchObject({ workspaceVolumeRevision: 1, stateRevision: 9, syncStatus: 'synced' })
+  })
+
+  it('shows a Room synced again once line-ending Undo restores its original files', async () => {
+    const room = packageRoom()
+    backend.fingerprintWorkspace = async (_roomId?: string, revision?: number) =>
+      revision === 1 ? 'synced-baseline' : 'normalized-generation'
+    backend.execResult = { code: 0, stdout: `${SCAN_SENTINEL}\0./gradlew\0`, stderr: '' }
+    backend.oneShotHandler = (_spec, cmd) => ({
+      code: 0,
+      stdout: cmd === LINE_ENDING_NORMALIZE_SCRIPT ? `${SCAN_SENTINEL}\0./gradlew\0` : `${SCAN_SENTINEL}\0`,
+      stderr: ''
+    })
+    const normalized = await orch.applyChange(room.id, { kind: 'normalize-line-endings' }, 'user')
+    expect(normalized.status).toBe('verified')
+    expect(orch.rooms.get(room.id)?.syncStatus).toBe('modified')
+
+    await orch.undoChange(room.id, normalized.id, 'user')
+
+    expect(orch.rooms.get(room.id)).toMatchObject({ workspaceVolumeRevision: 1, syncStatus: 'synced' })
+  })
+
+  it('does not run an Undo that was queued before its Room started deleting', async () => {
+    const room = packageRoom()
+    const installed = await orch.applyChange(
+      room.id,
+      { kind: 'package-install', name: 'zod', version: '4.0.0', dev: false },
+      'user'
+    )
+    backend.calls.length = 0
+
+    const undo = orch.undoChange(room.id, installed.id, 'user')
+    orch.rooms.update(room.id, { status: 'deleting' })
+
+    await expect(undo).rejects.toThrow(/being deleted/)
+    expect(orch.rooms.get(room.id)?.workspaceVolumeRevision).toBe(2)
+    expect(orch.changes.get(installed.id)?.status).toBe('verified')
+    expect(backend.calls.some((call) => call.startsWith('removeWorkspaceVolume:'))).toBe(false)
   })
 
   it('rejects package Undo after a later workspace revision', async () => {

@@ -4,7 +4,7 @@ import {
   type EmulatorOrientation,
   type EmulatorResolution
 } from '../../backend/naming'
-import type { ChangeDefinition } from '../types'
+import type { ChangeCtx, ChangeDefinition } from '../types'
 import { sleep } from '../types'
 
 type EmulatorSelection = {
@@ -24,6 +24,17 @@ const DEFAULT_SELECTION: EmulatorSelection = {
 function label(selection: EmulatorSelection): string {
   const orientation = selection.orientation === 'landscape' ? ', landscape' : ''
   return `${selection.device} (Android ${selection.version}, ${selection.resolution ?? 'fast'}${orientation})`
+}
+
+async function verifyEmulatorUp(ctx: ChangeCtx): Promise<{ ok: boolean; detail: string }> {
+  if (!ctx.isAwake()) return { ok: true, detail: 'applies on next wake (room is asleep)' }
+  for (let i = 0; i < 10; i++) {
+    const state = await ctx.backend.emulatorState(ctx.roomId)
+    if (state === 'running') return { ok: true, detail: 'emulator container running — the screen appears on the site view as it boots' }
+    if (state === 'missing' || state === 'degraded') return { ok: false, detail: state === 'missing' ? 'emulator container missing' : 'emulator container degraded' }
+    await sleep(2000)
+  }
+  return { ok: false, detail: 'emulator container did not stay up' }
 }
 
 export const emulatorConfigChange: ChangeDefinition<{
@@ -84,15 +95,11 @@ export const emulatorConfigChange: ChangeDefinition<{
       steps.push('Recorded — applies on next wake')
     }
   },
-  async verify(ctx) {
-    if (!ctx.isAwake()) return { ok: true, detail: 'applies on next wake (room is asleep)' }
-    for (let i = 0; i < 10; i++) {
-      const state = await ctx.backend.emulatorState(ctx.roomId)
-      if (state === 'running') return { ok: true, detail: 'emulator container running — the screen appears on the site view as it boots' }
-      if (state === 'missing' || state === 'degraded') return { ok: false, detail: state === 'missing' ? 'emulator container missing' : 'emulator container degraded' }
-      await sleep(2000)
-    }
-    return { ok: false, detail: 'emulator container did not stay up' }
+  verify(ctx) {
+    return verifyEmulatorUp(ctx)
+  },
+  verifyUndo(ctx) {
+    return verifyEmulatorUp(ctx)
   },
   async undo(ctx, entry) {
     const prev =

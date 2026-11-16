@@ -101,6 +101,7 @@ export interface ChangeDefinition<P = unknown> {
    */
   canRollbackApplyFailure?(ctx: ChangeCtx, p: P, captured: unknown): boolean
   undo?(ctx: ChangeCtx, entry: ChangeEntry): Promise<void>
+  verifyUndo?(ctx: ChangeCtx, entry: ChangeEntry): Promise<{ ok: boolean; detail: string }>
 }
 
 /** Poll until the web container reports running and the relay answers, or fail with the last web log hint. */
