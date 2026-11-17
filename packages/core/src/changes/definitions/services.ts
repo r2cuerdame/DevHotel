@@ -36,6 +36,9 @@ function assertNotPostgresDowngrade(service: ServiceKind, from: string, to: stri
   )
 }
 
+// The official image's first-boot init server listens on the Unix socket only, then shuts down; TCP answers only from the real server.
+const POSTGRES_READY_PROBE = ['pg_isready', '-h', '127.0.0.1', '-U', SERVICE_DB_USER]
+
 const POSTGRES_DUMP_HEADER_BYTES = 8192
 
 export function postgresDumpMajorVersion(file: string): number | null {
@@ -129,7 +132,7 @@ export async function pingService(
     if (state === 'running') {
       const res =
         svc === 'postgres'
-          ? await ctx.backend.execInService(ctx.roomId, svc, ['pg_isready', '-U', SERVICE_DB_USER], { timeoutMs: 10_000 })
+          ? await ctx.backend.execInService(ctx.roomId, svc, POSTGRES_READY_PROBE, { timeoutMs: 10_000 })
           : await ctx.backend.execInService(ctx.roomId, svc, ['redis-cli', 'ping'], { timeoutMs: 10_000 })
       if (res.code === 0 && (svc === 'postgres' || res.stdout.includes('PONG'))) {
         return { ok: true, detail: `${SERVICE_LABEL[svc]} answering on its in-room port` }
