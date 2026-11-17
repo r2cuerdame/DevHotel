@@ -4,7 +4,8 @@ import { registerQuickChanges } from '../changes/definitions/index'
 import { androidRunChange } from '../changes/definitions/androidRun'
 import { ANDROID_SNAPSHOT_CLEAN_SCRIPT, cleanupAndroidBuildArtifacts } from '../changes/definitions/androidBuild'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
-import { restoreServiceFromFile, serviceRemoveChange } from '../changes/definitions/services'
+import { pingService, restoreServiceFromFile, serviceRemoveChange } from '../changes/definitions/services'
+import { SERVICE_DB_USER } from '../backend/naming'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
   LINE_ENDING_NORMALIZE_SCRIPT,
@@ -675,6 +676,121 @@ describe('PostgreSQL version direction', () => {
     expect(entry.status).toBe('verified')
     expect(backend.calls).toContain('execInServiceToFile:postgres:pg_dump')
     expect(backend.calls).toContain('execInServiceFromFile:postgres:psql')
+  })
+})
+
+describe('PostgreSQL readiness after a fresh create', () => {
+  const BOOTSTRAP_MS = 1_000
+  const interrupted = { code: 2, stdout: '', stderr: 'FATAL: terminating connection due to administrator command' }
+
+  function simulateInitServerOnCreate() {
+    const events: string[] = []
+    let bootstrapUntil = 0
+    const bootstrapping = () => Date.now() < bootstrapUntil
+    const create = backend.createService.bind(backend)
+    backend.createService = async (roomId, svc, version) => {
+      await create(roomId, svc, version)
+      if (svc === 'postgres') bootstrapUntil = Date.now() + BOOTSTRAP_MS
+    }
+    const exec = backend.execInService.bind(backend)
+    backend.execInService = async (roomId, svc, cmd) => {
+      if (svc === 'postgres' && cmd[0] === 'pg_isready') {
+        backend.calls.push(`execInService:${svc}:${cmd[0]}`)
+        const overTcp = cmd.includes('-h')
+        if (bootstrapping() && overTcp) {
+          events.push('probe:no-response')
+          return { code: 2, stdout: '127.0.0.1:5432 - no response', stderr: '' }
+        }
+        events.push(bootstrapping() ? 'probe:init-server' : 'probe:real-server')
+        return { code: 0, stdout: 'accepting connections', stderr: '' }
+      }
+      if (svc === 'postgres' && cmd[0] === 'psql') {
+        events.push(bootstrapping() ? 'psql:interrupted' : 'psql')
+        if (bootstrapping()) {
+          backend.calls.push(`execInService:${svc}:${cmd[0]}`)
+          return interrupted
+        }
+      }
+      return exec(roomId, svc, cmd)
+    }
+    const execFromFile = backend.execInServiceFromFile.bind(backend)
+    backend.execInServiceFromFile = async (roomId, svc, cmd) => {
+      events.push(bootstrapping() ? 'restore:interrupted' : 'restore')
+      if (bootstrapping()) {
+        backend.calls.push(`execInServiceFromFile:${svc}:${cmd[0]}`)
+        return interrupted
+      }
+      return execFromFile(roomId, svc, cmd)
+    }
+    return { events }
+  }
+
+  function recordProbes(): string[][] {
+    const probes: string[][] = []
+    const exec = backend.execInService.bind(backend)
+    backend.execInService = async (roomId, svc, cmd) => {
+      if (cmd[0] === 'pg_isready' || cmd[0] === 'redis-cli') probes.push([svc, ...cmd])
+      return exec(roomId, svc, cmd)
+    }
+    return probes
+  }
+
+  beforeEach(() => {
+    backend.serviceStates.set('postgres', 'running')
+  })
+
+  it('probes PostgreSQL over TCP so the socket-only init server does not count as ready', async () => {
+    const probes = recordProbes()
+
+    await expect(pingService(ctx(), 'postgres')).resolves.toEqual({
+      ok: true,
+      detail: 'PostgreSQL answering on its in-room port'
+    })
+    expect(probes).toEqual([['postgres', 'pg_isready', '-h', '127.0.0.1', '-U', SERVICE_DB_USER]])
+  })
+
+  it('keeps the Redis probe and its result unchanged', async () => {
+    backend.serviceStates.set('redis', 'running')
+    const probes = recordProbes()
+
+    await expect(pingService(ctx(), 'redis')).resolves.toEqual({
+      ok: true,
+      detail: 'Redis answering on its in-room port'
+    })
+    expect(probes).toEqual([['redis', 'redis-cli', 'ping']])
+  })
+
+  it('upgrades PostgreSQL 16 to 17 only after the init server hands over to the real server', async () => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    const { events } = simulateInitServerOnCreate()
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '17' })
+    expect(events[0]).toBe('probe:no-response')
+    expect(events).not.toContain('probe:init-server')
+    expect(events.filter((e) => e.endsWith(':interrupted'))).toEqual([])
+    expect(events.indexOf('probe:real-server')).toBeLessThan(events.indexOf('psql'))
+    expect(events).toContain('restore')
+  })
+
+  it('shows the socket-only probe passing during the init server and the restore then being cut off', async () => {
+    const { events } = simulateInitServerOnCreate()
+    const changeCtx = ctx()
+    await backend.createService('room1abc', 'postgres', '17')
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    mkdirSync(changeCtx.userData, { recursive: true })
+    const backupFile = join(changeCtx.userData, 'postgres-before-fix.sql')
+    writeFileSync(backupFile, 'CREATE TABLE t();\n')
+
+    const socketProbe = await backend.execInService('room1abc', 'postgres', ['pg_isready', '-U', SERVICE_DB_USER])
+    expect(socketProbe.code).toBe(0)
+    await expect(restoreServiceFromFile(changeCtx, 'postgres', backupFile)).rejects.toThrow(
+      /database reset failed.*terminating connection/
+    )
+    expect(events).toEqual(['probe:init-server', 'psql:interrupted'])
   })
 })
 
