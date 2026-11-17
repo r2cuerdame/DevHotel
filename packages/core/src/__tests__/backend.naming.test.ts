@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { DEFAULT_TIMEOUT_MS } from '../backend/cli'
 import {
   ANCHOR_IMAGE,
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
   RELAY_PORT,
+  SERVICE_STOP_TIMEOUT_SECONDS,
   WEB_STOP_TIMEOUT_SECONDS,
   anchorName,
   androidControlNetworkName,
@@ -477,6 +479,12 @@ describe('buildWebCreateArgs', () => {
     expect(timeout).toBeGreaterThan(0)
     expect(args[timeout + 1]).toBe(String(WEB_STOP_TIMEOUT_SECONDS))
     expect(WEB_STOP_TIMEOUT_SECONDS).toBe(8)
+  })
+
+  it('lets data services shut down for longer than the web while staying inside one docker call', () => {
+    expect(SERVICE_STOP_TIMEOUT_SECONDS).toBe(60)
+    expect(SERVICE_STOP_TIMEOUT_SECONDS).toBeGreaterThan(WEB_STOP_TIMEOUT_SECONDS)
+    expect(SERVICE_STOP_TIMEOUT_SECONDS * 1000).toBeLessThan(DEFAULT_TIMEOUT_MS)
   })
 })
 

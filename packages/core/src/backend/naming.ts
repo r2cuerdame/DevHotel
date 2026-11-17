@@ -578,12 +578,9 @@ function quoteShellWord(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
-/**
- * Seconds `docker stop` gives a Room web container between TERM and KILL. Set
- * on the container itself so engine-initiated stops honour it too, and reused
- * by the explicit Room stop so both paths agree.
- */
 export const WEB_STOP_TIMEOUT_SECONDS = 8
+
+export const SERVICE_STOP_TIMEOUT_SECONDS = 60
 
 /**
  * The leading statements of the two shells `wrapStartCommand` emits. Workload
