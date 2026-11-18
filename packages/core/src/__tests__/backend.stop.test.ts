@@ -3,6 +3,7 @@ import { runDocker } from '../backend/cli'
 import {
   NETWORK_AUTHORITY_SANDBOX_LABEL,
   NETWORK_AUTHORITY_STARTED_AT_LABEL,
+  SERVICE_STOP_TIMEOUT_SECONDS,
   anchorName,
   roomNetworkName
 } from '../backend/naming'
@@ -173,6 +174,46 @@ describe('OciCliBackend.stopRoomPod', () => {
     ])
   })
 
+  it('gives Redis and PostgreSQL a longer shutdown after other leaves and before the anchors', async () => {
+    const states: Record<string, string> = {
+      aaa111: 'running',
+      ccc333: 'running',
+      fff666: 'running',
+      ddd777: 'running',
+      ddd444: 'running',
+      bbb222: 'running'
+    }
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'ps') {
+        return {
+          code: 0,
+          stdout: [
+            row('aaa111', 'dh-r1-web', 'web', states.aaa111!),
+            row('fff666', 'dh-r1-svc-postgres', 'svc-postgres', states.fff666!),
+            row('ccc333', 'dh-r1-svc-emulator', 'svc-emulator', states.ccc333!),
+            row('ddd777', 'dh-r1-svc-redis', 'svc-redis', states.ddd777!),
+            row('ddd444', 'dh-r1-android-runtime-anchor', 'android-runtime-anchor', states.ddd444!),
+            row('bbb222', 'dh-r1-anchor', 'anchor', states.bbb222!)
+          ].join('\n') + '\n',
+          stderr: ''
+        }
+      }
+      if (args[0] === 'stop') for (const id of args.slice(3)) states[id] = 'exited'
+      return { code: 0, stdout: '', stderr: '' }
+    })
+
+    await new OciCliBackend().stopRoomPod('r1')
+
+    const stops = mockedRunDocker.mock.calls.map(([args]) => args).filter((args) => args[0] === 'stop')
+    expect(stops).toEqual([
+      ['stop', '-t', '8', 'aaa111'],
+      ['stop', '-t', '5', 'ccc333'],
+      ['stop', '-t', '60', 'fff666', 'ddd777'],
+      ['stop', '-t', '5', 'ddd444'],
+      ['stop', '-t', '5', 'bbb222']
+    ])
+  })
+
   it('throws when a container still reports running after successful stop', async () => {
     mockedRunDocker.mockImplementation(async (args) => {
       if (args[0] === 'ps') {
@@ -221,7 +262,19 @@ describe('OciCliBackend service stop/start', () => {
       return { code: 1, stdout: '', stderr: 'stop denied' }
     })
     await expect(new OciCliBackend().stopService('r1', 'redis')).rejects.toThrow(/stop redis failed/)
-    expect(mockedRunDocker).toHaveBeenCalledWith(['stop', '-t', '5', 'c'.repeat(64)])
+    expect(mockedRunDocker).toHaveBeenCalledWith(['stop', '-t', String(SERVICE_STOP_TIMEOUT_SECONDS), 'c'.repeat(64)])
+  })
+
+  it('gives a restarted or restored service the long shutdown wait so it can save its data', async () => {
+    let state = 'running'
+    mockedRunDocker.mockImplementation(async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: redisInspect(state), stderr: '' }
+      if (args[0] === 'stop') state = 'exited'
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    await expect(new OciCliBackend().stopService('r1', 'redis')).resolves.toBeUndefined()
+    const stops = mockedRunDocker.mock.calls.map(([args]) => args).filter((args) => args[0] === 'stop')
+    expect(stops).toEqual([['stop', '-t', '60', 'c'.repeat(64)]])
   })
 
   it('post-verifies that a service really exited', async () => {

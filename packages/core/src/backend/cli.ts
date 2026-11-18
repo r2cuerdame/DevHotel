@@ -39,7 +39,7 @@ export interface RunDockerOpts {
   onStderr?: (chunk: ExecOutputChunk) => void
 }
 
-const DEFAULT_TIMEOUT_MS = 120_000
+export const DEFAULT_TIMEOUT_MS = 120_000
 
 function abortSignalError(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) return signal.reason

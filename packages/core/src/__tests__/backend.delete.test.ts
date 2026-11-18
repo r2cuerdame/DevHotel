@@ -154,7 +154,7 @@ describe('OciCliBackend.deleteRoomPod', () => {
     const stops = commands.filter((args) => args[0] === 'stop')
     expect(stops).toEqual([
       ['stop', '-t', '8', 'aaa111'],
-      ['stop', '-t', '5', 'ccc111'],
+      ['stop', '-t', '60', 'ccc111'],
       ['stop', '-t', '5', 'bbb222']
     ])
     expect(commands.findLastIndex((args) => args[0] === 'stop')).toBeLessThan(firstRemove)

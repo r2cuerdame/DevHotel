@@ -50,6 +50,7 @@ import {
   wrapStartCommand,
   workspaceSnapshotVolume,
   WEB_STOP_TIMEOUT_SECONDS,
+  SERVICE_STOP_TIMEOUT_SECONDS,
   type NetworkNamespaceAuthority,
 } from './naming'
 import type { ResumeRoomPodOpts, ResumeServiceSpec, RoomResumeResult } from './types'
@@ -1693,15 +1694,6 @@ export class OciCliBackend implements IsolationBackend {
     }
   }
 
-  /**
-   * Gracefully stops every owned container that is still active, leaves
-   * first and network authorities last so a server shuts down while its
-   * namespace still exists. Only `docker stop` is ever issued here: the
-   * engine delivers TERM and escalates to KILL on its own timeout, and this
-   * flow never force-kills or removes anything itself. One failing group does
-   * not skip the next; the failures come back for the caller to weigh against
-   * the inventory it re-reads.
-   */
   private async stopOwnedContainers(roomId: string, containers: ManagedRoomContainer[]): Promise<string[]> {
     const active = containers.filter((container) => !isStoppedContainerState(container.state))
     for (const container of active) {
@@ -1715,12 +1707,21 @@ export class OciCliBackend implements IsolationBackend {
     }
     const ids = (predicate: (container: ManagedRoomContainer) => boolean): string[] =>
       active.filter(predicate).map((container) => container.id)
+    const services = ['svc-postgres', 'svc-redis']
     const groups: Array<{ ids: string[]; timeout: number; what: string }> = [
       { ids: ids((container) => container.role === 'web'), timeout: WEB_STOP_TIMEOUT_SECONDS, what: 'web container' },
       {
-        ids: ids((container) => !['web', 'anchor', 'android-runtime-anchor'].includes(container.role)),
+        ids: ids(
+          (container) =>
+            !['web', 'anchor', 'android-runtime-anchor', ...services].includes(container.role)
+        ),
         timeout: 5,
         what: 'leaf containers'
+      },
+      {
+        ids: ids((container) => services.includes(container.role)),
+        timeout: SERVICE_STOP_TIMEOUT_SECONDS,
+        what: 'service containers'
       },
       { ids: ids((container) => container.role === 'android-runtime-anchor'), timeout: 5, what: 'runtime anchor' },
       { ids: ids((container) => container.role === 'anchor'), timeout: 5, what: 'control anchor' }
@@ -4051,7 +4052,7 @@ export class OciCliBackend implements IsolationBackend {
     const existing = await this.assertRoomContainer(roomId, name, `svc-${svc}`)
     if (existing.State?.Status === 'exited') return
     const id = exactContainerId(existing, roomId)
-    must(await this.docker(['stop', '-t', '5', id]), `stop ${svc}`)
+    must(await this.docker(['stop', '-t', String(SERVICE_STOP_TIMEOUT_SECONDS), id]), `stop ${svc}`)
     const stopped = await this.inspectContainer(id)
     if (!stopped || stopped.State?.Status !== 'exited') throw new Error(`${svc} stop incomplete: ${name}`)
   }
