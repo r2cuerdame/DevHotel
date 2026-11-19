@@ -1,10 +1,17 @@
+import { existsSync, readdirSync } from 'node:fs'
+import { join as joinPath } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ChangeEngine } from '../changes/engine'
 import { registerQuickChanges } from '../changes/definitions/index'
 import { androidRunChange } from '../changes/definitions/androidRun'
 import { ANDROID_SNAPSHOT_CLEAN_SCRIPT, cleanupAndroidBuildArtifacts } from '../changes/definitions/androidBuild'
 import { packageInstallCommand } from '../changes/definitions/packageInstall'
-import { pingService, restoreServiceFromFile, serviceRemoveChange } from '../changes/definitions/services'
+import {
+  backupServiceToFile,
+  pingService,
+  restoreServiceFromFile,
+  serviceRemoveChange
+} from '../changes/definitions/services'
 import { SERVICE_DB_USER } from '../backend/naming'
 import { NOTHING_TO_NORMALIZE } from '../changes/definitions/lineEndings'
 import {
@@ -465,6 +472,97 @@ describe('services', () => {
     expect(backend.serviceStates.get('redis')).toBe('running')
     expect(backend.calls.some((call) => call.startsWith('removeService:redis'))).toBe(false)
     expect(changes.list('room1abc').filter((c) => c.kind === 'service-remove')).toHaveLength(0)
+  })
+
+  describe('Redis SAVE reply', () => {
+    function scriptRedis(replies: { save: string[]; bgsave?: string[] }) {
+      const original = backend.execInService.bind(backend)
+      const saves = [...replies.save]
+      const bgsave = [...(replies.bgsave ?? [])]
+      backend.execInService = async (roomId, svc, cmd) => {
+        if (svc === 'redis' && cmd[0] === 'redis-cli' && cmd[1] === 'save') {
+          backend.calls.push('redis:save')
+          return { code: 0, stdout: `${saves.shift() ?? 'OK'}\n`, stderr: '' }
+        }
+        if (svc === 'redis' && cmd[0] === 'redis-cli' && cmd[1] === 'info') {
+          backend.calls.push('redis:info')
+          return { code: 0, stdout: `# Persistence\r\nrdb_bgsave_in_progress:${bgsave.shift() ?? '0'}\r\n`, stderr: '' }
+        }
+        return original(roomId, svc, cmd)
+      }
+    }
+
+    function backupFiles(): string[] {
+      const dir = joinPath(ctxUserData, 'rooms', 'room1abc', 'backups')
+      return existsSync(dir) ? readdirSync(dir) : []
+    }
+
+    let ctxUserData: string
+    function redisCtx(): ChangeCtx {
+      return { ...ctx(), userData: ctxUserData }
+    }
+
+    beforeEach(() => {
+      ctxUserData = tempDir()
+      rooms.update('room1abc', { services: { redis: { version: '8' } } })
+      backend.serviceStates.set('redis', 'running')
+      backend.calls.length = 0
+    })
+
+    it('waits out a background save and copies the file only after a fresh SAVE answers OK', async () => {
+      scriptRedis({ save: ['ERR Background save already in progress', 'OK'], bgsave: ['1', '0'] })
+
+      const file = await backupServiceToFile(redisCtx(), 'redis')
+
+      expect(file).toMatch(/redis-.*\.rdb$/)
+      const redisCalls = backend.calls.filter((c) => c.startsWith('redis:') || c.startsWith('copyFromService:redis'))
+      expect(redisCalls).toEqual([
+        'redis:save',
+        'redis:info',
+        'redis:info',
+        'redis:save',
+        'copyFromService:redis:/data/dump.rdb'
+      ])
+      expect(backupFiles()).toHaveLength(1)
+    })
+
+    it('fails with the Redis reason and leaves no backup when SAVE is refused with exit code 0', async () => {
+      scriptRedis({ save: ['MISCONF Redis is configured to save RDB snapshots, but it is currently not able to persist on disk'] })
+
+      await expect(backupServiceToFile(redisCtx(), 'redis')).rejects.toThrow(/redis SAVE failed: MISCONF .*not able to persist/)
+      expect(backend.calls.some((c) => c.startsWith('copyFromService:redis'))).toBe(false)
+      expect(backupFiles()).toEqual([])
+    })
+
+    it('room reset stops before deleting Redis data when SAVE is refused', async () => {
+      scriptRedis({ save: ['MISCONF disk error'] })
+      rooms.update('room1abc', { sourceType: 'managed-git', sourceRef: 'https://example.test/repo.git', workspaceMode: 'hotel' })
+
+      await expect(
+        engine.execute(
+          redisCtx(),
+          'room-reset',
+          { reinstallDependencies: false, clearCaches: false, services: 'empty', clearBrowserData: false },
+          'user'
+        )
+      ).rejects.toThrow(/redis SAVE failed: MISCONF disk error/)
+      expect(backend.calls.some((c) => c.startsWith('removeService:redis'))).toBe(false)
+      expect(backend.serviceStates.get('redis')).toBe('running')
+      expect(backupFiles()).toEqual([])
+    })
+
+    it('version switch stops before deleting Redis data when SAVE is refused', async () => {
+      scriptRedis({ save: ['ERR something went wrong'] })
+
+      const outcome = await engine
+        .execute(redisCtx(), 'service-version', { service: 'redis', version: '7' }, 'user')
+        .then((entry) => entry.verify?.detail ?? entry.status, (err: Error) => err.message)
+
+      expect(outcome).toMatch(/redis SAVE failed: ERR something went wrong/)
+      expect(backend.calls.some((c) => c.startsWith('removeService:redis'))).toBe(false)
+      expect(rooms.get('room1abc')!.services.redis).toEqual({ version: '8' })
+      expect(backupFiles()).toEqual([])
+    })
   })
 
   it('remove verify names the preserved safety backup', async () => {

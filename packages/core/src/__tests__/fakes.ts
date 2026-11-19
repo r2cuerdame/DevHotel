@@ -574,6 +574,10 @@ export class FakeBackend implements IsolationBackend {
   async execInService(_roomId: string, svc: 'postgres' | 'redis', cmd: string[]): Promise<ExecResult> {
     this.calls.push(`execInService:${svc}:${cmd[0]}`)
     if (cmd[0] === 'redis-cli' && cmd[1] === 'ping') return { code: 0, stdout: 'PONG', stderr: '' }
+    if (cmd[0] === 'redis-cli' && cmd[1] === 'save') return { code: 0, stdout: 'OK', stderr: '' }
+    if (cmd[0] === 'redis-cli' && cmd[1] === 'info') {
+      return { code: 0, stdout: '# Persistence\r\nrdb_bgsave_in_progress:0\r\n', stderr: '' }
+    }
     if (cmd[0] === 'pg_dump') return { code: 0, stdout: '-- fake dump\nCREATE TABLE t();', stderr: '' }
     return this.svcExecResult
   }
