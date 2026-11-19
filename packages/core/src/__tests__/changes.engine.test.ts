@@ -1107,6 +1107,192 @@ describe('service data restore while the room app holds a database connection', 
   })
 })
 
+describe('service data replacement pauses the room app', () => {
+  async function postgresBackupId(changeCtx: ChangeCtx): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const dir = join(changeCtx.userData, 'rooms', 'room1abc', 'backups')
+    mkdirSync(dir, { recursive: true })
+    const backupId = 'postgres-2026-11-01T10-00-00-0a1b2c3d.sql'
+    writeFileSync(join(dir, backupId), 'CREATE TABLE t();\n')
+    return backupId
+  }
+
+  function pauseCalls(): string[] {
+    return backend.calls.filter((call) => call === 'pauseWeb:room1abc' || call === 'unpauseWeb:room1abc')
+  }
+
+  beforeEach(() => {
+    rooms.update('room1abc', { services: { postgres: { version: '16' } } })
+    backend.serviceStates.set('postgres', 'running')
+  })
+
+  it('pauses the app after the safety backup and before the drop, and resumes it after the restore', async () => {
+    const trace = appConnectedToPostgres()
+    const changeCtx = ctx()
+    const backupId = await postgresBackupId(changeCtx)
+
+    const entry = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(trace).toEqual([DROP_DEVHOTEL, CREATE_DEVHOTEL, RESTORE_FROM_FILE])
+    const calls = backend.calls
+    const pause = calls.indexOf('pauseWeb:room1abc')
+    const firstSqlAfterPause = calls.indexOf('execInService:postgres:psql', pause)
+    expect(calls.indexOf('execInServiceToFile:postgres:pg_dump')).toBeLessThan(pause)
+    expect(pause).toBeGreaterThanOrEqual(0)
+    expect(calls.slice(0, pause)).not.toContain('execInService:postgres:psql')
+    expect(firstSqlAfterPause).toBeGreaterThan(pause)
+    expect(calls.indexOf('execInServiceFromFile:postgres:psql')).toBeGreaterThan(firstSqlAfterPause)
+    expect(calls.indexOf('unpauseWeb:room1abc')).toBeGreaterThan(calls.indexOf('execInServiceFromFile:postgres:psql'))
+    expect(pauseCalls()).toEqual(['pauseWeb:room1abc', 'unpauseWeb:room1abc'])
+    expect(backend.webPausedValue).toBe(false)
+  })
+
+  it('pauses the app before removing the old PostgreSQL and resumes it after loading the data into the new one', async () => {
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    const calls = backend.calls
+    const pause = calls.indexOf('pauseWeb:room1abc')
+    expect(pause).toBeGreaterThan(calls.indexOf('execInServiceToFile:postgres:pg_dump'))
+    expect(pause).toBeLessThan(calls.indexOf('removeService:postgres:with-volume'))
+    expect(calls.indexOf('unpauseWeb:room1abc')).toBeGreaterThan(calls.lastIndexOf('execInServiceFromFile:postgres:psql'))
+    expect(pauseCalls()).toEqual(['pauseWeb:room1abc', 'unpauseWeb:room1abc'])
+  })
+
+  it('pauses the app for the undo of a restore, a version switch and a removal', async () => {
+    const changeCtx = ctx()
+    const version = await engine.execute(changeCtx, 'service-version', { service: 'postgres', version: '17' }, 'user')
+    backend.calls.length = 0
+    await engine.undo(changeCtx, version.id, 'user')
+    expect(backend.calls.indexOf('pauseWeb:room1abc')).toBeLessThan(backend.calls.indexOf('removeService:postgres:with-volume'))
+    expect(backend.calls.indexOf('unpauseWeb:room1abc')).toBeGreaterThan(backend.calls.indexOf('execInServiceFromFile:postgres:psql'))
+
+    const restore = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId: await postgresBackupId(changeCtx) }, 'user')
+    backend.calls.length = 0
+    await engine.undo(changeCtx, restore.id, 'user')
+    expect(pauseCalls()).toEqual(['pauseWeb:room1abc', 'unpauseWeb:room1abc'])
+    expect(backend.calls.indexOf('pauseWeb:room1abc')).toBeLessThan(backend.calls.indexOf('execInService:postgres:psql'))
+
+    const removed = await engine.execute(changeCtx, 'service-remove', { service: 'postgres' }, 'user')
+    backend.calls.length = 0
+    await engine.undo(changeCtx, removed.id, 'user')
+    expect(backend.calls.indexOf('pauseWeb:room1abc')).toBeLessThan(backend.calls.indexOf('removeService:postgres:keep-volume'))
+    expect(backend.calls.indexOf('unpauseWeb:room1abc')).toBeGreaterThan(backend.calls.indexOf('execInServiceFromFile:postgres:psql'))
+    expect(backend.webPausedValue).toBe(false)
+  })
+
+  it('resumes the app when the restore fails and again around the automatic rollback', async () => {
+    const restore = backend.execInServiceFromFile.bind(backend)
+    let restores = 0
+    backend.execInServiceFromFile = async (roomId, svc, cmd) => {
+      restores += 1
+      if (restores === 1) {
+        backend.calls.push(`execInServiceFromFile:${svc}:${cmd[0]}`)
+        return { code: 3, stdout: '', stderr: 'ERROR:  relation "users" already exists' }
+      }
+      return restore(roomId, svc, cmd)
+    }
+    const changeCtx = ctx()
+
+    const entry = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId: await postgresBackupId(changeCtx) }, 'user')
+
+    expect(entry.status).toBe('rolled-back')
+    expect(restores).toBe(2)
+    expect(pauseCalls()).toEqual(['pauseWeb:room1abc', 'unpauseWeb:room1abc', 'pauseWeb:room1abc', 'unpauseWeb:room1abc'])
+    expect(backend.webPausedValue).toBe(false)
+  })
+
+  it('recreates the app when it cannot be resumed and keeps the restore result', async () => {
+    backend.unpauseWeb = async (roomId) => {
+      backend.calls.push(`unpauseWeb:${roomId}`)
+      throw new Error('container is not paused')
+    }
+    const changeCtx = ctx()
+
+    const entry = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId: await postgresBackupId(changeCtx) }, 'user')
+
+    expect(entry.status).toBe('verified')
+    const recreate = backend.calls.findIndex((call) => call.startsWith('recreateWeb:room1abc:'))
+    expect(recreate).toBeGreaterThan(backend.calls.indexOf('unpauseWeb:room1abc'))
+    expect(backend.webPausedValue).toBe(false)
+  })
+
+  it('reports the restore, resume and recreate errors together when the app cannot come back', async () => {
+    const { withWebPaused } = await import('../changes/definitions/services')
+    backend.unpauseWeb = async () => {
+      throw new Error('container is not paused')
+    }
+    backend.recreateWeb = async () => {
+      throw new Error('image missing')
+    }
+
+    const error = await withWebPaused(ctx(), async () => {
+      throw new Error('psql restore failed')
+    }).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(AggregateError)
+    expect((error as AggregateError).errors.map((e: Error) => e.message)).toEqual([
+      'psql restore failed',
+      'container is not paused',
+      'image missing'
+    ])
+  })
+
+  it('stops before dropping or removing anything when the app cannot be paused', async () => {
+    const trace = appConnectedToPostgres()
+    backend.pauseWeb = async (roomId) => {
+      backend.calls.push(`pauseWeb:${roomId}`)
+      throw new Error('cgroup freezer unavailable')
+    }
+    const changeCtx = ctx()
+
+    const restore = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId: await postgresBackupId(changeCtx) }, 'user')
+    expect(restore.status).toBe('failed')
+    expect(restore.verify?.detail).toMatch(/Could not pause the Room app.*cgroup freezer unavailable/)
+    expect(trace).toEqual([])
+
+    const version = await engine.execute(changeCtx, 'service-version', { service: 'postgres', version: '17' }, 'user')
+    expect(version.status).toBe('failed')
+    expect(backend.calls.some((call) => call.startsWith('removeService:postgres'))).toBe(false)
+    expect(backend.calls.some((call) => call.startsWith('execInServiceFromFile:'))).toBe(false)
+    expect(backend.calls).not.toContain('unpauseWeb:room1abc')
+    expect(trace).toEqual([])
+    expect(rooms.get('room1abc')!.services.postgres).toEqual({ version: '16' })
+  })
+
+  it.each([
+    ['stopped', () => { backend.webStateValue = 'exited' }],
+    ['already paused', () => { backend.webPausedValue = true }]
+  ])('leaves a %s app as it was', async (_label, arrange) => {
+    arrange()
+    const pausedBefore = backend.webPausedValue
+    const changeCtx = ctx()
+
+    const restore = await engine.execute(changeCtx, 'db-restore', { service: 'postgres', backupId: await postgresBackupId(changeCtx) }, 'user')
+    const version = await engine.execute(changeCtx, 'service-version', { service: 'postgres', version: '17' }, 'user')
+
+    expect(restore.status).toBe('verified')
+    expect(version.status).toBe('verified')
+    expect(pauseCalls()).toEqual([])
+    expect(backend.calls.some((call) => call.startsWith('recreateWeb:'))).toBe(false)
+    expect(backend.webPausedValue).toBe(pausedBefore)
+  })
+
+  it('pauses the app around a Redis restore', async () => {
+    rooms.update('room1abc', { services: { redis: { version: '8' } } })
+    backend.serviceStates.set('redis', 'running')
+
+    const entry = await engine.execute(ctx(), 'service-version', { service: 'redis', version: '7' }, 'user')
+
+    expect(entry.status).toBe('verified')
+    expect(backend.calls.indexOf('pauseWeb:room1abc')).toBeLessThan(backend.calls.indexOf('removeService:redis:with-volume'))
+    expect(backend.calls.indexOf('unpauseWeb:room1abc')).toBeGreaterThan(backend.calls.lastIndexOf('copyToService:redis:/data/dump.rdb'))
+    expect(pauseCalls()).toEqual(['pauseWeb:room1abc', 'unpauseWeb:room1abc'])
+  })
+})
+
 describe('Redis restore keeps the service running when the copy fails', () => {
   async function rdbFile(): Promise<string> {
     const { writeFileSync } = await import('node:fs')

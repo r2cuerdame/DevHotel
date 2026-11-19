@@ -224,6 +224,45 @@ export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Pro
   }
 }
 
+export async function withWebPaused<T>(ctx: ChangeCtx, fn: () => Promise<T>): Promise<T> {
+  const shouldPause = ctx.isAwake()
+    && (await ctx.backend.webState(ctx.roomId)) === 'running'
+    && !(await ctx.backend.webPaused(ctx.roomId))
+  if (!shouldPause) return fn()
+  try {
+    await ctx.backend.pauseWeb(ctx.roomId)
+  } catch (pauseError) {
+    throw new Error(
+      `Could not pause the Room app before replacing its data: ${pauseError instanceof Error ? pauseError.message : String(pauseError)}`,
+      { cause: pauseError }
+    )
+  }
+  let result: T | undefined
+  let failed = false
+  let failure: unknown
+  try {
+    result = await fn()
+  } catch (error) {
+    failed = true
+    failure = error
+  }
+  try {
+    await ctx.backend.unpauseWeb(ctx.roomId)
+  } catch (unpauseError) {
+    ctx.log(`Room app resume failed, recreating it: ${unpauseError instanceof Error ? unpauseError.message : String(unpauseError)}`)
+    try {
+      await ctx.backend.recreateWeb(ctx.webSpec())
+    } catch (recreateError) {
+      throw new AggregateError(
+        failed ? [failure, unpauseError, recreateError] : [unpauseError, recreateError],
+        'Could not resume or recreate the Room app after replacing its data'
+      )
+    }
+  }
+  if (failed) throw failure
+  return result as T
+}
+
 export async function restoreServiceFromFile(ctx: ChangeCtx, svc: ServiceKind, file: string): Promise<void> {
   if (!existsSync(file)) throw new Error(`Backup file not found: ${file}`)
   if (svc === 'postgres') {
@@ -406,10 +445,12 @@ export const serviceRemoveChange: ChangeDefinition<{ service: ServiceKind }> = {
     if (!ctx.isAwake()) throw new Error(`Wake the room first — restoring ${label} from its safety backup needs it running`)
     const version = captured?.version ?? SERVICE_DEFAULT_VERSIONS[service]
     ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version } } })
-    await materializeService(ctx, service, version)
-    const ping = await pingService(ctx, service)
-    if (!ping.ok) throw new Error(ping.detail)
-    await restoreServiceFromFile(ctx, service, backupFile)
+    await withWebPaused(ctx, async () => {
+      await materializeService(ctx, service, version)
+      const ping = await pingService(ctx, service)
+      if (!ping.ok) throw new Error(ping.detail)
+      await restoreServiceFromFile(ctx, service, backupFile)
+    })
   },
   verifyUndo(ctx, entry) {
     return pingService(ctx, inferService(entry.title))
@@ -445,12 +486,14 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
     steps.setCaptured({ prevVersion, backupFile })
     ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [p.service]: { version: p.version } } })
     steps.push(`Recreate ${SERVICE_LABEL[p.service]} ${p.version} with a fresh data volume`)
-    await ctx.backend.removeService(ctx.roomId, p.service, { volume: true })
-    await ctx.backend.createService(ctx.roomId, p.service, p.version)
-    const ping = await pingService(ctx, p.service)
-    if (!ping.ok) throw new Error(ping.detail)
-    steps.push('Restore the data into the new version')
-    await restoreServiceFromFile(ctx, p.service, backupFile)
+    await withWebPaused(ctx, async () => {
+      await ctx.backend.removeService(ctx.roomId, p.service, { volume: true })
+      await ctx.backend.createService(ctx.roomId, p.service, p.version)
+      const ping = await pingService(ctx, p.service)
+      if (!ping.ok) throw new Error(ping.detail)
+      steps.push('Restore the data into the new version')
+      await restoreServiceFromFile(ctx, p.service, backupFile)
+    })
   },
   canRollbackApplyFailure(_ctx, _p, captured) {
     const backup = captured as { prevVersion?: unknown; backupFile?: unknown } | null
@@ -472,11 +515,13 @@ export const serviceVersionChange: ChangeDefinition<{ service: ServiceKind; vers
     if (!ctx.isAwake()) throw new Error(`Wake the room first — switching ${label} back restores its data from the safety backup`)
     const prevVersion = captured?.prevVersion ?? (entry.before as { version?: string } | null)?.version ?? SERVICE_DEFAULT_VERSIONS[service]
     ctx.rooms.update(ctx.roomId, { services: { ...ctx.room().services, [service]: { version: prevVersion } } })
-    await ctx.backend.removeService(ctx.roomId, service, { volume: true })
-    await ctx.backend.createService(ctx.roomId, service, prevVersion)
-    const ping = await pingService(ctx, service)
-    if (!ping.ok) throw new Error(ping.detail)
-    await restoreServiceFromFile(ctx, service, backupFile)
+    await withWebPaused(ctx, async () => {
+      await ctx.backend.removeService(ctx.roomId, service, { volume: true })
+      await ctx.backend.createService(ctx.roomId, service, prevVersion)
+      const ping = await pingService(ctx, service)
+      if (!ping.ok) throw new Error(ping.detail)
+      await restoreServiceFromFile(ctx, service, backupFile)
+    })
   },
   verifyUndo(ctx, entry) {
     return pingService(ctx, inferService(entry.title))
@@ -574,7 +619,7 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; backupId:
   async apply(ctx, p, steps) {
     const file = resolveRoomBackupFile(ctx.userData, ctx.roomId, p.service, p.backupId)
     steps.push(`Restore ${SERVICE_LABEL[p.service]} from ${p.backupId}`)
-    await restoreServiceFromFile(ctx, p.service, file)
+    await withWebPaused(ctx, () => restoreServiceFromFile(ctx, p.service, file))
   },
   verify(ctx, p) {
     return pingService(ctx, p.service)
@@ -587,7 +632,7 @@ export const dbRestoreChange: ChangeDefinition<{ service: ServiceKind; backupId:
       throw new Error(`${label} safety backup is missing — undo cannot bring back the data from before the restore`)
     }
     if (!ctx.isAwake()) throw new Error(`Wake the room first — restoring ${label} from its safety backup needs it running`)
-    await restoreServiceFromFile(ctx, service, backupFile)
+    await withWebPaused(ctx, () => restoreServiceFromFile(ctx, service, backupFile))
   },
   verifyUndo(ctx, entry) {
     return pingService(ctx, inferService(entry.title))
