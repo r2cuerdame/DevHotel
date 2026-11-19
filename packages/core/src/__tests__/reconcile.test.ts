@@ -1,10 +1,11 @@
 import { rmSync } from 'node:fs'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { reconcile } from '../reconcile'
 import { jobName } from '../backend/naming'
-import { openDb } from '../store/db'
+import { RoomOrchestrator } from '../orchestrator'
+import { openDb, type Db } from '../store/db'
 import { roomsRepo } from '../store/roomsRepo'
-import { FakeBackend, makeRoom, tempDir } from './fakes'
+import { FakeBackend, FakeGateway, makeRoom, tempDir, testDb } from './fakes'
 
 describe('reconcile interrupted preparation', () => {
   const dirs: string[] = []
@@ -240,12 +241,10 @@ describe('reconcile deleting rooms', () => {
     rooms.create(makeRoom({ id: 'deleting02', status: 'deleting' }))
     const backend = new FakeBackend()
 
-    // First restart resumes and deletes
     const result1 = await reconcile(backend, rooms, () => undefined, { userData: dir })
     expect(rooms.get('deleting02')).toBeNull()
     expect(result1.roomsDeleted).toEqual(['deleting02'])
 
-    // Second restart sees clean state
     const result2 = await reconcile(backend, rooms, () => undefined, { userData: dir })
     expect(result2.roomsDeleted).toBeUndefined()
     db.close()
@@ -279,7 +278,6 @@ describe('reconcile stale one-shot jobs', () => {
       `removeManagedContainer:${exitedJob}`,
       `removeManagedContainer:${interruptedEmulator}`
     ])
-    // logs[0] is the plan digest line the reconciler emits before it acts.
     expect(logs.slice(1, 3).every((line) => line.includes('stale job container'))).toBe(true)
     expect(logs[3]).toContain('interrupted emulator create')
   })
@@ -372,6 +370,132 @@ describe('reconcile sleeping room stray runtimes', () => {
     expect(backend.calls).toContain('stopRoomPod:sleeppaused')
     expect(result.roomsSlept).toEqual([])
     expect(logs.some((l) => l.includes('sleeppaused') && l.includes('stray runtime'))).toBe(true)
+  })
+})
+
+describe('reconcile isolates individual startup failures', () => {
+  const dirs: string[] = []
+  const dbs: Db[] = []
+
+  afterEach(() => {
+    for (const db of dbs.splice(0)) db.close()
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  function repo() {
+    const dir = tempDir()
+    dirs.push(dir)
+    const db = openDb(dir)
+    dbs.push(db)
+    return roomsRepo(db)
+  }
+
+  it('keeps reconciling after one stray container cannot be removed', async () => {
+    const rooms = repo()
+    rooms.create(makeRoom({ id: 'awake0001', domain: 'awake.localhost', status: 'ready', hostPort: 41020 }))
+    rooms.create(makeRoom({ id: 'broken001', domain: 'broken.localhost', status: 'broken', hostPort: null }))
+    const backend = new FakeBackend()
+    backend.managedContainers = [
+      { roomId: 'gone00001', role: 'web', state: 'exited', name: 'dh-gone00001-web' },
+      { roomId: 'gone00002', role: 'web', state: 'exited', name: 'dh-gone00002-web' }
+    ]
+    backend.managedNetworks = [
+      { roomId: 'gone00002', name: 'dh-gone00002-net' },
+      { roomId: 'broken001', name: 'dh-broken001-net' }
+    ]
+    const remove = backend.removeManagedContainer.bind(backend)
+    backend.removeManagedContainer = async (name: string) => {
+      if (name === 'dh-gone00001-web') {
+        backend.calls.push(`removeManagedContainer:${name}`)
+        throw new Error('container is locked')
+      }
+      await remove(name)
+    }
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(result.straysFailed).toEqual(['dh-gone00001-web'])
+    expect(result.straysRemoved).toEqual(['dh-gone00002-web'])
+    expect(result.networksRemoved).toEqual(['dh-gone00002-net'])
+    expect(backend.calls).toContain('removeManagedContainer:dh-gone00002-web')
+    expect(backend.calls).toContain('removeManagedNetwork:dh-gone00002-net')
+    expect(backend.calls).toContain('adoptManagedNetwork:dh-broken001-net')
+    expect(backend.calls).toContain('stopRoomPod:broken001')
+    expect(rooms.get('awake0001')).toMatchObject({ status: 'sleeping', hostPort: null })
+    expect(result.roomsSlept).toEqual(['awake0001'])
+    expect(result.roomsFailedToSleep).toBeUndefined()
+    expect(logs.some((line) => line.includes('could not remove container dh-gone00001-web: container is locked'))).toBe(true)
+  })
+
+  it('marks a Room broken when it cannot be stopped and still sleeps the Rooms after it', async () => {
+    const rooms = repo()
+    rooms.create(makeRoom({ id: 'awake0001', domain: 'awake1.localhost', status: 'ready', hostPort: 41021 }))
+    rooms.create(makeRoom({ id: 'awake0002', domain: 'awake2.localhost', status: 'running', hostPort: 41022 }))
+    const backend = new FakeBackend()
+    const stop = backend.stopRoomPod.bind(backend)
+    backend.stopRoomPod = async (roomId: string) => {
+      if (roomId === 'awake0001') {
+        backend.calls.push(`stopRoomPod:${roomId}`)
+        throw new Error('Room awake0001 stop incomplete')
+      }
+      await stop(roomId)
+    }
+    const logs: string[] = []
+
+    const result = await reconcile(backend, rooms, (line) => logs.push(line))
+
+    expect(rooms.get('awake0001')).toMatchObject({ status: 'broken', hostPort: null })
+    expect(rooms.get('awake0002')).toMatchObject({ status: 'sleeping', hostPort: null })
+    expect(result.roomsSlept).toEqual(['awake0002'])
+    expect(result.roomsFailedToSleep).toEqual(['awake0001'])
+    expect(result.straysFailed).toBeUndefined()
+    expect(backend.calls).toContain('stopRoomPod:awake0002')
+    expect(logs.some((line) => line.includes('could not stop room awake0001') && line.includes('stop incomplete'))).toBe(true)
+  })
+
+  it('finishes startup when a stray removal and a Room stop both fail', async () => {
+    const userData = tempDir()
+    dirs.push(userData)
+    const db = testDb()
+    dbs.push(db)
+    const backend = new FakeBackend()
+    const gateway = new FakeGateway()
+    const orch = new RoomOrchestrator({ userData, db, backend, gateway: gateway.asGateway(), appVersion: 'test' })
+    orch.rooms.create(makeRoom({ id: 'awake0001', domain: 'awake1.localhost', status: 'ready', hostPort: 41023 }))
+    orch.rooms.create(makeRoom({ id: 'awake0002', domain: 'awake2.localhost', status: 'ready', hostPort: 41024 }))
+    backend.managedContainers = [{ roomId: 'gone00001', role: 'web', state: 'exited', name: 'dh-gone00001-web' }]
+    backend.removeManagedContainer = async () => {
+      throw new Error('container is locked')
+    }
+    const stop = backend.stopRoomPod.bind(backend)
+    backend.stopRoomPod = async (roomId: string) => {
+      if (roomId === 'awake0001') throw new Error('Room awake0001 stop incomplete')
+      await stop(roomId)
+    }
+    const internals = orch as unknown as {
+      reconcileWindowsRooms: () => Promise<void>
+      markInterruptedChanges: (slept: Set<string>) => Promise<void>
+    }
+    const windows = vi.spyOn(internals, 'reconcileWindowsRooms')
+    const changes = vi.spyOn(internals, 'markInterruptedChanges')
+    const browsersReconcile = vi.spyOn(orch.clientBrowsers, 'reconcile')
+    const browsersStart = vi.spyOn(orch.clientBrowsers, 'start')
+
+    const result = await orch.init()
+
+    expect(orch.startupStatus()).toMatchObject({ state: 'ready', code: null })
+    expect(result.reconciled).toMatchObject({
+      straysFailed: ['dh-gone00001-web'],
+      roomsFailedToSleep: ['awake0001'],
+      roomsSlept: ['awake0002']
+    })
+    expect(orch.rooms.get('awake0001')).toMatchObject({ status: 'broken', hostPort: null })
+    expect(orch.rooms.get('awake0002')).toMatchObject({ status: 'sleeping', hostPort: null })
+    expect(windows).toHaveBeenCalled()
+    expect(changes).toHaveBeenCalledWith(new Set(['awake0002']))
+    expect(browsersReconcile).toHaveBeenCalled()
+    expect(browsersStart).toHaveBeenCalled()
   })
 })
 

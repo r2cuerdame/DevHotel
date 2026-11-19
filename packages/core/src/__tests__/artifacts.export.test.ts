@@ -633,9 +633,11 @@ describe('Room screenshot artifact export', () => {
       throw new Error('exact helper removal could not be proved')
     }
 
-    await expect(orch.init()).rejects.toThrow('exact helper removal could not be proved')
+    const result = await orch.init()
 
     expect(backend.calls).toContain('removeManagedContainer:dh-aaaa1111-job-stale-artifact-helper')
+    expect(result.reconciled?.straysFailed).toEqual(['dh-aaaa1111-job-stale-artifact-helper'])
+    expect(result.reconciled?.straysRemoved).toEqual([])
     expect(backend.reconcileRoomArtifactPublicationCalls).toEqual([])
     expect(orch.settings.get(key)).toBe(raw)
     expect(orch.rooms.get('aaaa1111')).toMatchObject({ status: 'broken', hostPort: null })
