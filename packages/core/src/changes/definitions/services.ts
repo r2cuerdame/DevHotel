@@ -188,6 +188,45 @@ export async function validatePostgresLogicalClone(ctx: ChangeCtx): Promise<void
   }
 }
 
+const REDIS_SAVE_BUDGET_MS = 300_000
+const REDIS_BGSAVE_POLL_MS = 1_000
+const REDIS_BGSAVE_IN_PROGRESS = 'Background save already in progress'
+
+function redisReply(res: { stdout: string; stderr: string }): string {
+  return [res.stdout.trim(), res.stderr.trim()].filter(Boolean).join(' / ').slice(-300)
+}
+
+async function saveRedisSnapshot(ctx: ChangeCtx): Promise<void> {
+  const deadline = Date.now() + REDIS_SAVE_BUDGET_MS
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new Error('redis SAVE failed: a background save was still in progress when the backup time ran out')
+    const save = await ctx.backend.execInService(ctx.roomId, 'redis', ['redis-cli', 'save'], { timeoutMs: remaining })
+    if (save.code === 0 && save.stdout.trim() === 'OK') return
+    const reply = redisReply(save)
+    if (!reply.includes(REDIS_BGSAVE_IN_PROGRESS)) {
+      throw new Error(`redis SAVE failed: ${reply || `exit code ${save.code} with no reply`}`)
+    }
+    await waitForRedisBackgroundSave(ctx, deadline)
+  }
+}
+
+async function waitForRedisBackgroundSave(ctx: ChangeCtx, deadline: number): Promise<void> {
+  let last = ''
+  while (Date.now() < deadline) {
+    const info = await ctx.backend.execInService(ctx.roomId, 'redis', ['redis-cli', 'info', 'persistence'], {
+      timeoutMs: Math.max(1, Math.min(10_000, deadline - Date.now()))
+    })
+    const flag = /rdb_bgsave_in_progress:(\d+)/.exec(info.stdout)?.[1]
+    if (info.code === 0 && flag === '0') return
+    last = flag === undefined ? redisReply(info) : `rdb_bgsave_in_progress:${flag}`
+    await sleep(Math.max(0, Math.min(REDIS_BGSAVE_POLL_MS, deadline - Date.now())))
+  }
+  throw new Error(
+    `redis SAVE failed: a background save was still in progress when the backup time ran out${last ? ` (${last})` : ''}`
+  )
+}
+
 export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Promise<string> {
   const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19)
   const unique = randomUUID().slice(0, 8)
@@ -213,8 +252,7 @@ export async function backupServiceToFile(ctx: ChangeCtx, svc: ServiceKind): Pro
   const file = join(backupsDir(ctx), `redis-${stamp}-${unique}.rdb`)
   const partial = `${file}.${randomUUID()}.partial`
   try {
-    const save = await ctx.backend.execInService(ctx.roomId, 'redis', ['redis-cli', 'save'], { timeoutMs: 300_000 })
-    if (save.code !== 0) throw new Error(`redis SAVE failed: ${save.stderr.slice(-300)}`)
+    await saveRedisSnapshot(ctx)
     await ctx.backend.copyFromService(ctx.roomId, 'redis', '/data/dump.rdb', partial)
     if (statSync(partial).size === 0) throw new Error('Redis SAVE produced an empty backup')
     renameSync(partial, file)
