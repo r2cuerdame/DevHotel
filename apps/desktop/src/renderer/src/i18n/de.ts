@@ -230,7 +230,16 @@ export const de: Translation = {
   'services.databases': 'Datenbanken',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'Noch keine Ausgabe.',
+  'logs.filterPlaceholder': 'Logs filtern…',
+  'logs.clearFilter': 'Filter leeren',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'Keine passenden Logzeilen.',
+  'logs.follow': 'Auto-Scroll',
+  'logs.paused': 'Scroll pausiert',
+  'logs.copied': 'Logs kopiert',
+  'logs.copyFailed': 'Logs konnten nicht kopiert werden.',
 
   'changes.empty': 'Noch keine Änderungen. Änderungen aus Stack, Fixes und Agenten-Aktionen erscheinen hier.',
   'changes.undone': 'rückgängig gemacht',

@@ -229,7 +229,16 @@ export const ja: Translation = {
   'services.databases': 'データベース',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'まだ出力はありません。',
+  'logs.filterPlaceholder': 'ログを検索…',
+  'logs.clearFilter': '検索をクリア',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': '一致するログ行はありません。',
+  'logs.follow': '自動スクロール',
+  'logs.paused': 'スクロール一時停止',
+  'logs.copied': 'ログをコピーしました',
+  'logs.copyFailed': 'ログのコピーに失敗しました。',
 
   'changes.empty': 'まだ変更はありません。スタックでの変更、修正、エージェントの操作がここに表示されます。',
   'changes.undone': '取り消し済み',

@@ -261,7 +261,16 @@ export const ko: Translation = {
   'services.databases': '데이터베이스',
 
   'logs.web': '웹',
+  'logs.android': '안드로이드',
   'logs.empty': '아직 출력이 없습니다.',
+  'logs.filterPlaceholder': '로그 검색…',
+  'logs.clearFilter': '검색 지우기',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': '일치하는 로그가 없습니다.',
+  'logs.follow': '자동 스크롤',
+  'logs.paused': '스크롤 멈춤',
+  'logs.copied': '로그 복사 완료',
+  'logs.copyFailed': '로그를 복사하지 못했습니다.',
 
   'changes.empty': '아직 변경 사항이 없습니다. Quick Change에서 적용한 변경, 자동 수정, 에이전트 작업이 여기에 표시됩니다.',
   'changes.undone': '되돌림',

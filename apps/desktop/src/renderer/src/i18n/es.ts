@@ -230,7 +230,16 @@ export const es: Translation = {
   'services.databases': 'Bases de datos',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'Sin salida todavía.',
+  'logs.filterPlaceholder': 'Filtrar registros…',
+  'logs.clearFilter': 'Limpiar filtro',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'No hay líneas de registro coincidentes.',
+  'logs.follow': 'Desplazamiento automático',
+  'logs.paused': 'Desplazamiento en pausa',
+  'logs.copied': 'Registros copiados',
+  'logs.copyFailed': 'No se pudieron copiar los registros.',
 
   'changes.empty': 'Aún no hay cambios. Los cambios hechos desde Stack, las correcciones y las acciones de agentes aparecen aquí.',
   'changes.undone': 'deshecho',

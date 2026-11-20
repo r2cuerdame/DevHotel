@@ -228,7 +228,16 @@ export const zhCN: Translation = {
   'services.databases': '数据库',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': '暂无输出。',
+  'logs.filterPlaceholder': '筛选日志…',
+  'logs.clearFilter': '清除筛选',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': '没有匹配的日志行。',
+  'logs.follow': '自动滚动',
+  'logs.paused': '已暂停滚动',
+  'logs.copied': '已复制日志',
+  'logs.copyFailed': '复制日志失败。',
 
   'changes.empty': '还没有变更。来自技术栈的修改、修复和智能体操作会显示在这里。',
   'changes.undone': '已撤销',

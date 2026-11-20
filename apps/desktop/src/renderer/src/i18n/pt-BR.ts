@@ -230,7 +230,16 @@ export const ptBR: Translation = {
   'services.databases': 'Bancos de dados',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'Nenhuma saída ainda.',
+  'logs.filterPlaceholder': 'Filtrar logs…',
+  'logs.clearFilter': 'Limpar filtro',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'Nenhuma linha de log correspondente.',
+  'logs.follow': 'Rolagem automática',
+  'logs.paused': 'Rolagem pausada',
+  'logs.copied': 'Logs copiados',
+  'logs.copyFailed': 'Não foi possível copiar os logs.',
 
   'changes.empty': 'Nenhuma alteração ainda. Mudanças feitas na Stack, correções e ações de agentes aparecem aqui.',
   'changes.undone': 'desfeita',
