@@ -7,12 +7,14 @@ describe('redactSecrets', () => {
       'DATABASE_PASSWORD=hunter2',
       'apiKey: "sk_live_abcdef123456"',
       "secret = 'shh-dont-tell'",
+      'Authorization: Bearer opaque-secret-token-1234',
       'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'
     ].join('\n')
     const out = redactSecrets(input)
     expect(out).not.toContain('hunter2')
     expect(out).not.toContain('sk_live_abcdef123456')
     expect(out).not.toContain('shh-dont-tell')
+    expect(out).not.toContain('opaque-secret-token-1234')
     expect(out).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9')
     expect(out).toContain('DATABASE_PASSWORD')
   })

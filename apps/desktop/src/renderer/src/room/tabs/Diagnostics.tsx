@@ -57,11 +57,9 @@ export function DiagnosticsTab({ room }: { room: RoomRecord }): React.JSX.Elemen
         <button className="btn primary" disabled={running} onClick={() => void run()}>
           {running ? t('diag.checking') : t('diag.runChecks')}
         </button>
-        {room.provider !== 'windows' && (
-          <button className="btn" onClick={() => void copyDiagnostic(room.id)}>
-            {t('diag.copyDiagnostic')}
-          </button>
-        )}
+        <button className="btn" onClick={() => void copyDiagnostic(room.id)}>
+          {t('diag.copyDiagnostic')}
+        </button>
       </div>
 
       {!shown && <p className="muted">{t('diag.emptyHint')}</p>}
@@ -90,7 +88,7 @@ export function DiagnosticsTab({ room }: { room: RoomRecord }): React.JSX.Elemen
         </div>
       )}
 
-      {room.provider !== 'windows' && <p className="small muted">{t('diag.copyHint')}</p>}
+      <p className="small muted">{t('diag.copyHint')}</p>
     </>
   )
 }
