@@ -9,22 +9,20 @@ const BEARER = /((?:bearer|basic|token)\s+)[a-z0-9._~+/=-]{8,}/gi
 
 const CONNECTION_STRING = /((?:postgres(?:ql)?|mysql|redis|rediss|mongodb(?:\+srv)?|amqp|mssql):\/\/[^:\s/]+:)([^@\s]+)(@)/gi
 
-/** `https://user:secret@host` — a repository or webhook URL pasted with its credential inline. */
 const URL_USERINFO = /((?:https?|ssh|git):\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi
 
 const PEM_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
 
 const WELL_KNOWN_TOKENS = [
-  /\bsk-[a-zA-Z0-9_-]{16,}\b/g, // openai-style
-  /\bsk-ant-[a-zA-Z0-9_-]{16,}\b/g, // anthropic
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, // github classic
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, // github fine-grained
-  /\bxox[abps]-[A-Za-z0-9-]{10,}\b/g, // slack
-  /\bAKIA[0-9A-Z]{16}\b/g, // aws access key id
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g // jwt
+  /\bsk-[a-zA-Z0-9_-]{16,}\b/g,
+  /\bsk-ant-[a-zA-Z0-9_-]{16,}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[abps]-[A-Za-z0-9-]{10,}\b/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g
 ]
 
-/** `NAME=value` lines (env files / env dumps): keep the name, mask the value. */
 const ENV_LINE = /^(\s*(?:export\s+)?[A-Z][A-Z0-9_]{1,}\s*=\s*)(.+)$/gm
 
 /**
@@ -199,7 +197,6 @@ export class SecretRedactor {
 
 export const secretRedactor = new SecretRedactor()
 
-/** Register exact ephemeral values and return an idempotent release function. */
 export function registerSensitiveSecrets(values: Iterable<string>): () => void {
   return secretRedactor.register(values)
 }
@@ -208,12 +205,10 @@ export function redactSecrets(text: string, customPatterns: string[] = []): stri
   return secretRedactor.redactText(text, customPatterns)
 }
 
-/** Spans `redactSecrets` would rewrite; see `SecretRedactor.secretSpans`. */
 export function secretSpans(text: string): Array<[number, number]> {
   return secretRedactor.secretSpans(text)
 }
 
-/** Recursively redact strings and pairing-specific fields before serialization. */
 export function redactStructuredSecrets<T>(value: T, customPatterns: string[] = []): T {
   return secretRedactor.redactStructured(value, customPatterns)
 }
