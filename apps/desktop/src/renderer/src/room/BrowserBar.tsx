@@ -83,7 +83,6 @@ export function BrowserBar({
   const { fullyRunning: running, hasLiveComponent } = runtimeCapabilities(room)
   const web = room.provider === 'web'
   const windows = room.provider === 'windows'
-  // android rooms serve the emulator screen — their bar behaves like a site too
   const served = web || room.provider === 'android'
   const siteControlsEnabled = served && running && !configOpen
   const httpsPort = gateway?.httpsPort
@@ -304,15 +303,13 @@ export function BrowserBar({
                 setMenuOpen(false)
               }}
             />
-            {!windows && (
-              <MenuItem
-                label={t('diag.copyDiagnostic')}
-                onClick={() => {
-                  void useStore.getState().copyDiagnostic(room.id)
-                  setMenuOpen(false)
-                }}
-              />
-            )}
+            <MenuItem
+              label={t('diag.copyDiagnostic')}
+              onClick={() => {
+                void useStore.getState().copyDiagnostic(room.id)
+                setMenuOpen(false)
+              }}
+            />
             <div className="bar-menu-sep" />
             <MenuItem
               label={t('bar.deleteRoom')}

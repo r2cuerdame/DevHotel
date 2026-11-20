@@ -10216,6 +10216,7 @@ export class RoomOrchestrator {
   async getDiagnostic(roomId: string): Promise<string> {
     const room = this.mustGet(roomId)
     const report = await this.runChecks(roomId)
+    const latestRoom = this.rooms.get(roomId) ?? room
     let customPatterns: string[] = []
     try {
       customPatterns = JSON.parse(this.settings.get('redactPatterns') ?? '[]') as string[]
@@ -10223,12 +10224,13 @@ export class RoomOrchestrator {
       customPatterns = []
     }
     return buildDiagnostic({
-      room,
+      room: latestRoom,
       appVersion: this.appVersion,
       report,
       recentChanges: this.changes.list(roomId).slice(0, 6),
       gateway: this.gateway.status(),
-      webLogTail: this.logs.tail(roomId, 'web', 60),
+      webLogTail: latestRoom.provider === 'windows' ? [] : this.logs.tail(roomId, 'web', 60),
+      orchestratorLogTail: this.logs.tail(roomId, 'orchestrator', 60),
       customPatterns
     })
   }

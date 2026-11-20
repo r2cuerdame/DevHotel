@@ -109,8 +109,8 @@ export class SecretRedactor {
   redactText(text: string, customPatterns: string[] = []): string {
     let out = redactKnownPairingShapes(text)
     out = out.replace(PEM_BLOCK, '[private key redacted]')
-    out = out.replace(KEYED_VALUE, `$1${MASK}`)
     out = out.replace(BEARER, `$1${MASK}`)
+    out = out.replace(KEYED_VALUE, `$1${MASK}`)
     out = out.replace(CONNECTION_STRING, `$1${MASK}$3`)
     out = out.replace(URL_USERINFO, `$1${MASK}$3`)
     for (const re of WELL_KNOWN_TOKENS) out = out.replace(re, MASK)
