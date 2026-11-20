@@ -1,6 +1,7 @@
 import type { RoomRecord } from '@devhotel/shared'
 import type { TFunc } from '../i18n'
 import { stackLine, statusLabel, useStore, useT } from '../state/store'
+import { roomProviderBadgeKey } from './lobbyFilter'
 
 function relTime(t: TFunc, iso: string): string {
   const ms = Date.now() - new Date(iso).getTime()
@@ -36,6 +37,9 @@ export function RoomCard({ room }: { room: RoomRecord }): React.JSX.Element {
           <span className="room-no">№ {room.roomNumber}</span>
           <span className="room-title">
             {room.project} <span>/ {room.nickname}</span>
+          </span>
+          <span className="room-provider-badge" data-provider={room.provider}>
+            {t(roomProviderBadgeKey(room.provider))}
           </span>
         </div>
         <div className="room-meta">
