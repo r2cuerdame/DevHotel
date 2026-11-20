@@ -230,7 +230,16 @@ export const ru: Translation = {
   'services.databases': 'Базы данных',
 
   'logs.web': 'Веб',
+  'logs.android': 'Android',
   'logs.empty': 'Пока нет вывода.',
+  'logs.filterPlaceholder': 'Фильтр логов…',
+  'logs.clearFilter': 'Очистить фильтр',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'Нет совпадающих строк лога.',
+  'logs.follow': 'Автопрокрутка',
+  'logs.paused': 'Прокрутка на паузе',
+  'logs.copied': 'Логи скопированы',
+  'logs.copyFailed': 'Не удалось скопировать логи.',
 
   'changes.empty': 'Изменений пока нет. Здесь появятся изменения со вкладки «Стек», исправления и действия агентов.',
   'changes.undone': 'отменено',

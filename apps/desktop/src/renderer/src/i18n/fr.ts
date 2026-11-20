@@ -230,7 +230,16 @@ export const fr: Translation = {
   'services.databases': 'Bases de données',
 
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'Pas encore de sortie.',
+  'logs.filterPlaceholder': 'Filtrer les journaux…',
+  'logs.clearFilter': 'Effacer le filtre',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'Aucune ligne de journal correspondante.',
+  'logs.follow': 'Défilement auto',
+  'logs.paused': 'Défilement en pause',
+  'logs.copied': 'Journaux copiés',
+  'logs.copyFailed': 'Impossible de copier les journaux.',
 
   'changes.empty': 'Pas encore de modifications. Les changements faits depuis Stack, les correctifs et les actions des agents apparaissent ici.',
   'changes.undone': 'annulé',

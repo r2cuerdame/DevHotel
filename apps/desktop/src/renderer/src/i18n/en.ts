@@ -242,9 +242,17 @@ export const en = {
   'services.processMeta': '{status} · internal port {port}',
   'services.databases': 'Databases',
 
-  // Logs tab
   'logs.web': 'Web',
+  'logs.android': 'Android',
   'logs.empty': 'No output yet.',
+  'logs.filterPlaceholder': 'Filter logs…',
+  'logs.clearFilter': 'Clear filter',
+  'logs.matchCount': '{matched} / {total}',
+  'logs.noMatches': 'No matching log lines.',
+  'logs.follow': 'Auto-scroll',
+  'logs.paused': 'Scroll paused',
+  'logs.copied': 'Logs copied',
+  'logs.copyFailed': 'Failed to copy logs.',
 
   // Changes tab
   'changes.empty': 'No changes yet. Changes made from Stack, fixes, and agent actions appear here.',
