@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevHotel 가벼운 지표 제안 — VM 없이 도는 방 종류 수 · 공개 릴리스 간격</title>
+<style>
+  :root {
+    --ink: #1d2330;
+    --muted: #5b6475;
+    --line: #d9dee7;
+    --paper: #ffffff;
+    --bg: #eef1f6;
+    --accent: #2f6fdf;
+    --accent-soft: #dbe7fb;
+    --warn: #c9622b;
+    --warn-soft: #fbe6da;
+    --ok: #2f8f5b;
+    --ok-soft: #d9f0e3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Pretendard", "Malgun Gothic", "Apple SD Gothic Neo", "Segoe UI", sans-serif;
+    line-height: 1.55;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+  section.slide {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 36px 44px;
+    margin: 0 0 28px;
+    min-height: 420px;
+    box-shadow: 0 2px 10px rgba(29, 35, 48, 0.06);
+    position: relative;
+  }
+  .slide-no {
+    position: absolute; top: 18px; right: 24px;
+    color: var(--muted); font-size: 13px; letter-spacing: 0.04em;
+  }
+  .kicker { color: var(--accent); font-weight: 700; font-size: 14px; letter-spacing: 0.06em; margin: 0 0 6px; }
+  h1 { font-size: 34px; line-height: 1.25; margin: 0 0 14px; }
+  h2 { font-size: 26px; margin: 0 0 18px; }
+  h3 { font-size: 18px; margin: 0 0 8px; }
+  p { margin: 0 0 12px; }
+  .lead { font-size: 18px; color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 700; margin: 0 8px 8px 0;
+  }
+  .badge.wait { background: var(--warn-soft); color: var(--warn); }
+  .badge.free { background: var(--ok-soft); color: var(--ok); }
+  .badge.info { background: var(--accent-soft); color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 16px; font-size: 15px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 10px 0 18px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .card .label { color: var(--muted); font-size: 13px; }
+  .card .value { font-size: 26px; font-weight: 800; }
+  .choices { counter-reset: c; list-style: none; padding: 0; margin: 0 0 14px; }
+  .choices li {
+    counter-increment: c; border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px 12px 52px; margin: 0 0 10px; position: relative;
+  }
+  .choices li::before {
+    content: counter(c); position: absolute; left: 14px; top: 11px;
+    width: 26px; height: 26px; border-radius: 50%; background: var(--accent-soft);
+    color: var(--accent); font-weight: 800; text-align: center; line-height: 26px;
+  }
+  .choices li.pick { border-color: var(--accent); background: #f5f9ff; }
+  .note { color: var(--muted); font-size: 14px; }
+  code { background: #f2f4f8; border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+  svg { display: block; width: 100%; height: auto; margin: 6px 0 14px; }
+  @media (max-width: 720px) {
+    section.slide { padding: 26px 20px; }
+    .grid { grid-template-columns: 1fr; }
+    h1 { font-size: 27px; }
+  }
+  @media print {
+    body { background: #fff; }
+    section.slide { page-break-after: always; box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<section class="slide" id="cover">
+  <span class="slide-no">1 / 7</span>
+  <p class="kicker">DevHotel · PLC/KPI 제안 · 이슈 #293</p>
+  <h1>내부 사용 DAU 대신<br>가벼운 지표 두 개로 바꿉니다</h1>
+  <p class="lead">VM 없이 도는 방 종류 수 · 공개 릴리스 간격</p>
+  <p>
+    <span class="badge wait">의종 결정 대기</span>
+    <span class="badge free">새 비용 없음</span>
+    <span class="badge info">돈·삭제 단계 없음</span>
+  </p>
+  <svg viewBox="0 0 760 170" role="img" aria-label="내부 사용 DAU에서 두 지표로 바뀌는 흐름">
+    <rect x="10" y="45" width="190" height="80" rx="12" fill="#f2f4f8" stroke="#d9dee7"/>
+    <text x="105" y="80" text-anchor="middle" font-size="16" fill="#5b6475" text-decoration="line-through">내부 사용 DAU</text>
+    <text x="105" y="104" text-anchor="middle" font-size="12" fill="#5b6475">2026-11-23 의종 결정으로 뺌</text>
+    <path d="M210 85 H300" stroke="#2f6fdf" stroke-width="3" fill="none"/>
+    <path d="M300 85 l-12 -7 v14 z" fill="#2f6fdf"/>
+    <rect x="320" y="10" width="420" height="68" rx="12" fill="#dbe7fb" stroke="#2f6fdf"/>
+    <text x="340" y="40" font-size="17" font-weight="700" fill="#1d2330">① VM 없이 도는 방 종류 수</text>
+    <text x="340" y="62" font-size="13" fill="#1d2330">지금 0/3 → 목표 1/3 · 판정일 2026-12-23</text>
+    <rect x="320" y="92" width="420" height="68" rx="12" fill="#dbe7fb" stroke="#2f6fdf"/>
+    <text x="340" y="122" font-size="17" font-weight="700" fill="#1d2330">② 공개 릴리스 간격</text>
+    <text x="340" y="144" font-size="13" fill="#1d2330">지금 70일 → 목표 60일 이하 · 판정일 2027-01-22</text>
+  </svg>
+  <p class="note">의종 확인 전에는 지침(<code>.loop/guidelines.md</code>) KPI 표에 적용하지 않습니다. 그때까지 DevHotel KPI는 “없음”입니다.</p>
+</section>
+
+<section class="slide" id="why">
+  <span class="slide-no">2 / 7</span>
+  <p class="kicker">왜 바꾸나</p>
+  <h2>샌드박스의 진척은 사용자 수가 아닙니다</h2>
+  <p>의종 결정(2026-11-23 17:01 KST, devhotel-direction-1123)으로 DevHotel은 <b>다른 프로젝트의 실험을 돌리는 테스트 샌드박스</b>가 되었고, 업데이트 빈도는 <b>가끔</b>, 내부 사용 DAU KPI는 뺐습니다.</p>
+  <table>
+    <thead><tr><th>의종 결정에 적힌 방향</th><th>이 제안에서 맞춘 지표</th></tr></thead>
+    <tbody>
+      <tr><td>있으면 좋은 목표: 성능을 개선해 WSL·다른 가상머신 없이 방이 돌아가게 하기 (못 해도 괜찮음)</td><td>① VM 없이 도는 방 종류 수</td></tr>
+      <tr><td>가끔 GitHub에 공개 릴리스(재능기부 성격). PD는 제안 이슈만, 실행은 의종 확인 뒤 사람이</td><td>② 공개 릴리스 간격</td></tr>
+      <tr><td>내부 사용 DAU는 뺌. 새 지표는 현재값·목표·판정일과 함께 제안 이슈로</td><td>두 지표 모두 현재값·목표·판정일을 아래에 적음</td></tr>
+    </tbody>
+  </table>
+  <p class="note">두 값 모두 저장소와 릴리스 목록에서 바로 셀 수 있어 Pulse 같은 따로 된 측정 도구가 필요 없습니다.</p>
+</section>
+
+<section class="slide" id="metric-vmless">
+  <span class="slide-no">3 / 7</span>
+  <p class="kicker">지표 ① · 현재값 2026-11-24 실측</p>
+  <h2>VM 없이 도는 방 종류 수: 0 / 3</h2>
+  <svg viewBox="0 0 760 220" role="img" aria-label="방 종류별로 필요한 가상화 엔진">
+    <text x="20" y="28" font-size="14" fill="#5b6475">방 종류</text>
+    <text x="210" y="28" font-size="14" fill="#5b6475">지금 필요한 것</text>
+    <text x="640" y="28" font-size="14" fill="#5b6475">VM 없이</text>
+    <line x1="20" y1="40" x2="740" y2="40" stroke="#d9dee7"/>
+    <text x="20" y="80" font-size="18" font-weight="700" fill="#1d2330">웹</text>
+    <rect x="210" y="58" width="190" height="34" rx="8" fill="#fbe6da"/>
+    <text x="305" y="80" text-anchor="middle" font-size="13" fill="#c9622b">컨테이너 엔진 (WSL2)</text>
+    <text x="415" y="80" font-size="13" fill="#5b6475">또는</text>
+    <rect x="450" y="58" width="170" height="34" rx="8" fill="#fbe6da"/>
+    <text x="535" y="80" text-anchor="middle" font-size="13" fill="#c9622b">관리형 Hyper-V</text>
+    <circle cx="672" cy="75" r="13" fill="none" stroke="#c9622b" stroke-width="3"/>
+    <path d="M665 68 l14 14 M679 68 l-14 14" stroke="#c9622b" stroke-width="3"/>
+    <text x="20" y="140" font-size="18" font-weight="700" fill="#1d2330">안드로이드</text>
+    <rect x="210" y="118" width="410" height="34" rx="8" fill="#fbe6da"/>
+    <text x="415" y="140" text-anchor="middle" font-size="13" fill="#c9622b">컨테이너 엔진의 KVM (Docker /dev/kvm)</text>
+    <circle cx="672" cy="135" r="13" fill="none" stroke="#c9622b" stroke-width="3"/>
+    <path d="M665 128 l14 14 M679 128 l-14 14" stroke="#c9622b" stroke-width="3"/>
+    <text x="20" y="200" font-size="18" font-weight="700" fill="#1d2330">윈도우</text>
+    <rect x="210" y="178" width="410" height="34" rx="8" fill="#fbe6da"/>
+    <text x="415" y="200" text-anchor="middle" font-size="13" fill="#c9622b">VMware Workstation Pro 템플릿 VM</text>
+    <circle cx="672" cy="195" r="13" fill="none" stroke="#c9622b" stroke-width="3"/>
+    <path d="M665 188 l14 14 M679 188 l-14 14" stroke="#c9622b" stroke-width="3"/>
+  </svg>
+  <div class="grid">
+    <div class="card"><div class="label">현재값</div><div class="value">0 / 3</div></div>
+    <div class="card"><div class="label">목표 (있으면 좋음)</div><div class="value">1 / 3</div><div class="note">웹 방부터</div></div>
+    <div class="card"><div class="label">판정일</div><div class="value">2026-12-23</div></div>
+  </div>
+  <p class="note">셈법: 그 방 종류가 컨테이너 엔진·Hyper-V·VMware 없이 방 생성 → 시작 → 명령 실행을 통과하면 1로 셉니다. 근거: <code>README.md</code> “Room providers” 표와 “Installation &amp; prerequisites”, <code>packages/core/src/backend/roomRuntimeSelection.ts</code>의 <code>managed</code>(Hyper-V)·<code>compatibility</code>(OCI CLI) 두 모드.</p>
+</section>
+
+<section class="slide" id="metric-release">
+  <span class="slide-no">4 / 7</span>
+  <p class="kicker">지표 ② · 현재값 2026-11-24 실측</p>
+  <h2>공개 릴리스 간격: 70일</h2>
+  <svg viewBox="0 0 760 200" role="img" aria-label="마지막 공개 릴리스 뒤 지난 날과 60일 목표선">
+    <line x1="40" y1="110" x2="720" y2="110" stroke="#1d2330" stroke-width="2"/>
+    <text x="40" y="190" font-size="12" fill="#5b6475">9월</text>
+    <text x="174" y="190" font-size="12" fill="#5b6475">10월</text>
+    <text x="313" y="190" font-size="12" fill="#5b6475">11월</text>
+    <text x="447" y="190" font-size="12" fill="#5b6475">12월</text>
+    <text x="585" y="190" font-size="12" fill="#5b6475">2027년 1월</text>
+    <line x1="174" y1="104" x2="174" y2="116" stroke="#5b6475"/>
+    <line x1="313" y1="104" x2="313" y2="116" stroke="#5b6475"/>
+    <line x1="447" y1="104" x2="447" y2="116" stroke="#5b6475"/>
+    <line x1="585" y1="104" x2="585" y2="116" stroke="#5b6475"/>
+    <rect x="103" y="98" width="268" height="24" fill="#d9f0e3"/>
+    <rect x="371" y="98" width="44" height="24" fill="#fbe6da"/>
+    <circle cx="49" cy="110" r="5" fill="#5b6475"/>
+    <text x="49" y="90" text-anchor="middle" font-size="11" fill="#5b6475">0.5.0</text>
+    <circle cx="103" cy="110" r="8" fill="#2f8f5b"/>
+    <text x="103" y="78" text-anchor="middle" font-size="13" font-weight="700" fill="#2f8f5b">0.5.4 공개</text>
+    <text x="103" y="94" text-anchor="middle" font-size="11" fill="#2f8f5b">09-15</text>
+    <line x1="371" y1="60" x2="371" y2="140" stroke="#2f8f5b" stroke-dasharray="5 4" stroke-width="2"/>
+    <text x="371" y="54" text-anchor="middle" font-size="12" fill="#2f8f5b">60일 선 (11-14)</text>
+    <line x1="415" y1="40" x2="415" y2="150" stroke="#c9622b" stroke-width="3"/>
+    <text x="420" y="36" font-size="13" font-weight="700" fill="#c9622b">오늘 11-24 · 70일</text>
+    <line x1="679" y1="60" x2="679" y2="150" stroke="#2f6fdf" stroke-width="2"/>
+    <text x="679" y="54" text-anchor="middle" font-size="12" fill="#2f6fdf">판정일 2027-01-22</text>
+    <text x="237" y="146" text-anchor="middle" font-size="12" fill="#2f8f5b">목표 안 (60일 이하)</text>
+    <text x="393" y="146" text-anchor="middle" font-size="12" fill="#c9622b">초과</text>
+  </svg>
+  <div class="grid">
+    <div class="card"><div class="label">현재값</div><div class="value">70일</div><div class="note">마지막 공개 릴리스 0.5.4, 2026-09-15</div></div>
+    <div class="card"><div class="label">목표</div><div class="value">60일 이하</div><div class="note">가끔, 두 달에 한 번 이상</div></div>
+    <div class="card"><div class="label">판정일</div><div class="value">2027-01-22</div><div class="note">2026-11-23 이후 공개 릴리스 1번이면 달성</div></div>
+  </div>
+  <p class="note">셈법: 판정일 − 최신 비초안·비프리릴리스 공개 릴리스의 publishedAt. 근거: 릴리스 목록 0.5.4 Latest(2026-09-15T10:16:26Z), 저장소 태그 <code>v0.5.4</code>. 릴리스는 PD가 직접 내지 않고 제안 이슈 → 의종 확인 → 사람이 <code>release.yml</code> 실행 순서입니다.</p>
+</section>
+
+<section class="slide" id="plc">
+  <span class="slide-no">5 / 7</span>
+  <p class="kicker">제품 수명주기 계획 (PLC)</p>
+  <h2>두 단계, 둘 다 새 비용 없음</h2>
+  <svg viewBox="0 0 760 130" role="img" aria-label="지표 전환 다음 VM 없는 웹 방 조사">
+    <rect x="10" y="20" width="300" height="90" rx="12" fill="#dbe7fb" stroke="#2f6fdf"/>
+    <text x="30" y="52" font-size="17" font-weight="700" fill="#1d2330">1. 지표 전환 · 1일</text>
+    <text x="30" y="78" font-size="13" fill="#1d2330">두 지표를 지침 KPI 표에 적용</text>
+    <text x="30" y="98" font-size="13" fill="#1d2330">(의종 승인 뒤에만)</text>
+    <path d="M320 65 H420" stroke="#2f6fdf" stroke-width="3" fill="none"/>
+    <path d="M420 65 l-12 -7 v14 z" fill="#2f6fdf"/>
+    <rect x="440" y="20" width="310" height="90" rx="12" fill="#dbe7fb" stroke="#2f6fdf"/>
+    <text x="460" y="52" font-size="17" font-weight="700" fill="#1d2330">2. VM 없는 웹 방 조사 · 1주</text>
+    <text x="460" y="78" font-size="13" fill="#1d2330">가상머신 없이 도는 길 하나를 찾아 시험</text>
+    <text x="460" y="98" font-size="13" fill="#1d2330">0/3 → 1/3 가능 여부 판단</text>
+  </svg>
+  <table>
+    <thead><tr><th>단계</th><th>목표</th><th>기간</th><th>기대값</th><th>비용</th></tr></thead>
+    <tbody>
+      <tr><td>지표 전환</td><td>내부 사용 DAU를 빼고 두 가벼운 지표를 지침에 적용</td><td>1일</td><td>판정일마다 두 지표의 현재값을 바로 셀 수 있음</td><td>새 비용 없음</td></tr>
+      <tr><td>VM 없는 웹 방 조사</td><td>웹 방이 가상머신 없이 도는 길을 하나 찾아 시험</td><td>1주</td><td>VM 없이 도는 방 종류 수를 0/3에서 1/3로 올릴 수 있는지 판단</td><td>새 비용 없음</td></tr>
+    </tbody>
+  </table>
+  <p class="note">두 단계 모두 7일 이하 배포 창 안에 들어갑니다. 2단계는 “있으면 좋은 목표”라 못 이뤄도 실패로 보지 않습니다.</p>
+</section>
+
+<section class="slide" id="cost-risk">
+  <span class="slide-no">6 / 7</span>
+  <p class="kicker">비용 · 위험</p>
+  <h2>새 비용 없음, 돈·삭제 단계 없음</h2>
+  <table>
+    <thead><tr><th>항목</th><th>내용</th></tr></thead>
+    <tbody>
+      <tr><td>비용</td><td>새 비용 없음. 유료 인프라·유료 API·새 구독을 쓰지 않습니다.</td></tr>
+      <tr><td>출시</td><td>공개 릴리스는 PD가 직접 내지 않습니다. 낼 때마다 제안 이슈 → 의종 확인 → 사람이 실행합니다.</td></tr>
+      <tr><td>삭제</td><td>삭제 단계 없음. 기존 방·데이터·릴리스를 지우지 않습니다.</td></tr>
+      <tr><td>측정 위험</td><td>지표 ①은 방 종류 3개뿐이라 값이 크게 뛸 수 있습니다. 셈법(생성 → 시작 → 명령 실행 통과)을 고정해 둡니다.</td></tr>
+      <tr><td>방향 위험</td><td>지표 ②가 릴리스 압박이 되지 않도록 목표를 “가끔(60일 이하)”으로 둡니다.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="slide" id="decision">
+  <span class="slide-no">7 / 7</span>
+  <p class="kicker">의종 결정 요청 · 이슈 #293에 답해 주세요</p>
+  <h2>추천: 두 지표 모두 승인</h2>
+  <ol class="choices">
+    <li class="pick"><b>두 지표 모두 승인</b> — 지침 KPI 표에 두 지표를 적용하고 판정일에 현재값을 다시 셉니다. (추천)</li>
+    <li><b>공개 릴리스 간격만 승인</b> — 지표 ②만 적용하고, VM 없는 방은 KPI 없이 있으면 좋은 목표로만 둡니다.</li>
+    <li><b>목표값·판정일을 바꿔서 승인</b> — 댓글로 값을 정해 주시면 그 값으로 적용합니다.</li>
+    <li><b>보류</b> — KPI 없음 상태를 유지합니다.</li>
+    <li><b>직접 입력</b> — 위에 없는 다른 방향을 댓글로 적어 주세요.</li>
+  </ol>
+  <p class="note">승인 전에는 아무것도 적용하지 않습니다. 결정이 나면 PD가 <code>.loop/guidelines.md</code> KPI 표에 날짜·출처와 함께 한 줄을 더하는 작은 PR을 따로 올립니다.</p>
+</section>
+
+</main>
+</body>
+</html>
