@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-11-24
 
 ### Status and wake stay inside a Docker-process budget
 
@@ -160,6 +160,43 @@
   than spending a doomed emulator boot on every wake, and the warm Android path
   is tracked with [#108](https://github.com/r2cuerdame/DevHotel/issues/108).
 
+
+### Room services, consoles and shutdown hold up under failure
+
+- Database restores and version changes pause the Room's app first, refuse a
+  PostgreSQL downgrade or a newer-version archive before any data is deleted,
+  are no longer fooled by PostgreSQL's temporary init server, and leave the
+  service running with its data when they fail (#264, #267, #269, #280).
+- Redis keeps its last save: sleeping a Room or restarting Redis no longer kills
+  it after five seconds, and an "already saving" answer is no longer recorded as
+  a safe backup (#272, #275).
+- Room status is re-proved instead of trusted: dead containers no longer read
+  ready, a stopped network anchor reads degraded, and a dead app under a live
+  keeper is detected (#83, #12, #160).
+- Long Room mutations can be polled and survive a lost response, and removing a
+  service requires it to be running with a safety backup first (#71, #91).
+- Closing a console, switching or deleting Rooms, and quitting no longer leave
+  commands, automation browsers, preview connections or archive folders behind,
+  and the gateway and preview listeners no longer hang on open connections
+  (#219, #226, #229, #231, #234, #239).
+- Output split across chunks no longer garbles Korean text or slips past secret
+  masking in Room logs and consoles (#225, #237).
+- A failed startup no longer leaves a hidden app with no window or tray icon,
+  and startup cleanup carries on past one stuck leftover or Room (#253, #282).
+- A Web Room connection dropped mid-request no longer freezes the app, and
+  Windows file locks no longer lose Room run logs or break the bundled GitHub
+  tool install (#249, #247, #245).
+- An unresponsive Windows virtual Room can be deleted, and a restart during the
+  delete no longer brings it back (#241).
+- A running gateway adopts a rebuilt root CA (#259), Room start no longer
+  returns a wrong port (#221), and file-save errors fail their own operation
+  (#223).
+- `release_android_device` and `POST /v1/rooms/:id/device/release` accept an
+  optional `expectedLeaseId` and release only that lease (#257). Android and
+  Windows Rooms can copy a diagnostic summary for their own Room kind (#284).
+- Hyper-V provisioning runs its script with a UTF-8 BOM, under a bounded
+  timeout, grants traverse-only ACLs explicitly and stops before writing when a
+  deny is present (#179, #187, #193).
 
 ## 0.5.4 - 2026-09-15
 
