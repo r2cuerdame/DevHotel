@@ -76,6 +76,11 @@ export const en = {
   'wizard.enable': 'Enable',
   'wizard.preparingRoom': 'Preparing room…',
   'wizard.checkIn': 'Check in',
+  'wizard.invalidPort': 'Enter a whole number between 1 and 65535.',
+  'wizard.invalidDomain': 'Use lowercase letters, numbers, and hyphens ending in .localhost (e.g. my-app.localhost).',
+  'wizard.invalidRepoUrl': 'Start the URL with https:// or git@ (e.g. https://github.com/you/project).',
+  'wizard.nameBlank': 'Cannot be empty or spaces only.',
+  'wizard.nameTooLong': 'Must be {max} characters or fewer.',
 
   // Shared field labels
   'label.project': 'Project',

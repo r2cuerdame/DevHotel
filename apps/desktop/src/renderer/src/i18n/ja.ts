@@ -72,6 +72,11 @@ export const ja: Translation = {
   'wizard.enable': '有効にする',
   'wizard.preparingRoom': 'ルームを準備中…',
   'wizard.checkIn': 'チェックイン',
+  'wizard.invalidPort': '1〜65535 の整数を入力してください。',
+  'wizard.invalidDomain': '小文字・数字・ハイフンで入力し、.localhost で終わる形式にしてください（例: my-app.localhost）。',
+  'wizard.invalidRepoUrl': 'URL は https:// または git@ で始めてください（例: https://github.com/you/project）。',
+  'wizard.nameBlank': '空白やスペースのみにはできません。',
+  'wizard.nameTooLong': '{max} 文字以内で入力してください。',
 
   'label.project': 'プロジェクト',
   'label.runtime': 'ランタイム',
