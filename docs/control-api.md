@@ -14,7 +14,7 @@ While the DevHotel app runs, it writes `%APPDATA%\DevHotel\control.json`:
   "port": 6084,
   "token": "…48 hex chars…",
   "pid": 12345,
-  "version": "0.5.4",
+  "version": "0.6.0",
   "commit": "98a292c82209eb586409ceec1ea27b5fe21ccf0b",
   "buildTime": "2026-09-08T12:34:56.789Z",
   "sourceVerified": true
