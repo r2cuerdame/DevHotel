@@ -1,19 +1,25 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ProviderInfo, ProviderKind, RoomPlan, SourceType, VmwareSetupStatusInfo } from '@devhotel/shared'
+import type { ProviderInfo, RoomPlan, SourceType, VmwareSetupStatusInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
 import type { Translation } from '../i18n'
+import {
+  isNewRoomPlanReady,
+  isNewRoomSourceReady,
+  parseInternalPort,
+  validateDomain,
+  validateInternalPort,
+  validateNickname,
+  validateProjectName,
+  validateRepoUrl
+} from './newRoomValidation'
+import type { CreatableProvider } from './newRoomValidation'
 
 const NODE_MAJORS = ['18', '20', '22', '24']
 type WebPmKind = 'npm' | 'pnpm'
-type CreatableProvider = Extract<ProviderKind, 'web' | 'android' | 'windows'>
 type VmwareTemplate = { grantId: string; label: string; snapshots: string[] }
 
-/**
- * The registry answers *why* a provider is unavailable as a code; the wizard says it in
- * the user's language. Never render `unavailableReason` — that string is the agent-facing
- * (English) copy carried by the control API.
- */
+// Never render unavailableReason; it is English agent-facing API copy.
 function windowsUnavailableKey(info: ProviderInfo | undefined): keyof Translation {
   switch (info?.unavailableCode) {
     case 'host-not-windows':
@@ -57,8 +63,6 @@ export function NewRoomWizard(): React.JSX.Element {
         if (active) setProviderInfos(list)
       })
       .catch(() => undefined)
-    // Whether a private repository can be cloned is a fact about the GitHub Service,
-    // so the wizard asks it instead of guessing.
     void api.hotel
       .githubStatus()
       .then((status) => {
@@ -70,11 +74,10 @@ export function NewRoomWizard(): React.JSX.Element {
     }
   }, [])
 
-  // editable plan fields
   const [runtimeVersion, setRuntimeVersion] = useState('22')
   const [pmKind, setPmKind] = useState<WebPmKind>('npm')
   const [startCommand, setStartCommand] = useState('')
-  const [internalPort, setInternalPort] = useState(3000)
+  const [internalPortInput, setInternalPortInput] = useState('3000')
   const [domain, setDomain] = useState('')
   const [https, setHttps] = useState(false)
 
@@ -170,11 +173,40 @@ export function NewRoomWizard(): React.JSX.Element {
     }
   }
 
+  const repoUrlError =
+    provider !== 'windows' && sourceType === 'managed-git' && sourceRef.length > 0 ? validateRepoUrl(sourceRef) : null
+  const projectError = validateProjectName(project)
+  const nicknameError = validateNickname(nickname)
+  const parsedPort = parseInternalPort(internalPortInput)
+  const portError = provider === 'web' ? validateInternalPort(internalPortInput) : null
+  const domainError = provider === 'web' ? validateDomain(domain) : null
+
+  const sourceValid = isNewRoomSourceReady({
+    provider,
+    sourceType,
+    sourceRef,
+    project,
+    nickname,
+    vmwareReady,
+    hasVmwareTemplate: Boolean(vmwareTemplate),
+    snapshot
+  })
+
+  const planValid = isNewRoomPlanReady({
+    provider,
+    startCommand,
+    internalPort: internalPortInput,
+    domain,
+    hasVmwareTemplate: Boolean(vmwareTemplate),
+    snapshot
+  })
+
   async function analyze(): Promise<void> {
+    if (!sourceValid) return
     const effectiveSourceType: SourceType = provider === 'windows' ? 'empty' : sourceType
     const effectiveSourceRef = provider === 'windows' ? '' : sourceRef
     const projectName =
-      project ||
+      project.trim() ||
       (effectiveSourceType === 'managed-git'
         ? (effectiveSourceRef.split('/').pop() ?? '').replace(/\.git$/, '')
         : effectiveSourceRef.replaceAll('\\', '/').split('/').filter(Boolean).pop()) ||
@@ -196,7 +228,7 @@ export function NewRoomWizard(): React.JSX.Element {
           setPmKind(p.packageManager.value)
         }
         setStartCommand(p.startCommand.value)
-        setInternalPort(p.internalPort.value)
+        setInternalPortInput(String(p.internalPort.value))
         setDomain(p.domain)
         setHttps(p.https)
       }
@@ -209,14 +241,19 @@ export function NewRoomWizard(): React.JSX.Element {
   }
 
   async function checkIn(): Promise<void> {
+    if (!planValid) return
+    let planOverrides:
+      | { startCommand: string }
+      | { runtimeVersion: string; pmKind: WebPmKind; startCommand: string; internalPort: number; domain: string; https: boolean }
+      | undefined
+    if (provider === 'android') {
+      planOverrides = { startCommand }
+    } else if (provider === 'web') {
+      if (parsedPort === null) return
+      planOverrides = { runtimeVersion, pmKind, startCommand, internalPort: parsedPort, domain, https }
+    }
     setLoading(true)
     try {
-      const planOverrides =
-        provider === 'windows'
-          ? undefined
-          : provider === 'android'
-          ? { startCommand }
-          : { runtimeVersion, pmKind, startCommand, internalPort, domain, https }
       await createRoom({
         sourceType: provider === 'windows' ? 'empty' : sourceType,
         sourceRef: provider === 'windows' ? '' : sourceRef,
@@ -232,12 +269,6 @@ export function NewRoomWizard(): React.JSX.Element {
       setLoading(false)
     }
   }
-
-  const sourceValid =
-    provider === 'windows'
-      ? Boolean(vmwareReady && project.trim() && vmwareTemplate && snapshot)
-      : sourceType === 'empty' ||
-        (sourceType === 'managed-git' ? /^(https?:\/\/|git@)/.test(sourceRef) : sourceRef.length > 2)
 
   return (
     <div className="modal-backdrop" onClick={() => !loading && openWizard(false)}>
@@ -297,9 +328,16 @@ export function NewRoomWizard(): React.JSX.Element {
                   id="src-url"
                   placeholder="https://github.com/you/project"
                   value={sourceRef}
+                  aria-invalid={!!repoUrlError}
+                  aria-describedby={repoUrlError ? 'src-url-error' : undefined}
                   onChange={(e) => setSourceRef(e.target.value)}
                   autoFocus
                 />
+                {repoUrlError && (
+                  <small id="src-url-error" className="field-hint field-error" role="alert">
+                    {t(repoUrlError.key, repoUrlError.vars)}
+                  </small>
+                )}
                 <small className="field-hint">
                   {githubAccount
                     ? t('wizard.repoPrivateConnected', { account: githubAccount })
@@ -439,12 +477,30 @@ export function NewRoomWizard(): React.JSX.Element {
                   id="proj"
                   placeholder={provider === 'windows' ? t('windows.projectPlaceholder') : t('wizard.auto')}
                   value={project}
+                  aria-invalid={!!projectError}
+                  aria-describedby={projectError ? 'proj-error' : undefined}
                   onChange={(e) => setProject(e.target.value)}
                 />
+                {projectError && (
+                  <small id="proj-error" className="field-hint field-error" role="alert">
+                    {t(projectError.key, projectError.vars)}
+                  </small>
+                )}
               </div>
               <div className="field">
                 <label htmlFor="nick">{t('wizard.nickname')}</label>
-                <input id="nick" value={nickname} onChange={(e) => setNickname(e.target.value)} />
+                <input
+                  id="nick"
+                  value={nickname}
+                  aria-invalid={!!nicknameError}
+                  aria-describedby={nicknameError ? 'nick-error' : undefined}
+                  onChange={(e) => setNickname(e.target.value)}
+                />
+                {nicknameError && (
+                  <small id="nick-error" className="field-hint field-error" role="alert">
+                    {t(nicknameError.key, nicknameError.vars)}
+                  </small>
+                )}
               </div>
             </div>
 
@@ -452,7 +508,7 @@ export function NewRoomWizard(): React.JSX.Element {
               <button className="btn" onClick={() => openWizard(false)}>
                 {t('common.cancel')}
               </button>
-              <button className="btn primary" disabled={!sourceValid || !nickname || loading} onClick={() => void analyze()}>
+              <button className="btn primary" disabled={!sourceValid || loading} onClick={() => void analyze()}>
                 {loading ? t('wizard.analyzing') : provider === 'windows' ? t('windows.review') : t('wizard.analyze')}
               </button>
             </div>
@@ -534,18 +590,49 @@ export function NewRoomWizard(): React.JSX.Element {
                             <div className="row">
                               <input
                                 type="number"
-                                value={internalPort}
-                                onChange={(e) => setInternalPort(Number(e.target.value))}
+                                min={1}
+                                max={65535}
+                                step={1}
+                                value={internalPortInput}
+                                aria-invalid={!!portError}
+                                aria-describedby={portError ? 'plan-port-error' : undefined}
+                                onChange={(e) => setInternalPortInput(e.target.value)}
                                 style={{ width: 110 }}
                               />
                               <span className="src">{plan?.internalPort.source}</span>
                             </div>
+                            {portError && (
+                              <small
+                                id="plan-port-error"
+                                className="field-hint field-error"
+                                role="alert"
+                                style={{ display: 'block', marginTop: 4 }}
+                              >
+                                {t(portError.key, portError.vars)}
+                              </small>
+                            )}
                           </td>
                         </tr>
                         <tr>
                           <td>{t('label.domain')}</td>
                           <td>
-                            <input className="mono" value={domain} onChange={(e) => setDomain(e.target.value)} />
+                            <input
+                              className="mono"
+                              value={domain}
+                              aria-invalid={!!domainError}
+                              aria-describedby={domainError ? 'plan-domain-error' : undefined}
+                              onChange={(e) => setDomain(e.target.value)}
+                            />
+                            {domainError && (
+                              <small
+                                id="plan-domain-error"
+                                className="field-hint field-error"
+                                role="alert"
+                                style={{ display: 'block', marginTop: 4 }}
+                              >
+                                {t(domainError.key, domainError.vars)}
+                              </small>
+                            )}
                           </td>
                         </tr>
                         <tr>
@@ -579,16 +666,7 @@ export function NewRoomWizard(): React.JSX.Element {
               <button className="btn" onClick={() => setStep('source')} disabled={loading}>
                 {t('common.back')}
               </button>
-              <button
-                className="btn primary"
-                onClick={() => void checkIn()}
-                disabled={
-                  loading ||
-                  (provider === 'windows'
-                    ? !vmwareTemplate || !snapshot
-                    : !startCommand || (provider === 'web' && !domain))
-                }
-              >
+              <button className="btn primary" onClick={() => void checkIn()} disabled={loading || !planValid}>
                 {loading ? t('wizard.preparingRoom') : t('wizard.checkIn')}
               </button>
             </div>

@@ -72,6 +72,11 @@ export const de: Translation = {
   'wizard.enable': 'Aktivieren',
   'wizard.preparingRoom': 'Zimmer wird vorbereitet…',
   'wizard.checkIn': 'Einchecken',
+  'wizard.invalidPort': 'Gib eine ganze Zahl zwischen 1 und 65535 ein.',
+  'wizard.invalidDomain': 'Verwende Kleinbuchstaben, Ziffern und Bindestriche mit der Endung .localhost (z. B. my-app.localhost).',
+  'wizard.invalidRepoUrl': 'Die URL muss mit https:// oder git@ beginnen (z. B. https://github.com/you/project).',
+  'wizard.nameBlank': 'Darf nicht leer sein oder nur aus Leerzeichen bestehen.',
+  'wizard.nameTooLong': 'Darf höchstens {max} Zeichen lang sein.',
 
   'label.project': 'Projekt',
   'label.runtime': 'Runtime',

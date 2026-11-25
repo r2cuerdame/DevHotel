@@ -72,6 +72,11 @@ export const es: Translation = {
   'wizard.enable': 'Activar',
   'wizard.preparingRoom': 'Preparando la habitación…',
   'wizard.checkIn': 'Check-in',
+  'wizard.invalidPort': 'Introduce un número entero entre 1 y 65535.',
+  'wizard.invalidDomain': 'Usa letras minúsculas, números y guiones terminados en .localhost (por ejemplo, my-app.localhost).',
+  'wizard.invalidRepoUrl': 'La URL debe empezar por https:// o git@ (por ejemplo, https://github.com/you/project).',
+  'wizard.nameBlank': 'No puede estar vacío ni contener solo espacios.',
+  'wizard.nameTooLong': 'Debe tener {max} caracteres o menos.',
 
   'label.project': 'Proyecto',
   'label.runtime': 'Runtime',

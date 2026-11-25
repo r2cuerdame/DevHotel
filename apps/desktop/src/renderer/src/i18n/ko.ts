@@ -104,6 +104,11 @@ export const ko: Translation = {
   'wizard.enable': '사용',
   'wizard.preparingRoom': 'Room 준비 중…',
   'wizard.checkIn': '체크인',
+  'wizard.invalidPort': '1에서 65535 사이의 정수를 입력하세요.',
+  'wizard.invalidDomain': '소문자·숫자·하이픈으로 만들고 .localhost로 끝나야 합니다 (예: my-app.localhost).',
+  'wizard.invalidRepoUrl': '주소는 https:// 또는 git@로 시작해야 합니다 (예: https://github.com/you/project).',
+  'wizard.nameBlank': '비워 두거나 공백만 입력할 수 없습니다.',
+  'wizard.nameTooLong': '{max}자 이하로 입력하세요.',
 
   'label.project': '프로젝트',
   'label.runtime': '런타임',

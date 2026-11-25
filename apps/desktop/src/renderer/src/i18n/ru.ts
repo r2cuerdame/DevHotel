@@ -72,6 +72,11 @@ export const ru: Translation = {
   'wizard.enable': 'Включить',
   'wizard.preparingRoom': 'Готовим номер…',
   'wizard.checkIn': 'Заселиться',
+  'wizard.invalidPort': 'Введите целое число от 1 до 65535.',
+  'wizard.invalidDomain': 'Используйте строчные буквы, цифры и дефисы с окончанием .localhost (например, my-app.localhost).',
+  'wizard.invalidRepoUrl': 'URL должен начинаться с https:// или git@ (например, https://github.com/you/project).',
+  'wizard.nameBlank': 'Не может быть пустым или состоять только из пробелов.',
+  'wizard.nameTooLong': 'Не должно превышать {max} символов.',
 
   'label.project': 'Проект',
   'label.runtime': 'Рантайм',

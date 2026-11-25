@@ -72,6 +72,11 @@ export const ptBR: Translation = {
   'wizard.enable': 'Ativar',
   'wizard.preparingRoom': 'Preparando o quarto…',
   'wizard.checkIn': 'Fazer check-in',
+  'wizard.invalidPort': 'Digite um número inteiro entre 1 e 65535.',
+  'wizard.invalidDomain': 'Use letras minúsculas, números e hífens terminando em .localhost (ex.: my-app.localhost).',
+  'wizard.invalidRepoUrl': 'A URL deve começar com https:// ou git@ (ex.: https://github.com/you/project).',
+  'wizard.nameBlank': 'Não pode ficar em branco nem conter apenas espaços.',
+  'wizard.nameTooLong': 'Deve ter no máximo {max} caracteres.',
 
   'label.project': 'Projeto',
   'label.runtime': 'Runtime',

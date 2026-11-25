@@ -72,6 +72,11 @@ export const zhCN: Translation = {
   'wizard.enable': '启用',
   'wizard.preparingRoom': '正在准备房间…',
   'wizard.checkIn': '入住',
+  'wizard.invalidPort': '请输入 1 到 65535 之间的整数。',
+  'wizard.invalidDomain': '请使用小写字母、数字和连字符，并以 .localhost 结尾（例如 my-app.localhost）。',
+  'wizard.invalidRepoUrl': '地址必须以 https:// 或 git@ 开头（例如 https://github.com/you/project）。',
+  'wizard.nameBlank': '不能为空或只包含空格。',
+  'wizard.nameTooLong': '不能超过 {max} 个字符。',
 
   'label.project': '项目',
   'label.runtime': '运行时',
