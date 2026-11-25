@@ -39,6 +39,10 @@ export const ptBR: Translation = {
   'toast.caTrusted': 'CA local do DevHotel agora é confiável para o seu usuário do Windows',
   'toast.caUntrusted': 'CA local do DevHotel removida da confiança do Windows',
 
+  'error.recoveryHint': 'Como corrigir: {hint}',
+  'error.invalidInput': 'Alguns valores informados não estão no formato esperado. Verifique os campos e tente novamente.',
+  'error.unknown': 'Ocorreu um erro desconhecido. Veja o diagnóstico para mais detalhes.',
+
   'time.justNow': 'agora mesmo',
   'time.minutesAgo': 'há {n} min',
   'time.hoursAgo': 'há {n} h',

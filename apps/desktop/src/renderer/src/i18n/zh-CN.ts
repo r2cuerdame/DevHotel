@@ -39,6 +39,10 @@ export const zhCN: Translation = {
   'toast.caTrusted': '已为当前 Windows 用户信任 DevHotel 本地 CA',
   'toast.caUntrusted': '已从 Windows 信任列表中移除 DevHotel 本地 CA',
 
+  'error.recoveryHint': '解决方法：{hint}',
+  'error.invalidInput': '部分输入值的格式不正确。请检查输入项后重试。',
+  'error.unknown': '发生未知错误。详情请查看诊断。',
+
   'time.justNow': '刚刚',
   'time.minutesAgo': '{n} 分钟前',
   'time.hoursAgo': '{n} 小时前',

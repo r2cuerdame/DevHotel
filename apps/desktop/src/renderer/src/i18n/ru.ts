@@ -39,6 +39,10 @@ export const ru: Translation = {
   'toast.caTrusted': 'Локальный CA DevHotel добавлен в доверенные для вашего пользователя Windows',
   'toast.caUntrusted': 'Локальный CA DevHotel удалён из доверенных Windows',
 
+  'error.recoveryHint': 'Как исправить: {hint}',
+  'error.invalidInput': 'Некоторые введённые значения имеют неверный формат. Проверьте поля и попробуйте снова.',
+  'error.unknown': 'Произошла неизвестная ошибка. Подробности см. в диагностике.',
+
   'time.justNow': 'только что',
   'time.minutesAgo': '{n} мин назад',
   'time.hoursAgo': '{n} ч назад',

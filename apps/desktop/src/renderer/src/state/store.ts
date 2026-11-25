@@ -16,6 +16,7 @@ import type {
 } from '@devhotel/shared'
 import { IPC } from '@devhotel/shared'
 import { api } from '../api'
+import { describeError } from '../errorText'
 import { detectLocale, isLocaleId, translate } from '../i18n'
 import type { LocaleId, TFunc, Translation } from '../i18n'
 import { createRefreshCoalescer } from './refreshCoalescer'
@@ -70,6 +71,10 @@ interface DhState {
 
 let toastSeq = 1
 let roomRefreshSequence = 0
+
+function errorTextFor(lang: LocaleId, err: unknown): string {
+  return describeError(err, (key, vars) => translate(lang, key, vars))
+}
 
 export const useStore = create<DhState>((set, get) => ({
   view: { name: 'lobby' },
@@ -183,7 +188,7 @@ export const useStore = create<DhState>((set, get) => ({
       get().openRoom(room.id)
       return room
     } catch (err) {
-      get().toast('error', translate(get().lang, 'toast.checkInFailed', { message: err instanceof Error ? err.message : String(err) }))
+      get().toast('error', translate(get().lang, 'toast.checkInFailed', { message: errorTextFor(get().lang, err) }))
       return null
     }
   },
@@ -197,7 +202,7 @@ export const useStore = create<DhState>((set, get) => ({
       get().openRoom(room.id)
       return room
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
       return null
     } finally {
       set((s) => {
@@ -226,7 +231,7 @@ export const useStore = create<DhState>((set, get) => ({
         get().backToLobby()
       }
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
     } finally {
       set((s) => {
         const busy = { ...s.busy }
@@ -253,7 +258,7 @@ export const useStore = create<DhState>((set, get) => ({
       await get().refreshInspection(roomId)
       return entry
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
       return null
     }
   },
@@ -264,7 +269,7 @@ export const useStore = create<DhState>((set, get) => ({
       get().toast('success', translate(get().lang, 'toast.undone', { title: entry.title }))
       await get().refreshInspection(roomId)
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
     }
   },
 
@@ -274,7 +279,7 @@ export const useStore = create<DhState>((set, get) => ({
       await get().refreshInspection(roomId)
       return report
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
       return null
     }
   },
@@ -285,7 +290,7 @@ export const useStore = create<DhState>((set, get) => ({
       await navigator.clipboard.writeText(text)
       get().toast('success', translate(get().lang, 'toast.diagCopied'))
     } catch (err) {
-      get().toast('error', err instanceof Error ? err.message : String(err))
+      get().toast('error', errorTextFor(get().lang, err))
     }
   },
 

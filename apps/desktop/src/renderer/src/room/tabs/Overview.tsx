@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { RoomRecord, RuntimeRoomRecord } from '@devhotel/shared'
 import { statusLabel, useStore, useT } from '../../state/store'
+import { describeError } from '../../errorText'
 import { api } from '../../api'
 import { runtimeCapabilities } from '../runtimeCapabilities'
 
@@ -59,7 +60,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
         await Promise.all([refreshInspection(room.id), refreshRooms()])
         toast('success', t('working.roomOwned'))
       } catch (err) {
-        toast('error', err instanceof Error ? err.message : String(err))
+        toast('error', describeError(err, t))
       }
     })
   }
@@ -101,7 +102,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
         await Promise.all([refreshInspection(room.id), refreshRooms()])
         toast('success', t('working.synced'))
       } catch (err) {
-        toast('error', err instanceof Error ? err.message : String(err))
+        toast('error', describeError(err, t))
       }
     })
   }
@@ -146,7 +147,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
               onClick={() =>
                 void api.rooms
                   .openWindows(room.id)
-                  .catch((err: unknown) => toast('error', err instanceof Error ? err.message : String(err)))
+                  .catch((err: unknown) => toast('error', describeError(err, t)))
               }
               disabled={!!busy}
             >
@@ -249,7 +250,7 @@ export function OverviewTab({ room, onShowHealth }: { room: RuntimeRoomRecord; o
                         await api.rooms.setAgentHostSync(room.id, allowed)
                         await Promise.all([refreshInspection(room.id), refreshRooms()])
                       } catch (err) {
-                        toast('error', err instanceof Error ? err.message : String(err))
+                        toast('error', describeError(err, t))
                       }
                     })
                   }}

@@ -39,6 +39,10 @@ export const ja: Translation = {
   'toast.caTrusted': 'DevHotel ローカル CA を現在の Windows ユーザーで信頼しました',
   'toast.caUntrusted': 'DevHotel ローカル CA を Windows の信頼リストから削除しました',
 
+  'error.recoveryHint': '対処方法: {hint}',
+  'error.invalidInput': '入力された値の一部が正しい形式ではありません。入力欄を確認して、もう一度お試しください。',
+  'error.unknown': '不明なエラーが発生しました。詳細は診断タブを確認してください。',
+
   'time.justNow': 'たった今',
   'time.minutesAgo': '{n}分前',
   'time.hoursAgo': '{n}時間前',

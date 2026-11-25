@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { ResetServiceMode, RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 
 /**
  * The mirror of Clone: Clone carries a Room's state forward, Reset gives back
@@ -31,7 +32,7 @@ function WindowsResetRoomModal({ room, onClose }: { room: RoomRecord; onClose: (
       toast('success', t('windows.resetDone'))
       onClose()
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
       setResetting(false)
     }
   }

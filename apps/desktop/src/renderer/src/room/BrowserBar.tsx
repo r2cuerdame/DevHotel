@@ -3,6 +3,7 @@ import { IPC, type RuntimeRoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { runtimeCapabilities } from './runtimeCapabilities'
 import { statusLabel, useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 import { CloneRoomModal } from './CloneRoomModal'
 import { ResetRoomModal } from './ResetRoomModal'
 
@@ -188,7 +189,7 @@ export function BrowserBar({
           onClick={() => {
             void api.rooms
               .openWindows(room.id)
-              .catch((err: unknown) => useStore.getState().toast('error', err instanceof Error ? err.message : String(err)))
+              .catch((err: unknown) => useStore.getState().toast('error', describeError(err, t)))
           }}
         >
           {t('windows.openVmware')}
@@ -338,7 +339,7 @@ export function BrowserBar({
                 void useStore.getState().refreshRooms()
                 void useStore.getState().refreshInspection(room.id)
               }).catch((error: unknown) => {
-                useStore.getState().toast('error', error instanceof Error ? error.message : String(error))
+                useStore.getState().toast('error', describeError(error, t))
               })
             }}
           >

@@ -68,6 +68,7 @@ import {
   openOfficialVmwareDownload
 } from './vmwareSetup'
 import { AndroidPairingIpc } from './androidPairingIpc'
+import { toRendererError } from './rendererError'
 
 export function registerIpc(opts: {
   win: BrowserWindow
@@ -132,9 +133,13 @@ export function registerIpc(opts: {
 
   type TrustedHandler = (event: RendererIpcEvent, ...args: unknown[]) => unknown
   const handle = (channel: string, handler: TrustedHandler): void => {
-    ipcMain.handle(channel, (event, ...args) => {
+    ipcMain.handle(channel, async (event, ...args) => {
       assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
-      return handler(event, ...args)
+      try {
+        return await handler(event, ...args)
+      } catch (err) {
+        throw toRendererError(err)
+      }
     })
   }
   const on = (channel: string, handler: TrustedHandler): void => {
@@ -367,7 +372,8 @@ export function registerIpc(opts: {
   ipcMain.handle(IPC.cleanUninstall, async (event) => {
     assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
 
-    return runCleanRemoval(async () => {
+    try {
+      return await runCleanRemoval(async () => {
       const uninstallers = readdirSync(installDir).filter((f) => /^Uninstall.*\.exe$/i.test(f))
       if (uninstallers.length !== 1) {
         throw new Error(
@@ -436,6 +442,9 @@ export function registerIpc(opts: {
       finishCleanRemoval()
       return true
     })
+    } catch (err) {
+      throw toRendererError(err)
+    }
   })
 
   /* preview */

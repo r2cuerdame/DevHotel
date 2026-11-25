@@ -39,6 +39,10 @@ export const de: Translation = {
   'toast.caTrusted': 'DevHotel Local CA ist jetzt für deinen Windows-Benutzer vertrauenswürdig',
   'toast.caUntrusted': 'DevHotel Local CA aus dem Windows-Vertrauensspeicher entfernt',
 
+  'error.recoveryHint': 'So beheben: {hint}',
+  'error.invalidInput': 'Einige eingegebene Werte haben nicht das erwartete Format. Prüfe die Felder und versuche es erneut.',
+  'error.unknown': 'Ein unbekannter Fehler ist aufgetreten. Details findest du in der Diagnose.',
+
   'time.justNow': 'gerade eben',
   'time.minutesAgo': 'vor {n} Min.',
   'time.hoursAgo': 'vor {n} Std.',
