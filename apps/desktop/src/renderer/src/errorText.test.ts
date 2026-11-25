@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { RENDERER_ERROR_PREFIX } from '@devhotel/shared'
 import { describeError } from './errorText'
-import { translate, type LocaleId, type TFunc } from './i18n'
+import { LOCALES, translate, type LocaleId, type TFunc } from './i18n'
 
 const tFor = (lang: LocaleId): TFunc => (key, vars) => translate(lang, key, vars)
 const en = tFor('en')
@@ -52,5 +52,22 @@ describe('describeError', () => {
   it('falls back to the raw text when the payload is malformed', () => {
     const text = `${RENDERER_ERROR_PREFIX}{not json`
     expect(describeError(new Error(text), en)).toBe(text)
+  })
+
+  it('translates recovery hint, invalid input and unknown error across all 9 locales', () => {
+    expect(LOCALES).toHaveLength(9)
+    const hintErr = invokeRejection({ code: 'ROOM_NOT_RUNNING', message: 'Room is asleep', recoveryHint: 'Start the Room' })
+    const inputErr = invokeRejection({ code: 'INVALID_INPUT' }, 'rooms:create')
+    for (const { id } of LOCALES) {
+      const t = tFor(id)
+      const hintLines = describeError(hintErr, t).split('\n')
+      expect(hintLines).toHaveLength(2)
+      expect(hintLines[0]).toBe('Room is asleep')
+      expect(hintLines[1]).toContain('Start the Room')
+      expect(hintLines[1]).not.toContain('{hint}')
+      expect(hintLines[1]!.length).toBeGreaterThan('Start the Room'.length)
+      expect(describeError(inputErr, t).trim().length).toBeGreaterThan(0)
+      expect(describeError('', t).trim().length).toBeGreaterThan(0)
+    }
   })
 })

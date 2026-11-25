@@ -28,7 +28,7 @@
 .hotel-services-tabs button { background: none; border: 0; color: #8f9ca8; padding: 11px 14px; border-bottom: 2px solid transparent; cursor: pointer; }
 .hotel-services-tabs button[data-active="true"] { color: #eef2f5; border-color: #54cf9a; }
 .hotel-services-content, .hotel-service-error { max-width: 1180px; margin: 0 auto; }
-.hotel-service-error { background: #3b1f25; color: #ffbec8; padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; }
+.hotel-service-error { background: #3b1f25; color: #ffbec8; padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; white-space: pre-line; }
 .hotel-service-card { display: flex; gap: 20px; border: 1px solid #2b363f; background: #151b21; border-radius: 14px; padding: 24px; }
 .hotel-service-card.featured { box-shadow: inset 3px 0 #54cf9a; }
 .hotel-service-icon { width: 54px; height: 54px; flex: 0 0 auto; display: grid; place-items: center; background: #252d35; border-radius: 12px; font-weight: 800; }

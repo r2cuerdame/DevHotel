@@ -71,7 +71,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                   void api.ca
                     .trust()
                     .then(() => toast('success', t('toast.caTrusted')))
-                    .catch((err: unknown) => toast('error', String(err)))
+                    .catch((err: unknown) => toast('error', describeError(err, t)))
                 }}
               >
                 {t('settings.trustCa')}
@@ -83,7 +83,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                   void api.ca
                     .untrust()
                     .then(() => toast('success', t('toast.caUntrusted')))
-                    .catch((err: unknown) => toast('error', String(err)))
+                    .catch((err: unknown) => toast('error', describeError(err, t)))
                 }}
               >
                 {t('settings.untrustCa')}
@@ -109,7 +109,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                   .enableManagedRuntimeFeatures()
                   .then((gate) => setRuntimeGate(gate))
                   .then(() => api.app.managedRuntimeStatus().then(setRuntime))
-                  .catch((err: unknown) => toast('error', String(err)))
+                  .catch((err: unknown) => toast('error', describeError(err, t)))
                   .finally(() => setEnablingRuntime(false))
               }}
             >
@@ -121,7 +121,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                 void api.app
                   .managedRuntimeStatus()
                   .then(setRuntime)
-                  .catch((err: unknown) => toast('error', String(err)))
+                  .catch((err: unknown) => toast('error', describeError(err, t)))
               }}
             >
               {t('settings.runtimeRefresh')}

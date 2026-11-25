@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ANDROID_EMULATOR_VERSIONS, type ComponentInfo, type RoomRecord } from '@devhotel/shared'
 import { api } from '../../api'
+import { describeError } from '../../errorText'
 import { useStore, useT } from '../../state/store'
 import { PackageStoreModal } from '../PackageStoreModal'
 
@@ -422,7 +423,7 @@ function CaHint(): React.JSX.Element | null {
           void window.devhotel.ca
             .trust()
             .then(() => toast('success', t('toast.caTrusted')))
-            .catch((err: unknown) => toast('error', String(err)))
+            .catch((err: unknown) => toast('error', describeError(err, t)))
         }}
       >
         {t('stack.caHintLink')}

@@ -372,7 +372,8 @@ export function registerIpc(opts: {
   ipcMain.handle(IPC.cleanUninstall, async (event) => {
     assertTrustedMainFrame(event, win, app.isPackaged, process.env.ELECTRON_RENDERER_URL, packagedRendererUrl)
 
-    return runCleanRemoval(async () => {
+    try {
+      return await runCleanRemoval(async () => {
       const uninstallers = readdirSync(installDir).filter((f) => /^Uninstall.*\.exe$/i.test(f))
       if (uninstallers.length !== 1) {
         throw new Error(
@@ -441,6 +442,9 @@ export function registerIpc(opts: {
       finishCleanRemoval()
       return true
     })
+    } catch (err) {
+      throw toRendererError(err)
+    }
   })
 
   /* preview */

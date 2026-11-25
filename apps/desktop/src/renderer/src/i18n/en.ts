@@ -40,7 +40,6 @@ export const en = {
   'toast.caTrusted': 'DevHotel Local CA trusted for your Windows user',
   'toast.caUntrusted': 'DevHotel Local CA removed from Windows trust',
 
-  // Errors
   'error.recoveryHint': 'How to fix: {hint}',
   'error.invalidInput': 'Some entered values are not in the expected format. Check the fields and try again.',
   'error.unknown': 'Something went wrong. Check Diagnostics for details.',

@@ -5,6 +5,7 @@ import '@xterm/xterm/css/xterm.css'
 import type { RoomRecord } from '@devhotel/shared'
 import { IPC } from '@devhotel/shared'
 import { api } from '../../api'
+import { describeError } from '../../errorText'
 import { useStore, useT } from '../../state/store'
 import { translate } from '../../i18n'
 import type { Translation } from '../../i18n'
@@ -53,7 +54,7 @@ export function ConsoleTab({ room }: { room: RoomRecord }): React.JSX.Element {
         term.onResize(({ cols, rows }) => api.term.resize(id, cols, rows))
       })
       .catch((err: unknown) => {
-        term.write(`\x1b[31m${tr('console.openFailed', { error: String(err) })}\x1b[0m\r\n`)
+        term.write(`\x1b[31m${tr('console.openFailed', { error: describeError(err, tr).replace(/\n/g, '\r\n') })}\x1b[0m\r\n`)
         term.write(`\x1b[90m${tr('console.mustBeAwake')}\x1b[0m\r\n`)
       })
 

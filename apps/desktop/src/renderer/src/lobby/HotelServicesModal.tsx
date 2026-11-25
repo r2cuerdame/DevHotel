@@ -17,13 +17,13 @@ export function HotelServicesModal({ onClose }: { onClose: () => void }): React.
   const [mcp, setMcp] = useState<McpRegistryItem[]>([])
   const [loadingMcp, setLoadingMcp] = useState(false)
 
-  const refresh = (): void => { void api.hotel.githubStatus().then(setGithub).catch((e: unknown) => setError(String(e))) }
+  const refresh = (): void => { void api.hotel.githubStatus().then(setGithub).catch((e: unknown) => setError(describeError(e, t))) }
   useEffect(refresh, [])
   useEffect(() => {
     if (tab !== 'mcp') return
     const timer = setTimeout(() => {
       setLoadingMcp(true)
-      void api.hotel.mcpBrowse(query).then((page) => setMcp(page.items)).catch((e: unknown) => setError(String(e))).finally(() => setLoadingMcp(false))
+      void api.hotel.mcpBrowse(query).then((page) => setMcp(page.items)).catch((e: unknown) => setError(describeError(e, t))).finally(() => setLoadingMcp(false))
     }, query ? 300 : 0)
     return () => clearTimeout(timer)
   }, [query, tab])
