@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { IPC, type PreviewLayout } from '@devhotel/shared'
 import { api } from '../api'
 import { statusLabel, useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 import { BrowserBar } from './BrowserBar'
 import { RoomConfig, type ConfigTab } from './DetailPanel'
 import {
@@ -259,7 +260,7 @@ export function RoomView({ roomId }: { roomId: string }): React.JSX.Element {
                       onClick={() => {
                         void api.rooms
                           .openWindows(roomId)
-                          .catch((err: unknown) => toast('error', err instanceof Error ? err.message : String(err)))
+                          .catch((err: unknown) => toast('error', describeError(err, t)))
                       }}
                     >
                       {t('windows.openVmware')}

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { ManagedRuntimeStatusInfo, McpSetupInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 import { LOCALES } from '../i18n'
 import type { LocaleId, Translation } from '../i18n'
 
@@ -253,7 +254,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): React.JSX.E
                     })
                     .catch((error: unknown) => {
                       setCleaning(false)
-                      toast('error', error instanceof Error ? error.message : String(error))
+                      toast('error', describeError(error, t))
                     })
                 }
               }}

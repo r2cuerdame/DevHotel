@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { ProviderInfo, RoomPlan, SourceType, VmwareSetupStatusInfo } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 import type { Translation } from '../i18n'
 import {
   isNewRoomPlanReady,
@@ -120,7 +121,7 @@ export function NewRoomWizard(): React.JSX.Element {
       setSnapshot(selected.snapshots[0] ?? '')
       if (!project) setProject(selected.label.replace(/\.vmx$/i, ''))
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
     } finally {
       setLoading(false)
     }
@@ -138,7 +139,7 @@ export function NewRoomWizard(): React.JSX.Element {
         setProviderInfos(list)
       }
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
     } finally {
       vmwareActionRef.current = null
       setVmwareAction(null)
@@ -153,7 +154,7 @@ export function NewRoomWizard(): React.JSX.Element {
       await api.app.openVmwareDownload()
       setVmwareDownloadOpened(true)
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
     } finally {
       vmwareActionRef.current = null
       setVmwareAction(null)
@@ -167,7 +168,7 @@ export function NewRoomWizard(): React.JSX.Element {
     try {
       await api.app.relaunch()
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
       vmwareActionRef.current = null
       setVmwareAction(null)
     }
@@ -234,7 +235,7 @@ export function NewRoomWizard(): React.JSX.Element {
       }
       setStep('plan')
     } catch (err) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', describeError(err, t))
     } finally {
       setLoading(false)
     }

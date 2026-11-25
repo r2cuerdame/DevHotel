@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { RegistryPackageInfo, RoomRecord } from '@devhotel/shared'
 import { api } from '../api'
 import { useStore, useT } from '../state/store'
+import { describeError } from '../errorText'
 
 type StoreTab = 'packages' | 'services'
 type CategoryId = 'featured' | 'frontend' | 'backend' | 'testing' | 'tooling' | 'data'
@@ -92,7 +93,7 @@ export function PackageStoreModal({ room, onClose }: { room: RoomRecord; onClose
         .catch((err: unknown) => {
           if (active) {
             setResults([])
-            setError(err instanceof Error ? err.message : String(err))
+            setError(describeError(err, t))
           }
         })
         .finally(() => {
@@ -165,7 +166,7 @@ export function PackageStoreModal({ room, onClose }: { room: RoomRecord; onClose
         setExhaustedCategories({ ...exhaustedCategories, [selectedCategory]: true })
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(describeError(err, t))
     } finally {
       setLoadingMore(false)
     }

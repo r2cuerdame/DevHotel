@@ -1499,6 +1499,8 @@ code,
   padding: 9px 14px;
   min-width: 260px;
   max-width: 480px;
+  white-space: pre-line;
+  text-align: left;
   animation: rise 160ms ease-out;
 }
 

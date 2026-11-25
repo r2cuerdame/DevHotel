@@ -71,6 +71,10 @@ export const ko: Translation = {
   'toast.caTrusted': 'DevHotel 로컬 CA를 현재 Windows 사용자에 대해 신뢰했습니다',
   'toast.caUntrusted': 'DevHotel 로컬 CA를 Windows 신뢰 목록에서 제거했습니다',
 
+  'error.recoveryHint': '고치는 방법: {hint}',
+  'error.invalidInput': '입력한 값 중 형식이 맞지 않는 것이 있습니다. 입력 칸을 확인하고 다시 시도하세요.',
+  'error.unknown': '알 수 없는 오류가 발생했습니다. 자세한 내용은 진단을 확인하세요.',
+
   'time.justNow': '방금 전',
   'time.minutesAgo': '{n}분 전',
   'time.hoursAgo': '{n}시간 전',

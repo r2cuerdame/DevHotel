@@ -380,3 +380,11 @@ export interface IpcApi {
   }
   on(channel: IpcChannel, listener: (...args: any[]) => void): () => void
 }
+
+export const RENDERER_ERROR_PREFIX = 'DEVHOTEL_ERROR:'
+
+export interface RendererErrorPayload {
+  code: string
+  message?: string
+  recoveryHint?: string
+}

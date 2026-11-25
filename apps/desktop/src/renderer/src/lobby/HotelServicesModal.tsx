@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { GitHubServiceStatus, McpRegistryItem } from '@devhotel/shared'
 import { api } from '../api'
 import { useT } from '../state/store'
+import { describeError } from '../errorText'
 
 type Tab = 'infrastructure' | 'mcp' | 'skills'
 
@@ -27,7 +28,7 @@ export function HotelServicesModal({ onClose }: { onClose: () => void }): React.
     return () => clearTimeout(timer)
   }, [query, tab])
   const action = (name: string, job: () => Promise<GitHubServiceStatus>): void => {
-    setBusy(name); setError(''); void job().then(setGithub).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e))).finally(() => setBusy(''))
+    setBusy(name); setError(''); void job().then(setGithub).catch((e: unknown) => setError(describeError(e, t))).finally(() => setBusy(''))
   }
   const connect = (): void => {
     const submitted = token
